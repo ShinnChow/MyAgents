@@ -11,6 +11,7 @@ import {
   spaceCancelIssueClaim,
   spaceCancelIssueAssignee,
   spaceDeleteSkill,
+  spaceDeleteTool,
   spaceDeleteRegisteredAgentSubscription,
   spaceDownloadIssueAttachment,
   spaceErrorCode,
@@ -39,12 +40,17 @@ import {
   spaceReevaluateRegisteredAgent,
   spaceRevokeRegisteredAgent,
   spaceRollbackSkill,
+  spaceRollbackTool,
+  spacePublishCustomTool,
+  spacePublishMcpTool,
   spaceSetActiveSpace,
   spaceSetIssueState,
   spaceSetIssueAssignee,
   spaceUpdateProfile,
   spaceUpdateGoal,
   spaceUpdateIssue,
+  spaceUpdateCustomTool,
+  spaceUpdateMcpTool,
   spaceUpdateRegisteredAgent,
   spaceUpdateRegisteredAgentAvatar,
   spaceUploadIssueAttachments,
@@ -69,9 +75,11 @@ import {
   type SpaceSkillRevisionHistory,
   type SpaceTool,
   type SpaceToolDetail,
+  type SpaceToolMutationResult,
   type SpaceToolRevisionHistory,
   type SpaceUserSummary,
 } from "@/api/spaceCloud";
+import type { PortableMcpManifestV1 } from "../../../shared/spaceToolManifest";
 import type { IssueQueryParams } from "./spaceHelpers";
 import {
   buildIssueQueryKey,
@@ -282,6 +290,45 @@ export interface SpaceActions {
     options?: RefreshOptions,
   ) => Promise<void>;
   loadMoreToolRevisions: (toolId: string) => Promise<void>;
+  publishMcpTool: (input: {
+    spaceId: string;
+    name: string;
+    description?: string;
+    portableMcpManifest: PortableMcpManifestV1;
+  }) => Promise<SpaceToolMutationResult>;
+  publishCustomTool: (input: {
+    spaceId: string;
+    name: string;
+    description: string;
+    customInstallInstruction: string;
+    iconFilePath?: string | null;
+  }) => Promise<SpaceToolMutationResult>;
+  updateMcpTool: (input: {
+    toolId: string;
+    name: string;
+    description?: string;
+    portableMcpManifest: PortableMcpManifestV1;
+    expectedLatestRevision: number;
+  }) => Promise<SpaceToolMutationResult>;
+  updateCustomTool: (input: {
+    toolId: string;
+    name: string;
+    description: string;
+    customInstallInstruction: string;
+    expectedLatestRevision: number;
+    iconFilePath?: string | null;
+    resetIcon?: boolean;
+  }) => Promise<SpaceToolMutationResult>;
+  rollbackTool: (input: {
+    toolId: string;
+    revision: number;
+    expectedCurrentRevision: number;
+    toolKind: SpaceTool["kind"];
+  }) => Promise<SpaceToolMutationResult>;
+  deleteTool: (input: {
+    toolId: string;
+    toolKind: SpaceTool["kind"];
+  }) => Promise<void>;
   refreshLocalAgents: (options?: RefreshOptions) => Promise<void>;
   refreshRegisteredAgents: (options?: RefreshOptions) => Promise<void>;
   syncEvents: (options?: RefreshOptions) => Promise<SpaceEvent[]>;
@@ -756,8 +803,8 @@ function normalizeIssueQueryParams(params: IssueQueryParams): IssueQueryParams {
 }
 
 function compareUpdatedDesc(
-  left: Pick<SpaceIssue | SpaceSkill, "id" | "updatedAt">,
-  right: Pick<SpaceIssue | SpaceSkill, "id" | "updatedAt">,
+  left: { id: string; updatedAt: string },
+  right: { id: string; updatedAt: string },
 ): number {
   const updatedDelta = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
   if (Number.isFinite(updatedDelta) && updatedDelta !== 0) return updatedDelta;
@@ -982,6 +1029,157 @@ function patchIssueDetail(
 
 function detailKey(id: string): string {
   return scopedKey(id);
+}
+
+function toolMutationScopeKey(): string {
+  return `${state.session?.sessionBindingId ?? ""}\n${activeSpaceId()}`;
+}
+
+function invalidateToolReadRequests(toolId: string): void {
+  const key = detailKey(toolId);
+  for (const requestKey of [
+    "tools",
+    "tools-more",
+    `tool:${key}`,
+    `tool-revisions:${key}`,
+    `tool-revisions-more:${key}`,
+  ]) {
+    startRequest(requestKey);
+    inFlightRequests.delete(requestKey);
+  }
+}
+
+function applyToolMutationResult(result: SpaceToolMutationResult): void {
+  const key = detailKey(result.tool.id);
+  const timestamp = Date.now();
+  const currentHistoryState = state.toolRevisions[key];
+  let nextToolRevisions = state.toolRevisions;
+  if (currentHistoryState) {
+    const currentHistory = currentHistoryState.history;
+    if (currentHistory) {
+      const nextHistoryItems = [
+        result.revision,
+        ...currentHistory.items.filter(
+          (revision) => revision.revision !== result.revision.revision,
+        ),
+      ]
+        .sort((left, right) => right.revision - left.revision)
+        .map((revision) => ({
+          ...revision,
+          isCurrent: revision.revision === result.tool.currentRevision,
+        }));
+      nextToolRevisions = {
+        ...state.toolRevisions,
+        [key]: {
+          ...currentHistoryState,
+          history: {
+            ...currentHistory,
+            tool: {
+              id: result.tool.id,
+              latestRevision: result.tool.latestRevision,
+              currentRevision: result.tool.currentRevision,
+            },
+            items: nextHistoryItems,
+          },
+          lastFetchedAt: timestamp,
+          isLoading: false,
+          isLoadingMore: false,
+          error: null,
+        },
+      };
+    } else {
+      nextToolRevisions = Object.fromEntries(
+        Object.entries(state.toolRevisions).filter(
+          ([cacheKey]) => cacheKey !== key,
+        ),
+      );
+    }
+  }
+
+  setState({
+    tools: {
+      ...state.tools,
+      items: [
+        result.tool,
+        ...state.tools.items.filter((tool) => tool.id !== result.tool.id),
+      ].sort(compareUpdatedDesc),
+      isLoading: false,
+      isLoadingMore: false,
+      error: null,
+    },
+    toolDetails: trimCacheRecord(
+      {
+        ...state.toolDetails,
+        [key]: {
+          detail: { tool: result.tool, revision: result.revision },
+          lastFetchedAt: timestamp,
+          isLoading: false,
+          error: null,
+        },
+      },
+      SPACE_MAX_TOOL_DETAIL_CACHES,
+    ),
+    toolRevisions: nextToolRevisions,
+  });
+}
+
+function removeToolFromCache(toolId: string): void {
+  const key = detailKey(toolId);
+  setState({
+    tools: {
+      ...state.tools,
+      items: state.tools.items.filter((tool) => tool.id !== toolId),
+      isLoading: false,
+      isLoadingMore: false,
+      error: null,
+    },
+    toolDetails: Object.fromEntries(
+      Object.entries(state.toolDetails).filter(
+        ([cacheKey]) => cacheKey !== key,
+      ),
+    ),
+    toolRevisions: Object.fromEntries(
+      Object.entries(state.toolRevisions).filter(
+        ([cacheKey]) => cacheKey !== key,
+      ),
+    ),
+  });
+}
+
+async function reconcileToolRevisionConflict(
+  toolId: string,
+  error: unknown,
+): Promise<void> {
+  if (spaceErrorCode(error) !== "TOOL_REVISION_CONFLICT") return;
+  await Promise.allSettled([
+    actions.refreshToolDetail(toolId, { force: true, silent: true }),
+    actions.refreshToolRevisions(toolId, { force: true, silent: true }),
+  ]);
+}
+
+async function runToolMutation(
+  operation: "tool.publish" | "tool.update" | "tool.rollback",
+  toolKind: SpaceTool["kind"],
+  task: () => Promise<SpaceToolMutationResult>,
+  conflictToolId?: string,
+): Promise<SpaceToolMutationResult> {
+  const mutationScope = toolMutationScopeKey();
+  try {
+    const result = await withSpaceMutationMetric(operation, task, {
+      toolKind,
+      toolResult: "success",
+    });
+    if (toolMutationScopeKey() === mutationScope) {
+      invalidateToolReadRequests(result.tool.id);
+      applyToolMutationResult(result);
+    }
+    return result;
+  } catch (error) {
+    if (conflictToolId && toolMutationScopeKey() === mutationScope) {
+      await reconcileToolRevisionConflict(conflictToolId, error);
+    }
+    throw error;
+  }
 }
 
 function skillFileKey(skillId: string, path: string): string {
@@ -2150,6 +2348,53 @@ export const actions: SpaceActions = {
         throw error;
       }
     });
+  },
+
+  publishMcpTool: (input) =>
+    runToolMutation("tool.publish", "mcp", () => spacePublishMcpTool(input)),
+
+  publishCustomTool: (input) =>
+    runToolMutation("tool.publish", "custom_install_prompt", () =>
+      spacePublishCustomTool(input),
+    ),
+
+  updateMcpTool: (input) =>
+    runToolMutation(
+      "tool.update",
+      "mcp",
+      () => spaceUpdateMcpTool(input),
+      input.toolId,
+    ),
+
+  updateCustomTool: (input) =>
+    runToolMutation(
+      "tool.update",
+      "custom_install_prompt",
+      () => spaceUpdateCustomTool(input),
+      input.toolId,
+    ),
+
+  rollbackTool: ({ toolKind, ...input }) =>
+    runToolMutation(
+      "tool.rollback",
+      toolKind,
+      () => spaceRollbackTool(input),
+      input.toolId,
+    ),
+
+  deleteTool: ({ toolId, toolKind }) => {
+    const mutationScope = toolMutationScopeKey();
+    return withSpaceMutationMetric(
+      "tool.delete",
+      async () => {
+        await spaceDeleteTool(toolId);
+        if (toolMutationScopeKey() === mutationScope) {
+          invalidateToolReadRequests(toolId);
+          removeToolFromCache(toolId);
+        }
+      },
+      { toolKind, toolResult: "success" },
+    );
   },
 
   refreshLocalAgents: async (options: RefreshOptions = {}) => {

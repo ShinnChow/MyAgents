@@ -28,25 +28,9 @@ const configMocks = vi.hoisted(() => ({
   atomicModifyConfig: vi.fn(),
 }));
 
-const apiMocks = vi.hoisted(() => ({
-  spacePublishCustomTool: vi.fn(),
-  spaceUpdateCustomTool: vi.fn(),
-  spaceDeleteTool: vi.fn(),
-}));
-
 vi.mock("@/config/services/appConfigService", () => ({
   atomicModifyConfig: configMocks.atomicModifyConfig,
 }));
-
-vi.mock("@/api/spaceCloud", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/api/spaceCloud")>();
-  return {
-    ...actual,
-    spacePublishCustomTool: apiMocks.spacePublishCustomTool,
-    spaceUpdateCustomTool: apiMocks.spaceUpdateCustomTool,
-    spaceDeleteTool: apiMocks.spaceDeleteTool,
-  };
-});
 
 const mcpTool: SpaceTool = {
   id: "tool-mcp",
@@ -101,6 +85,7 @@ function renderTools(
     detailMissing?: boolean;
     revisionState?: SpaceToolRevisionState;
     refreshFailure?: boolean;
+    updateCustomFailure?: unknown;
     onSelectTool?: (toolId: string | null) => void;
   } = {},
 ) {
@@ -116,6 +101,46 @@ function renderTools(
       ? vi.fn().mockRejectedValue(new Error("refresh failed"))
       : vi.fn().mockResolvedValue(undefined),
     loadMoreTools: vi.fn().mockResolvedValue(undefined),
+    publishMcpTool: vi.fn().mockResolvedValue({
+      tool: mcpTool,
+      revision: {
+        id: "mcp-revision-1",
+        toolId: mcpTool.id,
+        revision: 1,
+        name: mcpTool.name,
+        description: mcpTool.description,
+        createdAt: mcpTool.createdAt,
+      },
+    }),
+    publishCustomTool: vi.fn().mockResolvedValue({
+      tool: customTool,
+      revision: {
+        id: "revision-1",
+        toolId: customTool.id,
+        revision: 1,
+        name: customTool.name,
+        description: customTool.description,
+        customInstallInstruction: "brew install ffmpeg",
+        createdAt: customTool.createdAt,
+      },
+    }),
+    updateMcpTool: vi.fn().mockResolvedValue(undefined),
+    updateCustomTool: input.updateCustomFailure
+      ? vi.fn().mockRejectedValue(input.updateCustomFailure)
+      : vi.fn().mockResolvedValue({
+          tool: customTool,
+          revision: {
+            id: "revision-1",
+            toolId: customTool.id,
+            revision: 1,
+            name: customTool.name,
+            description: customTool.description,
+            customInstallInstruction: "brew install ffmpeg",
+            createdAt: customTool.createdAt,
+          },
+        }),
+    rollbackTool: vi.fn().mockResolvedValue(undefined),
+    deleteTool: vi.fn().mockResolvedValue(undefined),
   } as unknown as SpaceActions;
   render(
     <ToastProvider>
@@ -135,52 +160,52 @@ function renderTools(
                 error: input.detailError ?? "offline",
               }
             : input.selectedToolId === mcpTool.id
-            ? {
-                detail: {
-                  tool: mcpTool,
-                  revision: {
-                    id: "mcp-revision-1",
-                    toolId: mcpTool.id,
-                    revision: 1,
-                    name: mcpTool.name,
-                    description: mcpTool.description,
-                    portableMcpManifest: {
-                      schemaVersion: 1,
-                      serverId: "team-mcp",
-                      transport: "stdio",
-                      stdio: {
-                        command: "npx",
-                        args: ["-y", "@example/team-mcp"],
-                        envTemplates: {},
+              ? {
+                  detail: {
+                    tool: mcpTool,
+                    revision: {
+                      id: "mcp-revision-1",
+                      toolId: mcpTool.id,
+                      revision: 1,
+                      name: mcpTool.name,
+                      description: mcpTool.description,
+                      portableMcpManifest: {
+                        schemaVersion: 1,
+                        serverId: "team-mcp",
+                        transport: "stdio",
+                        stdio: {
+                          command: "npx",
+                          args: ["-y", "@example/team-mcp"],
+                          envTemplates: {},
+                        },
+                        requiredConfigKeys: [],
                       },
-                      requiredConfigKeys: [],
+                      createdAt: mcpTool.createdAt,
                     },
-                    createdAt: mcpTool.createdAt,
                   },
-                },
-                lastFetchedAt: Date.now(),
-                isLoading: false,
-                error: input.detailError ?? null,
-              }
-            : input.selectedToolId === customTool.id
-            ? {
-                detail: {
-                  tool: customTool,
-                  revision: {
-                    id: "revision-1",
-                    toolId: customTool.id,
-                    revision: 1,
-                    name: customTool.name,
-                    description: customTool.description,
-                    customInstallInstruction: "brew install ffmpeg",
-                    createdAt: customTool.createdAt,
-                  },
-                },
-                lastFetchedAt: Date.now(),
-                isLoading: false,
-                error: input.detailError ?? null,
-              }
-            : undefined
+                  lastFetchedAt: Date.now(),
+                  isLoading: false,
+                  error: input.detailError ?? null,
+                }
+              : input.selectedToolId === customTool.id
+                ? {
+                    detail: {
+                      tool: customTool,
+                      revision: {
+                        id: "revision-1",
+                        toolId: customTool.id,
+                        revision: 1,
+                        name: customTool.name,
+                        description: customTool.description,
+                        customInstallInstruction: "brew install ffmpeg",
+                        createdAt: customTool.createdAt,
+                      },
+                    },
+                    lastFetchedAt: Date.now(),
+                    isLoading: false,
+                    error: input.detailError ?? null,
+                  }
+                : undefined
         }
         revisionState={input.revisionState}
         actions={actions}
@@ -197,9 +222,6 @@ describe("Space Tools workspace", () => {
     await i18n.changeLanguage("zh-CN");
     configMocks.diskConfig = {} as AppConfig;
     configMocks.atomicModifyConfig.mockClear();
-    apiMocks.spacePublishCustomTool.mockReset();
-    apiMocks.spaceUpdateCustomTool.mockReset();
-    apiMocks.spaceDeleteTool.mockReset();
     configMocks.atomicModifyConfig.mockImplementation(
       async (modify: (config: AppConfig) => AppConfig) => {
         configMocks.diskConfig = modify(configMocks.diskConfig);
@@ -249,9 +271,7 @@ describe("Space Tools workspace", () => {
     ).toBeVisible();
     fireEvent.blur(screen.getByRole("textbox", { name: "工具名称" }));
     fireEvent.blur(screen.getByRole("textbox", { name: "工具简介" }));
-    fireEvent.blur(
-      screen.getByRole("textbox", { name: "自定义安装指令" }),
-    );
+    fireEvent.blur(screen.getByRole("textbox", { name: "自定义安装指令" }));
     expect(screen.getByText("请填写工具名称")).toBeVisible();
     expect(screen.getByText("请填写工具简介")).toBeVisible();
     expect(screen.getByText("请填写自定义安装指令")).toBeVisible();
@@ -312,20 +332,8 @@ describe("Space Tools workspace", () => {
     expect(actions.loadMoreToolRevisions).toHaveBeenCalledWith(mcpTool.id);
   });
 
-  it("does not misreport a committed publish when post-mutation refresh fails", async () => {
-    apiMocks.spacePublishCustomTool.mockResolvedValueOnce({
-      tool: customTool,
-      revision: {
-        id: "revision-1",
-        toolId: customTool.id,
-        revision: 1,
-        name: customTool.name,
-        description: customTool.description,
-        customInstallInstruction: "brew install ffmpeg",
-        createdAt: customTool.createdAt,
-      },
-    });
-    renderTools({ refreshFailure: true });
+  it("does not couple a successful publish to read refreshes", async () => {
+    const actions = renderTools({ refreshFailure: true });
     fireEvent.click(screen.getByRole("button", { name: /发布工具/ }));
     fireEvent.click(
       screen.getByRole("button", { name: "发布自定义安装工具提示词" }),
@@ -336,15 +344,15 @@ describe("Space Tools workspace", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "工具简介" }), {
       target: { value: "Install FFmpeg" },
     });
-    fireEvent.change(
-      screen.getByRole("textbox", { name: "自定义安装指令" }),
-      { target: { value: "brew install ffmpeg" } },
-    );
+    fireEvent.change(screen.getByRole("textbox", { name: "自定义安装指令" }), {
+      target: { value: "brew install ffmpeg" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "发布" }));
 
     await waitFor(() =>
-      expect(apiMocks.spacePublishCustomTool).toHaveBeenCalledTimes(1),
+      expect(actions.publishCustomTool).toHaveBeenCalledTimes(1),
     );
+    expect(actions.refreshTools).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(
         screen.queryByRole("textbox", { name: "工具名称" }),
@@ -353,10 +361,9 @@ describe("Space Tools workspace", () => {
     expect(await screen.findByText("工具已发布")).toBeVisible();
   });
 
-  it("does not retry a committed delete when the post-mutation refresh fails", async () => {
-    apiMocks.spaceDeleteTool.mockResolvedValueOnce({ deleted: true });
+  it("does not couple a successful delete to read refreshes", async () => {
     const onSelectTool = vi.fn();
-    renderTools({
+    const actions = renderTools({
       selectedToolId: customTool.id,
       refreshFailure: true,
       onSelectTool,
@@ -365,49 +372,51 @@ describe("Space Tools workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "删除" }));
     fireEvent.click(screen.getByRole("button", { name: "删除" }));
 
-    await waitFor(() =>
-      expect(apiMocks.spaceDeleteTool).toHaveBeenCalledTimes(1),
-    );
+    await waitFor(() => expect(actions.deleteTool).toHaveBeenCalledTimes(1));
+    expect(actions.refreshTools).not.toHaveBeenCalled();
     await waitFor(() => expect(onSelectTool).toHaveBeenCalledWith(null));
     expect(await screen.findByText("工具已删除")).toBeVisible();
   });
 
   it("keeps the revision-conflict error visible when conflict refresh fails", async () => {
-    apiMocks.spaceUpdateCustomTool.mockRejectedValueOnce(
-      Object.assign(new Error("TOOL_REVISION_CONFLICT: stale revision"), {
-        code: "TOOL_REVISION_CONFLICT",
-      }),
+    const conflict = Object.assign(
+      new Error("TOOL_REVISION_CONFLICT: stale revision"),
+      { code: "TOOL_REVISION_CONFLICT" },
     );
-    renderTools({ selectedToolId: customTool.id, refreshFailure: true });
+    const actions = renderTools({
+      selectedToolId: customTool.id,
+      refreshFailure: true,
+      updateCustomFailure: conflict,
+    });
     fireEvent.click(screen.getByRole("button", { name: "更多操作" }));
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() =>
-      expect(apiMocks.spaceUpdateCustomTool).toHaveBeenCalledTimes(1),
+      expect(actions.updateCustomTool).toHaveBeenCalledTimes(1),
     );
     expect(await screen.findByText(/stale revision/)).toBeVisible();
   });
 
   it("keeps the edit-open revision as the CAS token after a remote refresh", async () => {
-    apiMocks.spaceUpdateCustomTool.mockResolvedValueOnce({
-      tool: { ...customTool, latestRevision: 3, currentRevision: 3 },
-      revision: {
-        id: "revision-3",
-        toolId: customTool.id,
-        revision: 3,
-        name: customTool.name,
-        description: customTool.description,
-        customInstallInstruction: "brew install ffmpeg",
-        createdAt: customTool.createdAt,
-      },
-    });
     const actions = {
       refreshToolDetail: vi.fn().mockResolvedValue(undefined),
       refreshToolRevisions: vi.fn().mockResolvedValue(undefined),
       loadMoreToolRevisions: vi.fn().mockResolvedValue(undefined),
       refreshTools: vi.fn().mockResolvedValue(undefined),
       loadMoreTools: vi.fn().mockResolvedValue(undefined),
+      updateCustomTool: vi.fn().mockResolvedValue({
+        tool: { ...customTool, latestRevision: 3, currentRevision: 3 },
+        revision: {
+          id: "revision-3",
+          toolId: customTool.id,
+          revision: 3,
+          name: customTool.name,
+          description: customTool.description,
+          customInstallInstruction: "brew install ffmpeg",
+          createdAt: customTool.createdAt,
+        },
+      }),
     } as unknown as SpaceActions;
     function Harness() {
       const [latestRevision, setLatestRevision] = useState(1);
@@ -460,7 +469,7 @@ describe("Space Tools workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     await waitFor(() =>
-      expect(apiMocks.spaceUpdateCustomTool).toHaveBeenCalledWith(
+      expect(actions.updateCustomTool).toHaveBeenCalledWith(
         expect.objectContaining({ expectedLatestRevision: 1 }),
       ),
     );

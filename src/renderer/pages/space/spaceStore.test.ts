@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   spaceCompleteIssue: vi.fn(),
   spaceCreateIssue: vi.fn(),
   spaceDeleteSkill: vi.fn(),
+  spaceDeleteTool: vi.fn(),
   spaceDownloadIssueAttachment: vi.fn(),
   spaceGetIssue: vi.fn(),
   spaceGetOfficial: vi.fn(),
@@ -34,11 +35,16 @@ const apiMocks = vi.hoisted(() => ({
   spaceLogout: vi.fn(),
   spaceRegisterAgent: vi.fn(),
   spaceRevokeRegisteredAgent: vi.fn(),
+  spacePublishCustomTool: vi.fn(),
+  spacePublishMcpTool: vi.fn(),
   spaceRollbackSkill: vi.fn(),
+  spaceRollbackTool: vi.fn(),
   spaceSetActiveSpace: vi.fn(),
   spaceSetIssueState: vi.fn(),
   spaceSetIssueAssignee: vi.fn(),
   spaceUpdateGoal: vi.fn(),
+  spaceUpdateCustomTool: vi.fn(),
+  spaceUpdateMcpTool: vi.fn(),
   spaceUpdateIssue: vi.fn(),
   spaceUpdateProfile: vi.fn(),
   spaceUpdateRegisteredAgent: vi.fn(),
@@ -74,6 +80,7 @@ vi.mock("@/api/spaceCloud", () => ({
   spaceCompleteIssue: apiMocks.spaceCompleteIssue,
   spaceCreateIssue: apiMocks.spaceCreateIssue,
   spaceDeleteSkill: apiMocks.spaceDeleteSkill,
+  spaceDeleteTool: apiMocks.spaceDeleteTool,
   spaceDownloadIssueAttachment: apiMocks.spaceDownloadIssueAttachment,
   spaceGetIssue: apiMocks.spaceGetIssue,
   spaceGetOfficial: apiMocks.spaceGetOfficial,
@@ -96,11 +103,16 @@ vi.mock("@/api/spaceCloud", () => ({
   spaceLogout: apiMocks.spaceLogout,
   spaceRegisterAgent: apiMocks.spaceRegisterAgent,
   spaceRevokeRegisteredAgent: apiMocks.spaceRevokeRegisteredAgent,
+  spacePublishCustomTool: apiMocks.spacePublishCustomTool,
+  spacePublishMcpTool: apiMocks.spacePublishMcpTool,
   spaceRollbackSkill: apiMocks.spaceRollbackSkill,
+  spaceRollbackTool: apiMocks.spaceRollbackTool,
   spaceSetActiveSpace: apiMocks.spaceSetActiveSpace,
   spaceSetIssueState: apiMocks.spaceSetIssueState,
   spaceSetIssueAssignee: apiMocks.spaceSetIssueAssignee,
   spaceUpdateGoal: apiMocks.spaceUpdateGoal,
+  spaceUpdateCustomTool: apiMocks.spaceUpdateCustomTool,
+  spaceUpdateMcpTool: apiMocks.spaceUpdateMcpTool,
   spaceUpdateIssue: apiMocks.spaceUpdateIssue,
   spaceUpdateProfile: apiMocks.spaceUpdateProfile,
   spaceUpdateRegisteredAgent: apiMocks.spaceUpdateRegisteredAgent,
@@ -407,9 +419,433 @@ describe("spaceStore Tool catalogue", () => {
     });
     const revisionState = Object.values(getSnapshot().toolRevisions)[0];
     expect(revisionState?.history?.items.map((item) => item.revision)).toEqual([
-      101,
-      100,
+      101, 100,
     ]);
+  });
+
+  it("projects a Tool mutation response into list, detail, and loaded history", async () => {
+    const revisionOne = {
+      id: "tool-revision-1",
+      toolId: fakeTool.id,
+      revision: 1,
+      name: fakeTool.name,
+      description: fakeTool.description,
+      createdAt: fakeTool.createdAt,
+    };
+    const updatedTool = {
+      ...fakeTool,
+      name: "Team MCP v2",
+      latestRevision: 2,
+      currentRevision: 2,
+      updatedAt: "2026-08-16T01:00:00.000Z",
+    };
+    const revisionTwo = {
+      ...revisionOne,
+      id: "tool-revision-2",
+      revision: 2,
+      name: updatedTool.name,
+      createdAt: updatedTool.updatedAt,
+    };
+    __setSpaceStoreStateForTest({
+      tools: {
+        items: [fakeTool],
+        hasMore: false,
+        nextCursor: null,
+        lastFetchedAt: 1,
+        isLoading: false,
+        isLoadingMore: false,
+        error: null,
+      },
+      toolDetails: {
+        [scoped(fakeTool.id)]: {
+          detail: { tool: fakeTool, revision: revisionOne },
+          lastFetchedAt: 1,
+          isLoading: false,
+          error: null,
+        },
+      },
+      toolRevisions: {
+        [scoped(fakeTool.id)]: {
+          history: {
+            tool: { id: fakeTool.id, latestRevision: 1, currentRevision: 1 },
+            items: [{ ...revisionOne, isCurrent: true }],
+            hasMore: false,
+            nextCursor: null,
+          },
+          lastFetchedAt: 1,
+          isLoading: false,
+          isLoadingMore: false,
+          error: null,
+        },
+      },
+    });
+    apiMocks.spaceUpdateMcpTool.mockResolvedValueOnce({
+      tool: updatedTool,
+      revision: revisionTwo,
+    });
+
+    await actions.updateMcpTool({
+      toolId: fakeTool.id,
+      name: updatedTool.name,
+      description: updatedTool.description,
+      portableMcpManifest: {
+        schemaVersion: 1,
+        serverId: "team-mcp",
+        transport: "stdio",
+        stdio: { command: "npx", args: [], envTemplates: {} },
+        requiredConfigKeys: [],
+      },
+      expectedLatestRevision: 1,
+    });
+
+    const snapshot = getSnapshot();
+    expect(snapshot.tools.items[0]).toEqual(updatedTool);
+    expect(snapshot.toolDetails[scoped(fakeTool.id)]?.detail).toEqual({
+      tool: updatedTool,
+      revision: revisionTwo,
+    });
+    expect(
+      snapshot.toolRevisions[scoped(fakeTool.id)]?.history?.items.map(
+        (revision) => [revision.revision, revision.isCurrent],
+      ),
+    ).toEqual([
+      [2, true],
+      [1, false],
+    ]);
+    expect(apiMocks.spaceListTools).not.toHaveBeenCalled();
+    expect(apiMocks.spaceGetTool).not.toHaveBeenCalled();
+    expect(apiMocks.spaceListToolRevisions).not.toHaveBeenCalled();
+  });
+
+  it("keeps an authoritative Tool mutation ahead of older in-flight reads", async () => {
+    const revisionOne = {
+      id: "tool-revision-1",
+      toolId: fakeTool.id,
+      revision: 1,
+      name: fakeTool.name,
+      description: fakeTool.description,
+      createdAt: fakeTool.createdAt,
+    };
+    const updatedTool = {
+      ...fakeTool,
+      name: "Team MCP v2",
+      latestRevision: 2,
+      currentRevision: 2,
+      updatedAt: "2026-08-16T01:00:00.000Z",
+    };
+    const revisionTwo = {
+      ...revisionOne,
+      id: "tool-revision-2",
+      revision: 2,
+      name: updatedTool.name,
+      createdAt: updatedTool.updatedAt,
+    };
+    const staleList = deferred<{
+      items: SpaceTool[];
+      hasMore: boolean;
+      nextCursor: string | null;
+    }>();
+    const staleDetail = deferred<{
+      tool: SpaceTool;
+      revision: typeof revisionOne;
+    }>();
+    const staleHistory = deferred<{
+      tool: { id: string; latestRevision: number; currentRevision: number };
+      items: Array<typeof revisionOne & { isCurrent: boolean }>;
+      hasMore: boolean;
+      nextCursor: string | null;
+    }>();
+    __setSpaceStoreStateForTest({
+      tools: {
+        items: [fakeTool],
+        hasMore: false,
+        nextCursor: null,
+        lastFetchedAt: 1,
+        isLoading: false,
+        isLoadingMore: false,
+        error: null,
+      },
+      toolDetails: {
+        [scoped(fakeTool.id)]: {
+          detail: { tool: fakeTool, revision: revisionOne },
+          lastFetchedAt: 1,
+          isLoading: false,
+          error: null,
+        },
+      },
+      toolRevisions: {
+        [scoped(fakeTool.id)]: {
+          history: {
+            tool: { id: fakeTool.id, latestRevision: 1, currentRevision: 1 },
+            items: [{ ...revisionOne, isCurrent: true }],
+            hasMore: false,
+            nextCursor: null,
+          },
+          lastFetchedAt: 1,
+          isLoading: false,
+          isLoadingMore: false,
+          error: null,
+        },
+      },
+    });
+    apiMocks.spaceListTools.mockReturnValueOnce(staleList.promise);
+    apiMocks.spaceGetTool.mockReturnValueOnce(staleDetail.promise);
+    apiMocks.spaceListToolRevisions.mockReturnValueOnce(staleHistory.promise);
+    const olderReads = [
+      actions.refreshTools({ force: true }),
+      actions.refreshToolDetail(fakeTool.id, { force: true }),
+      actions.refreshToolRevisions(fakeTool.id, { force: true }),
+    ];
+    apiMocks.spaceUpdateMcpTool.mockResolvedValueOnce({
+      tool: updatedTool,
+      revision: revisionTwo,
+    });
+
+    await actions.updateMcpTool({
+      toolId: fakeTool.id,
+      name: updatedTool.name,
+      description: updatedTool.description,
+      portableMcpManifest: {
+        schemaVersion: 1,
+        serverId: "team-mcp",
+        transport: "stdio",
+        stdio: { command: "npx", args: [], envTemplates: {} },
+        requiredConfigKeys: [],
+      },
+      expectedLatestRevision: 1,
+    });
+    staleList.resolve({ items: [fakeTool], hasMore: false, nextCursor: null });
+    staleDetail.resolve({ tool: fakeTool, revision: revisionOne });
+    staleHistory.resolve({
+      tool: { id: fakeTool.id, latestRevision: 1, currentRevision: 1 },
+      items: [{ ...revisionOne, isCurrent: true }],
+      hasMore: false,
+      nextCursor: null,
+    });
+    await Promise.all(olderReads);
+
+    const snapshot = getSnapshot();
+    expect(snapshot.tools.items[0]).toEqual(updatedTool);
+    expect(snapshot.tools.isLoading).toBe(false);
+    expect(snapshot.toolDetails[scoped(fakeTool.id)]?.detail).toEqual({
+      tool: updatedTool,
+      revision: revisionTwo,
+    });
+    expect(
+      snapshot.toolRevisions[scoped(fakeTool.id)]?.history?.items.map(
+        (revision) => revision.revision,
+      ),
+    ).toEqual([2, 1]);
+  });
+
+  it("removes a deleted Tool and its caches without a follow-up read", async () => {
+    __setSpaceStoreStateForTest({
+      tools: {
+        items: [fakeTool],
+        hasMore: false,
+        nextCursor: null,
+        lastFetchedAt: 1,
+        isLoading: false,
+        isLoadingMore: false,
+        error: null,
+      },
+      toolDetails: {
+        [scoped(fakeTool.id)]: {
+          detail: null,
+          lastFetchedAt: 1,
+          isLoading: false,
+          error: null,
+        },
+      },
+      toolRevisions: {
+        [scoped(fakeTool.id)]: {
+          history: null,
+          lastFetchedAt: 1,
+          isLoading: false,
+          isLoadingMore: false,
+          error: null,
+        },
+      },
+    });
+    apiMocks.spaceDeleteTool.mockResolvedValueOnce({ deleted: true });
+
+    await actions.deleteTool({ toolId: fakeTool.id, toolKind: fakeTool.kind });
+
+    const snapshot = getSnapshot();
+    expect(snapshot.tools.items).toEqual([]);
+    expect(snapshot.toolDetails).toEqual({});
+    expect(snapshot.toolRevisions).toEqual({});
+    expect(apiMocks.spaceListTools).not.toHaveBeenCalled();
+  });
+
+  it("does not let an older Tool list resurrect a committed delete", async () => {
+    const staleList = deferred<{
+      items: SpaceTool[];
+      hasMore: boolean;
+      nextCursor: string | null;
+    }>();
+    __setSpaceStoreStateForTest({
+      tools: {
+        items: [fakeTool],
+        hasMore: false,
+        nextCursor: null,
+        lastFetchedAt: 1,
+        isLoading: false,
+        isLoadingMore: false,
+        error: null,
+      },
+    });
+    apiMocks.spaceListTools.mockReturnValueOnce(staleList.promise);
+    const olderRead = actions.refreshTools({ force: true });
+    apiMocks.spaceDeleteTool.mockResolvedValueOnce({ deleted: true });
+
+    await actions.deleteTool({ toolId: fakeTool.id, toolKind: fakeTool.kind });
+    staleList.resolve({ items: [fakeTool], hasMore: false, nextCursor: null });
+    await olderRead;
+
+    expect(getSnapshot().tools.items).toEqual([]);
+    expect(getSnapshot().tools.isLoading).toBe(false);
+  });
+
+  it("does not project a late Tool mutation into a newly selected Space", async () => {
+    const pendingMutation = deferred<{
+      tool: SpaceTool;
+      revision: {
+        id: string;
+        toolId: string;
+        revision: number;
+        name: string;
+        description: string;
+        createdAt: string;
+      };
+    }>();
+    const teamSpace = {
+      ...fakeSession.space,
+      id: "space-2",
+      slug: "team",
+      name: "Team Space",
+    };
+    __setSpaceStoreStateForTest({
+      session: {
+        ...fakeSession,
+        spaces: [
+          { ...fakeSession.space, membership: fakeSession.membership },
+          { ...teamSpace, membership: fakeSession.membership },
+        ],
+      },
+    });
+    apiMocks.spaceUpdateMcpTool.mockReturnValueOnce(pendingMutation.promise);
+    const mutation = actions.updateMcpTool({
+      toolId: fakeTool.id,
+      name: "Team MCP v2",
+      description: fakeTool.description,
+      portableMcpManifest: {
+        schemaVersion: 1,
+        serverId: "team-mcp",
+        transport: "stdio",
+        stdio: { command: "npx", args: [], envTemplates: {} },
+        requiredConfigKeys: [],
+      },
+      expectedLatestRevision: 1,
+    });
+
+    await actions.switchSpace("team");
+    pendingMutation.resolve({
+      tool: { ...fakeTool, name: "Team MCP v2" },
+      revision: {
+        id: "tool-revision-2",
+        toolId: fakeTool.id,
+        revision: 2,
+        name: "Team MCP v2",
+        description: fakeTool.description,
+        createdAt: "2026-08-16T01:00:00.000Z",
+      },
+    });
+    await mutation;
+
+    expect(getSnapshot().spaceId).toBe("team");
+    expect(getSnapshot().tools.items).toEqual([]);
+    expect(getSnapshot().toolDetails).toEqual({});
+    expect(getSnapshot().toolRevisions).toEqual({});
+  });
+
+  it("does not repopulate signed-out state from a late Tool mutation", async () => {
+    const pendingMutation = deferred<{
+      tool: SpaceTool;
+      revision: {
+        id: string;
+        toolId: string;
+        revision: number;
+        name: string;
+        description: string;
+        createdAt: string;
+      };
+    }>();
+    apiMocks.spaceUpdateMcpTool.mockReturnValueOnce(pendingMutation.promise);
+    const mutation = actions.updateMcpTool({
+      toolId: fakeTool.id,
+      name: "Team MCP v2",
+      description: fakeTool.description,
+      portableMcpManifest: {
+        schemaVersion: 1,
+        serverId: "team-mcp",
+        transport: "stdio",
+        stdio: { command: "npx", args: [], envTemplates: {} },
+        requiredConfigKeys: [],
+      },
+      expectedLatestRevision: 1,
+    });
+
+    await actions.logout();
+    pendingMutation.resolve({
+      tool: { ...fakeTool, name: "Team MCP v2" },
+      revision: {
+        id: "tool-revision-2",
+        toolId: fakeTool.id,
+        revision: 2,
+        name: "Team MCP v2",
+        description: fakeTool.description,
+        createdAt: "2026-08-16T01:00:00.000Z",
+      },
+    });
+    await mutation;
+
+    expect(getSnapshot().boot).toBe("signedOut");
+    expect(getSnapshot().tools.items).toEqual([]);
+    expect(getSnapshot().toolDetails).toEqual({});
+    expect(getSnapshot().toolRevisions).toEqual({});
+  });
+
+  it("preserves the original revision conflict when reconciliation reads fail", async () => {
+    const conflict = Object.assign(new Error("stale revision"), {
+      code: "TOOL_REVISION_CONFLICT",
+    });
+    apiMocks.spaceUpdateMcpTool.mockRejectedValueOnce(conflict);
+    apiMocks.spaceGetTool.mockRejectedValueOnce(new Error("detail offline"));
+    apiMocks.spaceListToolRevisions.mockRejectedValueOnce(
+      new Error("history offline"),
+    );
+
+    await expect(
+      actions.updateMcpTool({
+        toolId: fakeTool.id,
+        name: fakeTool.name,
+        description: fakeTool.description,
+        portableMcpManifest: {
+          schemaVersion: 1,
+          serverId: "team-mcp",
+          transport: "stdio",
+          stdio: { command: "npx", args: [], envTemplates: {} },
+          requiredConfigKeys: [],
+        },
+        expectedLatestRevision: 1,
+      }),
+    ).rejects.toBe(conflict);
+    expect(apiMocks.spaceGetTool).toHaveBeenCalledWith(fakeTool.id);
+    expect(apiMocks.spaceListToolRevisions).toHaveBeenCalledWith({
+      toolId: fakeTool.id,
+      limit: 100,
+    });
   });
 });
 

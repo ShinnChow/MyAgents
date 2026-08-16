@@ -17,14 +17,7 @@ import {
 } from "lucide-react";
 
 import {
-  spaceDeleteTool,
-  spaceErrorCode,
   spaceErrorMessage,
-  spacePublishCustomTool,
-  spacePublishMcpTool,
-  spaceRollbackTool,
-  spaceUpdateCustomTool,
-  spaceUpdateMcpTool,
   type SpaceTool,
   type SpaceToolDetail,
 } from "@/api/spaceCloud";
@@ -99,9 +92,7 @@ function ToolTag({ kind }: { kind: SpaceTool["kind"] }) {
   const { t } = useTranslation("app");
   return (
     <span className="rounded-md border border-[var(--line-subtle)] bg-[var(--paper-inset)] px-1.5 py-0.5 text-xs font-semibold text-[var(--ink-muted)]">
-      {kind === "mcp"
-        ? t("space.tools.kindMcp")
-        : t("space.tools.kindCustom")}
+      {kind === "mcp" ? t("space.tools.kindMcp") : t("space.tools.kindCustom")}
     </span>
   );
 }
@@ -341,7 +332,9 @@ function CustomToolFormOverlay({
     });
     if (!selected || Array.isArray(selected)) return;
     try {
-      const preview = await fileService.readPathsAsBase64({ paths: [selected] });
+      const preview = await fileService.readPathsAsBase64({
+        paths: [selected],
+      });
       const file = preview.files[0];
       if (!file || file.error) {
         throw new Error(file?.error || t("space.tools.iconPreviewFailed"));
@@ -568,59 +561,16 @@ export function ToolsWorkspace({
     });
   }, [actions, selectedToolId]);
 
-  const settleRefreshes = async (
-    refreshes: Array<() => Promise<unknown>>,
-  ) => {
-    await Promise.allSettled(
-      refreshes.map((refresh) => Promise.resolve().then(refresh)),
-    );
-  };
-
-  const refreshAfterMutation = async (toolId: string) => {
-    await settleRefreshes([
-      () => actions.refreshTools({ force: true, silent: true }),
-      () =>
-        actions.refreshToolDetail(toolId, { force: true, silent: true }),
-      () =>
-        actions.refreshToolRevisions(toolId, {
-          force: true,
-          silent: true,
-        }),
-    ]);
-  };
-
-  const refreshAfterRevisionConflict = async (error: unknown) => {
-    if (!detail || spaceErrorCode(error) !== "TOOL_REVISION_CONFLICT") return;
-    await settleRefreshes([
-      () =>
-        actions.refreshToolDetail(detail.tool.id, {
-          force: true,
-          silent: true,
-        }),
-      () =>
-        actions.refreshToolRevisions(detail.tool.id, {
-          force: true,
-          silent: true,
-        }),
-    ]);
-  };
-
   const publishMcp = async (candidate: McpCandidate) => {
     if (!candidate.policy.manifest) return;
     setBusy(true);
     try {
-      const result = await withSpaceStoreMutationMetric(
-        "tool.publish",
-        () =>
-          spacePublishMcpTool({
-            spaceId,
-            name: candidate.server.name,
-            description: candidate.server.description,
-            portableMcpManifest: candidate.policy.manifest!,
-          }),
-        { toolKind: "mcp", toolResult: "success" },
-      );
-      await refreshAfterMutation(result.tool.id);
+      const result = await actions.publishMcpTool({
+        spaceId,
+        name: candidate.server.name,
+        description: candidate.server.description,
+        portableMcpManifest: candidate.policy.manifest,
+      });
       setPublishMode(null);
       onSelectTool(result.tool.id);
       toast.success(t("space.tools.published"));
@@ -639,19 +589,13 @@ export function ToolsWorkspace({
   }) => {
     setBusy(true);
     try {
-      const result = await withSpaceStoreMutationMetric(
-        "tool.publish",
-        () =>
-          spacePublishCustomTool({
-            spaceId,
-            name: input.name,
-            description: input.description,
-            customInstallInstruction: input.instruction,
-            iconFilePath: input.iconFilePath,
-          }),
-        { toolKind: "custom_install_prompt", toolResult: "success" },
-      );
-      await refreshAfterMutation(result.tool.id);
+      const result = await actions.publishCustomTool({
+        spaceId,
+        name: input.name,
+        description: input.description,
+        customInstallInstruction: input.instruction,
+        iconFilePath: input.iconFilePath,
+      });
       setPublishMode(null);
       onSelectTool(result.tool.id);
       toast.success(t("space.tools.published"));
@@ -671,24 +615,17 @@ export function ToolsWorkspace({
       return;
     setBusy(true);
     try {
-      await withSpaceStoreMutationMetric(
-        "tool.update",
-        () =>
-          spaceUpdateMcpTool({
-            toolId: detail.tool.id,
-            name: candidate.server.name,
-            description: candidate.server.description,
-            portableMcpManifest: candidate.policy.manifest!,
-            expectedLatestRevision: editBaseLatestRevision,
-          }),
-        { toolKind: "mcp", toolResult: "success" },
-      );
-      await refreshAfterMutation(detail.tool.id);
+      await actions.updateMcpTool({
+        toolId: detail.tool.id,
+        name: candidate.server.name,
+        description: candidate.server.description,
+        portableMcpManifest: candidate.policy.manifest,
+        expectedLatestRevision: editBaseLatestRevision,
+      });
       setEditing(false);
       setEditBaseLatestRevision(null);
       toast.success(t("space.tools.updated"));
     } catch (error) {
-      await refreshAfterRevisionConflict(error);
       toast.error(spaceErrorMessage(error));
     } finally {
       setBusy(false);
@@ -705,26 +642,19 @@ export function ToolsWorkspace({
     if (!detail || editBaseLatestRevision === null) return;
     setBusy(true);
     try {
-      await withSpaceStoreMutationMetric(
-        "tool.update",
-        () =>
-          spaceUpdateCustomTool({
-            toolId: detail.tool.id,
-            name: input.name,
-            description: input.description,
-            customInstallInstruction: input.instruction,
-            expectedLatestRevision: editBaseLatestRevision,
-            iconFilePath: input.iconFilePath,
-            resetIcon: input.resetIcon,
-          }),
-        { toolKind: "custom_install_prompt", toolResult: "success" },
-      );
-      await refreshAfterMutation(detail.tool.id);
+      await actions.updateCustomTool({
+        toolId: detail.tool.id,
+        name: input.name,
+        description: input.description,
+        customInstallInstruction: input.instruction,
+        expectedLatestRevision: editBaseLatestRevision,
+        iconFilePath: input.iconFilePath,
+        resetIcon: input.resetIcon,
+      });
       setEditing(false);
       setEditBaseLatestRevision(null);
       toast.success(t("space.tools.updated"));
     } catch (error) {
-      await refreshAfterRevisionConflict(error);
       toast.error(spaceErrorMessage(error));
     } finally {
       setBusy(false);
@@ -806,20 +736,14 @@ export function ToolsWorkspace({
     if (!detail) return;
     setBusy(true);
     try {
-      await withSpaceStoreMutationMetric(
-        "tool.rollback",
-        () =>
-          spaceRollbackTool({
-            toolId: detail.tool.id,
-            revision,
-            expectedCurrentRevision: detail.tool.currentRevision,
-          }),
-        { toolKind: detail.tool.kind, toolResult: "success" },
-      );
-      await refreshAfterMutation(detail.tool.id);
+      await actions.rollbackTool({
+        toolId: detail.tool.id,
+        revision,
+        expectedCurrentRevision: detail.tool.currentRevision,
+        toolKind: detail.tool.kind,
+      });
       toast.success(t("space.tools.rolledBack"));
     } catch (error) {
-      await refreshAfterRevisionConflict(error);
       toast.error(spaceErrorMessage(error));
     } finally {
       setBusy(false);
@@ -830,14 +754,10 @@ export function ToolsWorkspace({
     if (!detail) return;
     setBusy(true);
     try {
-      await withSpaceStoreMutationMetric(
-        "tool.delete",
-        () => spaceDeleteTool(detail.tool.id),
-        { toolKind: detail.tool.kind, toolResult: "success" },
-      );
-      await settleRefreshes([
-        () => actions.refreshTools({ force: true, silent: true }),
-      ]);
+      await actions.deleteTool({
+        toolId: detail.tool.id,
+        toolKind: detail.tool.kind,
+      });
       onSelectTool(null);
       toast.success(t("space.tools.deleted"));
     } catch (error) {
@@ -1046,9 +966,7 @@ export function ToolsWorkspace({
                       type="button"
                       onClick={() => {
                         setAdminMenuOpen(false);
-                        setEditBaseLatestRevision(
-                          detail.tool.latestRevision,
-                        );
+                        setEditBaseLatestRevision(detail.tool.latestRevision);
                         setEditing(true);
                       }}
                       className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-sm font-semibold hover:bg-[var(--hover-bg)]"
