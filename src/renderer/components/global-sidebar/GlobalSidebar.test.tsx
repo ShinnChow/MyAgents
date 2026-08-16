@@ -1011,8 +1011,8 @@ describe('GlobalSidebar rail flyout', () => {
       i18n.t('app:globalSidebar.settings'),
     ]) {
       const action = screen.getByRole('button', { name: String(label) });
-      expect(action).toHaveClass('h-9');
-      expect(action).not.toHaveClass('h-10');
+      expect(action).toHaveClass('h-8');
+      expect(action).not.toHaveClass('h-9', 'h-10');
     }
 
     const activeRow = screen.getByText('Project one').closest<HTMLElement>('[data-global-sidebar-workspace-row]')!;
@@ -1055,7 +1055,7 @@ describe('GlobalSidebar rail flyout', () => {
     // fade) reach the notification button, instead of stacking an extra
     // gradient band on top of an unchanged gap.
     const footerActions = document.querySelector<HTMLElement>('[data-global-sidebar-footer-actions]');
-    expect(footerActions).toHaveClass('pt-0', 'pb-3');
+    expect(footerActions).toHaveClass('pt-0', 'pb-2');
     const workspaceToggle = within(inactiveRow).getAllByRole('button')[0];
     const workspaceActions = inactiveRow.querySelector<HTMLElement>('[data-global-sidebar-workspace-actions]');
     expect(inactiveRow).toHaveClass('relative');

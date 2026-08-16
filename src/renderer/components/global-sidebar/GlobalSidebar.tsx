@@ -223,7 +223,7 @@ function SidebarNavButton({
       disabled={disabled}
       aria-current={active ? 'page' : undefined}
       aria-label={label}
-      className={`relative flex h-9 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
+      className={`relative flex h-8 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
         expanded ? 'w-full' : 'w-10'
       } ${
         active
@@ -1056,7 +1056,7 @@ export default memo(function GlobalSidebar({
         </div>
 
         <nav
-          className={`shrink-0 ${expanded ? 'px-3 pb-2 pt-1' : 'global-sidebar-rail-stack pb-2 pt-1'}`}
+          className={`shrink-0 ${expanded ? 'px-3 pb-1 pt-0' : 'global-sidebar-rail-stack pb-1 pt-0'}`}
           data-global-sidebar-primary-nav
         >
           <SidebarNavButton
@@ -1165,7 +1165,7 @@ export default memo(function GlobalSidebar({
         </div>
 
         <div
-          className={`shrink-0 pb-3 ${expanded ? 'px-3 pt-0' : 'global-sidebar-rail-stack pt-3'}`}
+          className={`shrink-0 pb-2 ${expanded ? 'px-3 pt-0' : 'global-sidebar-rail-stack pt-3'}`}
           data-global-sidebar-footer-actions
         >
           <button
@@ -1178,7 +1178,7 @@ export default memo(function GlobalSidebar({
             aria-haspopup="dialog"
             aria-expanded={notificationOpen}
             aria-controls="global-notification-center"
-            className={`relative flex h-9 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
+            className={`relative flex h-8 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
               expanded ? 'w-full' : 'w-10'
             } ${
               notificationOpen
