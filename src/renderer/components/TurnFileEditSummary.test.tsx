@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { i18n } from '@/i18n';
@@ -99,7 +99,13 @@ describe('TurnFileEditSummary', () => {
     expect(screen.getByRole('button', { name: '已新增: src/new.ts' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '更多操作: a.ts' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '更多操作: new.ts' })).toBeInTheDocument();
-    expect(screen.getByRole('dialog', { name: '本轮文件编辑' })).not.toHaveTextContent('src/');
+    const dialog = screen.getByRole('dialog', { name: '本轮文件编辑' });
+    expect(dialog).not.toHaveTextContent('src/');
+    expect(within(dialog).queryByText('M')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('A')).not.toBeInTheDocument();
+    expect(within(dialog).getByText('+2')).toHaveClass('text-[var(--success)]');
+    expect(within(dialog).getByText('−1')).toHaveClass('text-[var(--error)]');
+    expect(within(dialog).getByText('+8')).toHaveClass('text-[var(--success)]');
   });
 
   it('closes before delegating a file row to the existing preview action', () => {

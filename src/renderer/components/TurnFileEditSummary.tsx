@@ -147,7 +147,6 @@ function TurnFileEditRow({
   const basename = basenameOf(file.displayPath);
   const originalName = file.originalPath ? basenameOf(file.originalPath) : null;
   const showOriginalName = !!originalName && originalName !== basename;
-  const statusLetter = statusLetterFor(file.status);
   const statusLabel = t(`message.turnFileEdits.status.${file.status}`);
   const moreActionsLabel = `${t('dropdown.moreActions')}: ${basename}`;
 
@@ -168,12 +167,6 @@ function TurnFileEditRow({
         aria-label={`${statusLabel}: ${file.originalPath ? `${file.originalPath} → ` : ''}${file.displayPath}`}
         onClick={onOpen}
       >
-        <span
-          aria-hidden="true"
-          className={`w-4 shrink-0 text-center font-mono text-xs font-semibold ${statusColor(file.status)}`}
-        >
-          {statusLetter}
-        </span>
         <FileIcon name={basename} size="regular" />
         <span className="flex min-w-0 flex-1 items-baseline gap-1 text-sm text-[var(--ink)]">
           {showOriginalName && (
@@ -184,8 +177,8 @@ function TurnFileEditRow({
           )}
           <span className="truncate">{basename}</span>
         </span>
-        <span className="shrink-0 font-mono text-xs text-[var(--ink-muted)]">
-          {formatStats(file, t)}
+        <span className="shrink-0 font-mono text-xs">
+          {renderStats(file, t)}
         </span>
       </button>
       <button
@@ -213,30 +206,28 @@ function basenameOf(path: string): string {
   return normalized.split('/').pop() || normalized;
 }
 
-function statusLetterFor(status: TurnFileEditItem['status']): string {
-  if (status === 'added') return 'A';
-  if (status === 'deleted') return 'D';
-  if (status === 'renamed') return 'R';
-  return 'M';
-}
-
-function statusColor(status: TurnFileEditItem['status']): string {
-  if (status === 'added') return 'text-[var(--success)]';
-  if (status === 'deleted') return 'text-[var(--error)]';
-  if (status === 'renamed') return 'text-[var(--accent)]';
-  return 'text-[var(--accent-warm)]';
-}
-
-function formatStats(
+function renderStats(
   file: TurnFileEditItem,
   t: (key: string) => string,
-): string {
+): React.ReactNode {
   if (!file.statsReliable || (file.added === 0 && file.removed === 0)) {
-    return file.status === 'deleted'
-      ? t('message.turnFileEdits.deleted')
-      : t('message.turnFileEdits.edited');
+    return (
+      <span className="text-[var(--ink-muted)]">
+        {file.status === 'deleted'
+          ? t('message.turnFileEdits.deleted')
+          : t('message.turnFileEdits.edited')}
+      </span>
+    );
   }
-  if (file.status === 'added' && file.removed === 0) return `+${file.added}`;
-  if (file.status === 'deleted' && file.added === 0) return `−${file.removed}`;
-  return `+${file.added} −${file.removed}`;
+  return (
+    <>
+      {file.added > 0 && (
+        <span className="text-[var(--success)]">+{file.added}</span>
+      )}
+      {file.added > 0 && file.removed > 0 && ' '}
+      {file.removed > 0 && (
+        <span className="text-[var(--error)]">−{file.removed}</span>
+      )}
+    </>
+  );
 }
