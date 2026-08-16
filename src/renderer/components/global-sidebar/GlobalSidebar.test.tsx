@@ -1038,7 +1038,18 @@ describe('GlobalSidebar rail flyout', () => {
     expect(workspaceFade?.style.background).toContain('linear-gradient(to bottom');
     expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg-a0)');
     expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg)');
-    expect(document.querySelector('[role="tree"]')).toHaveClass('pb-6');
+    expect(document.querySelector('[role="tree"]')).toHaveClass('pt-4', 'pb-6');
+    const workspaceFadeTop = document.querySelector<HTMLElement>('[data-global-sidebar-workspace-fade-top]');
+    expect(workspaceFadeTop).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'top-8', 'h-4');
+    expect(workspaceFadeTop?.style.background).toContain('linear-gradient(to bottom');
+    expect(workspaceFadeTop?.style.background).toContain('var(--global-sidebar-bg)');
+    expect(workspaceFadeTop?.style.background).toContain('var(--global-sidebar-bg-a0)');
+    // The top fade must consume the header row's former bottom slack: the
+    // header shrinks from h-12 to h-8 so the scroller edge (and the fade)
+    // occupy the exact pixels that used to be solid spacing below the
+    // section title, instead of stacking a fade below an unchanged gap.
+    const workspaceSectionHeader = screen.getByText(String(i18n.t('app:globalSidebar.workspaceSection'))).closest('div');
+    expect(workspaceSectionHeader).toHaveClass('h-8');
     // The fade must consume the spacing directly above the notification entry:
     // the expanded footer drops its top padding so the scroller edge (and the
     // fade) reach the notification button, instead of stacking an extra

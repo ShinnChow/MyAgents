@@ -1583,8 +1583,8 @@ function WorkspaceTree({
   useNestedInteractionCleanup((open) => onNestedInteractionChange('view-options', open));
 
   return (
-    <section className="flex h-full min-h-0 flex-col" aria-label={t('globalSidebar.workspaces')}>
-      <div className="flex h-12 shrink-0 items-center gap-1 px-3">
+    <section className="relative flex h-full min-h-0 flex-col" aria-label={t('globalSidebar.workspaces')}>
+      <div className="flex h-8 shrink-0 items-center gap-1 px-3">
         <h2 className="min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wider text-[var(--ink-muted)]/60">
           {t('globalSidebar.workspaceSection')}
         </h2>
@@ -1635,7 +1635,16 @@ function WorkspaceTree({
       </div>
 
       <div
-        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 ${fadeBottom ? 'pb-6' : 'pb-3'}`}
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-8 z-10 h-4"
+        style={{
+          background: 'linear-gradient(to bottom, var(--global-sidebar-bg), var(--global-sidebar-bg-a0))',
+        }}
+        data-global-sidebar-workspace-fade-top
+      />
+
+      <div
+        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-4 ${fadeBottom ? 'pb-6' : 'pb-3'}`}
         role="tree"
         style={{ scrollbarGutter: 'stable' }}
       >
