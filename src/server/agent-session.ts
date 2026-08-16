@@ -10816,8 +10816,21 @@ async function startStreamingSession(preWarm = false): Promise<void> {
       stderr: (message: string) => {
         recentSdkStderr.push(message);
         if (recentSdkStderr.length > 20) recentSdkStderr.shift();
-        // Always log stderr to help diagnose subprocess issues (especially on older Windows)
-        console.error('[sdk-stderr]', message);
+        // `[claude-code:unrecognized_model]` is an informational client-side
+        // signal: the CLI's local registry doesn't know the model name, so it
+        // warns that its auto-compact fallback window applies. Expected for
+        // every third-party provider model (glm/deepseek/...); MyAgents owns
+        // the real ceiling via CLAUDE_CODE_AUTO_COMPACT_WINDOW + the [1m]
+        // launch suffix (#335/#516), and the paired tengu_api_unrecognized_model
+        // telemetry event is already dropped locally by
+        // CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC. Demote from ERROR to INFO
+        // so it stops reading as a subprocess failure.
+        if (message.includes('[claude-code:unrecognized_model]')) {
+          console.log('[sdk-stderr]', message);
+        } else {
+          // Always log stderr to help diagnose subprocess issues (especially on older Windows)
+          console.error('[sdk-stderr]', message);
+        }
         // Detect "Session ID already in use" early — stderr arrives before process exit error
         if (message.includes('already in use')) {
           detectedAlreadyInUse = true;
@@ -11569,6 +11582,14 @@ async function startStreamingSession(preWarm = false): Promise<void> {
     // can emit a single aggregate `chat:log` at turn-end instead of one per token.
     let streamEventDeltaCount = 0;
     let streamEventTokenTotal = 0;
+    // Same aggregation for `system subtype=thinking_tokens` (SDK 0.3.220+):
+    // a live estimate frame per streamed thinking chunk (SDKThinkingTokensMessage,
+    // meant for spinner UIs — MyAgents renders thinking via chat:thinking-chunk
+    // from stream_event instead, so these frames have no functional consumer).
+    // Unsynchronized they were ~37k unified-log lines/day + one full-JSON
+    // appendLogLine (session file + chat:log SSE) per frame.
+    let thinkingTokensFrameCount = 0;
+    let thinkingTokensMaxEstimate = 0;
 
     // #227 — track which background-task ids have already produced a terminal
     // `chat:task-notification` broadcast in THIS SDK session, AND whether that
@@ -11736,12 +11757,18 @@ async function startStreamingSession(preWarm = false): Promise<void> {
         }
       }
       // stream_event is high-frequency (per token delta) — skip logging entirely.
+      // `system subtype=thinking_tokens` frames are the same order of magnitude
+      // (one per streamed thinking chunk) and are aggregated below likewise.
       // All other types are low-frequency and logged with type-specific detail:
       //   system/init  — redacted counts/model summary (no workspace/plugin paths)
       //   result       — redacted terminal/usage summary (no assistant/error content)
       //   rate_limit   — key fields (was previously silenced)
       //   others       — compact one-line summary
-      if (sdkMessage.type !== 'stream_event') {
+      const isHighFrequencySdkMessage =
+        sdkMessage.type === 'stream_event' ||
+        (sdkMessage.type === 'system' &&
+          (sdkMessage as { subtype?: string }).subtype === 'thinking_tokens');
+      if (!isHighFrequencySdkMessage) {
         const msg = sdkMessage as Record<string, unknown>;
         const safeSdkLogMessage = summarizeSensitiveSdkMessage(sdkMessage);
 
@@ -11768,17 +11795,26 @@ async function startStreamingSession(preWarm = false): Promise<void> {
           console.log(`[agent][sdk] message #${messageCount} type=${sdkMessage.type}${extra}${stop}`);
         }
       }
-      // Pattern 3 §3.2.5 — for stream_event, default-suppress the per-event
+      // Pattern 3 §3.2.5 — for stream_event (and the equally high-frequency
+      // thinking_tokens estimate frames), default-suppress the per-event
       // disk write + SSE broadcast. The token text itself is delivered via
       // chat:message-chunk on a separate code path; the legacy logStringify
       // here was diagnostic only. Track counts so we can emit one aggregate
       // log line per turn (see `result` branch below).
-      if (sdkMessage.type === 'stream_event' && SUPPRESS_PER_TOKEN_LOG_BROADCAST) {
-        streamEventDeltaCount++;
-        const ev = (sdkMessage as { event?: { delta?: unknown; usage?: { output_tokens?: number } } }).event;
-        const outTok = ev?.usage?.output_tokens;
-        if (typeof outTok === 'number' && outTok > streamEventTokenTotal) {
-          streamEventTokenTotal = outTok;
+      if (isHighFrequencySdkMessage && SUPPRESS_PER_TOKEN_LOG_BROADCAST) {
+        if (sdkMessage.type === 'stream_event') {
+          streamEventDeltaCount++;
+          const ev = (sdkMessage as { event?: { delta?: unknown; usage?: { output_tokens?: number } } }).event;
+          const outTok = ev?.usage?.output_tokens;
+          if (typeof outTok === 'number' && outTok > streamEventTokenTotal) {
+            streamEventTokenTotal = outTok;
+          }
+        } else {
+          thinkingTokensFrameCount++;
+          const est = (sdkMessage as { estimated_tokens?: number }).estimated_tokens;
+          if (typeof est === 'number' && est > thinkingTokensMaxEstimate) {
+            thinkingTokensMaxEstimate = est;
+          }
         }
       } else {
         try {
@@ -11787,14 +11823,19 @@ async function startStreamingSession(preWarm = false): Promise<void> {
         } catch (error) {
           console.log('[agent][sdk] (unserializable)', error);
         }
-        // On turn-end (`result`), emit the stream_event aggregate so log
-        // consumers see "this turn streamed N deltas" without the per-token
-        // spam. Reset counters for the next turn.
-        if (sdkMessage.type === 'result' && streamEventDeltaCount > 0) {
-          const summary = `${localTimestamp()} [stream_event_summary] deltas=${streamEventDeltaCount} output_tokens=${streamEventTokenTotal}`;
+        // On turn-end (`result`), emit the high-frequency aggregate so log
+        // consumers see "this turn streamed N deltas / M thinking frames"
+        // without the per-token spam. Reset counters for the next turn.
+        if (sdkMessage.type === 'result' && (streamEventDeltaCount > 0 || thinkingTokensFrameCount > 0)) {
+          const thinkingPart = thinkingTokensFrameCount > 0
+            ? ` thinking_frames=${thinkingTokensFrameCount} thinking_est_tokens=${thinkingTokensMaxEstimate}`
+            : '';
+          const summary = `${localTimestamp()} [stream_event_summary] deltas=${streamEventDeltaCount} output_tokens=${streamEventTokenTotal}${thinkingPart}`;
           try { appendLogLine(summary); } catch { /* logger errors are non-fatal */ }
           streamEventDeltaCount = 0;
           streamEventTokenTotal = 0;
+          thinkingTokensFrameCount = 0;
+          thinkingTokensMaxEstimate = 0;
         }
       }
       const nextSystemInit = parseSystemInitInfo(sdkMessage);
