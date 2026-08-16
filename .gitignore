@@ -105,3 +105,6 @@ specs/assets/avatar-candidates/**/manifest.json
 .claude/plans/myagents/
 myagents_files/
 /HEARTBEAT.md
+
+# Agent long-term memory (raw daily notes & topic files, per .claude/rules/04-MEMORY.md)
+/memory/
