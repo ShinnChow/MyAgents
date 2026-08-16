@@ -1025,6 +1025,20 @@ describe('GlobalSidebar rail flyout', () => {
     expect(inactiveTitle).toHaveClass('font-normal');
     expect(inactiveTitle?.className).toContain('group-hover/workspace:font-medium');
     expect(inactiveTitle?.className).toContain('group-focus-within/workspace:font-medium');
+    const notificationButton = screen.getByRole('button', {
+      name: String(i18n.t('app:notificationCenter.bell')),
+    });
+    const helperButton = screen.getByRole('button', {
+      name: String(i18n.t('app:globalSidebar.helper')),
+    });
+    expect(notificationButton.querySelector('.global-sidebar-nav-label')).toBeInTheDocument();
+    expect(helperButton.querySelector('.global-sidebar-nav-label')).toBeInTheDocument();
+    const workspaceFade = document.querySelector<HTMLElement>('[data-global-sidebar-workspace-fade]');
+    expect(workspaceFade).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'bottom-0', 'h-10');
+    expect(workspaceFade?.style.background).toContain('linear-gradient(to bottom');
+    expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg-a0)');
+    expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg)');
+    expect(document.querySelector('[role="tree"]')).toHaveClass('pb-10');
     const workspaceToggle = within(inactiveRow).getAllByRole('button')[0];
     const workspaceActions = inactiveRow.querySelector<HTMLElement>('[data-global-sidebar-workspace-actions]');
     expect(inactiveRow).toHaveClass('relative');

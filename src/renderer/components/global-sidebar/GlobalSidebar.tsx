@@ -932,6 +932,7 @@ export default memo(function GlobalSidebar({
     && navigator.platform.toLowerCase().includes('win');
   const tree = (
     <WorkspaceTree
+      fadeBottom={expanded}
       projects={activeProjects}
       archivedProjects={archivedProjects}
       projectsLoading={projectsLoading}
@@ -1151,6 +1152,16 @@ export default memo(function GlobalSidebar({
               </div>
             </div>
           )}
+          {expanded && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-10"
+              style={{
+                background: 'linear-gradient(to bottom, var(--global-sidebar-bg-a0), var(--global-sidebar-bg))',
+              }}
+              data-global-sidebar-workspace-fade
+            />
+          )}
         </div>
 
         <div
@@ -1186,7 +1197,7 @@ export default memo(function GlobalSidebar({
               )}
             </span>
             <span
-              className={`global-sidebar-copy min-w-0 truncate text-left ${expanded ? 'ml-9 pr-3 opacity-100' : 'ml-9 opacity-0'}`}
+              className="global-sidebar-copy global-sidebar-nav-label min-w-0 truncate text-left"
               aria-hidden={!expanded}
             >
               {t('notificationCenter.bell')}
@@ -1374,6 +1385,7 @@ export default memo(function GlobalSidebar({
 });
 
 interface WorkspaceTreeProps {
+  fadeBottom: boolean;
   projects: Project[];
   archivedProjects: Project[];
   projectsLoading: boolean;
@@ -1480,6 +1492,7 @@ function WorkspaceSessionBranch({
 }
 
 function WorkspaceTree({
+  fadeBottom,
   projects,
   archivedProjects,
   projectsLoading,
@@ -1622,7 +1635,7 @@ function WorkspaceTree({
       </div>
 
       <div
-        className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pb-3"
+        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 ${fadeBottom ? 'pb-10' : 'pb-3'}`}
         role="tree"
         style={{ scrollbarGutter: 'stable' }}
       >
