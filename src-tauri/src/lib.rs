@@ -701,6 +701,8 @@ pub fn run() {
             space_cloud::skills::cmd_space_inspect_skill_source,
             space_cloud::skills::cmd_space_list_local_skills,
             space_cloud::skills::cmd_space_upload_skill,
+            space_cloud::tools::cmd_space_publish_custom_tool,
+            space_cloud::tools::cmd_space_update_custom_tool,
             space_cloud::attachments::cmd_space_upload_issue_attachments,
             space_cloud::attachments::cmd_space_inspect_attachment_drafts,
             space_cloud::attachments::cmd_space_create_issue_with_attachments,

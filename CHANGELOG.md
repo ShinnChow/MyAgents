@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.10] - 2026-08-16
+
+### Added
+
+- **Space 团队工具资源池**：Skills 旁新增 Tools 页面，团队可共享经过脱敏和可移植性校验的 MCP 配置，或发布面向小助理的自定义安装提示词；两类资源使用一致的卡片、详情、版本历史、回滚和删除体验。
+- **安全的本地工具安装闭环**：MCP 工具安装会写入全局配置并默认保持禁用，同 ID 的不同配置必须显式确认替换；自定义工具会新开小助理会话并使用内置 `/tool-install` Skill 执行安装与验证。
+
+### Changed
+
+- **Space 套餐包含 Tool 配额**：桌面端 Space 设置页显示团队 Tool 用量，并与 Free、Pro 和 Official 的云端配额保持一致。
+
 ## [0.4.9] - 2026-08-16
 
 > MyAgents 0.4.9 带来完全离线的本地文档转换、统一的文件图标与回合文件操作，并将默认 Mino 工作区模板直接随应用发布。版本同时改善 Session 回退、Codex 子 Agent、Space 登录、Channel 与自动记忆维护的可靠性，让多 Runtime 和无人值守场景更稳定。

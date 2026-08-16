@@ -74,6 +74,14 @@ struct MockSkillRecord {
 }
 
 #[derive(Clone)]
+struct MockToolRecord {
+    tool: Value,
+    revisions: Vec<Value>,
+    current_revision: u64,
+    deleted: bool,
+}
+
+#[derive(Clone)]
 struct MockDevicePresence {
     last_online_at: String,
     online_until: String,
@@ -90,6 +98,7 @@ struct MockState {
     claims: HashMap<String, Value>,
     complete_operations: HashMap<String, Value>,
     skills: Vec<MockSkillRecord>,
+    tools: Vec<MockToolRecord>,
     agents: Vec<LocalRegisteredAgent>,
     device_presence: HashMap<String, MockDevicePresence>,
     dispatches: Vec<Value>,
@@ -181,6 +190,20 @@ pub fn api_request(input: SpaceApiRequestInput) -> Result<Value, String> {
         None,
     )?;
     Ok(ok_envelope(data))
+}
+
+pub fn tool_multipart_mutation(
+    path: &str,
+    mut payload: Value,
+    icon_selected: bool,
+) -> Result<Value, String> {
+    if icon_selected {
+        payload
+            .as_object_mut()
+            .ok_or_else(|| "Mock Tool payload must be an object".to_string())?
+            .insert("__mockIconSelected".to_string(), json!(true));
+    }
+    handle_api_data_request("POST", path, HashMap::new(), Some(payload), None)
 }
 
 #[cfg(test)]
@@ -1213,6 +1236,10 @@ fn handle_api_data_request(
         ("GET", ["api", "spaces", "official", "skills"]) => Ok(json!({
             "items": state.skills.iter().map(|record| record.skill.clone()).collect::<Vec<_>>()
         })),
+        ("GET", ["api", "spaces", "official", "tools"])
+        | ("GET", ["api", "spaces", MOCK_SPACE_ID, "tools"]) => Ok(list_tools(&state, &query)),
+        ("POST", ["api", "spaces", "official", "tools"])
+        | ("POST", ["api", "spaces", MOCK_SPACE_ID, "tools"]) => publish_tool(&mut state, body),
         ("GET", ["api", "spaces", "official", "events"]) | ("GET", ["api", "events"]) => {
             Ok(list_events(&state, &query))
         }
@@ -1227,6 +1254,13 @@ fn handle_api_data_request(
             rollback_skill(&mut state, skill_id, body)
         }
         ("DELETE", ["api", "skills", skill_id]) => delete_skill(&mut state, skill_id),
+        ("GET", ["api", "tools", tool_id]) => tool_detail(&state, tool_id),
+        ("GET", ["api", "tools", tool_id, "revisions"]) => {
+            Ok(tool_revisions(&state, tool_id, &query)?)
+        }
+        ("POST", ["api", "tools", tool_id, "revisions"]) => update_tool(&mut state, tool_id, body),
+        ("POST", ["api", "tools", tool_id, "rollback"]) => rollback_tool(&mut state, tool_id, body),
+        ("DELETE", ["api", "tools", tool_id]) => delete_tool(&mut state, tool_id),
         ("GET", ["api", "registered-agents", "me", "dispatches"]) => {
             let agent_id = require_registered_agent_actor(&actor)?;
             let items = state
@@ -1920,6 +1954,8 @@ fn initial_state() -> MockState {
         ),
     ];
 
+    let tools = mock_tools();
+
     MockState {
         user,
         tags,
@@ -1930,6 +1966,7 @@ fn initial_state() -> MockState {
         claims: HashMap::new(),
         complete_operations: HashMap::new(),
         skills,
+        tools,
         agents,
         device_presence: HashMap::new(),
         dispatches,
@@ -4366,6 +4403,636 @@ fn attachment(issue_id: &str, name: &str, size: u64, mime: &str) -> Value {
     })
 }
 
+fn mock_tool_revision(
+    revision_id: String,
+    tool_id: &str,
+    revision: u64,
+    name: &str,
+    description: &str,
+    manifest: Option<Value>,
+    instruction: Option<String>,
+    icon_url: Option<String>,
+) -> Value {
+    json!({
+        "id": revision_id,
+        "toolId": tool_id,
+        "revision": revision,
+        "name": name,
+        "description": description,
+        "portableMcpManifest": manifest,
+        "customInstallInstruction": instruction,
+        "iconUrl": icon_url,
+        "uploader": {
+            "id": MOCK_OWNER_USER_ID,
+            "name": "Ethan",
+            "avatarUrl": "https://space.mock.myagents.local/mock-avatar/ethan.png"
+        },
+        "createdAt": format!("2026-08-{:02}T10:{:02}:00.000Z", 1 + (revision % 15), revision % 60)
+    })
+}
+
+fn mock_tool_record(
+    id: &str,
+    kind: &str,
+    server_id: Option<&str>,
+    name: &str,
+    description: &str,
+    manifest: Option<Value>,
+    instruction: Option<&str>,
+    icon_url: Option<&str>,
+    revision: u64,
+) -> MockToolRecord {
+    let updated_at = format!(
+        "2026-08-{:02}T12:{:02}:00.000Z",
+        1 + (revision % 15),
+        revision % 60
+    );
+    let tool = json!({
+        "id": id,
+        "kind": kind,
+        "mcpServerId": server_id,
+        "name": name,
+        "description": description,
+        "iconUrl": icon_url,
+        "latestRevision": revision,
+        "currentRevision": revision,
+        "createdAt": "2026-08-01T08:00:00.000Z",
+        "updatedAt": updated_at,
+    });
+    let revision_value = mock_tool_revision(
+        format!("toolrev_{}_{}", id, revision),
+        id,
+        revision,
+        name,
+        description,
+        manifest,
+        instruction.map(str::to_string),
+        icon_url.map(str::to_string),
+    );
+    MockToolRecord {
+        tool,
+        revisions: vec![revision_value],
+        current_revision: revision,
+        deleted: false,
+    }
+}
+
+fn mock_stdio_manifest(server_id: &str, package: &str) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "serverId": server_id,
+        "transport": "stdio",
+        "stdio": {
+            "command": "npx",
+            "args": ["-y", package],
+            "envTemplates": {}
+        },
+        "requiredConfigKeys": []
+    })
+}
+
+fn mock_tools() -> Vec<MockToolRecord> {
+    let mut tools = vec![
+        mock_tool_record(
+            "tool_mock_release_notes",
+            "mcp",
+            Some("release-notes-mcp"),
+            "Release Notes MCP",
+            "团队共用的发布说明与变更记录查询服务。",
+            Some(mock_stdio_manifest(
+                "release-notes-mcp",
+                "@myagents/release-notes-mcp",
+            )),
+            None,
+            None,
+            3,
+        ),
+        mock_tool_record(
+            "tool_mock_ffmpeg",
+            "custom_install_prompt",
+            None,
+            "FFmpeg",
+            "安装并验证 FFmpeg 命令行工具。",
+            None,
+            Some("优先使用当前系统的官方包管理器安装 ffmpeg，并运行 ffmpeg -version 验证。"),
+            Some("https://space.mock.myagents.local/mock-tool-icons/ffmpeg.webp"),
+            2,
+        ),
+        mock_tool_record(
+            "tool_mock_design_api",
+            "mcp",
+            Some("design-api-mcp"),
+            "Design API MCP",
+            "读取团队设计系统资料。",
+            Some(json!({
+                "schemaVersion": 1,
+                "serverId": "design-api-mcp",
+                "transport": "http",
+                "remote": {
+                    "urlTemplate": "https://design-api.example.com/mcp",
+                    "headerTemplates": {
+                        "Authorization": "Bearer {{DESIGN_API_TOKEN}}"
+                    }
+                },
+                "requiredConfigKeys": ["DESIGN_API_TOKEN"]
+            })),
+            None,
+            None,
+            1,
+        ),
+    ];
+    // Keep the mock catalogue above one page when callers choose a small page
+    // size, so pagination, cache retention and load-more UI are observable.
+    for index in 0..42 {
+        let id = format!("tool_mock_generated_{:02}", index + 1);
+        if index % 2 == 0 {
+            let server_id = format!("generated-mcp-{:02}", index + 1);
+            tools.push(mock_tool_record(
+                &id,
+                "mcp",
+                Some(&server_id),
+                &format!("Generated MCP {:02}", index + 1),
+                "Mock portable MCP used to exercise the dense Tool catalogue.",
+                Some(mock_stdio_manifest(&server_id, "@myagents/mock-mcp")),
+                None,
+                None,
+                1,
+            ));
+        } else {
+            tools.push(mock_tool_record(
+                &id,
+                "custom_install_prompt",
+                None,
+                &format!("Generated CLI {:02}", index + 1),
+                "Mock custom installation prompt used by the helper flow.",
+                None,
+                Some("Install the official CLI package and verify it with --version."),
+                None,
+                1,
+            ));
+        }
+    }
+    tools
+}
+
+fn list_tools(state: &MockState, query: &HashMap<String, String>) -> Value {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(40)
+        .clamp(1, 100);
+    let cursor = query.get("cursor").map(String::as_str);
+    let mut items = state
+        .tools
+        .iter()
+        .filter(|record| !record.deleted)
+        .map(|record| record.tool.clone())
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| {
+        let left_key = (
+            left.get("updatedAt").and_then(Value::as_str).unwrap_or(""),
+            left.get("id").and_then(Value::as_str).unwrap_or(""),
+        );
+        let right_key = (
+            right.get("updatedAt").and_then(Value::as_str).unwrap_or(""),
+            right.get("id").and_then(Value::as_str).unwrap_or(""),
+        );
+        right_key.cmp(&left_key)
+    });
+    if let Some(cursor) = cursor {
+        if let Some(position) = items.iter().position(|item| {
+            format!(
+                "{}|{}",
+                item.get("updatedAt").and_then(Value::as_str).unwrap_or(""),
+                item.get("id").and_then(Value::as_str).unwrap_or("")
+            ) == cursor
+        }) {
+            items = items.into_iter().skip(position + 1).collect();
+        }
+    }
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let next_cursor = items.last().map(|item| {
+        format!(
+            "{}|{}",
+            item.get("updatedAt").and_then(Value::as_str).unwrap_or(""),
+            item.get("id").and_then(Value::as_str).unwrap_or("")
+        )
+    });
+    json!({ "items": items, "hasMore": has_more, "nextCursor": next_cursor })
+}
+
+fn current_tool_revision(record: &MockToolRecord) -> Option<Value> {
+    record
+        .revisions
+        .iter()
+        .find(|revision| {
+            revision.get("revision").and_then(Value::as_u64) == Some(record.current_revision)
+        })
+        .cloned()
+}
+
+fn tool_detail(state: &MockState, tool_id: &str) -> Result<Value, String> {
+    let record = state
+        .tools
+        .iter()
+        .find(|record| {
+            !record.deleted && record.tool.get("id").and_then(Value::as_str) == Some(tool_id)
+        })
+        .ok_or_else(|| "TOOL_NOT_FOUND: Mock Tool not found".to_string())?;
+    Ok(json!({
+        "tool": record.tool,
+        "revision": current_tool_revision(record).ok_or_else(|| "TOOL_REVISION_CORRUPT".to_string())?
+    }))
+}
+
+fn tool_revisions(
+    state: &MockState,
+    tool_id: &str,
+    query: &HashMap<String, String>,
+) -> Result<Value, String> {
+    let record = state
+        .tools
+        .iter()
+        .find(|record| {
+            !record.deleted && record.tool.get("id").and_then(Value::as_str) == Some(tool_id)
+        })
+        .ok_or_else(|| "TOOL_NOT_FOUND: Mock Tool not found".to_string())?;
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 100);
+    let cursor = query
+        .get("cursor")
+        .and_then(|value| value.parse::<u64>().ok());
+    let mut items = record
+        .revisions
+        .iter()
+        .rev()
+        .filter(|revision| {
+            cursor
+                .map(|cursor| {
+                    revision
+                        .get("revision")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        < cursor
+                })
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    for item in &mut items {
+        let is_current =
+            item.get("revision").and_then(Value::as_u64) == Some(record.current_revision);
+        item.as_object_mut()
+            .expect("mock revision object")
+            .insert("isCurrent".to_string(), json!(is_current));
+    }
+    let next_cursor = has_more
+        .then(|| {
+            items
+                .last()
+                .and_then(|item| item.get("revision"))
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+        })
+        .flatten();
+    Ok(json!({
+        "tool": {
+            "id": tool_id,
+            "latestRevision": record.tool.get("latestRevision").cloned().unwrap_or(json!(1)),
+            "currentRevision": record.current_revision,
+        },
+        "items": items,
+        "hasMore": has_more,
+        "nextCursor": next_cursor,
+    }))
+}
+
+fn tool_payload_text(payload: &Value, key: &str, max: usize) -> Result<String, String> {
+    let value = payload
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if value.is_empty() || value.chars().count() > max {
+        return Err(format!("TOOL_PAYLOAD_INVALID: {key} is invalid"));
+    }
+    Ok(value.to_string())
+}
+
+fn tool_payload_revision(
+    state: &mut MockState,
+    tool_id: &str,
+    kind: &str,
+    payload: &Value,
+    revision: u64,
+    previous_icon: Option<String>,
+) -> Result<Value, String> {
+    let name = tool_payload_text(payload, "name", 100)?;
+    let description = if kind == "mcp" {
+        payload
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    } else {
+        tool_payload_text(payload, "description", 1_000)?
+    };
+    let manifest = if kind == "mcp" {
+        Some(
+            payload
+                .get("portableMcpManifest")
+                .cloned()
+                .ok_or_else(|| "TOOL_PAYLOAD_INVALID: manifest required".to_string())?,
+        )
+    } else {
+        None
+    };
+    let instruction = if kind == "custom_install_prompt" {
+        Some(tool_payload_text(
+            payload,
+            "customInstallInstruction",
+            20_000,
+        )?)
+    } else {
+        None
+    };
+    let reset_icon = payload
+        .get("resetIcon")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mock_icon = payload
+        .get("__mockIconSelected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let icon_url = if reset_icon {
+        None
+    } else if mock_icon {
+        Some(format!(
+            "{}/mock-tool-icons/{}.webp",
+            MOCK_BASE_URL,
+            state.next_id("icon")
+        ))
+    } else {
+        previous_icon
+    };
+    Ok(mock_tool_revision(
+        state.next_id("toolrev"),
+        tool_id,
+        revision,
+        &name,
+        &description,
+        manifest,
+        instruction,
+        icon_url,
+    ))
+}
+
+fn tool_revision_same(left: &Value, right: &Value) -> bool {
+    [
+        "name",
+        "description",
+        "portableMcpManifest",
+        "customInstallInstruction",
+        "iconUrl",
+    ]
+    .iter()
+    .all(|key| left.get(key) == right.get(key))
+}
+
+fn refresh_tool_summary(record: &mut MockToolRecord, revision: &Value) {
+    let latest = record
+        .revisions
+        .iter()
+        .filter_map(|item| item.get("revision").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(1);
+    let object = record
+        .tool
+        .as_object_mut()
+        .expect("mock Tool summary object");
+    for key in ["name", "description", "iconUrl"] {
+        object.insert(
+            key.to_string(),
+            revision.get(key).cloned().unwrap_or(Value::Null),
+        );
+    }
+    object.insert("latestRevision".to_string(), json!(latest));
+    object.insert(
+        "currentRevision".to_string(),
+        json!(record.current_revision),
+    );
+    object.insert(
+        "updatedAt".to_string(),
+        revision
+            .get("createdAt")
+            .cloned()
+            .unwrap_or_else(|| json!("2026-08-16T10:00:00.000Z")),
+    );
+}
+
+fn push_tool_event(state: &mut MockState, event_type: &str, tool_id: &str, revision: u64) {
+    let event_id = state.next_id("evt");
+    state.events.push(json!({
+        "id": event_id,
+        "type": event_type,
+        "resourceType": "tool",
+        "resourceId": tool_id,
+        "actorType": "user",
+        "actorId": MOCK_OWNER_USER_ID,
+        "targetRegisteredAgentId": null,
+        "payload": { "revision": revision },
+        "createdAt": "2026-08-16T10:00:00.000Z"
+    }));
+}
+
+fn publish_tool(state: &mut MockState, body: Option<Value>) -> Result<Value, String> {
+    let payload = body.ok_or_else(|| "TOOL_PAYLOAD_INVALID: body required".to_string())?;
+    let kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "TOOL_KIND_INVALID".to_string())?;
+    if kind != "mcp" && kind != "custom_install_prompt" {
+        return Err("TOOL_KIND_INVALID: Mock Tool kind is invalid".to_string());
+    }
+    let server_id = payload
+        .pointer("/portableMcpManifest/serverId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if kind == "mcp" {
+        if let Some(index) = state.tools.iter().position(|record| {
+            record.tool.get("mcpServerId").and_then(Value::as_str) == server_id.as_deref()
+        }) {
+            let tool_id = state.tools[index]
+                .tool
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("tool_mock")
+                .to_string();
+            return update_tool_at(state, index, &tool_id, payload, true);
+        }
+    }
+    let tool_id = state.next_id("tool");
+    let revision = tool_payload_revision(state, &tool_id, kind, &payload, 1, None)?;
+    let name = revision.get("name").cloned().unwrap_or(Value::Null);
+    let description = revision.get("description").cloned().unwrap_or(Value::Null);
+    let icon_url = revision.get("iconUrl").cloned().unwrap_or(Value::Null);
+    let tool = json!({
+        "id": tool_id,
+        "kind": kind,
+        "mcpServerId": server_id,
+        "name": name,
+        "description": description,
+        "iconUrl": icon_url,
+        "latestRevision": 1,
+        "currentRevision": 1,
+        "createdAt": "2026-08-16T10:00:00.000Z",
+        "updatedAt": "2026-08-16T10:00:00.000Z"
+    });
+    state.tools.insert(
+        0,
+        MockToolRecord {
+            tool: tool.clone(),
+            revisions: vec![revision.clone()],
+            current_revision: 1,
+            deleted: false,
+        },
+    );
+    push_tool_event(state, "tool.created", &tool_id, 1);
+    Ok(json!({ "tool": tool, "revision": revision, "created": true, "noOp": false }))
+}
+
+fn update_tool_at(
+    state: &mut MockState,
+    index: usize,
+    tool_id: &str,
+    payload: Value,
+    allow_restore: bool,
+) -> Result<Value, String> {
+    let kind = state.tools[index]
+        .tool
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("mcp")
+        .to_string();
+    if payload.get("kind").and_then(Value::as_str) != Some(kind.as_str()) {
+        return Err("TOOL_KIND_IMMUTABLE: Mock Tool kind cannot change".to_string());
+    }
+    let latest = state.tools[index]
+        .revisions
+        .iter()
+        .filter_map(|item| item.get("revision").and_then(Value::as_u64))
+        .max()
+        .unwrap_or(0);
+    if let Some(expected) = payload
+        .get("expectedLatestRevision")
+        .and_then(Value::as_u64)
+    {
+        if expected != latest {
+            return Err("TOOL_REVISION_CONFLICT: Mock Tool changed".to_string());
+        }
+    }
+    let previous_icon = current_tool_revision(&state.tools[index]).and_then(|revision| {
+        revision
+            .get("iconUrl")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let candidate =
+        tool_payload_revision(state, tool_id, &kind, &payload, latest + 1, previous_icon)?;
+    let current = current_tool_revision(&state.tools[index])
+        .ok_or_else(|| "TOOL_REVISION_CORRUPT".to_string())?;
+    if tool_revision_same(&candidate, &current) && !state.tools[index].deleted {
+        return Ok(json!({ "tool": state.tools[index].tool, "revision": current, "noOp": true }));
+    }
+    if state.tools[index].deleted && !allow_restore {
+        return Err("TOOL_NOT_FOUND: Mock Tool is deleted".to_string());
+    }
+    state.tools[index].revisions.push(candidate.clone());
+    state.tools[index].current_revision = latest + 1;
+    state.tools[index].deleted = false;
+    refresh_tool_summary(&mut state.tools[index], &candidate);
+    let tool = state.tools[index].tool.clone();
+    push_tool_event(state, "tool.updated", tool_id, latest + 1);
+    Ok(json!({ "tool": tool, "revision": candidate, "restored": allow_restore, "noOp": false }))
+}
+
+fn update_tool(state: &mut MockState, tool_id: &str, body: Option<Value>) -> Result<Value, String> {
+    let index = state
+        .tools
+        .iter()
+        .position(|record| {
+            !record.deleted && record.tool.get("id").and_then(Value::as_str) == Some(tool_id)
+        })
+        .ok_or_else(|| "TOOL_NOT_FOUND: Mock Tool not found".to_string())?;
+    update_tool_at(
+        state,
+        index,
+        tool_id,
+        body.ok_or_else(|| "TOOL_PAYLOAD_INVALID".to_string())?,
+        false,
+    )
+}
+
+fn rollback_tool(
+    state: &mut MockState,
+    tool_id: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    let input = body.ok_or_else(|| "TOOL_PAYLOAD_INVALID".to_string())?;
+    let target = input
+        .get("revision")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "TOOL_REVISION_INVALID".to_string())?;
+    let index = state
+        .tools
+        .iter()
+        .position(|record| {
+            !record.deleted && record.tool.get("id").and_then(Value::as_str) == Some(tool_id)
+        })
+        .ok_or_else(|| "TOOL_NOT_FOUND: Mock Tool not found".to_string())?;
+    let current = state.tools[index].current_revision;
+    if target == current {
+        return Ok(
+            json!({ "tool": state.tools[index].tool, "revision": current_tool_revision(&state.tools[index]), "noOp": true }),
+        );
+    }
+    if input.get("expectedCurrentRevision").and_then(Value::as_u64) != Some(current) {
+        return Err("TOOL_REVISION_CONFLICT: Mock Tool current revision changed".to_string());
+    }
+    let revision = state.tools[index]
+        .revisions
+        .iter()
+        .find(|revision| revision.get("revision").and_then(Value::as_u64) == Some(target))
+        .cloned()
+        .ok_or_else(|| "TOOL_REVISION_NOT_FOUND".to_string())?;
+    state.tools[index].current_revision = target;
+    refresh_tool_summary(&mut state.tools[index], &revision);
+    let tool = state.tools[index].tool.clone();
+    push_tool_event(state, "tool.rolled_back", tool_id, target);
+    Ok(json!({ "tool": tool, "revision": revision, "noOp": false }))
+}
+
+fn delete_tool(state: &mut MockState, tool_id: &str) -> Result<Value, String> {
+    let index = state
+        .tools
+        .iter()
+        .position(|record| {
+            !record.deleted && record.tool.get("id").and_then(Value::as_str) == Some(tool_id)
+        })
+        .ok_or_else(|| "TOOL_NOT_FOUND: Mock Tool not found".to_string())?;
+    state.tools[index].deleted = true;
+    let revision = state.tools[index].current_revision;
+    push_tool_event(state, "tool.deleted", tool_id, revision);
+    Ok(json!({ "deleted": true }))
+}
+
 fn skill(id: &str, name: &str, slug: &str, description: &str, revision: u32) -> Value {
     json!({
         "id": id,
@@ -4858,6 +5525,7 @@ fn mock_limits() -> Value {
         "joinedMembersMax": null,
         "openIssuesMax": 10_000,
         "hostedSkillsMax": 1_000,
+        "hostedToolsMax": 1_000,
         "registeredAgentsMax": 100,
         "storageBytesMax": 100_u64 * 1024 * 1024 * 1024
     })
@@ -4870,6 +5538,7 @@ fn mock_usage(state: &MockState) -> Value {
             matches!(issue.get("state").and_then(Value::as_str), Some("open" | "todo" | "doing"))
         }).count(),
         "hostedSkills": state.skills.len(),
+        "hostedTools": state.tools.iter().filter(|tool| !tool.deleted).count(),
         "registeredAgents": state.agents.iter().filter(|agent| agent.status != "revoked").count(),
         "storageBytes": 0
     })
@@ -5937,5 +6606,109 @@ mod tests {
             Some(json!({})),
         );
         assert!(root_archive.is_err());
+    }
+
+    #[test]
+    fn tool_routes_cover_pagination_revisions_rollback_delete_and_restore() {
+        let _mock = enable_for_test();
+        let first_page = api_data_request("GET", "/api/spaces/official/tools?limit=2", None)
+            .expect("Tool list should load");
+        assert_eq!(
+            first_page
+                .pointer("/items")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            first_page.get("hasMore").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(first_page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .is_some());
+
+        let created = api_data_request(
+            "POST",
+            "/api/spaces/official/tools",
+            Some(json!({
+                "kind": "custom_install_prompt",
+                "name": "Mock CLI",
+                "description": "Install a mock CLI",
+                "customInstallInstruction": "Install mock-cli and verify --version"
+            })),
+        )
+        .expect("custom Tool should publish");
+        let tool_id = created
+            .pointer("/tool/id")
+            .and_then(Value::as_str)
+            .expect("created Tool id")
+            .to_string();
+
+        let updated = api_data_request(
+            "POST",
+            &format!("/api/tools/{tool_id}/revisions"),
+            Some(json!({
+                "kind": "custom_install_prompt",
+                "name": "Mock CLI 2",
+                "description": "Install a mock CLI safely",
+                "customInstallInstruction": "Install mock-cli and verify mock-cli --version",
+                "expectedLatestRevision": 1
+            })),
+        )
+        .expect("custom Tool should update");
+        assert_eq!(
+            updated
+                .pointer("/revision/revision")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let history = api_data_request("GET", &format!("/api/tools/{tool_id}/revisions"), None)
+            .expect("Tool history should load");
+        assert_eq!(
+            history
+                .pointer("/items")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+
+        let rolled_back = api_data_request(
+            "POST",
+            &format!("/api/tools/{tool_id}/rollback"),
+            Some(json!({ "revision": 1, "expectedCurrentRevision": 2 })),
+        )
+        .expect("Tool should roll back");
+        assert_eq!(
+            rolled_back
+                .pointer("/tool/currentRevision")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        api_data_request("DELETE", &format!("/api/tools/{tool_id}"), None)
+            .expect("Tool should delete");
+        assert!(api_data_request("GET", &format!("/api/tools/{tool_id}"), None).is_err());
+
+        let seeded = api_data_request("GET", "/api/tools/tool_mock_release_notes", None)
+            .expect("seeded MCP should exist");
+        api_data_request("DELETE", "/api/tools/tool_mock_release_notes", None)
+            .expect("seeded MCP should delete");
+        let restored = api_data_request(
+            "POST",
+            "/api/spaces/official/tools",
+            Some(json!({
+                "kind": "mcp",
+                "name": "Release Notes MCP",
+                "description": "Restored release notes",
+                "portableMcpManifest": seeded.pointer("/revision/portableMcpManifest").cloned().unwrap()
+            })),
+        )
+        .expect("publishing the same server id should restore");
+        assert_eq!(
+            restored.get("restored").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 }

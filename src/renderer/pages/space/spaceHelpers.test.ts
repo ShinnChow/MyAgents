@@ -24,6 +24,7 @@ import {
   registeredAgentAvailability,
   spaceEventsRequireIssueListRefresh,
   spaceEventsRequireSessionRefresh,
+  spaceEventsRequireToolRefresh,
 } from "./spaceHelpers";
 
 const session = (
@@ -112,18 +113,20 @@ describe("space issue helpers", () => {
       issueId: "iss_123",
     });
 
-    expect(prompt).toBe([
-      "Instruction: 这是一个来自 MyAgents Space「MyAgents社区」的 Issue。请先通过下方只读命令获取当前上下文（标题、正文、附件元数据和最新评论）；如附件与判断有关，按需下载并读取。读取后，先向用户概括你的理解并提出下一步建议，等待用户确认后再修改代码、执行处理动作或变更 Issue 状态。",
-      "",
-      "- Issue ID: iss_123",
-      "- Space slug: official",
-      "",
-      "阅读 Issue：",
-      "`myagents space issue view iss_123 --space official --comments --json`",
-      "",
-      "查看其他可用操作：",
-      "`myagents space issue --help`",
-    ].join("\n"));
+    expect(prompt).toBe(
+      [
+        "Instruction: 这是一个来自 MyAgents Space「MyAgents社区」的 Issue。请先通过下方只读命令获取当前上下文（标题、正文、附件元数据和最新评论）；如附件与判断有关，按需下载并读取。读取后，先向用户概括你的理解并提出下一步建议，等待用户确认后再修改代码、执行处理动作或变更 Issue 状态。",
+        "",
+        "- Issue ID: iss_123",
+        "- Space slug: official",
+        "",
+        "阅读 Issue：",
+        "`myagents space issue view iss_123 --space official --comments --json`",
+        "",
+        "查看其他可用操作：",
+        "`myagents space issue --help`",
+      ].join("\n"),
+    );
     expect(prompt).not.toContain("myagents space issue claim");
     expect(prompt).not.toContain("myagents space issue complete");
     expect(prompt).not.toContain("myagents issue iss_123");
@@ -314,6 +317,24 @@ describe("space issue helpers", () => {
 
     expect(
       spaceEventsRequireIssueListRefresh([
+        { type: "skill.updated", resourceType: "skill" },
+      ]),
+    ).toBe(false);
+  });
+
+  it("invalidates the Tool catalogue and detail for Tool events", () => {
+    expect(
+      spaceEventsRequireToolRefresh([
+        { type: "tool.updated", resourceType: "tool" },
+      ]),
+    ).toBe(true);
+    expect(
+      spaceEventsRequireToolRefresh([
+        { type: "tool.deleted", resourceType: undefined },
+      ]),
+    ).toBe(true);
+    expect(
+      spaceEventsRequireToolRefresh([
         { type: "skill.updated", resourceType: "skill" },
       ]),
     ).toBe(false);

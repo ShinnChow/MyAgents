@@ -43,7 +43,7 @@ Phase 2 为本地验证和自动化测试新增了显式 mock mode：
 
 - debug/test build 中运行时设置 `MYAGENTS_SPACE_MOCK_DATA=true` 时，`space_build_capability()` 返回可用能力，baseUrl 为 `https://space.mock.myagents.local`。release build 中该环境变量被忽略。
 - mock mode 仍然由 Rust Space 边界拥有：renderer 继续只调用 `src/renderer/api/spaceCloud.ts`，Tauri command/CLI helper 继续进入 `src-tauri/src/space_cloud.rs` facade 或其明确 owner module，不会在 React 组件里塞假数据。
-- mock mode 使用进程内 deterministic 数据集，覆盖 Goals、Issues、评论、附件、Skills、Skill 文件、Registered Agents、IssueDelivery 与 claim。mutation 会更新同一份 in-memory state，便于验证创建/评论/状态/claim/complete 等交互。
+- mock mode 使用进程内 deterministic 数据集，覆盖 Goals、Issues、评论、附件、Skills、Skill 文件、Tools、Tool revisions、Registered Agents、IssueDelivery 与 claim。mutation 会更新同一份 in-memory state，便于验证创建/评论/状态/claim/complete、Tool 发布/更新/回滚/删除/恢复等交互。
 - mock mode 不读写真实 `~/.myagents/space/session.json`，不访问 `space.myagents.io`，不作为发布能力写入 CHANGELOG 或 Release notes。
 - mock mode 只用于 dev/test。生产构建仍以 `MYAGENTS_SPACE_ENABLED` / `MYAGENTS_SPACE_BASE_URL` / public client id 的 build-time capability 为准。
 
@@ -52,10 +52,10 @@ Phase 2 为本地验证和自动化测试新增了显式 mock mode：
 | 层           | 文件                                                          | 职责                                                                                                                                                                                                                                                                                                                               |
 | ------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Rust core    | `src-tauri/src/space_cloud.rs`                                | facade；account context + user credential authority、统一 Cloud response/auth policy、HTTP transport、session persistence，以及 Agent mutation→Connector wake、Attachment 下载 credential 选择等跨域编排                                                                                                                         |
-| Rust domains | `src-tauri/src/space_cloud/{registered_agents,delivery,cli,skills,attachments}.rs` | Registered Agent model/store/management、Connector + IssueDelivery、CLI actor/context、Skill package/install、Issue attachment IO；领域模块复用根 auth/client 与既有文件安全 helper，不建立平行 authority                                                                                                                          |
+| Rust domains | `src-tauri/src/space_cloud/{registered_agents,delivery,cli,skills,tools,attachments}.rs` | Registered Agent model/store/management、Connector + IssueDelivery、CLI actor/context、Skill package/install、Tool 自定义图标 multipart transport、Issue attachment IO；领域模块复用根 auth/client 与既有文件安全 helper，不建立平行 authority                                                                                                                          |
 | Rust tests   | `src-tauri/src/space_cloud/tests.rs`                          | account/session/auth、跨模块持久化、Prompt、Connector、CLI、Agent selector 与 Attachment 的契约回归；模块私有实现优先就近测试                                                                                                                                                                                                     |
 | Renderer API | `src/renderer/api/spaceCloud.ts`                              | Tauri invoke typed wrapper与结构化错误投影；不直接 `fetch` Space 服务、不裁决 credential validity                                                                                                                                                                                                                                  |
-| Renderer UI  | `src/renderer/pages/Space.tsx` + `src/renderer/pages/space/*` | Space shell 与 Issues / Skills / Agents 三个 workspace，登录轮询、创建/评论/Goal 订阅、Skill 安装、本地缓存                                                                                                                                                                                                                        |
+| Renderer UI  | `src/renderer/pages/Space.tsx` + `src/renderer/pages/space/*` | Space shell 与 Issues / Skills / Tools / Agents workspace，登录轮询、创建/评论/Goal 订阅、Skill/Tool 安装、本地缓存                                                                                                                                                                                                                        |
 | CLI          | `src/cli/myagents.ts` + Sidecar Admin API + Rust Management API | 每个业务命令显式 `--space <slug>`；Sidecar 从当前 project 补 stable workspace id，Rust 单点解析 User/Registered Agent actor 和 token。支持 list/whoami/Goal/assignee discovery、Issue create/read/metadata update/comment/claim/complete、top attachment add/download；CLI 不接受显式 actor/token |
 
 Rust 领域依赖固定为 `delivery → registered_agents`、`cli → registered_agents + attachments`，其余领域彼此独立并共同指向根 auth/client。`registered_agents` 不调用 `delivery`，`attachments` 也不选择 Registered Agent；需要同时修改 Agent 状态与 Connector schedule，或先裁决 User/Agent credential 再执行 Attachment 下载的 Tauri command，由根 facade 完成跨域编排。这些不是兼容 wrapper，而是显式的跨 owner 协调点。
@@ -154,9 +154,16 @@ Space 切换属于 Renderer 导航状态，不是 Cloud mutation。点击已加�
 
 Space 头像是产品/组织身份，所有尺寸统一使用 APP icon 式圆角矩形；User 与 Registered Agent 是主体身份，继续使用圆形头像。两类形态不得混用。
 
-Space 侧栏中的多个 Space 是同级导航实体，必须按服务端列表顺序渲染为一级手风琴项；每项都可在本地展开 Issues / Goals / Skills，以及按该 Space membership 权限展示的 Settings，且同时最多展开一个。展开/折叠只修改 Renderer UI 状态，不请求接口，也不改变当前 Space；只有点击某个子导航时才原子切换到对应 Space 与页面。其它 Space 不得嵌入当前 Space 的展开容器伪装成子级。
+Space 侧栏中的多个 Space 是同级导航实体，必须按服务端列表顺序渲染为一级手风琴项；每项都可在本地展开 Issues / Goals / Skills / Tools，以及按该 Space membership 权限展示的 Settings，且同时最多展开一个。展开/折叠只修改 Renderer UI 状态，不请求接口，也不改变当前 Space；只有点击某个子导航时才原子切换到对应 Space 与页面。其它 Space 不得嵌入当前 Space 的展开容器伪装成子级。
 
-Space 页面各 workspace 的数据加载必须显式以 active Space identity 为依赖，不能依赖 boot loading→ready 的视觉状态跃迁来间接触发；静默切换保持页面可见时，目标 Space 的 Issues / Goals / Skills / Settings 仍必须主动加载并收口自己的 loading 状态。各 collection 的 freshness 必须由该 collection 在当前 active Space 投影内独立持有；不得复用 session/bootstrap 的刷新时间，否则切换时清空 collection 后会被旧 owner 的 boot freshness 错误拦截。
+Space 页面各 workspace 的数据加载必须显式以 active Space identity 为依赖，不能依赖 boot loading→ready 的视觉状态跃迁来间接触发；静默切换保持页面可见时，目标 Space 的 Issues / Goals / Skills / Tools / Settings 仍必须主动加载并收口自己的 loading 状态。各 collection 的 freshness 必须由该 collection 在当前 active Space 投影内独立持有；不得复用 session/bootstrap 的刷新时间，否则切换时清空 collection 后会被旧 owner 的 boot freshness 错误拦截。
+
+### Space Tool 本地安装边界
+
+- Cloud 是 Tool 元数据、revision、权限、配额与图标对象的 authority；Desktop `spaceStore` 仅缓存列表、详情和历史，并通过 Space event cursor 失效刷新。
+- `mcp` revision 只携带版本化 `portableMcpManifest`。Desktop 发布前使用 `src/shared/spaceToolManifest.ts` 脱敏和校验；安装时由 Renderer 在 `atomicModifyConfig` 锁内合并最新 `config.json`，新装和替换都默认禁用，同 ID 不同定义必须用户明确确认。Rust Space facade 不写 MCP 配置，也不修改 Agent、workspace 或 OAuth 引用。
+- `custom_install_prompt` 不是新的 Runtime Tool 类型，而是安装协议。详情页把版本化指令放进无语言标签、长度安全的 Markdown fence，复用小助理 launch 链路新建会话，并要求 bundled helper 的 `/tool-install` Skill 执行安全检查和验证；完成状态只在对话中自然收口。
+- 自定义图标选择经过 Rust `tools.rs`：只接受绝对路径普通文件，拒绝 symlink，输入最大 5 MiB，归一为最长边 256 px 的 lossless WebP，归一结果最大 512 KiB，再由统一 authorized multipart client 上传。
 
 Space 侧栏的加入方式副标题必须通过 i18n 显式映射领域值：`open_join` 显示“开放加入”，`approval_required` 显示“需审核加入”；未知值显示本地化兜底文案，禁止把原始技术 token 转空格后直接暴露给用户。
 

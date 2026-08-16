@@ -100,6 +100,13 @@ const mocks = vi.hoisted(() => {
     sidebarProps: [] as Array<Record<string, unknown>>,
     tabbarProps: [] as Array<Record<string, unknown>>,
     settingsProps: [] as Array<Record<string, unknown>>,
+    toast: {
+      error: vi.fn(),
+      success: vi.fn(),
+      warning: vi.fn(),
+      info: vi.fn(),
+    },
+    selfAwarenessProject: project as typeof project | null,
   };
 });
 
@@ -303,12 +310,7 @@ vi.mock('@/pages/TaskCenter', () => ({
 }));
 
 vi.mock('@/components/Toast', () => ({
-  useToast: () => ({
-    error: vi.fn(),
-    success: vi.fn(),
-    warning: vi.fn(),
-    info: vi.fn(),
-  }),
+  useToast: () => mocks.toast,
 }));
 
 vi.mock('@/hooks/useUpdater', () => ({
@@ -433,7 +435,7 @@ vi.mock('@/utils/tauriListen', () => ({
 }));
 
 vi.mock('@/config/configService', () => ({
-  ensureSelfAwarenessWorkspace: vi.fn(async () => mocks.project),
+  ensureSelfAwarenessWorkspace: vi.fn(async () => mocks.selfAwarenessProject),
   resolveBuiltinSelection: mocks.resolveBuiltinSelection,
   pairBuiltinSelection: vi.fn((_provider, model) => ({ providerId: mocks.provider.id, model })),
   isProviderAvailable: vi.fn(() => true),
@@ -457,6 +459,7 @@ describe('App helper launch', () => {
     mocks.sidebarProps.length = 0;
     mocks.tabbarProps.length = 0;
     mocks.settingsProps.length = 0;
+    mocks.selfAwarenessProject = mocks.project;
     mocks.deleteTargetSessionId = null;
     mocks.deleteResults.length = 0;
     mocks.durableTabs = null;
@@ -508,7 +511,7 @@ describe('App helper launch', () => {
         initialMessage?: unknown,
         analyticsContext?: unknown,
         sessionBirthHint?: unknown,
-      ) => void;
+      ) => Promise<boolean>;
     };
   }
 
@@ -1815,6 +1818,140 @@ describe('App helper launch', () => {
       }));
     } finally {
       logSpy.mockRestore();
+    }
+  });
+
+  it('launches Space Tool installation without the support prompt wrapper', async () => {
+    const prompt = [
+      '## 工具安装请求',
+      '',
+      '**工具**：FFmpeg',
+      '',
+      '```',
+      'brew install ffmpeg',
+      '```',
+    ].join('\n');
+    render(<App />);
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+        detail: {
+          scenario: 'space_tool_install',
+          description: prompt,
+          images: [],
+        },
+      }));
+    });
+
+    await waitFor(() => expect(mocks.ensureSessionSidecar).toHaveBeenCalled());
+    const helperChat = [...mocks.chatProps].reverse().find((props) =>
+      Boolean(props.initialMessage),
+    ) as { initialMessage?: { text?: string } } | undefined;
+    expect(helperChat?.initialMessage?.text).toBe(prompt);
+    expect(helperChat?.initialMessage?.text).not.toContain('用户反馈');
+    await waitFor(() => {
+      expect(mocks.track).toHaveBeenCalledWith(
+        'space_tool_mutation',
+        expect.objectContaining({
+          space_surface: 'tools',
+          operation: 'helper_launch',
+          tool_kind: 'custom_install_prompt',
+          result: 'success',
+        }),
+      );
+    });
+    expect(latestTabbarProps().tabs).toContainEqual(
+      expect.objectContaining({ title: '安装工具' }),
+    );
+  });
+
+  it('reports Space Tool helper launch failure when the tab limit is reached', async () => {
+    render(<App />);
+    for (let index = 0; index < 30; index += 1) {
+      act(() => latestTabbarProps().onNewTab());
+    }
+    mocks.track.mockClear();
+    mocks.toast.error.mockClear();
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+        detail: {
+          scenario: 'space_tool_install',
+          description: 'Install safely',
+          images: [],
+        },
+      }));
+    });
+
+    await waitFor(() => expect(mocks.track).toHaveBeenCalledWith(
+      'space_tool_mutation',
+      expect.objectContaining({
+        operation: 'helper_launch',
+        result: 'failure',
+      }),
+    ));
+    expect(mocks.toast.error).toHaveBeenCalledWith(
+      '已达到最大标签页数量，请关闭其他标签页后重试',
+    );
+  });
+
+  it('reports Space Tool helper launch failure when its workspace is unavailable', async () => {
+    mocks.selfAwarenessProject = null;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      render(<App />);
+      act(() => {
+        window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+          detail: {
+            scenario: 'space_tool_install',
+            description: 'Install safely',
+            images: [],
+          },
+        }));
+      });
+
+      await waitFor(() => expect(mocks.track).toHaveBeenCalledWith(
+        'space_tool_mutation',
+        expect.objectContaining({
+          operation: 'helper_launch',
+          result: 'failure',
+        }),
+      ));
+      expect(mocks.toast.error).toHaveBeenCalledWith(
+        '无法启动工具安装小助手，请重试。',
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('reports Space Tool helper launch failure when Session startup rejects', async () => {
+    mocks.ensureSessionSidecar.mockRejectedValueOnce(new Error('startup failed'));
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      render(<App />);
+      act(() => {
+        window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+          detail: {
+            scenario: 'space_tool_install',
+            description: 'Install safely',
+            images: [],
+          },
+        }));
+      });
+
+      await waitFor(() => expect(mocks.track).toHaveBeenCalledWith(
+        'space_tool_mutation',
+        expect.objectContaining({
+          operation: 'helper_launch',
+          result: 'failure',
+        }),
+      ));
+      expect(mocks.toast.error).toHaveBeenCalledWith(
+        '无法启动工具安装小助手，请重试。',
+      );
+    } finally {
+      errorSpy.mockRestore();
     }
   });
 

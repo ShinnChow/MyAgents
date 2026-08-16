@@ -12,6 +12,12 @@ describe('space analytics metrics', () => {
     expect(normalizeSpaceMutationOperation('issue.state')).toBe('state_change');
     expect(normalizeSpaceMutationOperation('issue.cancel_claim')).toBe('cancel_claim');
     expect(normalizeSpaceMutationOperation('skill.install')).toBe('install');
+    expect(normalizeSpaceMutationOperation('tool.publish')).toBe('publish');
+    expect(normalizeSpaceMutationOperation('tool.update')).toBe('update');
+    expect(normalizeSpaceMutationOperation('tool.rollback')).toBe('rollback');
+    expect(normalizeSpaceMutationOperation('tool.delete')).toBe('delete');
+    expect(normalizeSpaceMutationOperation('tool.install')).toBe('install');
+    expect(normalizeSpaceMutationOperation('tool.helper_launch')).toBe('helper_launch');
     expect(normalizeSpaceMutationOperation('agent.revoke')).toBe('revoke');
     expect(normalizeSpaceMutationOperation('member.approve')).toBe('approve');
     expect(normalizeSpaceMutationOperation('member.role')).toBe('role_update');
@@ -24,6 +30,7 @@ describe('space analytics metrics', () => {
     expect(normalizeSpaceMutationSurface('issue.comment')).toBe('issue_detail');
     expect(normalizeSpaceMutationSurface('goal.archive')).toBe('goals');
     expect(normalizeSpaceMutationSurface('skill.upload')).toBe('skills');
+    expect(normalizeSpaceMutationSurface('tool.install')).toBe('tools');
     expect(normalizeSpaceMutationSurface('agent.update')).toBe('agents');
     expect(normalizeSpaceMutationSurface('member.remove')).toBe('members');
     expect(normalizeSpaceMutationSurface('profile.update')).toBe('settings');

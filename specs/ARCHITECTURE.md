@@ -854,7 +854,7 @@ Cloud Space 把官方/团队空间接入桌面端。0.3.0 起作为实验室能�
 **核心边界：**
 
 - Space 不是 AI Runtime / Session Sidecar。云端登录、HTTP 请求、附件/Skill IO、registered-agent IssueDelivery poll/process 都由 Rust Tauri command 拥有。
-- Rust 内部以 `space_cloud.rs` 为 facade 与 account/session、统一 authorized Cloud client owner；`space_cloud/{registered_agents,delivery,cli,skills,attachments}.rs` 分别拥有现有领域状态与操作，`tests.rs` 承载跨模块契约。依赖只能从领域模块指向根 auth/client，且 `delivery → registered_agents`、`cli → registered_agents + attachments`；Agent mutation 后唤醒 connector、Attachment 下载的 User/Agent credential 选择由根 facade 编排，禁止 `registered_agents → delivery`、`attachments → registered_agents`、平行 HTTP/auth helper 或第二套状态。
+- Rust 内部以 `space_cloud.rs` 为 facade 与 account/session、统一 authorized Cloud client owner；`space_cloud/{registered_agents,delivery,cli,skills,tools,attachments}.rs` 分别拥有现有领域状态与操作，`tests.rs` 承载跨模块契约。Tool 模块只负责自定义 Tool 图标的本地文件校验、归一化和 multipart transport；MCP 安装写入仍由 Renderer 的 `atomicModifyConfig` 进入 `config.json` authority。依赖只能从领域模块指向根 auth/client，且 `delivery → registered_agents`、`cli → registered_agents + attachments`；Agent mutation 后唤醒 connector、Attachment 下载的 User/Agent credential 选择由根 facade 编排，禁止 `registered_agents → delivery`、`attachments → registered_agents`、平行 HTTP/auth helper 或第二套状态。
 - Renderer 只通过 `src/renderer/api/spaceCloud.ts` 调 Tauri invoke，不直连 Space 服务，也不持有 session token。
 - build-time capability 由 `src-tauri/build.rs` 注入 `MYAGENTS_SPACE_*`，`cmd_space_get_capability` 只裁决构建能力与当前 build-time origin；实验室入口还受 `config.teamSpaceEnabled` 默认关闭门控。debug 构建可烘焙 `MYAGENTS_SPACE_DEV_BASE_URL`，release profile 机制性丢弃 Dev origin。
 - `config.spaceEnvironment` 只在烘焙的 `production` / `dev` origin 之间二选一，Renderer 不提供自由 URL 输入。旧配置值 `staging` 仅在 debug 构建包含 Dev origin 时读取为 `dev`；新写入永远使用 `dev`，release 构建一律回落 Production。

@@ -146,6 +146,27 @@ describe('spaceCloud API errors', () => {
     expect(spaceErrorMessage(thrown)).toBe('Space 创建失败：这个 Space slug 已被占用，请换一个');
   });
 
+  it('projects an old Cloud without Tool routes as a recoverable unavailable state', async () => {
+    const { spaceErrorCode, spaceListTools } = await loadSpaceCloud();
+    mocks.invoke.mockResolvedValueOnce({
+      success: false,
+      error: 'Route not found',
+      code: 'NOT_FOUND',
+      requestId: 'req_old_cloud',
+    });
+
+    let thrown: unknown;
+    try {
+      await spaceListTools({ spaceId: 'official' });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(spaceErrorCode(thrown)).toBe('SPACE_TOOLS_UNAVAILABLE');
+    expect(thrown).toMatchObject({ httpStatus: 404, retryable: true });
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe('当前服务暂不可用，请稍后重试。');
+  });
+
   it('returns Space data from successful envelopes', async () => {
     const { spaceCommentIssue } = await loadSpaceCloud();
     const comment = {
@@ -204,5 +225,113 @@ describe('spaceCloud API errors', () => {
     const detail = await spaceGetIssue('iss_1');
     expect(detail.attachments.map(item => item.id)).toEqual(['att_top']);
     expect(detail.comments.items[0]?.attachments).toEqual([]);
+  });
+
+  it('routes Tool reads and MCP mutations through the typed Space facade', async () => {
+    const {
+      spaceDeleteTool,
+      spaceGetTool,
+      spaceListToolRevisions,
+      spaceListTools,
+      spacePublishMcpTool,
+      spaceRollbackTool,
+      spaceUpdateMcpTool,
+    } = await loadSpaceCloud();
+    mocks.invoke.mockResolvedValue({ success: true, data: {} });
+    const manifest = {
+      schemaVersion: 1 as const,
+      serverId: 'team-mcp',
+      transport: 'stdio' as const,
+      stdio: { command: 'npx', args: ['-y', '@example/team-mcp'], envTemplates: {} },
+      requiredConfigKeys: [],
+    };
+
+    await spaceListTools({ spaceId: 'space 1', cursor: 'next/cursor', limit: 30 });
+    await spaceGetTool('tool/1');
+    await spaceListToolRevisions({ toolId: 'tool/1', cursor: 'rev/cursor', limit: 20 });
+    await spacePublishMcpTool({ spaceId: 'space 1', name: 'Team MCP', portableMcpManifest: manifest });
+    await spaceUpdateMcpTool({
+      toolId: 'tool/1',
+      name: 'Team MCP',
+      portableMcpManifest: manifest,
+      expectedLatestRevision: 3,
+    });
+    await spaceRollbackTool({ toolId: 'tool/1', revision: 2, expectedCurrentRevision: 3 });
+    await spaceDeleteTool('tool/1');
+
+    const calls = mocks.invoke.mock.calls.map(([, args]) => args.input);
+    expect(calls).toEqual([
+      { method: 'GET', path: '/api/spaces/space%201/tools?cursor=next%2Fcursor&limit=30', body: null },
+      { method: 'GET', path: '/api/tools/tool%2F1', body: null },
+      { method: 'GET', path: '/api/tools/tool%2F1/revisions?cursor=rev%2Fcursor&limit=20', body: null },
+      {
+        method: 'POST',
+        path: '/api/spaces/space%201/tools',
+        body: {
+          kind: 'mcp',
+          name: 'Team MCP',
+          description: '',
+          portableMcpManifest: manifest,
+        },
+      },
+      {
+        method: 'POST',
+        path: '/api/tools/tool%2F1/revisions',
+        body: {
+          kind: 'mcp',
+          name: 'Team MCP',
+          description: '',
+          portableMcpManifest: manifest,
+          expectedLatestRevision: 3,
+        },
+      },
+      {
+        method: 'POST',
+        path: '/api/tools/tool%2F1/rollback',
+        body: { revision: 2, expectedCurrentRevision: 3 },
+      },
+      { method: 'DELETE', path: '/api/tools/tool%2F1', body: null },
+    ]);
+  });
+
+  it('routes custom Tool icon mutations through Rust instead of renderer file reads', async () => {
+    const { spacePublishCustomTool, spaceUpdateCustomTool } = await loadSpaceCloud();
+    mocks.invoke.mockResolvedValue({});
+
+    await spacePublishCustomTool({
+      spaceId: 'official',
+      name: 'FFmpeg',
+      description: 'Video tools',
+      customInstallInstruction: 'brew install ffmpeg',
+      iconFilePath: '/tmp/icon.png',
+    });
+    await spaceUpdateCustomTool({
+      toolId: 'tool-1',
+      name: 'FFmpeg',
+      description: 'Video tools',
+      customInstallInstruction: 'brew install ffmpeg',
+      expectedLatestRevision: 1,
+      resetIcon: true,
+    });
+
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'cmd_space_publish_custom_tool', {
+      input: {
+        spaceId: 'official',
+        name: 'FFmpeg',
+        description: 'Video tools',
+        customInstallInstruction: 'brew install ffmpeg',
+        iconFilePath: '/tmp/icon.png',
+      },
+    });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, 'cmd_space_update_custom_tool', {
+      input: {
+        toolId: 'tool-1',
+        name: 'FFmpeg',
+        description: 'Video tools',
+        customInstallInstruction: 'brew install ffmpeg',
+        expectedLatestRevision: 1,
+        resetIcon: true,
+      },
+    });
   });
 });

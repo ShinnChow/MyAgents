@@ -22,14 +22,30 @@ export interface SpaceMetricPayload {
 
 type SpaceAnalyticsRole = 'owner' | 'admin' | 'member' | 'unknown';
 type SpaceAnalyticsKind = 'official' | 'team' | 'personal' | 'unknown';
-type SpaceAnalyticsSurface = 'home' | 'issue_list' | 'issue_detail' | 'goals' | 'skills' | 'agents' | 'members' | 'settings' | 'unknown';
+type SpaceAnalyticsSurface = 'home' | 'issue_list' | 'issue_detail' | 'goals' | 'skills' | 'tools' | 'agents' | 'members' | 'settings' | 'unknown';
 type SpaceMutationEvent =
   | 'space_issue_mutation'
   | 'space_goal_mutation'
   | 'space_skill_mutation'
+  | 'space_tool_mutation'
   | 'space_registered_agent_mutation'
   | 'space_member_mutation'
   | 'space_settings_mutation';
+
+export type SpaceToolMetricKind = 'mcp' | 'custom_install_prompt';
+export type SpaceToolMetricResult =
+  | 'success'
+  | 'new'
+  | 'identical'
+  | 'replace'
+  | 'conflict'
+  | 'cancel'
+  | 'failure';
+
+interface SpaceMutationMetricOptions {
+  toolKind?: SpaceToolMetricKind;
+  toolResult?: SpaceToolMetricResult | (() => SpaceToolMetricResult);
+}
 
 interface SpaceAnalyticsContext {
   space_kind: SpaceAnalyticsKind;
@@ -79,6 +95,22 @@ export function trackSpaceOpen(surface: SpaceAnalyticsSurface = 'home'): void {
   track('space_open', baseParams(surface));
 }
 
+export function trackSpaceToolListLoad(input: {
+  ok: boolean;
+  durationMs: number;
+  count?: number;
+  error?: unknown;
+}): void {
+  track('space_open', {
+    ...baseParams('tools'),
+    operation: 'list_load',
+    ok: input.ok,
+    duration_ms: input.durationMs,
+    ...(input.count === undefined ? {} : { count: input.count }),
+    ...(input.ok ? {} : { error_code: normalizeSpaceErrorCode(input.error) }),
+  });
+}
+
 export function trackSpaceSwitch(): void {
   track('space_switch', baseParams('home'));
 }
@@ -110,11 +142,12 @@ export function normalizeSpaceErrorCode(error: unknown): string {
 function mutationEvent(operation: string): SpaceMutationEvent {
   if (operation.startsWith('issue.')) return 'space_issue_mutation';
   if (operation.startsWith('goal.')) return 'space_goal_mutation';
-	  if (operation.startsWith('skill.')) return 'space_skill_mutation';
-	  if (operation.startsWith('agent.')) return 'space_registered_agent_mutation';
-	  if (operation.startsWith('member.')) return 'space_member_mutation';
-	  return 'space_settings_mutation';
-	}
+  if (operation.startsWith('skill.')) return 'space_skill_mutation';
+  if (operation.startsWith('tool.')) return 'space_tool_mutation';
+  if (operation.startsWith('agent.')) return 'space_registered_agent_mutation';
+  if (operation.startsWith('member.')) return 'space_member_mutation';
+  return 'space_settings_mutation';
+}
 
 export function normalizeSpaceMutationOperation(operation: string): string {
   const table: Record<string, string> = {
@@ -135,18 +168,24 @@ export function normalizeSpaceMutationOperation(operation: string): string {
     'skill.revision.rollback': 'upload',
     'skill.delete': 'delete',
     'skill.install': 'install',
-	    'agent.register': 'register',
-	    'agent.update': 'update',
-	    'agent.revoke': 'revoke',
-	    'member.join': 'join',
-	    'member.approve': 'approve',
-	    'member.reject': 'reject',
-	    'member.remove': 'remove',
-	    'member.role': 'role_update',
-	    'profile.update': 'profile_update',
-	    'settings.create': 'create',
-	    'settings.update': 'settings_update',
-	  };
+    'tool.publish': 'publish',
+    'tool.update': 'update',
+    'tool.rollback': 'rollback',
+    'tool.delete': 'delete',
+    'tool.install': 'install',
+    'tool.helper_launch': 'helper_launch',
+    'agent.register': 'register',
+    'agent.update': 'update',
+    'agent.revoke': 'revoke',
+    'member.join': 'join',
+    'member.approve': 'approve',
+    'member.reject': 'reject',
+    'member.remove': 'remove',
+    'member.role': 'role_update',
+    'profile.update': 'profile_update',
+    'settings.create': 'create',
+    'settings.update': 'settings_update',
+  };
   return table[operation] ?? 'settings_update';
 }
 
@@ -154,26 +193,53 @@ export function normalizeSpaceMutationSurface(operation: string): SpaceAnalytics
   if (operation.startsWith('issue.')) return 'issue_detail';
   if (operation.startsWith('goal.')) return 'goals';
   if (operation.startsWith('skill.')) return 'skills';
+  if (operation.startsWith('tool.')) return 'tools';
   if (operation.startsWith('agent.')) return 'agents';
   if (operation.startsWith('member.')) return 'members';
   return 'settings';
 }
 
-export function trackSpaceMutation(operation: string, input: { durationMs: number; ok: boolean; error?: unknown }): void {
+export function trackSpaceMutation(operation: string, input: {
+  durationMs: number;
+  ok: boolean;
+  error?: unknown;
+  toolKind?: SpaceToolMetricKind;
+  result?: SpaceToolMetricResult;
+}): void {
   const params = {
     ...baseParams(normalizeSpaceMutationSurface(operation)),
     operation: normalizeSpaceMutationOperation(operation),
     ok: input.ok,
     duration_ms: input.durationMs,
+    ...(operation.startsWith('tool.') && input.toolKind ? { tool_kind: input.toolKind } : {}),
+    ...(operation.startsWith('tool.') && input.result ? { result: input.result } : {}),
     ...(input.ok ? {} : { error_code: normalizeSpaceErrorCode(input.error) }),
   };
   const event = mutationEvent(operation);
   if (event === 'space_issue_mutation') track('space_issue_mutation', params);
   else if (event === 'space_goal_mutation') track('space_goal_mutation', params);
   else if (event === 'space_skill_mutation') track('space_skill_mutation', params);
+  else if (event === 'space_tool_mutation') track('space_tool_mutation', params);
   else if (event === 'space_registered_agent_mutation') track('space_registered_agent_mutation', params);
   else if (event === 'space_member_mutation') track('space_member_mutation', params);
   else track('space_settings_mutation', params);
+}
+
+export function trackSpaceToolMutation(input: {
+  operation: 'install' | 'helper_launch';
+  toolKind: SpaceToolMetricKind;
+  result: SpaceToolMetricResult;
+  ok: boolean;
+  durationMs?: number;
+  error?: unknown;
+}): void {
+  trackSpaceMutation(`tool.${input.operation}`, {
+    durationMs: input.durationMs ?? 0,
+    ok: input.ok,
+    error: input.error,
+    toolKind: input.toolKind,
+    result: input.result,
+  });
 }
 
 export function nowForSpaceMetric(): number {
@@ -199,7 +265,11 @@ export function recordSpaceMetric(name: SpaceMetricName, payload: SpaceMetricPay
   }
 }
 
-export async function withSpaceMutationMetric<T>(operation: string, task: () => Promise<T>): Promise<T> {
+export async function withSpaceMutationMetric<T>(
+  operation: string,
+  task: () => Promise<T>,
+  options: SpaceMutationMetricOptions = {},
+): Promise<T> {
   const startedAt = nowForSpaceMetric();
   try {
     const result = await task();
@@ -209,7 +279,15 @@ export async function withSpaceMutationMetric<T>(operation: string, task: () => 
       durationMs,
       ok: true,
     });
-    trackSpaceMutation(operation, { durationMs, ok: true });
+    const resultLabel = typeof options.toolResult === 'function'
+      ? options.toolResult()
+      : options.toolResult;
+    trackSpaceMutation(operation, {
+      durationMs,
+      ok: true,
+      toolKind: options.toolKind,
+      result: resultLabel,
+    });
     return result;
   } catch (error) {
     const durationMs = Math.round(nowForSpaceMetric() - startedAt);
@@ -219,7 +297,13 @@ export async function withSpaceMutationMetric<T>(operation: string, task: () => 
       ok: false,
       error: error instanceof Error ? error.message : String(error),
     });
-    trackSpaceMutation(operation, { durationMs, ok: false, error });
+    trackSpaceMutation(operation, {
+      durationMs,
+      ok: false,
+      error,
+      toolKind: options.toolKind,
+      result: 'failure',
+    });
     throw error;
   }
 }

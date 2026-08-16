@@ -139,6 +139,14 @@ export function spaceEventsRequireIssueListRefresh(
   });
 }
 
+export function spaceEventsRequireToolRefresh(
+  events: Array<Pick<SpaceEvent, "type" | "resourceType">>,
+): boolean {
+  return events.some(
+    (event) => event.resourceType === "tool" || event.type.startsWith("tool."),
+  );
+}
+
 export function findJoinedSpaceBySlug(
   session: SpaceSession | null | undefined,
   slug: string,

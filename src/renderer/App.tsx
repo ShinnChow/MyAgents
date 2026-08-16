@@ -27,6 +27,7 @@ import { SessionDeletionContext } from '@/context/SessionDeletionContext';
 import TabProvider from '@/context/TabProvider';
 import type { AdoptMigratedSessionOptions } from '@/context/TabContext';
 import { useToast } from '@/components/Toast';
+import type { HelperRequestDetail } from '@/utils/dispatchHelperRequest';
 import { useUpdater } from '@/hooks/useUpdater';
 import { useTrayEvents } from '@/hooks/useTrayEvents';
 import { useHelperAgentModelDefaults } from '@/hooks/useHelperAgentModelDefaults';
@@ -68,7 +69,6 @@ import { tabContentKind } from '@/utils/tabContentKind';
 import { runAfterNextPaint } from '@/utils/afterPaint';
 import { perfMark } from '@/utils/perfMark';
 import { RENDERER_PERF_PHASE } from '../shared/perfTrace';
-import type { ImageAttachment } from '@/components/SimpleChatInput';
 import { type CronRecoverySummaryPayload, type CronTaskRecoveredPayload, CRON_EVENTS } from '@/types/cronEvents';
 import { isBrowserDevMode, isTauriEnvironment } from '@/utils/browserMock';
 import { apiGetJson } from '@/api/apiFetch';
@@ -123,6 +123,10 @@ import {
 } from '../shared/session-origin';
 import { buildRuntimeBackedInitialSessionBirth } from '@/utils/providerSwitchSessionBirth';
 import { resolveGlobalSidebarWorkspace } from '@/utils/globalSidebarProjection';
+import {
+  nowForSpaceMetric,
+  trackSpaceToolMutation,
+} from '@/pages/space/spaceMetrics';
 
 // ============================================================
 // User Support Prompt Builder
@@ -256,7 +260,7 @@ interface TabContentProps {
   capabilityInitialOfficialToolId: OfficialToolId | undefined;
   capabilityInitialSelect: CapabilityInitialSelect | undefined;
   // Launcher callbacks
-  onLaunchProject: (project: Project, initialMessage?: InitialMessage, analyticsContext?: LaunchProjectAnalyticsContext, sessionBirthHint?: LaunchSessionBirthHint) => void;
+  onLaunchProject: (project: Project, initialMessage?: InitialMessage, analyticsContext?: LaunchProjectAnalyticsContext, sessionBirthHint?: LaunchSessionBirthHint) => Promise<boolean>;
   // Chat callbacks
   onOpenHistorySession: (tabId: string, sessionId: string, title: string, historyEntrySource?: HistoryEntrySource) => Promise<void>;
   onNewSession: (tabId: string) => Promise<boolean>;
@@ -1657,13 +1661,13 @@ export default function App() {
     sessionBirthHint?: LaunchSessionBirthHint,
   ) => {
     const activeTabId = activeTabIdRef.current;
-    if (!activeTabId) return;
+    if (!activeTabId) return false;
 
     // Per-tab launch guard: prevent concurrent launches on the same tab
     // A second launch would overwrite the first's initialMessage and kill its sidecar
     if (launchingTabRef.current === activeTabId) {
       console.warn(`[App] handleLaunchProject: launch already in progress for tab ${activeTabId}, ignoring`);
-      return;
+      return false;
     }
     launchingTabRef.current = activeTabId;
 
@@ -1725,7 +1729,7 @@ export default function App() {
       if (currentSessionHasPersistentOwners) {
         if (tabsRef.current.length >= MAX_TABS) {
           setTabErrors((prev) => ({ ...prev, [activeTabId]: t('appChrome.maxTabsReached') }));
-          return;
+          return false;
         }
         const newTab = createNewTab();
         setTabs((prev) => [...prev, newTab]);
@@ -1851,7 +1855,7 @@ export default function App() {
           setTabErrors((prev) => ({ ...prev, [targetTabId]: t('appChrome.codexSessionCreateFailed') }));
           setLoadingTabs((prev) => ({ ...prev, [targetTabId]: false }));
           launchingTabRef.current = null;
-          return;
+          return false;
         }
       }
 
@@ -1918,6 +1922,7 @@ export default function App() {
         )
       );
       setLoadingTabs((prev) => ({ ...prev, [targetTabId]: false }));
+      return true;
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       console.error('[App] Failed to start:', errorMsg);
@@ -1956,6 +1961,7 @@ export default function App() {
           )
         );
       }
+      return false;
     } finally {
       launchingTabRef.current = null;
       setLoadingTabs((prev) => ({ ...prev, [activeTabId]: false, [targetTabId]: false }));
@@ -3071,16 +3077,17 @@ export default function App() {
 
   // Listen for LAUNCH_BUG_REPORT custom event (AI-powered bug reporting)
   useEffect(() => {
-    const handleLaunchBugReport = async (event: CustomEvent<{
-      description: string;
-      providerId?: string;
-      model?: string;
-      appVersion: string;
-      images?: ImageAttachment[];
-      resumeSessionId?: string;
-      assistantEntry?: AssistantEntry;
-    }>) => {
-      const { description, appVersion, providerId, model, resumeSessionId, assistantEntry } = event.detail;
+    const handleLaunchBugReport = async (event: CustomEvent<HelperRequestDetail>) => {
+      const {
+        description,
+        appVersion,
+        providerId,
+        model,
+        resumeSessionId,
+        assistantEntry,
+        scenario = 'support',
+      } = event.detail;
+      const helperLaunchStartedAt = nowForSpaceMetric();
       try {
         // Existing helper Sessions use the same new/jump/revive owner as every
         // other history surface. The canonical path applies the tab limit only
@@ -3106,6 +3113,17 @@ export default function App() {
 
         if (tabsRef.current.length >= MAX_TABS) {
           console.warn(`[App] Max tabs (${MAX_TABS}) reached, cannot open bug report`);
+          if (scenario === 'space_tool_install') {
+            trackSpaceToolMutation({
+              operation: 'helper_launch',
+              toolKind: 'custom_install_prompt',
+              result: 'failure',
+              ok: false,
+              durationMs: Math.round(nowForSpaceMetric() - helperLaunchStartedAt),
+              error: new Error('Maximum tab count reached'),
+            });
+            toastRef.current?.error(t('appChrome.maxTabsReached'));
+          }
           return;
         }
 
@@ -3118,6 +3136,17 @@ export default function App() {
         );
         if (!project) {
           console.error('[App] ensureSelfAwarenessWorkspace returned null');
+          if (scenario === 'space_tool_install') {
+            trackSpaceToolMutation({
+              operation: 'helper_launch',
+              toolKind: 'custom_install_prompt',
+              result: 'failure',
+              ok: false,
+              durationMs: Math.round(nowForSpaceMetric() - helperLaunchStartedAt),
+              error: new Error('Helper workspace unavailable'),
+            });
+            toastRef.current?.error(t('space.tools.helperLaunchFailed'));
+          }
           return;
         }
 
@@ -3182,7 +3211,9 @@ export default function App() {
         });
 
         const initialMessage: InitialMessage = {
-          text: buildSupportPrompt(description, appVersion),
+          text: scenario === 'space_tool_install'
+            ? description
+            : buildSupportPrompt(description, appVersion ?? ''),
           ...(helperPermissionMode ? { permissionMode: helperPermissionMode } : {}),
           ...(builtinSelection ? { builtinSelection } : {}),
           ...(providerExecutionIdentity ? {
@@ -3196,22 +3227,62 @@ export default function App() {
         openLaunchTabNow(newTab);
 
         try {
-          await handleLaunchProject(
+          const launched = await handleLaunchProject(
             project,
             initialMessage,
-            { surface: 'bug_report', entryIntent: 'support_diagnostics', assistantEntry: assistantEntry ?? 'other' },
+            scenario === 'space_tool_install'
+              ? {
+                  surface: 'space_tools',
+                  entryIntent: 'tool_install',
+                  assistantEntry: 'space_tool_install',
+                }
+              : {
+                  surface: 'bug_report',
+                  entryIntent: 'support_diagnostics',
+                  assistantEntry: assistantEntry ?? 'other',
+                },
           );
+          if (!launched) {
+            throw new Error('Helper Session failed to start');
+          }
+          if (scenario === 'space_tool_install') {
+            trackSpaceToolMutation({
+              operation: 'helper_launch',
+              toolKind: 'custom_install_prompt',
+              result: 'success',
+              ok: true,
+              durationMs: Math.round(nowForSpaceMetric() - helperLaunchStartedAt),
+            });
+          }
 
           // Override tab title
           setTabs((prev) =>
             prev.map((tab) =>
-              tab.id === newTab.id ? { ...tab, title: t('appChrome.diagnosticsTabTitle') } : tab
+              tab.id === newTab.id
+                ? {
+                    ...tab,
+                    title: scenario === 'space_tool_install'
+                      ? t('space.tools.installSessionTitle')
+                      : t('appChrome.diagnosticsTabTitle'),
+                  }
+                : tab
             )
           );
         } finally {
           removeUnusedPrecreatedLaunchTab(newTab.id);
         }
       } catch (err) {
+        if (scenario === 'space_tool_install') {
+          trackSpaceToolMutation({
+            operation: 'helper_launch',
+            toolKind: 'custom_install_prompt',
+            result: 'failure',
+            ok: false,
+            durationMs: Math.round(nowForSpaceMetric() - helperLaunchStartedAt),
+            error: err,
+          });
+          toastRef.current?.error(t('space.tools.helperLaunchFailed'));
+        }
         console.error('[App] Failed to launch bug report:', err);
       }
     };

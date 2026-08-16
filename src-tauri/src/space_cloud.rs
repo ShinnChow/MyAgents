@@ -20,6 +20,7 @@ pub(crate) mod cli;
 pub(crate) mod delivery;
 pub(crate) mod registered_agents;
 pub(crate) mod skills;
+pub(crate) mod tools;
 
 pub use attachments::{
     SpaceAttachmentDraftMetadata, SpaceCommentIssueWithAttachmentsInput,
@@ -54,6 +55,7 @@ pub use skills::{
     SpaceSkillInstallTarget, SpaceSkillSourceInspection, SpaceSkillSourceMetaInput,
     SpaceUploadSkillInput,
 };
+pub use tools::{SpacePublishCustomToolInput, SpaceUpdateCustomToolInput};
 
 const SPACE_ENABLED_ENV: Option<&str> = option_env!("MYAGENTS_SPACE_ENABLED");
 const SPACE_BASE_URL_ENV: Option<&str> = option_env!("MYAGENTS_SPACE_BASE_URL");
@@ -70,6 +72,7 @@ const SESSION_FILE: &str = "session.json";
 const MAX_PROFILE_AVATAR_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_SPACE_AVATAR_BYTES: u64 = MAX_PROFILE_AVATAR_BYTES;
 const NORMALIZED_AVATAR_MAX_EDGE: u32 = 256;
+const NORMALIZED_AVATAR_MAX_BYTES: usize = 512 * 1024;
 const MAX_CLOUD_ISSUE_INSTRUCTION_CHARS: usize = 20_000;
 #[derive(Debug)]
 struct SpaceClientDeviceContext {
@@ -1386,7 +1389,7 @@ fn space_form(input: SpaceUpdateSpaceInput) -> Result<reqwest::multipart::Form, 
     Ok(form.part("avatar", part))
 }
 
-fn normalized_avatar_upload_part(
+pub(super) fn normalized_avatar_upload_part(
     file_path: &Path,
     max_bytes: u64,
 ) -> Result<reqwest::multipart::Part, String> {
@@ -1407,6 +1410,12 @@ fn normalized_avatar_upload_part(
     validate_avatar_file_extension(file_path)?;
     let bytes = read_avatar_file_bytes(file_path, &metadata, max_bytes)?;
     let normalized = normalize_avatar_bytes_to_webp(&bytes)?;
+    if normalized.len() > NORMALIZED_AVATAR_MAX_BYTES {
+        return Err(format!(
+            "Normalized avatar image exceeds {} bytes",
+            NORMALIZED_AVATAR_MAX_BYTES
+        ));
+    }
     reqwest::multipart::Part::bytes(normalized)
         .file_name("avatar.webp")
         .mime_str("image/webp")

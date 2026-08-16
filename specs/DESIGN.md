@@ -1,7 +1,7 @@
 # MyAgents Design Guide
 
-> **Version**: 2.8.51
-> **Last Updated**: 2026-08-15
+> **Version**: 2.8.52
+> **Last Updated**: 2026-08-16
 > **Status**: Active
 > **Platform**: macOS / Windows Desktop Client
 
@@ -1428,6 +1428,7 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.52 | 2026-08-16 | **Space Tools 资源池**：Skills 后新增同级 Tools 导航；MCP 与自定义工具使用一致的双列卡片（32px 图标、单行名称/描述、类型 Tag），点击进入最大 800px / 80vh 的居中卡片式详情；发布按钮只展开“本地 MCP / 自定义安装提示词”两个入口，管理动作收进详情更多菜单，MCP 冲突替换必须在详情内显式确认 |
 | 2.8.51 | 2026-08-15 | **历史搜索连续展开**：Overlay 首帧保留筛选器并在右侧展示紧凑搜索框，激活后以 transform/opacity 向左展开为整行输入；Escape/X 恢复紧凑态与焦点，Suspense fallback 保持相同几何 |
 | 2.8.50 | 2026-08-15 | **统一文件资源图标**：固定 vendoring Symbols SVG，由 MyAgents typed resolver 统一负责文件名、复合扩展名、类别与未知兜底；所有具体文件/文件夹身份入口共用 `FileIcon` 的 16/20/24px 契约，动作图标和真实媒体预览保持独立 |
 | 2.8.49 | 2026-08-09 | **Managed Codex 原生智能压缩**：Managed Codex 斜杠菜单仅新增 `/compact`，与 context 用量卡片右上角「智能压缩」共用 SessionEngine 原生控制动作、忙碌与成功失败状态；其余 Claude SDK 系统指令及其他 external Runtime 继续隐藏，compact control turn 不进入对话消息流 |

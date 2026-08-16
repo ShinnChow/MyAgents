@@ -58,7 +58,7 @@ interface LauncherProps {
         initialMessage?: InitialMessage,
         analyticsContext?: { surface?: Surface; entryIntent?: EntryIntent },
         sessionBirthHint?: LaunchSessionBirthHint,
-    ) => void;
+    ) => Promise<boolean>;
     isStarting?: boolean;
     startError?: string | null;
     isActive: boolean;

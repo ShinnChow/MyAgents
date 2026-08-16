@@ -19,6 +19,7 @@ const apiMocks = vi.hoisted(() => ({
   spaceGetSession: vi.fn(),
   spaceGetSkill: vi.fn(),
   spaceGetSkillFile: vi.fn(),
+  spaceGetTool: vi.fn(),
   spaceInstallSkill: vi.fn(),
   spaceListSkillRevisions: vi.fn(),
   spaceListGoals: vi.fn(),
@@ -28,6 +29,8 @@ const apiMocks = vi.hoisted(() => ({
   spaceListLocalAgents: vi.fn(),
   spaceListRegisteredAgents: vi.fn(),
   spaceListSkills: vi.fn(),
+  spaceListTools: vi.fn(),
+  spaceListToolRevisions: vi.fn(),
   spaceLogout: vi.fn(),
   spaceRegisterAgent: vi.fn(),
   spaceRevokeRegisteredAgent: vi.fn(),
@@ -78,6 +81,7 @@ vi.mock("@/api/spaceCloud", () => ({
   spaceGetSession: apiMocks.spaceGetSession,
   spaceGetSkill: apiMocks.spaceGetSkill,
   spaceGetSkillFile: apiMocks.spaceGetSkillFile,
+  spaceGetTool: apiMocks.spaceGetTool,
   spaceInstallSkill: apiMocks.spaceInstallSkill,
   spaceListSkillRevisions: apiMocks.spaceListSkillRevisions,
   spaceListGoals: apiMocks.spaceListGoals,
@@ -87,6 +91,8 @@ vi.mock("@/api/spaceCloud", () => ({
   spaceListLocalAgents: apiMocks.spaceListLocalAgents,
   spaceListRegisteredAgents: apiMocks.spaceListRegisteredAgents,
   spaceListSkills: apiMocks.spaceListSkills,
+  spaceListTools: apiMocks.spaceListTools,
+  spaceListToolRevisions: apiMocks.spaceListToolRevisions,
   spaceLogout: apiMocks.spaceLogout,
   spaceRegisterAgent: apiMocks.spaceRegisterAgent,
   spaceRevokeRegisteredAgent: apiMocks.spaceRevokeRegisteredAgent,
@@ -119,6 +125,7 @@ import type {
   SpaceIssueDetail,
   SpaceSession,
   SpaceSkill,
+  SpaceTool,
 } from "@/api/spaceCloud";
 import {
   SPACE_MAX_ISSUE_DETAIL_CACHES,
@@ -211,6 +218,18 @@ const fakeSkill: SpaceSkill = {
   updatedAt: "2026-06-24T00:00:00.000Z",
 };
 
+const fakeTool: SpaceTool = {
+  id: "tool-1",
+  kind: "mcp",
+  mcpServerId: "team-mcp",
+  name: "Team MCP",
+  description: "Shared context",
+  currentRevision: 1,
+  latestRevision: 1,
+  createdAt: "2026-08-16T00:00:00.000Z",
+  updatedAt: "2026-08-16T00:00:00.000Z",
+};
+
 const fakeAgent: LocalRegisteredAgent = {
   id: "rag_123",
   baseUrl: "https://space.myagents.test",
@@ -287,10 +306,120 @@ describe("spaceStore snapshot", () => {
   });
 });
 
+describe("spaceStore Tool catalogue", () => {
+  beforeEach(() => {
+    __setSpaceStoreStateForTest({
+      boot: "ready",
+      serviceBaseUrl: fakeSession.baseUrl,
+      session: fakeSession,
+      spaceId: "official",
+    });
+  });
+
+  it("keeps the last good Tool list when a refresh fails", async () => {
+    apiMocks.spaceListTools.mockResolvedValueOnce({
+      items: [fakeTool],
+      hasMore: false,
+      nextCursor: null,
+    });
+    await actions.refreshTools({ force: true });
+
+    apiMocks.spaceListTools.mockRejectedValueOnce(new Error("offline"));
+    await expect(actions.refreshTools({ force: true })).rejects.toThrow(
+      "offline",
+    );
+
+    expect(getSnapshot().tools.items).toEqual([fakeTool]);
+    expect(getSnapshot().tools.error).toBe("offline");
+    expect(analyticsMocks.track).toHaveBeenCalledWith(
+      "space_open",
+      expect.objectContaining({
+        space_surface: "tools",
+        operation: "list_load",
+        ok: false,
+      }),
+    );
+  });
+
+  it("appends a cursor page without duplicating existing Tools", async () => {
+    apiMocks.spaceListTools
+      .mockResolvedValueOnce({
+        items: [fakeTool],
+        hasMore: true,
+        nextCursor: "cursor-1",
+      })
+      .mockResolvedValueOnce({
+        items: [
+          fakeTool,
+          {
+            ...fakeTool,
+            id: "tool-2",
+            name: "Second Tool",
+          },
+        ],
+        hasMore: false,
+        nextCursor: null,
+      });
+    await actions.refreshTools({ force: true });
+    await actions.loadMoreTools();
+
+    expect(apiMocks.spaceListTools).toHaveBeenLastCalledWith({
+      spaceId: "official",
+      cursor: "cursor-1",
+      limit: 40,
+    });
+    expect(getSnapshot().tools.items.map((tool) => tool.id)).toEqual([
+      "tool-1",
+      "tool-2",
+    ]);
+  });
+
+  it("appends Tool revision history so older revisions remain roll-backable", async () => {
+    const revision = (value: number) => ({
+      id: `tool-revision-${value}`,
+      toolId: fakeTool.id,
+      revision: value,
+      name: `Team MCP v${value}`,
+      description: "Shared context",
+      createdAt: `2026-08-${String(value).padStart(2, "0")}T00:00:00.000Z`,
+    });
+    apiMocks.spaceListToolRevisions
+      .mockResolvedValueOnce({
+        tool: { id: fakeTool.id, latestRevision: 101, currentRevision: 101 },
+        items: [revision(101)],
+        hasMore: true,
+        nextCursor: "revision-cursor-100",
+      })
+      .mockResolvedValueOnce({
+        tool: { id: fakeTool.id, latestRevision: 101, currentRevision: 101 },
+        items: [revision(100)],
+        hasMore: false,
+        nextCursor: null,
+      });
+
+    await actions.refreshToolRevisions(fakeTool.id, { force: true });
+    await actions.loadMoreToolRevisions(fakeTool.id);
+
+    expect(apiMocks.spaceListToolRevisions).toHaveBeenLastCalledWith({
+      toolId: fakeTool.id,
+      cursor: "revision-cursor-100",
+      limit: 100,
+    });
+    const revisionState = Object.values(getSnapshot().toolRevisions)[0];
+    expect(revisionState?.history?.items.map((item) => item.revision)).toEqual([
+      101,
+      100,
+    ]);
+  });
+});
+
 describe("spaceStore boot", () => {
   it("projects an invalidated credential as reauth instead of a boot error", async () => {
-    const { sessionBindingId: _binding, expiresAt: _expiresAt, ...account } =
-      fakeSession;
+    const {
+      sessionBindingId: _binding,
+      expiresAt: _expiresAt,
+      ...account
+    } = fakeSession;
     apiMocks.spaceGetSession.mockResolvedValueOnce({
       state: "reauth_required",
       account,
@@ -806,7 +935,10 @@ describe("spaceStore issue refresh", () => {
       session: fakeSession,
       spaceId: "official",
     });
-    const pending = deferred<{ items: SpaceIssue[]; nextCursor?: string | null }>();
+    const pending = deferred<{
+      items: SpaceIssue[];
+      nextCursor?: string | null;
+    }>();
     apiMocks.spaceListIssues.mockReturnValueOnce(pending.promise);
     const refresh = actions.refreshIssues({ limit: 50 }, { force: true });
 
