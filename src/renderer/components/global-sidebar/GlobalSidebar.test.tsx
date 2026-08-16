@@ -1034,11 +1034,17 @@ describe('GlobalSidebar rail flyout', () => {
     expect(notificationButton.querySelector('.global-sidebar-nav-label')).toBeInTheDocument();
     expect(helperButton.querySelector('.global-sidebar-nav-label')).toBeInTheDocument();
     const workspaceFade = document.querySelector<HTMLElement>('[data-global-sidebar-workspace-fade]');
-    expect(workspaceFade).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'bottom-0', 'h-10');
+    expect(workspaceFade).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'bottom-0', 'h-6');
     expect(workspaceFade?.style.background).toContain('linear-gradient(to bottom');
     expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg-a0)');
     expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg)');
-    expect(document.querySelector('[role="tree"]')).toHaveClass('pb-10');
+    expect(document.querySelector('[role="tree"]')).toHaveClass('pb-6');
+    // The fade must consume the spacing directly above the notification entry:
+    // the expanded footer drops its top padding so the scroller edge (and the
+    // fade) reach the notification button, instead of stacking an extra
+    // gradient band on top of an unchanged gap.
+    const footerActions = document.querySelector<HTMLElement>('[data-global-sidebar-footer-actions]');
+    expect(footerActions).toHaveClass('pt-0', 'pb-3');
     const workspaceToggle = within(inactiveRow).getAllByRole('button')[0];
     const workspaceActions = inactiveRow.querySelector<HTMLElement>('[data-global-sidebar-workspace-actions]');
     expect(inactiveRow).toHaveClass('relative');

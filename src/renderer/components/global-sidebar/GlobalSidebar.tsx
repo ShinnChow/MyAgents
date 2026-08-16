@@ -1155,7 +1155,7 @@ export default memo(function GlobalSidebar({
           {expanded && (
             <div
               aria-hidden="true"
-              className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-10"
+              className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-6"
               style={{
                 background: 'linear-gradient(to bottom, var(--global-sidebar-bg-a0), var(--global-sidebar-bg))',
               }}
@@ -1165,7 +1165,7 @@ export default memo(function GlobalSidebar({
         </div>
 
         <div
-          className={`shrink-0 py-3 ${expanded ? 'px-3' : 'global-sidebar-rail-stack'}`}
+          className={`shrink-0 pb-3 ${expanded ? 'px-3 pt-0' : 'global-sidebar-rail-stack pt-3'}`}
           data-global-sidebar-footer-actions
         >
           <button
@@ -1635,7 +1635,7 @@ function WorkspaceTree({
       </div>
 
       <div
-        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 ${fadeBottom ? 'pb-10' : 'pb-3'}`}
+        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 ${fadeBottom ? 'pb-6' : 'pb-3'}`}
         role="tree"
         style={{ scrollbarGutter: 'stable' }}
       >
