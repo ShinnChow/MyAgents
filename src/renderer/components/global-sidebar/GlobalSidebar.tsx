@@ -1636,7 +1636,7 @@ function WorkspaceTree({
 
       <div
         aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-8 z-10 h-4"
+        className="pointer-events-none absolute inset-x-0 top-8 z-10 h-2"
         style={{
           background: 'linear-gradient(to bottom, var(--global-sidebar-bg), var(--global-sidebar-bg-a0))',
         }}
@@ -1644,7 +1644,7 @@ function WorkspaceTree({
       />
 
       <div
-        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-4 ${fadeBottom ? 'pb-6' : 'pb-3'}`}
+        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-2 ${fadeBottom ? 'pb-6' : 'pb-3'}`}
         role="tree"
         style={{ scrollbarGutter: 'stable' }}
       >

@@ -1038,9 +1038,9 @@ describe('GlobalSidebar rail flyout', () => {
     expect(workspaceFade?.style.background).toContain('linear-gradient(to bottom');
     expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg-a0)');
     expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg)');
-    expect(document.querySelector('[role="tree"]')).toHaveClass('pt-4', 'pb-6');
+    expect(document.querySelector('[role="tree"]')).toHaveClass('pt-2', 'pb-6');
     const workspaceFadeTop = document.querySelector<HTMLElement>('[data-global-sidebar-workspace-fade-top]');
-    expect(workspaceFadeTop).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'top-8', 'h-4');
+    expect(workspaceFadeTop).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'top-8', 'h-2');
     expect(workspaceFadeTop?.style.background).toContain('linear-gradient(to bottom');
     expect(workspaceFadeTop?.style.background).toContain('var(--global-sidebar-bg)');
     expect(workspaceFadeTop?.style.background).toContain('var(--global-sidebar-bg-a0)');
