@@ -1,7 +1,7 @@
 import type { SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { InteractionScenario } from '../system-prompt';
 import { trackServer as defaultTrackServer } from '../analytics';
-import { shouldTitleCompletedTurn } from '../../shared/terminalReason';
+import { formatApiErrorDetail, shouldTitleCompletedTurn } from '../../shared/terminalReason';
 import type { CancelReason } from '../utils/cancellation';
 import {
   extractTurnUsageFromSdkResult,
@@ -571,20 +571,37 @@ export function createBuiltinTurnLifecycle(deps: BuiltinTurnLifecycleDeps): Buil
       || resultMessage.errors?.join('; ')
       || getLastAssistantMessageError()
       || '';
-    const noOutputResultText = isTerminalFailure ? resultErrorText : (hasResultText ? resultText : '');
-    if (noOutputResultText && !hasCurrentTurnOutput() && !getCurrentTurnToolCount() && !isAbortResult) {
-      if (isTerminalFailure) {
-        console.warn('[agent] SDK error result with no streamed output, showing as agent-error:', resultErrorText);
-        deps.setLastAgentError(resultErrorText);
-        deps.broadcast('chat:agent-error', { message: resultErrorText });
-      } else if (resultText) {
-        console.warn('[agent] SDK non-error result with no streamed output, showing as message:', resultText);
-        deps.emitFirstDeltaTrace(resultText);
-        if (deps.appendTextChunk(resultText)) {
-          deps.broadcast('chat:message-chunk', resultText);
-          markCurrentTurnHasOutput();
-          deps.stageAssistantChannelBlock(resultText);
-        }
+    const apiErrorStatus = 'api_error_status' in resultMessage
+      ? resultMessage.api_error_status ?? null
+      : null;
+    // `error_during_execution` 是 SDKResultError 里唯一表示真实执行错误的 subtype；
+    // `error_max_turns` / `error_max_budget_usd` / `error_max_structured_output_retries`
+    // 是策略上限（max_turns / budget / structured_output），应走 terminal_reason banner
+    // 而非 agentError。`errors[]` 是 SDKResultError 的权威错误通道，不能整体排除。
+    const hasSdkExecutionError = resultMessage.subtype === 'error_during_execution'
+      && (resultMessage.errors?.length ?? 0) > 0;
+    const hasProviderErrorDetail = apiErrorStatus != null
+      || hadAssistantMessageError()
+      || hasSdkExecutionError;
+
+    // 终端失败携带 provider 细节（状态码 / provisional error / 执行错误）时，无论本轮
+    // 是否已流式输出或执行工具，都要把细节 surface 成 agent-error。原守卫只覆盖「无输出
+    // 且无工具」场景，多轮 / 多工具中途失败的 429 / 5xx 会被静默丢进日志。
+    if (isTerminalFailure && !isAbortResult && hasProviderErrorDetail) {
+      const formatted = formatApiErrorDetail({ status: apiErrorStatus, rawMessage: resultErrorText });
+      console.warn('[agent] SDK terminal error surfaced as agent-error:', formatted, 'raw=', resultErrorText);
+      deps.setLastAgentError(formatted);
+      deps.broadcast('chat:agent-error', { message: formatted });
+    }
+
+    // 非错误 result 且无流式输出：把 result 文本作为消息回显（原行为不变）。
+    if (!isTerminalFailure && hasResultText && !hasCurrentTurnOutput() && !getCurrentTurnToolCount() && !isAbortResult) {
+      console.warn('[agent] SDK non-error result with no streamed output, showing as message:', resultText);
+      deps.emitFirstDeltaTrace(resultText);
+      if (deps.appendTextChunk(resultText)) {
+        deps.broadcast('chat:message-chunk', resultText);
+        markCurrentTurnHasOutput();
+        deps.stageAssistantChannelBlock(resultText);
       }
     }
 
@@ -767,9 +784,7 @@ export function createBuiltinTurnLifecycle(deps: BuiltinTurnLifecycleDeps): Buil
       const sessionEventError = isTerminalFailure
         ? {
             code: 'turn_failed',
-            message:
-              resultMessage.result ||
-              (resultMessage.errors?.join('; ') ?? 'turn ended with error'),
+            message: resultErrorText || 'turn ended with error',
           }
         : undefined;
       const replyMeta = getCurrentTurnInboxMeta();

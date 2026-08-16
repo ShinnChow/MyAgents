@@ -3,6 +3,7 @@ import { appendMessage, resetTranscriptForTest, transcriptState } from './transc
 import {
   accumulateCurrentTurnUsage,
   appendCurrentTurnTextBlock,
+  markAssistantMessageError,
   markCurrentTurnHasOutput,
   peekPendingOutputOwner,
   popPendingOutputOwner,
@@ -29,6 +30,11 @@ import {
   type BuiltinTurnLifecycleDeps,
 } from './turn-lifecycle';
 import { NO_CHANNEL_DELIVERY, SESSION_BOUND_CHANNEL_DELIVERY } from '../session-core/channel-delivery';
+
+vi.mock('../inbox/watch-deliver', () => ({
+  deliverSessionWatchEvents: vi.fn(async () => undefined),
+}));
+import { deliverSessionWatchEvents } from '../inbox/watch-deliver';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -631,6 +637,153 @@ describe('turn-lifecycle owner', () => {
       role: 'assistant',
       content: expect.stringContaining('Error: 上游模型服务达到账号并发限制'),
     });
+  });
+
+  it('surfaces provider error detail as agent-error even with output + tools (PRD 0.4.10)', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+    markCurrentTurnHasOutput();
+    setCurrentTurnToolCount(6);
+
+    await lifecycle.handleSdkResult(makeResult({
+      is_error: true,
+      terminal_reason: 'api_error',
+      api_error_status: 429,
+      result: 'rate_limit: API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。]',
+    }));
+
+    const agentErrors = broadcasts.filter((item) => item.event === 'chat:agent-error');
+    expect(agentErrors).toHaveLength(1);
+    expect(deps.setLastAgentError).toHaveBeenCalledWith(
+      '(429) 限流 / 额度受限 - rate_limit: API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。]',
+    );
+  });
+
+  it('surfaces provisional assistant error as agent-error even without a status code', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+    markAssistantMessageError('model overloaded');
+
+    await lifecycle.handleSdkResult(makeResult({
+      is_error: true,
+      terminal_reason: 'model_error',
+    }));
+
+    const agentErrors = broadcasts.filter((item) => item.event === 'chat:agent-error');
+    expect(agentErrors).toHaveLength(1);
+    expect(deps.setLastAgentError).toHaveBeenCalledWith('model overloaded');
+  });
+
+  it('does NOT surface enum-only terminal reasons (max_turns) as agent-error', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+
+    await lifecycle.handleSdkResult(makeResult({
+      is_error: false,
+      terminal_reason: 'max_turns',
+      result: 'partial answer that hit the turn limit',
+    }));
+
+    expect(broadcasts.map((item) => item.event)).not.toContain('chat:agent-error');
+    expect(deps.setLastAgentError).not.toHaveBeenCalled();
+  });
+
+  it('emits exactly one chat:agent-error for a provider failure (no double broadcast)', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+
+    await lifecycle.handleSdkResult(makeResult({
+      is_error: true,
+      terminal_reason: 'api_error',
+      api_error_status: 500,
+      result: 'upstream overloaded',
+    }));
+
+    const agentErrors = broadcasts.filter((item) => item.event === 'chat:agent-error');
+    expect(agentErrors).toHaveLength(1);
+    expect(agentErrors[0].data).toEqual({ message: '(500) 供应商服务器错误 - upstream overloaded' });
+  });
+
+  it('surfaces image_error delivered as SDKResultError (errors-only, no status) with rewind text', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+
+    await lifecycle.handleSdkResult(makeResult({
+      subtype: 'error_during_execution',
+      is_error: true,
+      terminal_reason: 'image_error',
+      errors: ['image dimensions exceed max allowed size: 8000 pixels'],
+    }));
+
+    const agentErrors = broadcasts.filter((item) => item.event === 'chat:agent-error');
+    expect(agentErrors).toHaveLength(1);
+    expect(deps.setLastAgentError).toHaveBeenCalledWith(
+      'image dimensions exceed max allowed size: 8000 pixels',
+    );
+    expect(deps.handleTerminalRecovery).toHaveBeenCalledWith('image');
+  });
+
+  it('does NOT surface policy-limit subtypes (error_max_turns) even with a non-empty errors array', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+
+    await lifecycle.handleSdkResult(makeResult({
+      subtype: 'error_max_turns',
+      is_error: true,
+      terminal_reason: 'max_turns',
+      errors: ['max turns exceeded'],
+    }));
+
+    expect(broadcasts.map((item) => item.event)).not.toContain('chat:agent-error');
+    expect(deps.setLastAgentError).not.toHaveBeenCalled();
+  });
+
+  it('does NOT surface a terminal failure whose only text is the ambiguous result field', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+
+    await lifecycle.handleSdkResult(makeResult({
+      is_error: true,
+      terminal_reason: 'turn_setup_failed',
+      result: 'setup failed for an unknown reason',
+    }));
+
+    expect(broadcasts.map((item) => item.event)).not.toContain('chat:agent-error');
+    expect(deps.setLastAgentError).not.toHaveBeenCalled();
+  });
+
+  it('does NOT surface a provisional error recovered by a completed result', async () => {
+    const { deps, broadcasts } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+    markAssistantMessageError('transient hiccup');
+
+    await lifecycle.handleSdkResult(makeResult({
+      is_error: false,
+      terminal_reason: 'completed',
+      result: 'final answer',
+    }));
+
+    expect(broadcasts.map((item) => item.event)).not.toContain('chat:agent-error');
+    expect(deps.setLastAgentError).not.toHaveBeenCalled();
+  });
+
+  it('feeds the unified resultErrorText (incl. provisional) into sessionEventError', async () => {
+    const { deps } = makeDeps();
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+    markAssistantMessageError('upstream overloaded');
+
+    await lifecycle.handleSdkResult(makeResult({
+      is_error: true,
+      terminal_reason: 'model_error',
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(vi.mocked(deliverSessionWatchEvents)).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({
+        error: expect.objectContaining({ code: 'turn_failed', message: 'upstream overloaded' }),
+      }),
+    );
   });
 
   it('finalizes stopped turns with queue cleanup, IM completion, and persistence', async () => {
