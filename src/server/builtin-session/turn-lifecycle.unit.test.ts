@@ -908,7 +908,7 @@ describe('turn-lifecycle owner', () => {
     expect(deps.surfaceInFlightQueueItem).toHaveBeenCalledWith(
       'queued-1',
       { messageText: 'run now', channelDelivery: NO_CHANNEL_DELIVERY },
-      expect.objectContaining({ reason: 'force-send #289' }),
+      expect.objectContaining({ reason: 'force-send #289', midTurnBreak: true }),
     );
     expect(deps.dropInFlightQueueItem).not.toHaveBeenCalled();
 
@@ -930,6 +930,51 @@ describe('turn-lifecycle owner', () => {
     expect(natural.deps.preserveInFlightAfterTerminalBoundary).toHaveBeenCalledWith('natural result');
     expect(natural.deps.surfaceInFlightQueueItem).not.toHaveBeenCalled();
     expect(natural.deps.dropInFlightQueueItem).not.toHaveBeenCalled();
+  });
+
+  it('does not broadcast message-stopped on force-surface (loading stays continuous)', async () => {
+    const { deps } = makeDeps({
+      getIsInterruptingResponse: () => true,
+    });
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+    setInFlightQueueItem('queued-force', {
+      messageText: 'run now',
+      channelDelivery: NO_CHANNEL_DELIVERY,
+    });
+    setForceSurfaceInFlightId('queued-force');
+    setInterruptingInFlightQueueId('queued-force');
+    appendMessage({ id: '1', role: 'assistant', content: 'done', timestamp: 't1' });
+    markCurrentTurnHasOutput();
+
+    await lifecycle.handleSdkResult(makeResult({
+      result: 'done',
+      terminal_reason: 'aborted_streaming',
+    }));
+    // Flush the afterPersist microtask chain (persistTranscript -> afterPersist).
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(deps.surfaceInFlightQueueItem).toHaveBeenCalledOnce();
+    expect(deps.broadcast).not.toHaveBeenCalledWith(
+      'chat:message-stopped',
+      expect.anything(),
+    );
+  });
+
+  it('still broadcasts message-stopped on a plain stop without force-surface', async () => {
+    const { deps } = makeDeps({
+      getIsInterruptingResponse: () => true,
+    });
+    const lifecycle = createBuiltinTurnLifecycle(deps);
+    appendMessage({ id: '1', role: 'assistant', content: 'done', timestamp: 't1' });
+    markCurrentTurnHasOutput();
+
+    await lifecycle.handleSdkResult(makeResult({
+      result: 'done',
+      terminal_reason: 'aborted_streaming',
+    }));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(deps.broadcast).toHaveBeenCalledWith('chat:message-stopped', null);
   });
 
   it('preserves a plain-stop in-flight item when the interrupt receipt says it will run', () => {

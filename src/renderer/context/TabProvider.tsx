@@ -239,6 +239,44 @@ function applyAssistantCompletionPatch(message: Message, patch: AssistantComplet
     };
 }
 
+// Force-close incomplete thinking/tool blocks on an assistant message before it
+// moves into history. Shared by moveStreamingToHistory (turn terminal) and the
+// queue:started midTurnBreak split — a force-send interrupts the old turn, so the
+// snapshot must mark its thinking as stopped rather than leave it "in progress".
+function finalizeAssistantForHistory(msg: Message, status: 'completed' | 'stopped' | 'failed'): Message {
+    if (msg.role !== 'assistant' || !Array.isArray(msg.content)) return msg;
+    const statusFlags = status === 'stopped' ? { isStopped: true }
+        : status === 'failed' ? { isFailed: true }
+            : {};
+    const hasIncomplete = msg.content.some(b =>
+        (b.type === 'thinking' && !b.isComplete) ||
+        (b.type === 'tool_use' && b.tool?.isLoading)
+    );
+    if (!hasIncomplete) return msg;
+    return {
+        ...msg,
+        content: msg.content.map(block => {
+            if (block.type === 'thinking' && !block.isComplete) {
+                return {
+                    ...block,
+                    isComplete: true,
+                    ...statusFlags,
+                    thinkingDurationMs: block.thinkingStartedAt
+                        ? Date.now() - block.thinkingStartedAt
+                        : undefined
+                };
+            }
+            if (block.type === 'tool_use' && block.tool?.isLoading) {
+                return {
+                    ...block,
+                    tool: { ...block.tool, isLoading: false, ...statusFlags }
+                };
+            }
+            return block;
+        }),
+    };
+}
+
 function normalizeFiniteNumber(value: number | null | undefined): number | undefined {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -1872,40 +1910,7 @@ export default function TabProvider({
                 return null;
             }
 
-            let finalMsg = prev;
-            if (prev.role === 'assistant' && Array.isArray(prev.content)) {
-                const statusFlags = status === 'stopped' ? { isStopped: true }
-                    : status === 'failed' ? { isFailed: true }
-                        : {};
-                const hasIncomplete = prev.content.some(b =>
-                    (b.type === 'thinking' && !b.isComplete) ||
-                    (b.type === 'tool_use' && b.tool?.isLoading)
-                );
-                if (hasIncomplete) {
-                    finalMsg = {
-                        ...prev,
-                        content: prev.content.map(block => {
-                            if (block.type === 'thinking' && !block.isComplete) {
-                                return {
-                                    ...block,
-                                    isComplete: true,
-                                    ...statusFlags,
-                                    thinkingDurationMs: block.thinkingStartedAt
-                                        ? Date.now() - block.thinkingStartedAt
-                                        : undefined
-                                };
-                            }
-                            if (block.type === 'tool_use' && block.tool?.isLoading) {
-                                return {
-                                    ...block,
-                                    tool: { ...block.tool, isLoading: false, ...statusFlags }
-                                };
-                            }
-                            return block;
-                        }),
-                    };
-                }
-            }
+            let finalMsg = finalizeAssistantForHistory(prev, status);
 
             finalMsg = finalizeMessageSubagentProjection(finalMsg, status);
 
@@ -3842,7 +3847,8 @@ export default function TabProvider({
                                 flushPendingTextNow();
                                 rawSetStreamingMessage(prev => {
                                     if (prev) {
-                                        setHistoryMessages(prevHistory => [...prevHistory, prev, userMsg]);
+                                        const finalizedPrev = finalizeAssistantForHistory(prev, 'stopped');
+                                        setHistoryMessages(prevHistory => [...prevHistory, finalizedPrev, userMsg]);
                                     } else {
                                         setHistoryMessages(prevHistory => [...prevHistory, userMsg]);
                                     }
@@ -3861,6 +3867,11 @@ export default function TabProvider({
                                 revealLastRef.current = 0;
                                 isStreamingRef.current = false;
                                 adoptedStreamRef.current = false;
+                                // force-surface suppresses message-stopped, so its renderer cleanup
+                                // (setSystemStatus(null) + clearRuntimePlanTodos) is owned here — the
+                                // old turn's transient status/todos must not leak into the new turn (V3c).
+                                setSystemStatus(null);
+                                clearRuntimePlanTodos();
                             } else {
                                 // Normal turn start: render immediately
                                 setHistoryMessages(prev => [...prev, userMsg]);

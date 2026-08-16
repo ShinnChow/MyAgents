@@ -178,7 +178,7 @@ export type BuiltinTurnLifecycle = {
     terminalError?: string,
     afterPersist?: () => void,
     terminalKind?: 'complete' | 'cancelled',
-  ) => void;
+  ) => boolean;
   stopTurn: () => SessionCompletionTerminal | null;
   failTurn: (error: string, localizedError?: string) => SessionCompletionTerminal | null;
   failAdmittedTurnSetup: (error: string) => SessionCompletionTerminal | null;
@@ -236,7 +236,7 @@ export function createBuiltinTurnLifecycle(deps: BuiltinTurnLifecycleDeps): Buil
     terminalError?: string,
     afterPersist?: () => void,
     terminalKind: 'complete' | 'cancelled' = 'complete',
-  ): void => {
+  ): boolean => {
     deps.setStreamingMessage(false);
     const turnStartTime = getCurrentTurnStartTime();
     const settledDurationMs = durationMs
@@ -265,6 +265,7 @@ export function createBuiltinTurnLifecycle(deps: BuiltinTurnLifecycleDeps): Buil
         } else if (inFlightAction === 'surface' && meta) {
           void deps.surfaceInFlightQueueItem(stale, meta, {
             sdkUuid: stale,
+            midTurnBreak: true,
             reason: forced ? 'force-send #289' : 'confirmed result handoff',
             awaitPersist: false,
           }).catch((error) => {
@@ -369,6 +370,7 @@ export function createBuiltinTurnLifecycle(deps: BuiltinTurnLifecycleDeps): Buil
     if (terminalKind === 'cancelled') {
       deps.claimPostInterruptResultTerminal();
     }
+    return confirmedQueueTurnKeepStreaming;
   };
 
   const stopTurn = (): SessionCompletionTerminal | null => {
@@ -739,16 +741,25 @@ export function createBuiltinTurnLifecycle(deps: BuiltinTurnLifecycleDeps): Buil
       // the turn accumulator immediately afterwards, while the terminal
       // callback runs only after that async persistence completes.
       const composedAssistantText = getCurrentTurnText();
-      completeTurn(
+      // completeTurn returns whether this result force-surfaced the in-flight
+      // item (#289). The afterPersist callback runs after persistence, so it
+      // reads the settled flag: a force-surface keeps loading continuous (the
+      // midTurnBreak split owns the old-turn teardown), so only a plain stop
+      // broadcasts message-stopped. The stopped terminal is still recorded in
+      // both cases.
+      let forceSurfaced = false;
+      forceSurfaced = completeTurn(
         durationMs,
         terminalError,
         () => {
           if (isAbortResult) {
             const completionTerminal = recordCompletionTerminal('stopped');
-            deps.broadcast(
-              'chat:message-stopped',
-              withSessionCompletionTerminal(null, completionTerminal),
-            );
+            if (!forceSurfaced) {
+              deps.broadcast(
+                'chat:message-stopped',
+                withSessionCompletionTerminal(null, completionTerminal),
+              );
+            }
           } else {
             console.log('[agent][sdk] Broadcasting chat:message-complete');
             const completionStatus = terminalError ? 'error' : 'complete';
