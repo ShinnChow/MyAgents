@@ -537,6 +537,8 @@ Item 选中: 文字 var(--accent-warm)
 
 所有新 Overlay 必须复用 `src/renderer/components/OverlayBackdrop.tsx`，不要手写裸 backdrop。组件封装了正确的 pointer dismissal 语义；`className` 只补 z-index、padding、overflow 等布局差异，图片预览用 `variant="dark"`。可关闭 Overlay 还必须用 `useCloseLayer(handler, zIndex)` 注册关闭层，且 z-index 与视觉层级一致，避免 Cmd+W 跳过 Overlay 直接关闭 Tab。
 
+如果 Overlay 由页面内部声明、但产品语义要求覆盖全局侧栏和完整 App Shell，必须使用 `OverlayBackdrop portal` 将稳定 backdrop 挂到 `document.body`；不能只提高页面局部 stacking context 的 z-index。Space Tool / Skill 详情和发布表单属于这一类。
+
 内嵌 `BrowserPanel` 是全表面例外：它承载浮于 React DOM 之上的原生 child Webview，窄布局时必须让同一个 Chat / Tab-owned host 原位铺满 Chat，不能通过 `OverlayBackdrop` 重挂载或重建 Webview。其全屏关闭层 z-index 必须与视觉层级一致，并与分屏、工具栏、Browser Tab × 复用同一个关闭 callback；只有当前 active Browser view 可以消费该关闭层。
 
 全局历史搜索由 DOM 顺序早于 Tab 工作区的 `GlobalSidebar` 声明，因此 `HistorySearchOverlayFrame` 的稳定外壳必须 portal 到 `document.body`。这里不能只提高 `z-index`：macOS WKWebView 的 overflow scrollbar 使用独立合成层，后续 Tab 滚动面仍可能穿透较早的 backdrop。未来新增或重构同类 App 级 Overlay 时应先核对 owner 与 DOM 绘制顺序；页面内部、天然位于自身滚动面之后的局部 Overlay不受此约束。

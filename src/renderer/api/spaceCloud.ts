@@ -1751,16 +1751,16 @@ export function spacePublishMcpTool(input: {
   name: string;
   description?: string;
   portableMcpManifest: PortableMcpManifestV1;
+  iconFilePath?: string | null;
 }) {
-  return spaceApi<SpaceToolMutationResult>(
-    "POST",
-    `/api/spaces/${spacePath(input.spaceId)}/tools`,
+  return spaceMutationInvoke<SpaceToolMutationResult>(
+    "cmd_space_publish_tool",
     {
+      ...input,
       kind: "mcp",
-      name: input.name,
       description: input.description ?? "",
-      portableMcpManifest: input.portableMcpManifest,
     },
+    { operation: "publish MCP Tool" },
   );
 }
 
@@ -1770,17 +1770,17 @@ export function spaceUpdateMcpTool(input: {
   description?: string;
   portableMcpManifest: PortableMcpManifestV1;
   expectedLatestRevision: number;
+  iconFilePath?: string | null;
+  resetIcon?: boolean;
 }) {
-  return spaceApi<SpaceToolMutationResult>(
-    "POST",
-    `/api/tools/${encodeURIComponent(input.toolId)}/revisions`,
+  return spaceMutationInvoke<SpaceToolMutationResult>(
+    "cmd_space_update_tool",
     {
+      ...input,
       kind: "mcp",
-      name: input.name,
       description: input.description ?? "",
-      portableMcpManifest: input.portableMcpManifest,
-      expectedLatestRevision: input.expectedLatestRevision,
     },
+    { operation: "update MCP Tool" },
   );
 }
 
@@ -1792,8 +1792,8 @@ export function spacePublishCustomTool(input: {
   iconFilePath?: string | null;
 }) {
   return spaceMutationInvoke<SpaceToolMutationResult>(
-    "cmd_space_publish_custom_tool",
-    input,
+    "cmd_space_publish_tool",
+    { ...input, kind: "custom_install_prompt" },
     { operation: "publish custom Tool" },
   );
 }
@@ -1808,8 +1808,8 @@ export function spaceUpdateCustomTool(input: {
   resetIcon?: boolean;
 }) {
   return spaceMutationInvoke<SpaceToolMutationResult>(
-    "cmd_space_update_custom_tool",
-    input,
+    "cmd_space_update_tool",
+    { ...input, kind: "custom_install_prompt" },
     { operation: "update custom Tool" },
   );
 }

@@ -57,7 +57,7 @@ pub use skills::{
     SpaceSkillInstallTarget, SpaceSkillSourceInspection, SpaceSkillSourceMetaInput,
     SpaceUploadSkillInput,
 };
-pub use tools::{SpacePublishCustomToolInput, SpaceUpdateCustomToolInput};
+pub use tools::{SpacePublishToolInput, SpaceUpdateToolInput};
 
 const SPACE_ENABLED_ENV: Option<&str> = option_env!("MYAGENTS_SPACE_ENABLED");
 const SPACE_BASE_URL_ENV: Option<&str> = option_env!("MYAGENTS_SPACE_BASE_URL");

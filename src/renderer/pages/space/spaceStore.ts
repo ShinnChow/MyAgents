@@ -295,6 +295,7 @@ export interface SpaceActions {
     name: string;
     description?: string;
     portableMcpManifest: PortableMcpManifestV1;
+    iconFilePath?: string | null;
   }) => Promise<SpaceToolMutationResult>;
   publishCustomTool: (input: {
     spaceId: string;
@@ -309,6 +310,8 @@ export interface SpaceActions {
     description?: string;
     portableMcpManifest: PortableMcpManifestV1;
     expectedLatestRevision: number;
+    iconFilePath?: string | null;
+    resetIcon?: boolean;
   }) => Promise<SpaceToolMutationResult>;
   updateCustomTool: (input: {
     toolId: string;

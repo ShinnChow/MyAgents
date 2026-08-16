@@ -32,6 +32,18 @@ function stdio(patch: Partial<McpServerDefinition> = {}): McpServerDefinition {
 }
 
 describe("Space portable MCP policy", () => {
+  it("accepts Unicode letter and number server IDs used by the local MCP editor", () => {
+    expect(
+      validatePortableMcpManifest({
+        ...buildPortableMcpManifest(
+          stdio({ id: "figma版framelink-mcp" }),
+          config(),
+        ),
+        serverId: "figma版framelink-mcp",
+      }).serverId,
+    ).toBe("figma版framelink-mcp");
+  });
+
   it("exports stdio configuration without copying configured secret values", () => {
     const manifest = buildPortableMcpManifest(
       stdio(),

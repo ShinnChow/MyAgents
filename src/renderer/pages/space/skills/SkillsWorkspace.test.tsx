@@ -62,6 +62,12 @@ describe("Space Skill overwrite install", () => {
     await i18n.changeLanguage("en-US");
   });
 
+  it("portals Skill details above the complete App shell", () => {
+    renderSkill(vi.fn<SpaceActions["installSkill"]>());
+    const detailTitle = screen.getByRole("heading", { name: "Shared Skill" });
+    expect(detailTitle.closest(".fixed")?.parentElement).toBe(document.body);
+  });
+
   it("defaults a same-name conflict to cancellation", async () => {
     const installSkill = vi
       .fn<SpaceActions["installSkill"]>()

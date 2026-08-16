@@ -13,6 +13,9 @@ export const RESERVED_SPACE_MCP_SERVER_IDS = new Set(
   PRESET_MCP_SERVERS.map((server) => server.id),
 );
 
+const PORTABLE_MCP_SERVER_ID_PATTERN =
+  /^[\p{L}\p{N}][\p{L}\p{N}._-]{0,127}$/u;
+
 export type PortableMcpManifestV1 = {
   schemaVersion: 1;
   serverId: string;
@@ -365,7 +368,7 @@ export function validatePortableMcpManifest(
   if (value.schemaVersion !== 1)
     reject("schema_invalid", "unsupported manifest schema");
   const serverId = boundedString(value.serverId, "serverId").trim();
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(serverId))
+  if (!PORTABLE_MCP_SERVER_ID_PATTERN.test(serverId))
     reject("schema_invalid", "invalid serverId");
   if (RESERVED_SPACE_MCP_SERVER_IDS.has(serverId))
     reject("preset_reserved", "preset MCP cannot be published");

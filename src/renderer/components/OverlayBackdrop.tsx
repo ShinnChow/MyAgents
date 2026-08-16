@@ -3,6 +3,7 @@ import {
   type CSSProperties,
   type ReactNode,
 } from 'react';
+import { createPortal } from 'react-dom';
 
 /**
  * OverlayBackdrop — Pit-of-success backdrop for all overlay/modal components.
@@ -32,6 +33,8 @@ interface OverlayBackdropProps {
   style?: CSSProperties;
   /** Background opacity variant. Default: "normal" (bg-black/30). "dark" uses bg-black/80 (e.g. image preview). */
   variant?: 'normal' | 'dark';
+  /** Portal App-level overlays above page-local stacking contexts so they cover the full shell. */
+  portal?: boolean;
 }
 
 const OverlayBackdrop = forwardRef<HTMLDivElement, OverlayBackdropProps>(function OverlayBackdrop({
@@ -40,10 +43,11 @@ const OverlayBackdrop = forwardRef<HTMLDivElement, OverlayBackdropProps>(functio
   className = '',
   style,
   variant = 'normal',
+  portal = false,
 }, ref) {
   const bg = variant === 'dark' ? 'bg-black/80' : 'bg-black/30';
 
-  return (
+  const backdrop = (
     <div
       ref={ref}
       className={`fixed inset-0 flex items-center justify-center ${bg} backdrop-blur-sm ${className}`}
@@ -53,6 +57,9 @@ const OverlayBackdrop = forwardRef<HTMLDivElement, OverlayBackdropProps>(functio
       {children}
     </div>
   );
+  return portal && typeof document !== 'undefined'
+    ? createPortal(backdrop, document.body)
+    : backdrop;
 });
 
 export default OverlayBackdrop;

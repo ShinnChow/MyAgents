@@ -12,22 +12,32 @@ const MAX_TOOL_ICON_INPUT_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpacePublishCustomToolInput {
+pub struct SpacePublishToolInput {
     pub space_id: String,
+    pub kind: String,
     pub name: String,
+    #[serde(default)]
     pub description: String,
-    pub custom_install_instruction: String,
+    #[serde(default)]
+    pub portable_mcp_manifest: Option<Value>,
+    #[serde(default)]
+    pub custom_install_instruction: Option<String>,
     #[serde(default)]
     pub icon_file_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpaceUpdateCustomToolInput {
+pub struct SpaceUpdateToolInput {
     pub tool_id: String,
+    pub kind: String,
     pub name: String,
+    #[serde(default)]
     pub description: String,
-    pub custom_install_instruction: String,
+    #[serde(default)]
+    pub portable_mcp_manifest: Option<Value>,
+    #[serde(default)]
+    pub custom_install_instruction: Option<String>,
     pub expected_latest_revision: u32,
     #[serde(default)]
     pub icon_file_path: Option<String>,
@@ -51,6 +61,19 @@ fn required_text(value: &str, label: &str, max_chars: usize) -> Result<String, S
     Ok(trimmed.to_string())
 }
 
+fn optional_text(value: &str, label: &str, max_chars: usize) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.chars().count() > max_chars {
+        return Err(format!("{label} exceeds {max_chars} characters"));
+    }
+    if trimmed.chars().any(|character| {
+        character == '\0' || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    }) {
+        return Err(format!("{label} contains unsupported control characters"));
+    }
+    Ok(trimmed.to_string())
+}
+
 fn optional_icon_part(path: Option<&str>) -> Result<Option<reqwest::multipart::Part>, String> {
     let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) else {
         return Ok(None);
@@ -62,22 +85,49 @@ fn optional_icon_part(path: Option<&str>) -> Result<Option<reqwest::multipart::P
     )?))
 }
 
-fn custom_tool_payload(
+fn tool_payload(
+    kind: &str,
     name: &str,
     description: &str,
-    instruction: &str,
+    portable_mcp_manifest: Option<Value>,
+    custom_install_instruction: Option<&str>,
     expected_latest_revision: Option<u32>,
     reset_icon: bool,
 ) -> Result<Value, String> {
     let name = required_text(name, "Tool name", 100)?;
-    let description = required_text(description, "Tool description", 1_000)?;
-    let instruction = required_text(instruction, "Tool install instruction", 20_000)?;
+    let description = if kind == "mcp" {
+        optional_text(description, "Tool description", 1_000)?
+    } else {
+        required_text(description, "Tool description", 1_000)?
+    };
     let mut payload = Map::from_iter([
-        ("kind".to_string(), json!("custom_install_prompt")),
+        ("kind".to_string(), json!(kind)),
         ("name".to_string(), json!(name)),
         ("description".to_string(), json!(description)),
-        ("customInstallInstruction".to_string(), json!(instruction)),
     ]);
+    match kind {
+        "mcp" => {
+            if custom_install_instruction.is_some() {
+                return Err("MCP Tools cannot contain custom install instructions".to_string());
+            }
+            let manifest = portable_mcp_manifest
+                .filter(Value::is_object)
+                .ok_or_else(|| "Portable MCP manifest is required".to_string())?;
+            payload.insert("portableMcpManifest".to_string(), manifest);
+        }
+        "custom_install_prompt" => {
+            if portable_mcp_manifest.is_some() {
+                return Err("Custom Tools cannot contain an MCP manifest".to_string());
+            }
+            let instruction = required_text(
+                custom_install_instruction.unwrap_or_default(),
+                "Tool install instruction",
+                20_000,
+            )?;
+            payload.insert("customInstallInstruction".to_string(), json!(instruction));
+        }
+        _ => return Err("Unsupported Tool kind".to_string()),
+    }
     if let Some(revision) = expected_latest_revision {
         payload.insert("expectedLatestRevision".to_string(), json!(revision));
     }
@@ -93,20 +143,20 @@ fn multipart_form(
 ) -> reqwest::multipart::Form {
     let mut form = reqwest::multipart::Form::new().text("payload", payload.to_string());
     if let Some(icon) = icon {
-        form = form.part("icon", icon);
+        form = form.part("file", icon);
     }
     form
 }
 
 #[tauri::command]
-pub async fn cmd_space_publish_custom_tool(
-    input: SpacePublishCustomToolInput,
-) -> SpaceCommandResult<Value> {
+pub async fn cmd_space_publish_tool(input: SpacePublishToolInput) -> SpaceCommandResult<Value> {
     let space_id = required_text(&input.space_id, "Space id", 256)?;
-    let payload = custom_tool_payload(
+    let payload = tool_payload(
+        &input.kind,
         &input.name,
         &input.description,
-        &input.custom_install_instruction,
+        input.portable_mcp_manifest,
+        input.custom_install_instruction.as_deref(),
         None,
         false,
     )?;
@@ -121,14 +171,14 @@ pub async fn cmd_space_publish_custom_tool(
 }
 
 #[tauri::command]
-pub async fn cmd_space_update_custom_tool(
-    input: SpaceUpdateCustomToolInput,
-) -> SpaceCommandResult<Value> {
+pub async fn cmd_space_update_tool(input: SpaceUpdateToolInput) -> SpaceCommandResult<Value> {
     let tool_id = required_text(&input.tool_id, "Tool id", 256)?;
-    let payload = custom_tool_payload(
+    let payload = tool_payload(
+        &input.kind,
         &input.name,
         &input.description,
-        &input.custom_install_instruction,
+        input.portable_mcp_manifest,
+        input.custom_install_instruction.as_deref(),
         Some(input.expected_latest_revision),
         input.reset_icon,
     )?;
@@ -155,16 +205,40 @@ mod tests {
 
     #[test]
     fn custom_payload_rejects_empty_and_control_text() {
-        assert!(custom_tool_payload("", "description", "install", None, false).is_err());
-        assert!(
-            custom_tool_payload("Tool", "description", "bad\0instruction", None, false).is_err()
-        );
+        assert!(tool_payload(
+            "custom_install_prompt",
+            "",
+            "description",
+            None,
+            Some("install"),
+            None,
+            false,
+        )
+        .is_err());
+        assert!(tool_payload(
+            "custom_install_prompt",
+            "Tool",
+            "description",
+            None,
+            Some("bad\0instruction"),
+            None,
+            false,
+        )
+        .is_err());
     }
 
     #[test]
-    fn custom_payload_keeps_only_the_cloud_contract_fields() {
-        let payload = custom_tool_payload(" Tool ", " Description ", " Install ", Some(7), true)
-            .expect("payload");
+    fn tool_payload_keeps_only_the_cloud_contract_fields() {
+        let payload = tool_payload(
+            "custom_install_prompt",
+            " Tool ",
+            " Description ",
+            None,
+            Some(" Install "),
+            Some(7),
+            true,
+        )
+        .expect("payload");
         assert_eq!(
             payload,
             json!({
@@ -174,6 +248,32 @@ mod tests {
                 "customInstallInstruction": "Install",
                 "expectedLatestRevision": 7,
                 "resetIcon": true,
+            })
+        );
+
+        let manifest = json!({
+            "schemaVersion": 1,
+            "serverId": "中文-mcp",
+            "transport": "stdio",
+            "stdio": { "command": "npx", "args": [], "envTemplates": {} },
+            "requiredConfigKeys": [],
+        });
+        assert_eq!(
+            tool_payload(
+                "mcp",
+                " MCP ",
+                "",
+                Some(manifest.clone()),
+                None,
+                None,
+                false,
+            )
+            .expect("MCP payload"),
+            json!({
+                "kind": "mcp",
+                "name": "MCP",
+                "description": "",
+                "portableMcpManifest": manifest,
             })
         );
     }

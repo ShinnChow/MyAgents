@@ -48,8 +48,11 @@ import { buildSpaceToolInstallPrompt } from "@/utils/spaceToolInstallPrompt";
 import { CUSTOM_EVENTS } from "../../../../shared/constants";
 import {
   RESERVED_SPACE_MCP_SERVER_IDS,
+  SpaceMcpPolicyError,
   analyzeSpaceMcpCandidate,
   applyPortableMcpInstall,
+  validatePortableMcpManifest,
+  type PortableMcpManifestV1,
   type SpaceMcpPolicyResult,
 } from "../../../../shared/spaceToolManifest";
 
@@ -101,19 +104,24 @@ function ToolOverlay({
   children,
   onClose,
   busy = false,
+  size = "form",
 }: {
   children: ReactNode;
   onClose: () => void;
   busy?: boolean;
+  size?: "form" | "detail";
 }) {
   return (
     <OverlayBackdrop
+      portal
       onClose={() => {
         if (!busy) onClose();
       }}
       className="z-[220] items-center justify-center px-3 py-6 sm:px-6"
     >
-      <section className="flex max-h-[calc(100dvh-24px)] w-full max-w-[800px] flex-col overflow-hidden rounded-2xl border border-[var(--line)] bg-[var(--paper-elevated)] shadow-lg sm:max-h-[min(80vh,820px)]">
+      <section
+        className={`flex max-h-[calc(100dvh-24px)] w-full flex-col overflow-hidden rounded-2xl border border-[var(--line)] bg-[var(--paper-elevated)] shadow-lg ${size === "detail" ? "h-[min(680px,calc(100dvh-48px))] max-w-[720px]" : "max-w-[800px] sm:max-h-[min(80vh,820px)]"}`}
+      >
         {children}
       </section>
     </OverlayBackdrop>
@@ -158,16 +166,14 @@ type McpCandidate = {
 
 function McpPublishOverlay({
   config,
-  existing,
   busy,
   onClose,
-  onSubmit,
+  onContinue,
 }: {
   config: AppConfig;
-  existing?: SpaceToolDetail | null;
   busy: boolean;
   onClose: () => void;
-  onSubmit: (candidate: McpCandidate) => Promise<void>;
+  onContinue: (candidate: McpCandidate) => void;
 }) {
   const { t } = useTranslation("app");
   const candidates = useMemo<McpCandidate[]>(
@@ -176,27 +182,20 @@ function McpPublishOverlay({
         .filter(
           (server) =>
             server.isBuiltin !== true &&
-            !RESERVED_SPACE_MCP_SERVER_IDS.has(server.id) &&
-            (!existing || server.id === existing.tool.mcpServerId),
+            !RESERVED_SPACE_MCP_SERVER_IDS.has(server.id),
         )
         .map((server) => ({
           server,
           policy: analyzeSpaceMcpCandidate(server, config),
         })),
-    [config, existing],
+    [config],
   );
-  const [selectedId, setSelectedId] = useState(
-    existing?.tool.mcpServerId ?? candidates[0]?.server.id ?? "",
-  );
+  const [selectedId, setSelectedId] = useState(candidates[0]?.server.id ?? "");
   const selected = candidates.find(({ server }) => server.id === selectedId);
   return (
     <ToolOverlay onClose={onClose} busy={busy}>
       <OverlayHeader
-        title={
-          existing
-            ? t("space.tools.updateMcp")
-            : t("space.tools.publishInstalledMcp")
-        }
+        title={t("space.tools.publishInstalledMcp")}
         onClose={onClose}
         closeDisabled={busy}
       />
@@ -209,7 +208,7 @@ function McpPublishOverlay({
                 <button
                   key={server.id}
                   type="button"
-                  disabled={blocked || Boolean(existing)}
+                  disabled={blocked}
                   onClick={() => setSelectedId(server.id)}
                   className={`grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 rounded-xl border p-3 text-left transition-colors ${selectedId === server.id ? "border-[var(--accent-warm)] bg-[var(--accent-warm-subtle)]/50" : "border-[var(--line)] hover:bg-[var(--hover-bg)]"} disabled:cursor-not-allowed disabled:opacity-60`}
                 >
@@ -267,57 +266,46 @@ function McpPublishOverlay({
         <button
           type="button"
           disabled={!selected?.policy.manifest || busy}
-          onClick={() => selected && void onSubmit(selected)}
+          onClick={() => selected && onContinue(selected)}
           className={SPACE_PRIMARY_TOOL_BUTTON_CLASS}
         >
           {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
-          {existing ? t("space.common.save") : t("space.tools.publish")}
+          {t("space.tools.next")}
         </button>
       </footer>
     </ToolOverlay>
   );
 }
 
-function CustomToolFormOverlay({
-  existing,
-  busy,
-  onClose,
-  onSubmit,
+function ToolIdentityFields({
+  name,
+  description,
+  iconFilePath,
+  iconPreview,
+  resetIcon,
+  existingIconUrl,
+  descriptionRequired,
+  onNameChange,
+  onDescriptionChange,
+  onIconChange,
+  onResetIcon,
 }: {
-  existing?: SpaceToolDetail | null;
-  busy: boolean;
-  onClose: () => void;
-  onSubmit: (input: {
-    name: string;
-    description: string;
-    instruction: string;
-    iconFilePath: string | null;
-    resetIcon: boolean;
-  }) => Promise<void>;
+  name: string;
+  description: string;
+  iconFilePath: string | null;
+  iconPreview: string | null;
+  resetIcon: boolean;
+  existingIconUrl?: string | null;
+  descriptionRequired: boolean;
+  onNameChange: (value: string) => void;
+  onDescriptionChange: (value: string) => void;
+  onIconChange: (path: string, preview: string) => void;
+  onResetIcon: () => void;
 }) {
   const { t } = useTranslation("app");
   const toast = useToast();
   const fileService = useWorkspaceFileService(null);
-  const [name, setName] = useState(existing?.revision.name ?? "");
-  const [description, setDescription] = useState(
-    existing?.revision.description ?? "",
-  );
-  const [instruction, setInstruction] = useState(
-    existing?.revision.customInstallInstruction ?? "",
-  );
-  const [iconFilePath, setIconFilePath] = useState<string | null>(null);
-  const [resetIcon, setResetIcon] = useState(false);
-  const [iconPreview, setIconPreview] = useState<string | null>(
-    existing?.revision.iconUrl ?? null,
-  );
-  const [touched, setTouched] = useState({
-    name: false,
-    description: false,
-    instruction: false,
-  });
-  const canSubmit = Boolean(
-    name.trim() && description.trim() && instruction.trim(),
-  );
+  const [touched, setTouched] = useState({ name: false, description: false });
   const pickIcon = async () => {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
@@ -339,13 +327,123 @@ function CustomToolFormOverlay({
       if (!file || file.error) {
         throw new Error(file?.error || t("space.tools.iconPreviewFailed"));
       }
-      setIconFilePath(selected);
-      setIconPreview(`data:${file.mimeType};base64,${file.data}`);
-      setResetIcon(false);
+      onIconChange(selected, `data:${file.mimeType};base64,${file.data}`);
     } catch (error) {
       toast.error(spaceErrorMessage(error));
     }
   };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={() => void pickIcon()}
+          className="rounded-xl outline-none ring-[var(--accent-warm)] focus-visible:ring-2"
+          aria-label={t("space.tools.chooseIcon")}
+        >
+          <ToolIcon
+            name={name || t("space.tools.defaultName")}
+            iconUrl={resetIcon ? null : iconPreview}
+            size={48}
+          />
+        </button>
+        <div className="min-w-0 text-xs text-[var(--ink-muted)]">
+          <button
+            type="button"
+            onClick={() => void pickIcon()}
+            className="font-semibold text-[var(--accent-warm)] hover:underline"
+          >
+            {t("space.tools.chooseIcon")}
+          </button>
+          {iconFilePath ? (
+            <p className="mt-1 truncate">{iconFilePath.split(/[\\/]/).pop()}</p>
+          ) : null}
+          {existingIconUrl && !resetIcon ? (
+            <button
+              type="button"
+              className="mt-1 block hover:underline"
+              onClick={onResetIcon}
+            >
+              {t("space.tools.resetIcon")}
+            </button>
+          ) : null}
+        </div>
+      </div>
+      <label className="block text-xs font-semibold text-[var(--ink-muted)]">
+        {t("space.tools.name")}
+        <input
+          value={name}
+          maxLength={100}
+          onChange={(event) => onNameChange(event.target.value)}
+          onBlur={() => setTouched((value) => ({ ...value, name: true }))}
+          aria-invalid={touched.name && !name.trim()}
+          className="mt-1 h-10 w-full rounded-lg border border-[var(--line)] bg-[var(--paper)] px-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--accent-warm)]"
+        />
+        {touched.name && !name.trim() ? (
+          <span className="mt-1 block text-xs font-normal text-[var(--danger)]">
+            {t("space.tools.nameRequired")}
+          </span>
+        ) : null}
+      </label>
+      <label className="block text-xs font-semibold text-[var(--ink-muted)]">
+        {t("space.tools.description")}
+        <input
+          value={description}
+          maxLength={1000}
+          onChange={(event) => onDescriptionChange(event.target.value)}
+          onBlur={() =>
+            setTouched((value) => ({ ...value, description: true }))
+          }
+          aria-invalid={
+            descriptionRequired && touched.description && !description.trim()
+          }
+          className="mt-1 h-10 w-full rounded-lg border border-[var(--line)] bg-[var(--paper)] px-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--accent-warm)]"
+        />
+        {descriptionRequired && touched.description && !description.trim() ? (
+          <span className="mt-1 block text-xs font-normal text-[var(--danger)]">
+            {t("space.tools.descriptionRequired")}
+          </span>
+        ) : null}
+      </label>
+    </div>
+  );
+}
+
+function CustomToolFormOverlay({
+  existing,
+  busy,
+  onClose,
+  onSubmit,
+}: {
+  existing?: SpaceToolDetail | null;
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (input: {
+    name: string;
+    description: string;
+    instruction: string;
+    iconFilePath: string | null;
+    resetIcon: boolean;
+  }) => Promise<void>;
+}) {
+  const { t } = useTranslation("app");
+  const [name, setName] = useState(existing?.revision.name ?? "");
+  const [description, setDescription] = useState(
+    existing?.revision.description ?? "",
+  );
+  const [instruction, setInstruction] = useState(
+    existing?.revision.customInstallInstruction ?? "",
+  );
+  const [iconFilePath, setIconFilePath] = useState<string | null>(null);
+  const [resetIcon, setResetIcon] = useState(false);
+  const [iconPreview, setIconPreview] = useState<string | null>(
+    existing?.revision.iconUrl ?? null,
+  );
+  const [instructionTouched, setInstructionTouched] = useState(false);
+  const canSubmit = Boolean(
+    name.trim() && description.trim() && instruction.trim(),
+  );
   return (
     <ToolOverlay onClose={onClose} busy={busy}>
       <OverlayHeader
@@ -358,81 +456,27 @@ function CustomToolFormOverlay({
         closeDisabled={busy}
       />
       <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => void pickIcon()}
-            className="rounded-xl outline-none ring-[var(--accent-warm)] focus-visible:ring-2"
-            aria-label={t("space.tools.chooseIcon")}
-          >
-            <ToolIcon
-              name={name || t("space.tools.defaultName")}
-              iconUrl={resetIcon ? null : iconPreview}
-              size={48}
-            />
-          </button>
-          <div className="min-w-0 text-xs text-[var(--ink-muted)]">
-            <button
-              type="button"
-              onClick={() => void pickIcon()}
-              className="font-semibold text-[var(--accent-warm)] hover:underline"
-            >
-              {t("space.tools.chooseIcon")}
-            </button>
-            {iconFilePath ? (
-              <p className="mt-1 truncate">
-                {iconFilePath.split(/[\\/]/).pop()}
-              </p>
-            ) : null}
-            {existing?.revision.iconUrl && !resetIcon ? (
-              <button
-                type="button"
-                className="mt-1 block hover:underline"
-                onClick={() => {
-                  setIconFilePath(null);
-                  setIconPreview(null);
-                  setResetIcon(true);
-                }}
-              >
-                {t("space.tools.resetIcon")}
-              </button>
-            ) : null}
-          </div>
-        </div>
-        <label className="block text-xs font-semibold text-[var(--ink-muted)]">
-          {t("space.tools.name")}
-          <input
-            value={name}
-            maxLength={100}
-            onChange={(event) => setName(event.target.value)}
-            onBlur={() => setTouched((value) => ({ ...value, name: true }))}
-            aria-invalid={touched.name && !name.trim()}
-            className="mt-1 h-10 w-full rounded-lg border border-[var(--line)] bg-[var(--paper)] px-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--accent-warm)]"
-          />
-          {touched.name && !name.trim() ? (
-            <span className="mt-1 block text-xs font-normal text-[var(--danger)]">
-              {t("space.tools.nameRequired")}
-            </span>
-          ) : null}
-        </label>
-        <label className="block text-xs font-semibold text-[var(--ink-muted)]">
-          {t("space.tools.description")}
-          <input
-            value={description}
-            maxLength={1000}
-            onChange={(event) => setDescription(event.target.value)}
-            onBlur={() =>
-              setTouched((value) => ({ ...value, description: true }))
-            }
-            aria-invalid={touched.description && !description.trim()}
-            className="mt-1 h-10 w-full rounded-lg border border-[var(--line)] bg-[var(--paper)] px-3 text-sm text-[var(--ink)] outline-none focus:border-[var(--accent-warm)]"
-          />
-          {touched.description && !description.trim() ? (
-            <span className="mt-1 block text-xs font-normal text-[var(--danger)]">
-              {t("space.tools.descriptionRequired")}
-            </span>
-          ) : null}
-        </label>
+        <ToolIdentityFields
+          name={name}
+          description={description}
+          iconFilePath={iconFilePath}
+          iconPreview={iconPreview}
+          resetIcon={resetIcon}
+          existingIconUrl={existing?.revision.iconUrl}
+          descriptionRequired
+          onNameChange={setName}
+          onDescriptionChange={setDescription}
+          onIconChange={(path, preview) => {
+            setIconFilePath(path);
+            setIconPreview(preview);
+            setResetIcon(false);
+          }}
+          onResetIcon={() => {
+            setIconFilePath(null);
+            setIconPreview(null);
+            setResetIcon(true);
+          }}
+        />
         <label className="block text-xs font-semibold text-[var(--ink-muted)]">
           {t("space.tools.installInstruction")}
           <textarea
@@ -441,13 +485,11 @@ function CustomToolFormOverlay({
             rows={10}
             placeholder={t("space.tools.installInstructionPlaceholder")}
             onChange={(event) => setInstruction(event.target.value)}
-            onBlur={() =>
-              setTouched((value) => ({ ...value, instruction: true }))
-            }
-            aria-invalid={touched.instruction && !instruction.trim()}
+            onBlur={() => setInstructionTouched(true)}
+            aria-invalid={instructionTouched && !instruction.trim()}
             className="mt-1 min-h-56 w-full resize-y rounded-lg border border-[var(--line)] bg-[var(--paper)] p-3 font-mono text-sm leading-6 text-[var(--ink)] outline-none placeholder:font-sans placeholder:text-[var(--ink-faint)] focus:border-[var(--accent-warm)]"
           />
-          {touched.instruction && !instruction.trim() ? (
+          {instructionTouched && !instruction.trim() ? (
             <span className="mt-1 block text-xs font-normal text-[var(--danger)]">
               {t("space.tools.instructionRequired")}
             </span>
@@ -475,6 +517,166 @@ function CustomToolFormOverlay({
               resetIcon,
             })
           }
+          className={SPACE_PRIMARY_TOOL_BUTTON_CLASS}
+        >
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+          {existing ? t("space.common.save") : t("space.tools.publish")}
+        </button>
+      </footer>
+    </ToolOverlay>
+  );
+}
+
+type McpToolFormInput = {
+  name: string;
+  description: string;
+  portableMcpManifest: PortableMcpManifestV1;
+  iconFilePath: string | null;
+  resetIcon: boolean;
+};
+
+function McpToolFormOverlay({
+  candidate,
+  existing,
+  busy,
+  onClose,
+  onSubmit,
+}: {
+  candidate?: McpCandidate | null;
+  existing?: SpaceToolDetail | null;
+  busy: boolean;
+  onClose: () => void;
+  onSubmit: (input: McpToolFormInput) => Promise<void>;
+}) {
+  const { t } = useTranslation("app");
+  const initialManifest =
+    existing?.revision.portableMcpManifest ?? candidate?.policy.manifest;
+  const [name, setName] = useState(
+    existing?.revision.name ?? candidate?.server.name ?? "",
+  );
+  const [description, setDescription] = useState(
+    existing?.revision.description ?? candidate?.server.description ?? "",
+  );
+  const [manifestJson, setManifestJson] = useState(() =>
+    initialManifest ? JSON.stringify(initialManifest, null, 2) : "",
+  );
+  const [manifestTouched, setManifestTouched] = useState(false);
+  const [iconFilePath, setIconFilePath] = useState<string | null>(null);
+  const [resetIcon, setResetIcon] = useState(false);
+  const [iconPreview, setIconPreview] = useState<string | null>(
+    existing?.revision.iconUrl ?? null,
+  );
+  const parsed = useMemo<{
+    manifest: PortableMcpManifestV1 | null;
+    error: string | null;
+  }>(() => {
+    try {
+      const manifest = validatePortableMcpManifest(JSON.parse(manifestJson));
+      const expectedServerId =
+        existing?.tool.mcpServerId ??
+        existing?.revision.portableMcpManifest?.serverId;
+      if (expectedServerId && manifest.serverId !== expectedServerId) {
+        return {
+          manifest: null,
+          error: t("space.tools.mcpServerIdImmutable"),
+        };
+      }
+      return { manifest, error: null };
+    } catch (error) {
+      if (error instanceof SpaceMcpPolicyError) {
+        return {
+          manifest: null,
+          error: t(`space.tools.policy.${error.code}`),
+        };
+      }
+      return { manifest: null, error: t("space.tools.mcpJsonInvalid") };
+    }
+  }, [existing, manifestJson, t]);
+  const canSubmit = Boolean(name.trim() && parsed.manifest);
+
+  return (
+    <ToolOverlay onClose={onClose} busy={busy}>
+      <OverlayHeader
+        title={
+          existing
+            ? t("space.tools.updateMcp")
+            : t("space.tools.publishInstalledMcp")
+        }
+        onClose={onClose}
+        closeDisabled={busy}
+      />
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+        <ToolIdentityFields
+          name={name}
+          description={description}
+          iconFilePath={iconFilePath}
+          iconPreview={iconPreview}
+          resetIcon={resetIcon}
+          existingIconUrl={existing?.revision.iconUrl}
+          descriptionRequired={false}
+          onNameChange={setName}
+          onDescriptionChange={setDescription}
+          onIconChange={(path, preview) => {
+            setIconFilePath(path);
+            setIconPreview(preview);
+            setResetIcon(false);
+          }}
+          onResetIcon={() => {
+            setIconFilePath(null);
+            setIconPreview(null);
+            setResetIcon(true);
+          }}
+        />
+        <label className="block text-xs font-semibold text-[var(--ink-muted)]">
+          {t("space.tools.mcpConfiguration")}
+          <textarea
+            value={manifestJson}
+            rows={14}
+            spellCheck={false}
+            aria-label={t("space.tools.mcpConfiguration")}
+            onChange={(event) => {
+              setManifestJson(event.target.value);
+              setManifestTouched(true);
+            }}
+            onBlur={() => setManifestTouched(true)}
+            aria-invalid={manifestTouched && Boolean(parsed.error)}
+            className="mt-1 min-h-72 w-full resize-y rounded-lg border border-[var(--line)] bg-[var(--paper)] p-3 font-mono text-sm leading-6 text-[var(--ink)] outline-none focus:border-[var(--accent-warm)]"
+          />
+          <span className="mt-1 block text-xs font-normal leading-5 text-[var(--ink-faint)]">
+            {existing
+              ? t("space.tools.mcpConfigurationEditHelp")
+              : t("space.tools.mcpConfigurationHelp")}
+          </span>
+          {manifestTouched && parsed.error ? (
+            <span className="mt-1 block text-xs font-normal text-[var(--danger)]">
+              {parsed.error}
+            </span>
+          ) : null}
+        </label>
+      </div>
+      <footer className="flex shrink-0 justify-end gap-2 border-t border-[var(--line-subtle)] px-4 py-3">
+        <button
+          type="button"
+          onClick={onClose}
+          disabled={busy}
+          className="h-9 rounded-lg px-3 text-sm font-semibold text-[var(--ink-muted)] hover:bg-[var(--hover-bg)]"
+        >
+          {t("space.common.cancel")}
+        </button>
+        <button
+          type="button"
+          disabled={!canSubmit || busy}
+          onClick={() => {
+            setManifestTouched(true);
+            if (!parsed.manifest) return;
+            void onSubmit({
+              name: name.trim(),
+              description: description.trim(),
+              portableMcpManifest: parsed.manifest,
+              iconFilePath,
+              resetIcon,
+            });
+          }}
           className={SPACE_PRIMARY_TOOL_BUTTON_CLASS}
         >
           {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
@@ -514,6 +716,7 @@ export function ToolsWorkspace({
   const toast = useToast();
   const [publishMenuOpen, setPublishMenuOpen] = useState(false);
   const [publishMode, setPublishMode] = useState<PublishMode>(null);
+  const [mcpCandidate, setMcpCandidate] = useState<McpCandidate | null>(null);
   const [detailMode, setDetailMode] = useState<DetailMode>("entry");
   const [adminMenuOpen, setAdminMenuOpen] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -543,6 +746,7 @@ export function ToolsWorkspace({
     }
     if (publishMode) {
       setPublishMode(null);
+      setMcpCandidate(null);
       return true;
     }
     if (selectedToolId) {
@@ -561,17 +765,18 @@ export function ToolsWorkspace({
     });
   }, [actions, selectedToolId]);
 
-  const publishMcp = async (candidate: McpCandidate) => {
-    if (!candidate.policy.manifest) return;
+  const publishMcp = async (input: McpToolFormInput) => {
     setBusy(true);
     try {
       const result = await actions.publishMcpTool({
         spaceId,
-        name: candidate.server.name,
-        description: candidate.server.description,
-        portableMcpManifest: candidate.policy.manifest,
+        name: input.name,
+        description: input.description,
+        portableMcpManifest: input.portableMcpManifest,
+        iconFilePath: input.iconFilePath,
       });
       setPublishMode(null);
+      setMcpCandidate(null);
       onSelectTool(result.tool.id);
       toast.success(t("space.tools.published"));
     } catch (error) {
@@ -606,21 +811,18 @@ export function ToolsWorkspace({
     }
   };
 
-  const updateMcp = async (candidate: McpCandidate) => {
-    if (
-      !detail ||
-      editBaseLatestRevision === null ||
-      !candidate.policy.manifest
-    )
-      return;
+  const updateMcp = async (input: McpToolFormInput) => {
+    if (!detail || editBaseLatestRevision === null) return;
     setBusy(true);
     try {
       await actions.updateMcpTool({
         toolId: detail.tool.id,
-        name: candidate.server.name,
-        description: candidate.server.description,
-        portableMcpManifest: candidate.policy.manifest,
+        name: input.name,
+        description: input.description,
+        portableMcpManifest: input.portableMcpManifest,
         expectedLatestRevision: editBaseLatestRevision,
+        iconFilePath: input.iconFilePath,
+        resetIcon: input.resetIcon,
       });
       setEditing(false);
       setEditBaseLatestRevision(null);
@@ -895,12 +1097,24 @@ export function ToolsWorkspace({
       </main>
 
       {publishMode === "mcp" ? (
-        <McpPublishOverlay
-          config={config}
-          busy={busy}
-          onClose={() => setPublishMode(null)}
-          onSubmit={publishMcp}
-        />
+        mcpCandidate ? (
+          <McpToolFormOverlay
+            candidate={mcpCandidate}
+            busy={busy}
+            onClose={() => {
+              setPublishMode(null);
+              setMcpCandidate(null);
+            }}
+            onSubmit={publishMcp}
+          />
+        ) : (
+          <McpPublishOverlay
+            config={config}
+            busy={busy}
+            onClose={() => setPublishMode(null)}
+            onContinue={setMcpCandidate}
+          />
+        )
       ) : null}
       {publishMode === "custom" ? (
         <CustomToolFormOverlay
@@ -910,13 +1124,17 @@ export function ToolsWorkspace({
         />
       ) : null}
 
-      {selectedToolId ? (
-        <ToolOverlay onClose={() => onSelectTool(null)} busy={busy}>
-          <header className="flex min-h-16 shrink-0 items-center gap-3 border-b border-[var(--line-subtle)] px-4">
+      {selectedToolId && !editing ? (
+        <ToolOverlay
+          onClose={() => onSelectTool(null)}
+          busy={busy}
+          size="detail"
+        >
+          <header className="flex min-h-20 shrink-0 items-center gap-3 border-b border-[var(--line-subtle)] px-5">
             <ToolIcon
               name={detail?.revision.name ?? selectedSummary?.name ?? "Tool"}
               iconUrl={detail?.revision.iconUrl ?? selectedSummary?.iconUrl}
-              size={40}
+              size={44}
             />
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
@@ -1213,12 +1431,27 @@ export function ToolsWorkspace({
                   </section>
                 ) : null}
                 {detail.tool.kind === "custom_install_prompt" ? (
-                  <section>
+                  <section className="border-t border-[var(--line-subtle)] pt-5">
                     <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--ink-muted)]">
                       {t("space.tools.customInstruction")}
                     </h3>
                     <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-xl border border-[var(--line)] bg-[var(--paper-inset)] p-4 text-sm leading-6 text-[var(--ink-secondary)]">
                       <code>{detail.revision.customInstallInstruction}</code>
+                    </pre>
+                  </section>
+                ) : detail.revision.portableMcpManifest ? (
+                  <section className="border-t border-[var(--line-subtle)] pt-5">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--ink-muted)]">
+                      {t("space.tools.mcpConfiguration")}
+                    </h3>
+                    <pre className="mt-2 max-h-80 overflow-auto whitespace-pre rounded-xl border border-[var(--line)] bg-[var(--paper-inset)] p-4 font-mono text-xs leading-5 text-[var(--ink-secondary)]">
+                      <code>
+                        {JSON.stringify(
+                          detail.revision.portableMcpManifest,
+                          null,
+                          2,
+                        )}
+                      </code>
                     </pre>
                   </section>
                 ) : null}
@@ -1229,8 +1462,7 @@ export function ToolsWorkspace({
       ) : null}
 
       {editing && detail?.tool.kind === "mcp" ? (
-        <McpPublishOverlay
-          config={config}
+        <McpToolFormOverlay
           existing={detail}
           busy={busy}
           onClose={() => {

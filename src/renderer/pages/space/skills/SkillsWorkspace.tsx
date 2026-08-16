@@ -729,6 +729,7 @@ function PublishSkillDialog({
 
   return (
     <OverlayBackdrop
+      portal
       onClose={closeAndCleanup}
       className="z-[240] items-center justify-center bg-black/25 backdrop-blur-sm"
     >
@@ -1734,6 +1735,7 @@ function SkillDetailWorkspace({
   return (
     <>
       <OverlayBackdrop
+        portal
         onClose={onBack}
         className="z-[230] items-stretch justify-end bg-black/20 backdrop-blur-sm"
       >

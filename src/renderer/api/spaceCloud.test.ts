@@ -265,25 +265,19 @@ describe('spaceCloud API errors', () => {
       { method: 'GET', path: '/api/tools/tool%2F1', body: null },
       { method: 'GET', path: '/api/tools/tool%2F1/revisions?cursor=rev%2Fcursor&limit=20', body: null },
       {
-        method: 'POST',
-        path: '/api/spaces/space%201/tools',
-        body: {
-          kind: 'mcp',
-          name: 'Team MCP',
-          description: '',
-          portableMcpManifest: manifest,
-        },
+        spaceId: 'space 1',
+        kind: 'mcp',
+        name: 'Team MCP',
+        description: '',
+        portableMcpManifest: manifest,
       },
       {
-        method: 'POST',
-        path: '/api/tools/tool%2F1/revisions',
-        body: {
-          kind: 'mcp',
-          name: 'Team MCP',
-          description: '',
-          portableMcpManifest: manifest,
-          expectedLatestRevision: 3,
-        },
+        toolId: 'tool/1',
+        kind: 'mcp',
+        name: 'Team MCP',
+        description: '',
+        portableMcpManifest: manifest,
+        expectedLatestRevision: 3,
       },
       {
         method: 'POST',
@@ -294,8 +288,12 @@ describe('spaceCloud API errors', () => {
     ]);
   });
 
-  it('routes custom Tool icon mutations through Rust instead of renderer file reads', async () => {
-    const { spacePublishCustomTool, spaceUpdateCustomTool } = await loadSpaceCloud();
+  it('routes every Tool icon mutation through the shared Rust normalization boundary', async () => {
+    const {
+      spacePublishCustomTool,
+      spacePublishMcpTool,
+      spaceUpdateCustomTool,
+    } = await loadSpaceCloud();
     mocks.invoke.mockResolvedValue({});
 
     await spacePublishCustomTool({
@@ -313,24 +311,54 @@ describe('spaceCloud API errors', () => {
       expectedLatestRevision: 1,
       resetIcon: true,
     });
+    await spacePublishMcpTool({
+      spaceId: 'official',
+      name: 'Team MCP',
+      portableMcpManifest: {
+        schemaVersion: 1,
+        serverId: '团队-mcp',
+        transport: 'stdio',
+        stdio: { command: 'npx', args: [], envTemplates: {} },
+        requiredConfigKeys: [],
+      },
+      iconFilePath: '/tmp/mcp-icon.png',
+    });
 
-    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'cmd_space_publish_custom_tool', {
+    expect(mocks.invoke).toHaveBeenNthCalledWith(1, 'cmd_space_publish_tool', {
       input: {
         spaceId: 'official',
+        kind: 'custom_install_prompt',
         name: 'FFmpeg',
         description: 'Video tools',
         customInstallInstruction: 'brew install ffmpeg',
         iconFilePath: '/tmp/icon.png',
       },
     });
-    expect(mocks.invoke).toHaveBeenNthCalledWith(2, 'cmd_space_update_custom_tool', {
+    expect(mocks.invoke).toHaveBeenNthCalledWith(2, 'cmd_space_update_tool', {
       input: {
         toolId: 'tool-1',
+        kind: 'custom_install_prompt',
         name: 'FFmpeg',
         description: 'Video tools',
         customInstallInstruction: 'brew install ffmpeg',
         expectedLatestRevision: 1,
         resetIcon: true,
+      },
+    });
+    expect(mocks.invoke).toHaveBeenNthCalledWith(3, 'cmd_space_publish_tool', {
+      input: {
+        spaceId: 'official',
+        kind: 'mcp',
+        name: 'Team MCP',
+        description: '',
+        portableMcpManifest: {
+          schemaVersion: 1,
+          serverId: '团队-mcp',
+          transport: 'stdio',
+          stdio: { command: 'npx', args: [], envTemplates: {} },
+          requiredConfigKeys: [],
+        },
+        iconFilePath: '/tmp/mcp-icon.png',
       },
     });
   });

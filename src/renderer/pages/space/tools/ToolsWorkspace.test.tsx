@@ -64,6 +64,15 @@ const config = {
       args: ["-y", "@example/team-mcp"],
       isBuiltin: false,
     },
+    {
+      id: "figma版framelink-mcp",
+      name: "Figma 版 Framelink MCP",
+      description: "连接团队设计资源",
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "figma-developer-mcp", "--stdio"],
+      isBuiltin: false,
+    },
   ],
 } as AppConfig;
 
@@ -275,6 +284,101 @@ describe("Space Tools workspace", () => {
     expect(screen.getByText("请填写工具名称")).toBeVisible();
     expect(screen.getByText("请填写工具简介")).toBeVisible();
     expect(screen.getByText("请填写自定义安装指令")).toBeVisible();
+  });
+
+  it("publishes a Unicode-ID MCP through the shared metadata and JSON form", async () => {
+    const actions = renderTools();
+    fireEvent.click(screen.getByRole("button", { name: /发布工具/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "发布本地已安装 MCP 工具" }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: /Figma 版 Framelink MCP/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "下一步" }));
+
+    const manifest = screen.getByRole("textbox", { name: "MCP 配置 JSON" });
+    expect((manifest as HTMLTextAreaElement).value).toContain(
+      "figma版framelink-mcp",
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "工具名称" }), {
+      target: { value: "设计协作 MCP" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发布" }));
+
+    await waitFor(() =>
+      expect(actions.publishMcpTool).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "设计协作 MCP",
+          description: "连接团队设计资源",
+          portableMcpManifest: expect.objectContaining({
+            serverId: "figma版framelink-mcp",
+          }),
+          iconFilePath: null,
+        }),
+      ),
+    );
+  });
+
+  it("edits MCP metadata and JSON while keeping its stable server identity", async () => {
+    const actions = renderTools({ selectedToolId: mcpTool.id });
+    fireEvent.click(screen.getByRole("button", { name: "更多操作" }));
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+
+    expect(screen.getByRole("textbox", { name: "工具名称" })).toHaveValue(
+      "Team MCP",
+    );
+    const manifest = screen.getByRole("textbox", { name: "MCP 配置 JSON" });
+    const parsed = JSON.parse(String((manifest as HTMLTextAreaElement).value));
+    fireEvent.change(manifest, {
+      target: {
+        value: JSON.stringify({ ...parsed, serverId: "renamed-mcp" }, null, 2),
+      },
+    });
+    fireEvent.blur(manifest);
+    expect(
+      screen.getByText(/已有 MCP Tool 的 serverId 不能修改/),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "保存" })).toBeDisabled();
+
+    fireEvent.change(manifest, {
+      target: {
+        value: JSON.stringify(
+          {
+            ...parsed,
+            stdio: { ...parsed.stdio, args: ["-y", "@example/team-mcp@2"] },
+          },
+          null,
+          2,
+        ),
+      },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "工具简介" }), {
+      target: { value: "Updated shared context" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(actions.updateMcpTool).toHaveBeenCalledWith(
+        expect.objectContaining({
+          description: "Updated shared context",
+          expectedLatestRevision: 1,
+          portableMcpManifest: expect.objectContaining({
+            serverId: "team-mcp",
+          }),
+        }),
+      ),
+    );
+  });
+
+  it("renders Tool details as an App-level vertical card", () => {
+    renderTools({ selectedToolId: mcpTool.id });
+    const heading = screen.getByText("MCP 配置 JSON");
+    const backdrop = heading.closest(".fixed");
+    expect(backdrop?.parentElement).toBe(document.body);
+    expect(backdrop?.firstElementChild).toHaveClass("max-w-[720px]");
+    expect(backdrop?.firstElementChild).toHaveClass(
+      "h-[min(680px,calc(100dvh-48px))]",
+    );
   });
 
   it("renders custom instructions as an unlabeled code block", () => {
