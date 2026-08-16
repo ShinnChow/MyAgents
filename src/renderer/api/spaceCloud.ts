@@ -1093,6 +1093,10 @@ export function isSpaceErrorCode(error: unknown, code: string): boolean {
   return spaceErrorCode(error) === code;
 }
 
+export function isSpaceErrorRetryable(error: unknown): boolean {
+  return spaceErrorDetails(error).retryable === true;
+}
+
 async function spaceApi<T>(
   method: string,
   path: string,

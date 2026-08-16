@@ -16,6 +16,7 @@ import {
   spaceAuthStart,
   spaceCreateSpace,
   spaceErrorMessage,
+  isSpaceErrorRetryable,
   isSpaceErrorCode,
   spaceJoinSpace,
   spaceWakeConnector,
@@ -80,6 +81,7 @@ import {
   SPACE_BACKGROUND_STYLE,
 } from "@/pages/space/spaceUi";
 import { spaceSlugCandidate } from "@/pages/space/spaceSlug";
+import type { PendingAppRoute } from "../../shared/appRoute";
 
 const AUTH_POLL_DELAY_MS = 3000;
 const AUTH_POLL_TIMEOUT_MS = 10 * 60 * 1000;
@@ -448,7 +450,15 @@ function registeredAgentToListItem(
   };
 }
 
-export default function Space({ isActive }: { isActive: boolean }) {
+export default function Space({
+  isActive,
+  pendingRoute,
+  onRouteConsumed,
+}: {
+  isActive: boolean;
+  pendingRoute?: PendingAppRoute | null;
+  onRouteConsumed?: (generation: number) => void;
+}) {
   const { t } = useTranslation("app");
   const toast = useToast();
   const { projects, config } = useConfig();
@@ -495,6 +505,12 @@ export default function Space({ isActive }: { isActive: boolean }) {
   const [skillRemoteUpdateAvailable, setSkillRemoteUpdateAvailable] =
     useState(false);
   const [issueDetailId, setIssueDetailId] = useState<string | null>(null);
+  const [routeAttempt, setRouteAttempt] = useState(0);
+  const [routeFailure, setRouteFailure] = useState<{
+    generation: number;
+    message: string;
+    retryable: boolean;
+  } | null>(null);
   const [createIssueOpen, setCreateIssueOpen] = useState(false);
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
@@ -1175,6 +1191,69 @@ export default function Space({ isActive }: { isActive: boolean }) {
     [enterSpace, toast],
   );
 
+  useEffect(() => {
+    if (
+      !isActive
+      || !pendingRoute
+      || pendingRoute.route.name !== "space.issue"
+      || spaceData.boot !== "ready"
+      || !session
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const { spaceId, issueId } = pendingRoute.route.params;
+    const currentMatches = session.space.id === spaceId || session.space.slug === spaceId;
+    const target = session.spaces?.find(
+      (space) => space.id === spaceId || space.slug === spaceId,
+    );
+
+    void (async () => {
+      try {
+        setRouteFailure(null);
+        if (!currentMatches) {
+          await actions.switchSpace(spaceId, target);
+        }
+        if (cancelled) return;
+        setMode("issues");
+        setSelectedSkillId(null);
+        setSelectedToolId(null);
+        setIssueDetailId(issueId);
+        setRouteFailure(null);
+        onRouteConsumed?.(pendingRoute.generation);
+      } catch (error) {
+        if (cancelled) return;
+        setMode("issues");
+        setIssueDetailId(null);
+        toast.error(t("space.route.openFailed", { message: spaceErrorMessage(error) }));
+        const retainForRetry = isSpaceErrorRetryable(error)
+          || isSpaceErrorCode(error, "SPACE_REAUTH_REQUIRED");
+        setRouteFailure({
+          generation: pendingRoute.generation,
+          message: isSpaceErrorCode(error, "SPACE_NOT_FOUND")
+            || isSpaceErrorCode(error, "SPACE_MEMBERSHIP_REQUIRED")
+            ? t("space.route.spaceUnavailable")
+            : t("space.route.openFailed", { message: spaceErrorMessage(error) }),
+          retryable: retainForRetry,
+        });
+        if (!retainForRetry) onRouteConsumed?.(pendingRoute.generation);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    actions,
+    isActive,
+    onRouteConsumed,
+    pendingRoute,
+    routeAttempt,
+    session,
+    spaceData.boot,
+    t,
+    toast,
+  ]);
+
   const joinSpace = useCallback(() => {
     setSpaceDialogError(null);
     setSpaceDialogMode("join");
@@ -1353,6 +1432,29 @@ export default function Space({ isActive }: { isActive: boolean }) {
         authFlow={authFlow}
         onLogin={startLogin}
       />
+    );
+  }
+
+  if (routeFailure) {
+    const canRetry = routeFailure.retryable
+      && pendingRoute?.generation === routeFailure.generation;
+    return (
+      <div className="flex h-full items-center justify-center bg-[var(--paper)] px-6 text-sm text-[var(--ink-muted)]">
+        <div className="max-w-sm text-center">
+          <p>{routeFailure.message}</p>
+          <button
+            type="button"
+            onClick={() => {
+              setRouteFailure(null);
+              if (canRetry) setRouteAttempt((value) => value + 1);
+            }}
+            className="mt-3 inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--button-secondary-bg)] px-3 text-sm font-semibold text-[var(--button-secondary-text)] hover:bg-[var(--button-secondary-bg-hover)]"
+          >
+            {canRetry && <RefreshCw className="h-4 w-4" />}
+            {t(canRetry ? "space.common.retry" : "space.route.back")}
+          </button>
+        </div>
+      </div>
     );
   }
 

@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   Archive,
+  Bell,
   Bot,
   Check,
   CheckSquare,
@@ -107,6 +108,9 @@ import { getFullSessionDisplayText } from '@/utils/sessionDisplay';
 import { copyPlainText } from '@/utils/clipboard';
 import { openExternal } from '@/utils/openExternal';
 import { OverflowNameTooltip } from '@/components/workspace-tree/OverflowNameTooltip';
+import NotificationCenterFlyout from '@/notifications/NotificationCenterFlyout';
+import { useNotificationCenter } from '@/notifications/useNotificationCenter';
+import type { AppRoute } from '../../../shared/appRoute';
 
 const loadHistorySearchOverlayContent = () => import('@/components/HistorySearchOverlayContent');
 const HistorySearchOverlayContent = lazy(loadHistorySearchOverlayContent);
@@ -151,6 +155,7 @@ interface GlobalSidebarProps {
   onNewTab: () => void;
   onOpenTaskCenter: () => void;
   onOpenSpace: () => void;
+  onOpenAppRoute?: (route: AppRoute) => Promise<boolean> | boolean;
   onOpenCapabilities: (section?: CapabilitySection) => void;
   onOpenSettings: () => void;
   onOpenBugReport: () => void;
@@ -339,6 +344,7 @@ export default memo(function GlobalSidebar({
   onNewTab,
   onOpenTaskCenter,
   onOpenSpace,
+  onOpenAppRoute,
   onOpenCapabilities,
   onOpenSettings,
   onOpenBugReport,
@@ -374,6 +380,9 @@ export default memo(function GlobalSidebar({
   const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [flyoutOpen, setFlyoutOpen] = useState(false);
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const notificationCenter = useNotificationCenter();
+  const refreshNotificationCenter = notificationCenter.refresh;
   const previousActiveTabIdRef = useRef(activeTab?.id ?? null);
   const activeTabIdRef = useRef(activeTab?.id ?? null);
   activeTabIdRef.current = activeTab?.id ?? null;
@@ -388,6 +397,8 @@ export default memo(function GlobalSidebar({
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showFeedback, setShowFeedback] = useState(false);
   const feedbackTriggerRef = useRef<HTMLDivElement | null>(null);
+  const notificationTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const notificationPanelRef = useRef<HTMLDivElement | null>(null);
 
   const [pathDialogOpen, setPathDialogOpen] = useState(false);
   const [pendingFolderName, setPendingFolderName] = useState('');
@@ -483,6 +494,9 @@ export default memo(function GlobalSidebar({
 
   const openFlyoutNow = useCallback(() => {
     clearFlyoutTimers();
+    setNotificationOpen(false);
+    setShowFeedback(false);
+    setSearchOpen(false);
     resourceSurfaceInteractionGenerationRef.current += 1;
     setFlyoutOpen(true);
   }, [clearFlyoutTimers]);
@@ -491,6 +505,9 @@ export default memo(function GlobalSidebar({
     if (expanded || flyoutOpen) return;
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
     openTimerRef.current = setTimeout(() => {
+      setNotificationOpen(false);
+      setShowFeedback(false);
+      setSearchOpen(false);
       resourceSurfaceInteractionGenerationRef.current += 1;
       setFlyoutOpen(true);
     }, 125);
@@ -571,6 +588,29 @@ export default memo(function GlobalSidebar({
     if (restoreFocus) flyoutTriggerRef.current?.focus();
   }, [clearFlyoutTimers]);
 
+  const closeNotificationCenter = useCallback((restoreFocus = false) => {
+    setNotificationOpen(false);
+    if (restoreFocus) notificationTriggerRef.current?.focus();
+  }, []);
+
+  const toggleNotificationCenter = useCallback(() => {
+    closeFlyout();
+    setShowFeedback(false);
+    setSearchOpen(false);
+    setNotificationOpen((open) => {
+      const next = !open;
+      if (next) refreshNotificationCenter();
+      return next;
+    });
+  }, [closeFlyout, refreshNotificationCenter]);
+
+  const toggleFeedback = useCallback(() => {
+    closeFlyout();
+    closeNotificationCenter();
+    setSearchOpen(false);
+    setShowFeedback((value) => !value);
+  }, [closeFlyout, closeNotificationCenter]);
+
   useEffect(() => {
     const activeTabId = activeTab?.id ?? null;
     const activeTabChanged = previousActiveTabIdRef.current !== activeTabId;
@@ -578,13 +618,42 @@ export default memo(function GlobalSidebar({
     if (!activeTabChanged) return;
     setSearchOpen(false);
     closeFlyout();
-  }, [activeTab?.id, closeFlyout]);
+    closeNotificationCenter();
+  }, [activeTab?.id, closeFlyout, closeNotificationCenter]);
 
   useCloseLayer(() => {
     if (!flyoutOpen) return false;
     closeFlyout(true);
     return true;
   }, flyoutOpen ? 240 : -1);
+
+  useCloseLayer(() => {
+    if (!notificationOpen) return false;
+    closeNotificationCenter(true);
+    return true;
+  }, notificationOpen ? 245 : -1);
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (notificationPanelRef.current?.contains(target)) return;
+      if (notificationTriggerRef.current?.contains(target)) return;
+      closeNotificationCenter();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeNotificationCenter(true);
+    };
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [closeNotificationCenter, notificationOpen]);
 
   useEffect(() => {
     if (expanded && flyoutOpen) closeFlyout();
@@ -846,9 +915,12 @@ export default memo(function GlobalSidebar({
 
   const handleSearchOpen = useCallback(() => {
     if (!isTauriEnvironment()) return;
+    closeFlyout();
+    closeNotificationCenter();
+    setShowFeedback(false);
     resourceSurfaceInteractionGenerationRef.current += 1;
     setSearchOpen(true);
-  }, []);
+  }, [closeFlyout, closeNotificationCenter]);
 
   const handleSearchClose = useCallback(() => {
     resourceSurfaceInteractionGenerationRef.current += 1;
@@ -1085,13 +1157,48 @@ export default memo(function GlobalSidebar({
           className={`shrink-0 py-3 ${expanded ? 'px-3' : 'global-sidebar-rail-stack'}`}
           data-global-sidebar-footer-actions
         >
+          <button
+            ref={notificationTriggerRef}
+            type="button"
+            onClick={toggleNotificationCenter}
+            aria-label={notificationCenter.snapshot.hasUnread
+              ? t('notificationCenter.bellUnread')
+              : t('notificationCenter.bell')}
+            aria-haspopup="dialog"
+            aria-expanded={notificationOpen}
+            aria-controls="global-notification-center"
+            className={`relative flex h-9 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
+              expanded ? 'w-full' : 'w-10'
+            } ${
+              notificationOpen
+                ? 'bg-[var(--hover-bg)] text-[var(--ink)] shadow-sm'
+                : 'text-[var(--ink-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]'
+            }`}
+            data-notification-center-trigger
+          >
+            <span className="absolute left-3 flex h-4 w-4 items-center justify-center">
+              <Bell className="h-4 w-4" />
+              {notificationCenter.snapshot.hasUnread && (
+                <span
+                  className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-[var(--accent-warm)] ring-2 ring-[var(--global-sidebar-bg)]"
+                  aria-hidden="true"
+                />
+              )}
+            </span>
+            <span
+              className={`global-sidebar-copy min-w-0 truncate text-left ${expanded ? 'ml-9 pr-3 opacity-100' : 'ml-9 opacity-0'}`}
+              aria-hidden={!expanded}
+            >
+              {t('notificationCenter.bell')}
+            </span>
+          </button>
           <div ref={feedbackTriggerRef} className={expanded ? '' : 'flex justify-center'}>
             <SidebarNavButton
               expanded={expanded}
               icon={<Bot className="h-4 w-4" />}
               label={t('globalSidebar.helper')}
               tooltipDisabled={showFeedback}
-              onClick={() => setShowFeedback((value) => !value)}
+              onClick={toggleFeedback}
             />
             <FeedbackPopover
               open={showFeedback}
@@ -1135,6 +1242,36 @@ export default memo(function GlobalSidebar({
         >
           {tree}
         </div>
+      )}
+
+      {notificationOpen && createPortal(
+        <div
+          ref={notificationPanelRef}
+          id="global-notification-center"
+          role="dialog"
+          aria-label={t('notificationCenter.title')}
+          aria-modal="false"
+          className="fixed z-[245] overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--global-sidebar-bg)] shadow-md"
+          style={{
+            left: expanded
+              ? 'calc(var(--global-sidebar-expanded-width) + var(--space-2))'
+              : 'calc(var(--global-sidebar-rail-width) + var(--space-2))',
+            bottom: 'var(--space-5)',
+            width: 'min(380px, calc(100vw - var(--global-sidebar-rail-width) - var(--space-5)))',
+            height: 'min(620px, calc(100vh - var(--space-8)))',
+          }}
+          data-notification-center-shell
+        >
+          <NotificationCenterFlyout
+            snapshot={notificationCenter.snapshot}
+            onRefresh={notificationCenter.refresh}
+            onLoadMore={notificationCenter.loadMore}
+            onMarkAllRead={notificationCenter.markAllRead}
+            onOpenAppRoute={onOpenAppRoute ?? (() => false)}
+            onClose={() => closeNotificationCenter()}
+          />
+        </div>,
+        document.body,
       )}
 
       <PathInputDialog

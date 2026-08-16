@@ -2,6 +2,7 @@
 // Main entry point with sidecar lifecycle management
 
 pub mod app_dirs;
+pub mod app_route;
 pub mod attachment_protocol;
 pub mod browser;
 pub mod cli;
@@ -75,6 +76,7 @@ use tauri::{
     WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_deep_link::DeepLinkExt;
 
 #[cfg(target_os = "macos")]
 const MAIN_TRAFFIC_LIGHT_X: f64 = 15.0;
@@ -156,10 +158,10 @@ fn classify_navigation(url: &Url) -> NavDecision {
     // Tauri-internal schemes: always allow.
     // - tauri / ipc: Tauri 2.x core IPC bridges
     // - asset: tauri-plugin-fs asset serving
-    // - myagents / myagents-internal: app's custom protocols
+    // - myagents-resource / myagents-internal: app's custom protocols
     if matches!(
         scheme,
-        "tauri" | "ipc" | "asset" | "myagents" | "myagents-internal"
+        "tauri" | "ipc" | "asset" | "myagents-resource" | "myagents-internal"
     ) {
         return NavDecision::Allow;
     }
@@ -295,6 +297,10 @@ pub fn run() {
     // Create SSE proxy state
     let sse_proxy_state = Arc::new(sse_proxy::SseProxyState::default());
     let proxy_spill_state = Arc::new(proxy_spill::ProxySpillManager::new(data_dir.join("refs")));
+    let app_route_queue = app_route::create_queue();
+    let app_route_queue_for_single_instance = app_route_queue.clone();
+    let notification_center = space_cloud::notifications::create_state();
+    let notification_center_for_window_events = notification_center.clone();
 
     // Build the app first, then run with event handler
     // This allows us to handle RunEvent::ExitRequested for Cmd+Q and Dock quit
@@ -309,21 +315,21 @@ pub fn run() {
                 }
             }
         })
+        .register_asynchronous_uri_scheme_protocol("myagents-resource", attachment_protocol::handle)
+        // Historical WebView-only compatibility. OS deep links are parsed by
+        // app_route and reject these authorities.
         .register_asynchronous_uri_scheme_protocol("myagents", attachment_protocol::handle)
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Another instance was launched — bring the existing window to the
-            // foreground. Reuses the same routine as tray click and toast click
-            // so all three "raise window" entry points stay in lockstep.
-            ulog_info!("[App] single-instance activation, showing main window");
-            tray::show_main_window(app);
-            // Notify the front-end that the user just re-activated the app via
-            // an external trigger (taskbar icon, dock click on Linux, etc.).
-            // The notification module piggy-backs on this to consume any
-            // pending deep-link target from a recently-clicked toast on
-            // platforms where in-process Activated callbacks aren't available
-            // (macOS / Linux fallback path).
-            notification::on_window_activated_externally(app);
-        }))
+        .plugin(tauri_plugin_single_instance::init(
+            move |app, args, _cwd| {
+                // Another instance was launched — bring the existing window to the
+                // foreground. Reuses the same routine as tray click and toast click
+                // so all three "raise window" entry points stay in lockstep.
+                ulog_info!("[App] single-instance activation, showing main window");
+                tray::show_main_window(app);
+                app_route::enqueue_from_args(app, &app_route_queue_for_single_instance, &args);
+            },
+        ))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
@@ -370,6 +376,8 @@ pub fn run() {
         .manage(browser_state)
         .manage(thought_state)
         .manage(task_state)
+        .manage(app_route_queue)
+        .manage(notification_center)
         // PRD 0.2.35 — global force-wake-lock holder. `setup_tray` later registers
         // `TrayMenuHandles` for the matching CheckMenuItem; the boot hydrate
         // runs after both so they start coherent.
@@ -527,8 +535,15 @@ pub fn run() {
             floating_ball::cmd_fb_open_desktop_pet_settings,
             // OS notification + click-to-foreground deep-link (v0.2.14)
             notification::cmd_show_notification,
-            notification::cmd_consume_notification_click,
+            notification::cmd_request_notification_permission,
             notification_badge::cmd_set_notification_badge,
+            app_route::cmd_take_pending_app_route,
+            space_cloud::notifications::cmd_notification_get_snapshot,
+            space_cloud::notifications::cmd_notification_refresh,
+            space_cloud::notifications::cmd_notification_load_more,
+            space_cloud::notifications::cmd_notification_mark_read,
+            space_cloud::notifications::cmd_notification_mark_all_read,
+            space_cloud::notifications::cmd_notification_open_external,
             // IM Bot commands (non-deprecated survivors)
             im::commands::cmd_im_conversations,
             // Group permission commands (v0.1.28)
@@ -744,6 +759,42 @@ pub fn run() {
             // calls (extremely early startup) fall back to a synchronous
             // append protected by a mutex.
             logger::init_buffered_writer();
+            #[cfg(target_os = "macos")]
+            if let Err(error) =
+                notification::install_macos_notification_delegate(app.handle())
+            {
+                ulog_warn!(
+                    "[Notification] Failed to install UserNotifications delegate: {}",
+                    error
+                );
+            }
+            let notification_center = app
+                .state::<space_cloud::notifications::ManagedNotificationCenter>()
+                .inner()
+                .clone();
+            space_cloud::notifications::start(app.handle().clone(), notification_center);
+            let deep_link_queue = app.state::<app_route::ManagedAppRouteQueue>().inner().clone();
+            let deep_link_handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    app_route::enqueue_deep_link(
+                        &deep_link_handle,
+                        &deep_link_queue,
+                        url.as_str(),
+                    );
+                }
+                tray::show_main_window(&deep_link_handle);
+            });
+            match app.deep_link().get_current() {
+                Ok(Some(urls)) => {
+                    let queue = app.state::<app_route::ManagedAppRouteQueue>().inner().clone();
+                    for url in urls {
+                        app_route::enqueue_deep_link(app.handle(), &queue, url.as_str());
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => ulog_warn!("[AppRoute] failed to inspect startup links: {}", error),
+            }
             // The app bundle owns CLI business code. HOME only contains
             // deterministic launchers pointing back to this executable. A
             // failure must not brick the Desktop; Sidecar admission retries
@@ -1421,6 +1472,11 @@ pub fn run() {
                                 }),
                             );
                         }
+                        if label == "main" && *focused {
+                            space_cloud::notifications::wake(
+                                &notification_center_for_window_events,
+                            );
+                        }
                     }
                 }
                 tauri::WindowEvent::Destroyed => {
@@ -1566,10 +1622,17 @@ mod nav_guard_tests {
         assert_eq!(decide("tauri://localhost/"), NavDecision::Allow);
         assert_eq!(decide("asset://localhost/x"), NavDecision::Allow);
         assert_eq!(decide("ipc://localhost/"), NavDecision::Allow);
-        assert_eq!(decide("myagents://x/y"), NavDecision::Allow);
+        assert_eq!(
+            decide("myagents-resource://attachment/x/y"),
+            NavDecision::Allow
+        );
         assert_eq!(decide("http://localhost:5173/"), NavDecision::Allow);
         assert_eq!(decide("https://tauri.localhost/"), NavDecision::Allow);
         assert_eq!(decide("http://127.0.0.1:1420/"), NavDecision::Allow);
+        assert_eq!(
+            decide("myagents://attachment/x/y"),
+            NavDecision::BlockSilently
+        );
     }
 
     #[test]

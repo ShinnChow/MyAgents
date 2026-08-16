@@ -13,10 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Space 团队工具资源池**：Skills 旁新增 Tools 页面，团队可共享经过脱敏和可移植性校验的 MCP 配置，或发布面向小助理的自定义安装提示词；两类资源使用一致的卡片、详情、版本历史、回滚和删除体验。
 - **安全的本地工具安装闭环**：MCP 工具安装会写入全局配置并默认保持禁用，同 ID 的不同配置必须显式确认替换；自定义工具会新开小助理会话并使用内置 `/tool-install` Skill 执行安装与验证。
+- **统一云端通知中心**：侧边栏新增常驻通知入口；未登录时接收官方公告，登录后还会接收 Space Issue 评论。点击才标记已读，公告打开运营链接，评论会直接进入对应 Space 的 Issue 详情。
+- **MyAgents 应用内路由**：新增严格版本化的 `myagents://open/v1/spaces/.../issues/...` 深链，并将附件资源迁移到独立的 `myagents-resource://` 协议，保留历史内容兼容。
 
 ### Changed
 
 - **Space 套餐包含 Tool 配额**：桌面端 Space 设置页显示团队 Tool 用量，并与 Free、Pro 和 Official 的云端配额保持一致。
+- **系统通知点击精确关联**：macOS、Windows 与 Linux 都使用每条系统通知自身的原生点击回调，多条通知堆叠时不会再依赖窗口聚焦猜测目标；启动和登录补拉只建立基线，不轰炸历史提醒。
 
 ## [0.4.9] - 2026-08-16
 

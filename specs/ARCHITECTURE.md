@@ -224,6 +224,10 @@ Node.js SSE Server (`src/server/sse.ts`) 管理客户端连接、heartbeat、广
 
 普通 Session 的 complete/stopped/error 通知也不归 Tab：builtin/external Runtime 产生统一的 turn identity、owner 和 origin 描述；Rust SSE proxy 与 `BackgroundCompletion` 只是两个提交入口。当前 Sidecar generation 负责发放一次性完成资格，`notification.rs` 再根据业务类型、窗口焦点和通知偏好统一处理系统通知、badge 与 deep-link。Renderer 的 terminal handler 只维护消息、UI 和未读状态。
 
+Cloud 通知同样不归 Tab，但有独立的进程级 Owner：`space_cloud::notifications` 随 Tauri App 启动，通过一个 optional-auth Cloud feed 投影公开公告与当前账号的 Space Issue 评论；Renderer 只消费 normalized snapshot。Rust 只持久化公告 receipt/cutoff 与账号隔离的 pending read 元数据，私有标题、评论摘要、actor、target 和 URL 永不落盘。登录、登出与 401 是同步清空私有内存的 identity boundary；1 / 5 分钟前后台节奏、wake、退避、分页、baseline 与 toast 去重都由同一个 sync gate/loop 裁决，不由 Window、Tab 或 Space 页面另建 interval。
+
+通知 target 进入 shared typed `AppRoute`，当前唯一 wire 为 `myagents://open/v1/spaces/:spaceId/issues/:issueId`。OS deep link 先在 Rust 严格解析并进入 latest-wins queue，App Shell 再创建/聚焦唯一 Space Tab 并下发 generation intent；Space 页面通过既有 store 切换 Space、进入 Issues、打开准确详情。应用导航 scheme 与 WebView 二进制资源 scheme 分离：新资源只生成 `myagents-resource://`（Windows 为对应 localhost projection），旧 `myagents://attachment` 只在历史内容读取边界兼容，不能进入 AppRoute。
+
 ### HTTP API 调用
 
 ```

@@ -104,6 +104,14 @@ const BROWSER_INIT_SCRIPT: &str = r#"
 /// reuse the same exec path when it intercepts an external-frame navigation
 /// and reroutes it to the OS default browser.
 pub(crate) fn spawn_external_open(url: &str) {
+    if let Err(e) = open_external(url) {
+        ulog_info!("[browser] spawn_external_open failed for {}: {}", url, e);
+    }
+}
+
+/// Hand an already-validated URL to the OS and report synchronous spawn
+/// failures to callers that need an explicit retry/copy affordance.
+pub(crate) fn open_external(url: &str) -> Result<(), String> {
     // All three platform arms route through process_cmd::new for the
     // single-mental-model rule. The Windows arm in particular benefits —
     // `cmd /C start` is a console-subsystem binary, so CREATE_NO_WINDOW
@@ -112,15 +120,21 @@ pub(crate) fn spawn_external_open(url: &str) {
     // macOS `open` and Linux `xdg-open` are unaffected (CREATE_NO_WINDOW
     // is Windows-only).
     #[cfg(target_os = "macos")]
-    let res = crate::process_cmd::new("open").arg(url).spawn();
+    let res = crate::process_cmd::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string());
     #[cfg(target_os = "windows")]
     let res = shell_execute_open(url);
     #[cfg(target_os = "linux")]
-    let res = crate::process_cmd::new("xdg-open").arg(url).spawn();
+    let res = crate::process_cmd::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string());
 
-    if let Err(e) = res {
-        ulog_info!("[browser] spawn_external_open failed for {}: {}", url, e);
-    }
+    res
 }
 
 #[cfg(target_os = "windows")]

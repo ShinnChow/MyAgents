@@ -4630,7 +4630,13 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                     </div>
                                     <button
                                         onClick={() => {
-                                            updateConfig({ osNotifications: !config.osNotifications });
+                                            const enabling = !config.osNotifications;
+                                            updateConfig({ osNotifications: enabling });
+                                            if (enabling && isTauriEnvironment()) {
+                                                void invoke('cmd_request_notification_permission').catch((error: unknown) => {
+                                                    console.warn('[Notification] Permission request failed:', error);
+                                                });
+                                            }
                                             toast.success(config.osNotifications ? tSettings('general.notificationDisabled') : tSettings('general.notificationEnabled'));
                                         }}
                                         className={`relative h-6 w-11 shrink-0 cursor-pointer rounded-full transition-colors ${

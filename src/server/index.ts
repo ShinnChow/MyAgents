@@ -2071,7 +2071,7 @@ async function main() {
       }
 
       // Browser dev-mode fallback for attachment files.
-      // Production uses the Tauri `myagents://attachment/<path>` custom protocol
+      // Production uses the Tauri `myagents-resource://attachment/<path>` custom protocol
       // (`src-tauri/src/attachment_protocol.rs`) which serves bytes directly
       // through WebKit without round-tripping JSON. In dev (vite + browser) the
       // custom scheme isn't registered, so this route serves the same bytes

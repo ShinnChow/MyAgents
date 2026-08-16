@@ -1,0 +1,1733 @@
+//! Process-scoped Cloud notification synchronization owner (PRD 0.4.10).
+//!
+//! The Renderer only receives a normalized in-memory snapshot. The file below
+//! deliberately persists receipts, cutoffs, and pending operation IDs only —
+//! never announcement text, Issue titles, actors, excerpts, targets, or URLs.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::Utc;
+use reqwest::header::AUTHORIZATION;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
+
+use super::{
+    api_url, capability_base_url, ensure_space_available, http_client, parse_authorized_cloud_data,
+    parse_cloud_data, read_current_session, session_path, session_user_id, space_build_capability,
+    space_data_dir, url_component, with_space_client_context_headers, write_private_json_unlocked,
+    AuthenticatedSpaceSession, SpaceCommandError,
+};
+use crate::app_route::AppRoute;
+use crate::{ulog_debug, ulog_info, ulog_warn};
+
+const STATE_FILE: &str = "notification-state.json";
+const UPDATED_EVENT: &str = "notification-center:updated";
+const PAGE_SIZE: usize = 20;
+const MAX_SCAN_PAGES: usize = 100;
+const MAX_PENDING_IDS: usize = 2_000;
+const MAX_ANNOUNCEMENT_RECEIPTS: usize = 2_000;
+const MAX_ACCOUNTS: usize = 20;
+const FOREGROUND_INTERVAL: Duration = Duration::from_secs(60);
+const BACKGROUND_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationSortPoint {
+    pub created_at: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NotificationTarget {
+    ExternalUrl { url: String },
+    AppRoute { route: AppRoute },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationActor {
+    #[serde(rename = "type")]
+    pub actor_type: String,
+    pub id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationIssue {
+    pub id: String,
+    pub number: Option<i64>,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum NotificationItem {
+    Announcement {
+        id: String,
+        created_at: String,
+        is_read: bool,
+        summary_zh: String,
+        summary_other: Option<String>,
+        target: NotificationTarget,
+    },
+    #[serde(rename = "space_issue_comment")]
+    SpaceIssueComment {
+        id: String,
+        created_at: String,
+        is_read: bool,
+        comment_id: String,
+        actor: NotificationActor,
+        space_id: String,
+        issue: NotificationIssue,
+        excerpt: Option<String>,
+        target: NotificationTarget,
+    },
+}
+
+impl NotificationItem {
+    fn id(&self) -> &str {
+        match self {
+            Self::Announcement { id, .. } | Self::SpaceIssueComment { id, .. } => id,
+        }
+    }
+
+    fn created_at(&self) -> &str {
+        match self {
+            Self::Announcement { created_at, .. } | Self::SpaceIssueComment { created_at, .. } => {
+                created_at
+            }
+        }
+    }
+
+    fn is_read(&self) -> bool {
+        match self {
+            Self::Announcement { is_read, .. } | Self::SpaceIssueComment { is_read, .. } => {
+                *is_read
+            }
+        }
+    }
+
+    fn set_read(&mut self) {
+        match self {
+            Self::Announcement { is_read, .. } | Self::SpaceIssueComment { is_read, .. } => {
+                *is_read = true
+            }
+        }
+    }
+
+    fn is_announcement(&self) -> bool {
+        matches!(self, Self::Announcement { .. })
+    }
+
+    fn target(&self) -> NotificationTarget {
+        match self {
+            Self::Announcement { target, .. } | Self::SpaceIssueComment { target, .. } => {
+                target.clone()
+            }
+        }
+    }
+
+    fn point(&self) -> NotificationSortPoint {
+        NotificationSortPoint {
+            created_at: self.created_at().to_string(),
+            id: self.id().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationAuthState {
+    SignedOut,
+    Authenticated,
+    ReauthRequired,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationLoadState {
+    Idle,
+    Loading,
+    Ready,
+    Error,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationSnapshot {
+    pub load_state: NotificationLoadState,
+    pub auth_state: NotificationAuthState,
+    pub items: Vec<NotificationItem>,
+    pub has_unread: bool,
+    pub has_more: bool,
+    pub is_loading_more: bool,
+    pub feed_cutoff: Option<NotificationSortPoint>,
+    pub last_synced_at: Option<String>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationActivation {
+    pub notification_id: String,
+    pub target: NotificationTarget,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeedPage {
+    items: Vec<NotificationItem>,
+    next_cursor: Option<String>,
+    feed_cutoff: NotificationSortPoint,
+    has_unread: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AnnouncementReceipts {
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    cutoff: Option<NotificationSortPoint>,
+    #[serde(default)]
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountPendingState {
+    #[serde(default)]
+    pending_ids: Vec<String>,
+    #[serde(default)]
+    pending_read_all: Option<NotificationSortPoint>,
+    #[serde(default)]
+    merged_announcement_revision: u64,
+    #[serde(default)]
+    touched_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedNotificationState {
+    version: u8,
+    #[serde(default)]
+    announcements: AnnouncementReceipts,
+    #[serde(default)]
+    accounts: BTreeMap<String, AccountPendingState>,
+}
+
+impl Default for PersistedNotificationState {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            announcements: AnnouncementReceipts::default(),
+            accounts: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Baseline {
+    cutoff: NotificationSortPoint,
+}
+
+#[derive(Debug)]
+struct RuntimeState {
+    load_state: NotificationLoadState,
+    auth_state: NotificationAuthState,
+    identity_key: Option<String>,
+    account_key: Option<String>,
+    items: Vec<NotificationItem>,
+    next_cursor: Option<String>,
+    feed_cutoff: Option<NotificationSortPoint>,
+    has_unread: bool,
+    is_loading_more: bool,
+    last_synced_at: Option<String>,
+    error_code: Option<String>,
+    baselines: HashMap<String, Baseline>,
+    reminded_ids: HashSet<String>,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            load_state: NotificationLoadState::Idle,
+            auth_state: NotificationAuthState::SignedOut,
+            identity_key: None,
+            account_key: None,
+            items: Vec::new(),
+            next_cursor: None,
+            feed_cutoff: None,
+            has_unread: false,
+            is_loading_more: false,
+            last_synced_at: None,
+            error_code: None,
+            baselines: HashMap::new(),
+            reminded_ids: HashSet::new(),
+        }
+    }
+}
+
+impl RuntimeState {
+    fn snapshot(&self) -> NotificationSnapshot {
+        NotificationSnapshot {
+            load_state: self.load_state,
+            auth_state: self.auth_state,
+            items: self.items.clone(),
+            has_unread: self.has_unread,
+            has_more: self.next_cursor.is_some(),
+            is_loading_more: self.is_loading_more,
+            feed_cutoff: self.feed_cutoff.clone(),
+            last_synced_at: self.last_synced_at.clone(),
+            error_code: self.error_code.clone(),
+        }
+    }
+}
+
+pub struct NotificationCenter {
+    path: PathBuf,
+    runtime: Mutex<RuntimeState>,
+    persisted: Mutex<PersistedNotificationState>,
+    sync_gate: AsyncMutex<()>,
+    wake: Notify,
+}
+
+pub type ManagedNotificationCenter = Arc<NotificationCenter>;
+
+#[derive(Debug, Clone)]
+struct SyncContext {
+    identity_key: String,
+    account_key: Option<String>,
+    auth_state: NotificationAuthState,
+    base_url: String,
+    session: Option<AuthenticatedSpaceSession>,
+}
+
+fn account_key(base_url: &str, user_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(base_url.trim().trim_end_matches('/').as_bytes());
+    hasher.update([0]);
+    hasher.update(user_id.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn state_path() -> PathBuf {
+    space_data_dir()
+        .or_else(|_| {
+            crate::app_dirs::myagents_data_dir()
+                .map(|path| path.join("space"))
+                .ok_or_else(|| "Home dir not found".to_string())
+        })
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(STATE_FILE)
+}
+
+fn load_persisted(path: &Path) -> PersistedNotificationState {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<PersistedNotificationState>(&content) {
+            Ok(state) if state.version == 1 => state,
+            Ok(_) => {
+                ulog_warn!("[NotificationCenter] ignored unsupported local state version");
+                PersistedNotificationState::default()
+            }
+            Err(error) => {
+                ulog_warn!(
+                    "[NotificationCenter] ignored invalid local state: {}",
+                    error
+                );
+                PersistedNotificationState::default()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            PersistedNotificationState::default()
+        }
+        Err(error) => {
+            ulog_warn!("[NotificationCenter] failed to read local state: {}", error);
+            PersistedNotificationState::default()
+        }
+    }
+}
+
+pub fn create_state() -> ManagedNotificationCenter {
+    let path = state_path();
+    Arc::new(NotificationCenter {
+        persisted: Mutex::new(load_persisted(&path)),
+        path,
+        runtime: Mutex::new(RuntimeState::default()),
+        sync_gate: AsyncMutex::new(()),
+        wake: Notify::new(),
+    })
+}
+
+fn persist(center: &NotificationCenter) -> Result<(), String> {
+    let persisted = center
+        .persisted
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    write_private_json_unlocked(&center.path, &*persisted)
+}
+
+fn current_context() -> Result<SyncContext, String> {
+    if crate::space_cloud_mock::is_enabled() {
+        return Err("SPACE_NOTIFICATIONS_UNAVAILABLE_IN_MOCK".to_string());
+    }
+    let capability = ensure_space_available()?;
+    let configured_base_url = capability_base_url(&capability)?;
+    let Some(session) = read_current_session()? else {
+        return Ok(SyncContext {
+            identity_key: format!("anonymous:{}", configured_base_url.trim_end_matches('/')),
+            account_key: None,
+            auth_state: NotificationAuthState::SignedOut,
+            base_url: configured_base_url,
+            session: None,
+        });
+    };
+    let user_id = session_user_id(&session)
+        .ok_or_else(|| "SPACE_NOTIFICATION_ACCOUNT_ID_MISSING".to_string())?;
+    let key = account_key(&session.base_url, &user_id);
+    if session.authenticated_token().is_none() {
+        return Ok(SyncContext {
+            identity_key: format!("reauth:{key}"),
+            account_key: None,
+            auth_state: NotificationAuthState::ReauthRequired,
+            base_url: session.base_url,
+            session: None,
+        });
+    }
+    let authenticated = AuthenticatedSpaceSession::from_account(session, session_path()?)?;
+    Ok(SyncContext {
+        identity_key: format!("account:{key}"),
+        account_key: Some(key),
+        auth_state: NotificationAuthState::Authenticated,
+        base_url: authenticated.base_url.clone(),
+        session: Some(authenticated),
+    })
+}
+
+fn reset_projection_for_identity(center: &NotificationCenter, context: &SyncContext) -> bool {
+    let mut runtime = center
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let changed = runtime.identity_key.as_deref() != Some(context.identity_key.as_str());
+    if changed {
+        // Private content is process memory only and must disappear before a
+        // request for the next identity starts.
+        runtime.items.clear();
+        runtime.next_cursor = None;
+        runtime.feed_cutoff = None;
+        runtime.has_unread = false;
+        runtime.last_synced_at = None;
+        runtime.error_code = None;
+        // Entering an identity always establishes a fresh no-toast baseline.
+        // The process-wide reminded set remains intact so one public
+        // announcement cannot toast again after login/logout.
+        runtime.baselines.remove(&context.identity_key);
+    }
+    runtime.identity_key = Some(context.identity_key.clone());
+    runtime.account_key = context.account_key.clone();
+    runtime.auth_state = context.auth_state;
+    runtime.load_state = NotificationLoadState::Loading;
+    changed
+}
+
+fn emit_snapshot<R: tauri::Runtime>(app: &AppHandle<R>, center: &NotificationCenter) {
+    let snapshot = center
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    if let Err(error) = app.emit(UPDATED_EVENT, snapshot) {
+        ulog_debug!(
+            "[NotificationCenter] renderer update not delivered: {}",
+            error
+        );
+    }
+}
+
+fn is_at_or_before(point: &NotificationSortPoint, cutoff: &NotificationSortPoint) -> bool {
+    point.created_at < cutoff.created_at
+        || (point.created_at == cutoff.created_at && point.id <= cutoff.id)
+}
+
+fn is_after(point: &NotificationSortPoint, cutoff: &NotificationSortPoint) -> bool {
+    point.created_at > cutoff.created_at
+        || (point.created_at == cutoff.created_at && point.id > cutoff.id)
+}
+
+fn later_cutoff(
+    current: Option<NotificationSortPoint>,
+    candidate: NotificationSortPoint,
+) -> NotificationSortPoint {
+    match current {
+        Some(current) if !is_after(&candidate, &current) => current,
+        _ => candidate,
+    }
+}
+
+fn normalize_item(
+    item: &mut NotificationItem,
+    receipts: &AnnouncementReceipts,
+    pending: Option<&AccountPendingState>,
+) {
+    if item.is_announcement()
+        && (receipts.ids.iter().any(|id| id == item.id())
+            || receipts
+                .cutoff
+                .as_ref()
+                .is_some_and(|cutoff| is_at_or_before(&item.point(), cutoff)))
+    {
+        item.set_read();
+    }
+    if let Some(pending) = pending {
+        if pending.pending_ids.iter().any(|id| id == item.id())
+            || pending
+                .pending_read_all
+                .as_ref()
+                .is_some_and(|cutoff| is_at_or_before(&item.point(), cutoff))
+        {
+            item.set_read();
+        }
+    }
+}
+
+fn normalized_page(
+    center: &NotificationCenter,
+    account_key: Option<&str>,
+    mut page: FeedPage,
+) -> FeedPage {
+    let persisted = center
+        .persisted
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let pending = account_key.and_then(|key| persisted.accounts.get(key));
+    for item in &mut page.items {
+        normalize_item(item, &persisted.announcements, pending);
+    }
+    page
+}
+
+async fn fetch_page(
+    context: &SyncContext,
+    cursor: Option<&str>,
+) -> Result<FeedPage, SpaceCommandError> {
+    let path = match cursor {
+        Some(cursor) => format!(
+            "/api/notifications?limit={PAGE_SIZE}&cursor={}",
+            url_component(cursor)
+        ),
+        None => format!("/api/notifications?limit={PAGE_SIZE}"),
+    };
+    let client = http_client().map_err(SpaceCommandError::from)?;
+    let mut request = with_space_client_context_headers(
+        client.get(api_url(&context.base_url, &path).map_err(SpaceCommandError::from)?),
+        &space_build_capability(),
+    );
+    if let Some(session) = context.session.as_ref() {
+        request = request.header(AUTHORIZATION, format!("Bearer {}", session.session_token()));
+    }
+    let response = request.send().await.map_err(|error| {
+        SpaceCommandError::transport(format!("Notification feed request failed: {error}"))
+    })?;
+    if let Some(session) = context.session.as_ref() {
+        let value = parse_authorized_cloud_data(response, Some(session)).await?;
+        serde_json::from_value(value).map_err(|error| {
+            SpaceCommandError::local(
+                "SPACE_RESPONSE_INVALID",
+                format!("Invalid notification feed response: {error}"),
+            )
+        })
+    } else {
+        parse_cloud_data::<FeedPage>(response)
+            .await
+            .map_err(SpaceCommandError::from)
+    }
+}
+
+async fn post_authenticated(
+    context: &SyncContext,
+    path: &str,
+    body: Value,
+) -> Result<Value, SpaceCommandError> {
+    let session = context.session.as_ref().ok_or_else(|| {
+        SpaceCommandError::local("SPACE_REAUTH_REQUIRED", "Space login is required")
+    })?;
+    let response = with_space_client_context_headers(
+        http_client()
+            .map_err(SpaceCommandError::from)?
+            .post(api_url(&context.base_url, path).map_err(SpaceCommandError::from)?)
+            .header(AUTHORIZATION, format!("Bearer {}", session.session_token()))
+            .json(&body),
+        &space_build_capability(),
+    )
+    .send()
+    .await
+    .map_err(|error| {
+        SpaceCommandError::transport(format!("Notification mutation failed: {error}"))
+    })?;
+    parse_authorized_cloud_data(response, Some(session)).await
+}
+
+fn touch_account<'a>(
+    persisted: &'a mut PersistedNotificationState,
+    key: &str,
+) -> &'a mut AccountPendingState {
+    persisted
+        .accounts
+        .entry(key.to_string())
+        .or_default()
+        .touched_at = Utc::now().timestamp();
+    if persisted.accounts.len() > MAX_ACCOUNTS {
+        let active = key.to_string();
+        let mut oldest = persisted
+            .accounts
+            .iter()
+            .filter(|(candidate, state)| {
+                **candidate != active
+                    && state.pending_ids.is_empty()
+                    && state.pending_read_all.is_none()
+            })
+            .map(|(candidate, state)| (candidate.clone(), state.touched_at))
+            .collect::<Vec<_>>();
+        oldest.sort_by_key(|(_, touched_at)| *touched_at);
+        for (candidate, _) in oldest
+            .into_iter()
+            .take(persisted.accounts.len().saturating_sub(MAX_ACCOUNTS))
+        {
+            persisted.accounts.remove(&candidate);
+        }
+    }
+    persisted
+        .accounts
+        .get_mut(key)
+        .expect("active account retained")
+}
+
+async fn flush_pending(
+    center: &NotificationCenter,
+    context: &SyncContext,
+) -> Result<(), SpaceCommandError> {
+    let Some(key) = context.account_key.as_deref() else {
+        return Ok(());
+    };
+
+    let (announcement_revision, announcement_ids, announcement_cutoff, merged_revision) = {
+        let persisted = center
+            .persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let account = persisted.accounts.get(key).cloned().unwrap_or_default();
+        (
+            persisted.announcements.revision,
+            persisted.announcements.ids.clone(),
+            persisted.announcements.cutoff.clone(),
+            account.merged_announcement_revision,
+        )
+    };
+    if announcement_revision > merged_revision {
+        if announcement_ids.is_empty() {
+            if let Some(cutoff) = announcement_cutoff.clone() {
+                post_authenticated(
+                    context,
+                    "/api/notifications/announcement-reads/merge",
+                    json!({ "cutoff": cutoff }),
+                )
+                .await?;
+            }
+        } else {
+            for (index, chunk) in announcement_ids.chunks(100).enumerate() {
+                let mut body = json!({ "announcementIds": chunk });
+                if index == 0 {
+                    if let Some(cutoff) = announcement_cutoff.clone() {
+                        body["cutoff"] = serde_json::to_value(cutoff).unwrap_or(Value::Null);
+                    }
+                }
+                post_authenticated(context, "/api/notifications/announcement-reads/merge", body)
+                    .await?;
+            }
+        }
+        {
+            let mut persisted = center
+                .persisted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let account = touch_account(&mut persisted, key);
+            account.merged_announcement_revision = account
+                .merged_announcement_revision
+                .max(announcement_revision);
+        }
+        if let Err(error) = persist(center) {
+            ulog_warn!(
+                "[NotificationCenter] failed to persist merge checkpoint: {}",
+                error
+            );
+        }
+    }
+
+    loop {
+        let batch = {
+            let persisted = center
+                .persisted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            persisted
+                .accounts
+                .get(key)
+                .map(|account| {
+                    account
+                        .pending_ids
+                        .iter()
+                        .take(100)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        if batch.is_empty() {
+            break;
+        }
+        post_authenticated(
+            context,
+            "/api/notifications/read",
+            json!({ "notificationIds": batch }),
+        )
+        .await?;
+        {
+            let mut persisted = center
+                .persisted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let account = touch_account(&mut persisted, key);
+            account
+                .pending_ids
+                .retain(|id| !batch.iter().any(|sent| sent == id));
+        }
+        if let Err(error) = persist(center) {
+            ulog_warn!(
+                "[NotificationCenter] failed to persist ACK checkpoint: {}",
+                error
+            );
+        }
+    }
+
+    let pending_cutoff = {
+        let persisted = center
+            .persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        persisted
+            .accounts
+            .get(key)
+            .and_then(|account| account.pending_read_all.clone())
+    };
+    if let Some(cutoff) = pending_cutoff.clone() {
+        post_authenticated(
+            context,
+            "/api/notifications/read-all",
+            json!({ "cutoff": cutoff }),
+        )
+        .await?;
+        {
+            let mut persisted = center
+                .persisted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let account = touch_account(&mut persisted, key);
+            if account.pending_read_all.as_ref() == pending_cutoff.as_ref() {
+                account.pending_read_all = None;
+            }
+        }
+        if let Err(error) = persist(center) {
+            ulog_warn!(
+                "[NotificationCenter] failed to persist read-all checkpoint: {}",
+                error
+            );
+        }
+    }
+    Ok(())
+}
+
+fn toast_text(item: &NotificationItem) -> (String, String) {
+    let locale = crate::i18n::current_locale();
+    match item {
+        NotificationItem::Announcement {
+            summary_zh,
+            summary_other,
+            ..
+        } => {
+            let body = if locale.as_str().starts_with("zh") {
+                summary_zh.clone()
+            } else {
+                summary_other.clone().unwrap_or_else(|| summary_zh.clone())
+            };
+            (
+                crate::i18n::t("notification.centerAnnouncementTitle", locale).to_string(),
+                body,
+            )
+        }
+        NotificationItem::SpaceIssueComment { actor, issue, .. } => (
+            crate::i18n::t("notification.centerCommentTitle", locale).to_string(),
+            format!("{} · {}", actor.display_name, issue.title),
+        ),
+    }
+}
+
+fn main_window_unfocused(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .map(|window| {
+            !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false)
+        })
+        .unwrap_or(true)
+}
+
+fn update_baseline_and_collect_toasts(
+    runtime: &mut RuntimeState,
+    identity_key: &str,
+    cutoff: &NotificationSortPoint,
+    scanned_items: &[NotificationItem],
+) -> Vec<NotificationItem> {
+    let Some(baseline) = runtime.baselines.get_mut(identity_key) else {
+        runtime.baselines.insert(
+            identity_key.to_string(),
+            Baseline {
+                cutoff: cutoff.clone(),
+            },
+        );
+        return Vec::new();
+    };
+    let previous = baseline.cutoff.clone();
+    let mut toasts = Vec::new();
+    for item in scanned_items {
+        if !item.is_read()
+            && is_after(&item.point(), &previous)
+            && runtime.reminded_ids.insert(item.id().to_string())
+        {
+            toasts.push(item.clone());
+        }
+    }
+    if is_after(cutoff, &baseline.cutoff) {
+        baseline.cutoff = cutoff.clone();
+    }
+    toasts
+}
+
+fn advance_baseline_without_toasts(
+    runtime: &mut RuntimeState,
+    identity_key: &str,
+    cutoff: &NotificationSortPoint,
+) {
+    match runtime.baselines.get_mut(identity_key) {
+        Some(baseline) if is_after(cutoff, &baseline.cutoff) => {
+            baseline.cutoff = cutoff.clone();
+        }
+        Some(_) => {}
+        None => {
+            runtime.baselines.insert(
+                identity_key.to_string(),
+                Baseline {
+                    cutoff: cutoff.clone(),
+                },
+            );
+        }
+    }
+}
+
+fn collect_refresh_toasts(
+    runtime: &mut RuntimeState,
+    identity_key: &str,
+    cutoff: &NotificationSortPoint,
+    scanned_items: &[NotificationItem],
+    scan_complete_for_new: bool,
+) -> Vec<NotificationItem> {
+    if scan_complete_for_new {
+        update_baseline_and_collect_toasts(runtime, identity_key, cutoff, scanned_items)
+    } else {
+        advance_baseline_without_toasts(runtime, identity_key, cutoff);
+        Vec::new()
+    }
+}
+
+fn should_scan_next_page(
+    account_key: Option<&str>,
+    old_cutoff: Option<&NotificationSortPoint>,
+    anonymous_has_unread: bool,
+    reached_old_cutoff: bool,
+) -> bool {
+    let needs_anonymous_unread_scan = account_key.is_none() && !anonymous_has_unread;
+    match old_cutoff {
+        // First process sync establishes a no-toast baseline. Authenticated
+        // `hasUnread` is already authoritative, so it never walks history.
+        None => needs_anonymous_unread_scan,
+        Some(_) => needs_anonymous_unread_scan || !reached_old_cutoff,
+    }
+}
+
+async fn refresh_once(
+    app: &AppHandle,
+    center: &NotificationCenter,
+) -> Result<(), SpaceCommandError> {
+    let context = current_context().map_err(SpaceCommandError::from)?;
+    let identity_changed = reset_projection_for_identity(center, &context);
+    emit_snapshot(app, center);
+    if identity_changed {
+        ulog_info!(
+            "[NotificationCenter] projection identity changed auth={:?}",
+            context.auth_state
+        );
+    }
+
+    if context.session.is_some() {
+        flush_pending(center, &context).await?;
+    }
+
+    let first = normalized_page(
+        center,
+        context.account_key.as_deref(),
+        fetch_page(&context, None).await?,
+    );
+    let mut scanned_items = first.items.clone();
+    let old_cutoff = {
+        let runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime
+            .baselines
+            .get(&context.identity_key)
+            .map(|baseline| baseline.cutoff.clone())
+    };
+    let mut anonymous_has_unread = first.items.iter().any(|item| !item.is_read());
+    let mut cursor = first.next_cursor.clone();
+    let mut scanned_pages = 1usize;
+    let mut reached_old_cutoff = false;
+    if let Some(cutoff) = old_cutoff.as_ref() {
+        reached_old_cutoff = first
+            .items
+            .iter()
+            .any(|item| !is_after(&item.point(), cutoff));
+    }
+    while cursor.is_some()
+        && scanned_pages < MAX_SCAN_PAGES
+        && should_scan_next_page(
+            context.account_key.as_deref(),
+            old_cutoff.as_ref(),
+            anonymous_has_unread,
+            reached_old_cutoff,
+        )
+    {
+        let page = normalized_page(
+            center,
+            context.account_key.as_deref(),
+            fetch_page(&context, cursor.as_deref()).await?,
+        );
+        if let Some(cutoff) = old_cutoff.as_ref() {
+            reached_old_cutoff |= page
+                .items
+                .iter()
+                .any(|item| !is_after(&item.point(), cutoff));
+        }
+        anonymous_has_unread |= page.items.iter().any(|item| !item.is_read());
+        scanned_items.extend(page.items);
+        cursor = page.next_cursor;
+        scanned_pages += 1;
+    }
+
+    let scan_complete_for_new = old_cutoff.is_some() && (reached_old_cutoff || cursor.is_none());
+    let should_toast = main_window_unfocused(app);
+    let toasts = {
+        let mut runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime.identity_key.as_deref() != Some(context.identity_key.as_str()) {
+            return Ok(());
+        }
+        runtime.items = first.items;
+        runtime.next_cursor = first.next_cursor;
+        runtime.feed_cutoff = Some(first.feed_cutoff.clone());
+        runtime.has_unread = if context.account_key.is_some() {
+            first.has_unread.unwrap_or(false)
+        } else {
+            anonymous_has_unread
+        };
+        runtime.load_state = NotificationLoadState::Ready;
+        runtime.last_synced_at = Some(Utc::now().to_rfc3339());
+        runtime.error_code = None;
+        // First sync must never toast history. A capped scan also advances
+        // safely without toasts; otherwise it would refetch the same 100
+        // pages every minute forever while holding a stale baseline.
+        collect_refresh_toasts(
+            &mut runtime,
+            &context.identity_key,
+            &first.feed_cutoff,
+            &scanned_items,
+            scan_complete_for_new,
+        )
+    };
+    emit_snapshot(app, center);
+
+    if should_toast {
+        for item in toasts {
+            let (title, body) = toast_text(&item);
+            crate::notification::show_cloud_notification(
+                app,
+                &title,
+                &body,
+                item.id().to_string(),
+                item.target(),
+                item.is_announcement(),
+                context.account_key.clone(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn classify_error(error: &SpaceCommandError) -> String {
+    if error.code == "SPACE_REAUTH_REQUIRED" {
+        "reauth_required".to_string()
+    } else if error.retryable {
+        "network".to_string()
+    } else {
+        "unavailable".to_string()
+    }
+}
+
+async fn run_refresh(app: &AppHandle, center: &NotificationCenter) -> bool {
+    let _guard = center.sync_gate.lock().await;
+    match refresh_once(app, center).await {
+        Ok(()) => true,
+        Err(error) => {
+            ulog_warn!(
+                "[NotificationCenter] sync failed code={} retryable={}",
+                error.code,
+                error.retryable
+            );
+            {
+                let mut runtime = center
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let requires_reauth = matches!(
+                    error.code.as_str(),
+                    "SPACE_REAUTH_REQUIRED" | "SPACE_SESSION_STATE_WRITE_FAILED"
+                );
+                if requires_reauth {
+                    // A 401 is an immediate privacy boundary. Do not retain
+                    // account-only Issue text while the public reauth feed is
+                    // waiting for its next fetch.
+                    runtime.items.clear();
+                    runtime.next_cursor = None;
+                    runtime.feed_cutoff = None;
+                    runtime.has_unread = false;
+                    runtime.identity_key = None;
+                    runtime.account_key = None;
+                    runtime.auth_state = NotificationAuthState::ReauthRequired;
+                }
+                runtime.error_code = Some(classify_error(&error));
+                runtime.load_state = if runtime.items.is_empty() && !error.retryable {
+                    NotificationLoadState::Unavailable
+                } else {
+                    NotificationLoadState::Error
+                };
+            }
+            emit_snapshot(app, center);
+            if error.code == "SPACE_REAUTH_REQUIRED" {
+                // parse_authorized_cloud_data has committed the reauth state;
+                // consume it immediately to project the public feed.
+                center.wake.notify_one();
+            }
+            false
+        }
+    }
+}
+
+fn poll_interval(app: &AppHandle) -> Duration {
+    if main_window_unfocused(app) {
+        BACKGROUND_INTERVAL
+    } else {
+        FOREGROUND_INTERVAL
+    }
+}
+
+pub fn start(app: AppHandle, center: ManagedNotificationCenter) {
+    tauri::async_runtime::spawn(async move {
+        let mut failures = 0u32;
+        loop {
+            let succeeded = run_refresh(&app, &center).await;
+            failures = if succeeded {
+                0
+            } else {
+                failures.saturating_add(1)
+            };
+            let base = poll_interval(&app);
+            let wait = if failures == 0 {
+                base
+            } else {
+                let multiplier = 1u32 << failures.min(5);
+                base.saturating_mul(multiplier).min(MAX_BACKOFF)
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {},
+                _ = center.wake.notified() => {},
+            }
+        }
+    });
+}
+
+pub fn wake(center: &ManagedNotificationCenter) {
+    center.wake.notify_one();
+}
+
+/// Clear the current projection synchronously at login/logout boundaries.
+/// The following network refresh may be slow or offline; private text must not
+/// survive in Renderer memory while that request is pending.
+pub fn auth_boundary_changed<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    center: &ManagedNotificationCenter,
+) {
+    let auth_state = current_context()
+        .map(|context| context.auth_state)
+        .unwrap_or(NotificationAuthState::SignedOut);
+    {
+        let mut runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        runtime.items.clear();
+        runtime.next_cursor = None;
+        runtime.feed_cutoff = None;
+        runtime.has_unread = false;
+        runtime.identity_key = None;
+        runtime.account_key = None;
+        runtime.auth_state = auth_state;
+        runtime.load_state = NotificationLoadState::Loading;
+        runtime.last_synced_at = None;
+        runtime.error_code = None;
+        runtime.baselines.clear();
+    }
+    emit_snapshot(app, center);
+    center.wake.notify_one();
+}
+
+/// Called by the canonical Space 401 transition after it has atomically
+/// committed `reauth_required`. This keeps notification privacy attached to
+/// that single auth owner instead of each API caller remembering a cleanup.
+pub fn user_session_invalidated() {
+    let Some(app) = crate::logger::get_app_handle() else {
+        return;
+    };
+    let Some(center) = app.try_state::<ManagedNotificationCenter>() else {
+        return;
+    };
+    auth_boundary_changed(app, center.inner());
+}
+
+#[tauri::command]
+pub fn cmd_notification_get_snapshot(
+    state: tauri::State<'_, ManagedNotificationCenter>,
+) -> NotificationSnapshot {
+    state
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot()
+}
+
+#[tauri::command]
+pub fn cmd_notification_refresh(state: tauri::State<'_, ManagedNotificationCenter>) {
+    wake(state.inner());
+}
+
+#[tauri::command]
+pub async fn cmd_notification_load_more(
+    app: AppHandle,
+    state: tauri::State<'_, ManagedNotificationCenter>,
+) -> Result<NotificationSnapshot, String> {
+    let center = state.inner().clone();
+    let _guard = center.sync_gate.lock().await;
+    let context = current_context()?;
+    let cursor = {
+        let mut runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime.identity_key.as_deref() != Some(context.identity_key.as_str()) {
+            return Err("Notification identity changed".to_string());
+        }
+        let cursor = runtime.next_cursor.clone();
+        if cursor.is_none() {
+            return Ok(runtime.snapshot());
+        }
+        runtime.is_loading_more = true;
+        cursor
+    };
+    emit_snapshot(&app, &center);
+    let result = fetch_page(&context, cursor.as_deref()).await;
+    let mut runtime = center
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    runtime.is_loading_more = false;
+    match result {
+        Ok(page) if runtime.identity_key.as_deref() == Some(context.identity_key.as_str()) => {
+            let page = normalized_page(&center, context.account_key.as_deref(), page);
+            let existing = runtime
+                .items
+                .iter()
+                .map(|item| item.id().to_string())
+                .collect::<HashSet<_>>();
+            runtime.items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|item| !existing.contains(item.id())),
+            );
+            runtime.next_cursor = page.next_cursor;
+            runtime.error_code = None;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            runtime.error_code = Some(classify_error(&error));
+        }
+    }
+    let snapshot = runtime.snapshot();
+    drop(runtime);
+    if let Err(error) = app.emit(UPDATED_EVENT, snapshot.clone()) {
+        ulog_debug!(
+            "[NotificationCenter] load-more update not delivered: {}",
+            error
+        );
+    }
+    Ok(snapshot)
+}
+
+fn record_announcement_read(persisted: &mut PersistedNotificationState, id: &str) {
+    if !persisted
+        .announcements
+        .ids
+        .iter()
+        .any(|candidate| candidate == id)
+    {
+        persisted.announcements.ids.push(id.to_string());
+        if persisted.announcements.ids.len() > MAX_ANNOUNCEMENT_RECEIPTS {
+            let overflow = persisted
+                .announcements
+                .ids
+                .len()
+                .saturating_sub(MAX_ANNOUNCEMENT_RECEIPTS);
+            persisted.announcements.ids.drain(0..overflow);
+        }
+        persisted.announcements.revision = persisted.announcements.revision.saturating_add(1);
+    }
+}
+
+fn record_read_receipt(
+    persisted: &mut PersistedNotificationState,
+    notification_id: &str,
+    is_announcement: bool,
+    account_key: Option<&str>,
+) {
+    if is_announcement {
+        record_announcement_read(persisted, notification_id);
+    }
+    let Some(key) = account_key else {
+        return;
+    };
+    let account = touch_account(persisted, key);
+    if account.pending_ids.iter().any(|id| id == notification_id) {
+        return;
+    }
+    if account.pending_ids.len() >= MAX_PENDING_IDS {
+        // A local queue bound must never turn an explicit click into a dead
+        // navigation. Keep the optimistic projection and retry capacity on a
+        // later refresh; normal accounts remain far below this 90-day bound.
+        ulog_warn!(
+            "[NotificationCenter] pending read queue full account={} id={}",
+            key,
+            notification_id
+        );
+        return;
+    }
+    account.pending_ids.push(notification_id.to_string());
+}
+
+fn persist_receipts_best_effort(center: &NotificationCenter) {
+    if let Err(error) = persist(center) {
+        // The in-memory pending operation is still eligible for this process'
+        // next sync. Disk availability must not block the click target.
+        ulog_warn!(
+            "[NotificationCenter] failed to persist notification receipt: {}",
+            error
+        );
+    }
+}
+
+async fn mark_read_local<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    center: &NotificationCenter,
+    notification_id: &str,
+) -> Result<NotificationActivation, String> {
+    let (target, is_announcement, account_key) = {
+        let mut runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let item = runtime
+            .items
+            .iter_mut()
+            .find(|item| item.id() == notification_id)
+            .ok_or_else(|| "Notification is no longer available".to_string())?;
+        let target = item.target();
+        let is_announcement = item.is_announcement();
+        item.set_read();
+        let no_loaded_unread = runtime.items.iter().all(NotificationItem::is_read);
+        if no_loaded_unread && runtime.next_cursor.is_none() {
+            runtime.has_unread = false;
+        }
+        (target, is_announcement, runtime.account_key.clone())
+    };
+    {
+        let mut persisted = center
+            .persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        record_read_receipt(
+            &mut persisted,
+            notification_id,
+            is_announcement,
+            account_key.as_deref(),
+        );
+    }
+    persist_receipts_best_effort(center);
+    emit_snapshot(app, center);
+    center.wake.notify_one();
+    Ok(NotificationActivation {
+        notification_id: notification_id.to_string(),
+        target,
+    })
+}
+
+#[tauri::command]
+pub async fn cmd_notification_mark_read(
+    app: AppHandle,
+    state: tauri::State<'_, ManagedNotificationCenter>,
+    notification_id: String,
+) -> Result<NotificationActivation, String> {
+    let id = notification_id.trim();
+    if id.is_empty() || id.len() > 200 {
+        return Err("Notification id is invalid".to_string());
+    }
+    mark_read_local(&app, state.inner(), id).await
+}
+
+#[tauri::command]
+pub fn cmd_notification_mark_all_read(
+    app: AppHandle,
+    state: tauri::State<'_, ManagedNotificationCenter>,
+) -> Result<NotificationSnapshot, String> {
+    let center = state.inner();
+    let (cutoff, account_key) = {
+        let mut runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = runtime
+            .feed_cutoff
+            .clone()
+            .ok_or_else(|| "Notification snapshot is not ready".to_string())?;
+        for item in &mut runtime.items {
+            item.set_read();
+        }
+        runtime.has_unread = false;
+        (cutoff, runtime.account_key.clone())
+    };
+    {
+        let mut persisted = center
+            .persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        persisted.announcements.cutoff = Some(later_cutoff(
+            persisted.announcements.cutoff.take(),
+            cutoff.clone(),
+        ));
+        persisted.announcements.revision = persisted.announcements.revision.saturating_add(1);
+        if let Some(key) = account_key.as_deref() {
+            let account = touch_account(&mut persisted, key);
+            account.pending_read_all = Some(later_cutoff(account.pending_read_all.take(), cutoff));
+        }
+    }
+    persist_receipts_best_effort(center);
+    let snapshot = center
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot();
+    if let Err(error) = app.emit(UPDATED_EVENT, snapshot.clone()) {
+        ulog_debug!(
+            "[NotificationCenter] read-all update not delivered: {}",
+            error
+        );
+    }
+    center.wake.notify_one();
+    Ok(snapshot)
+}
+
+fn validate_external_url(raw: &str) -> Result<String, String> {
+    if raw.len() > 2048 {
+        return Err("Notification URL is too long".to_string());
+    }
+    let parsed = url::Url::parse(raw).map_err(|_| "Notification URL is invalid".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("Notification URL scheme is not allowed".to_string());
+    }
+    Ok(parsed.to_string())
+}
+
+#[tauri::command]
+pub fn cmd_notification_open_external(url: String) -> Result<(), String> {
+    let url = validate_external_url(url.trim())?;
+    crate::browser::open_external(&url)
+}
+
+pub fn activate_from_toast<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    notification_id: String,
+    target: NotificationTarget,
+    is_announcement: bool,
+    origin_account_key: Option<String>,
+) {
+    let center = app.state::<ManagedNotificationCenter>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        // A delivered banner can outlive a feed refresh, logout, or account
+        // switch. Its closure captures the origin account so an old private
+        // toast can never be ACKed against the newly active account.
+        let projection_changed = {
+            let mut runtime = center
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let same_identity = runtime.account_key == origin_account_key;
+            let changed = if same_identity {
+                runtime
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id() == notification_id)
+                    .is_some_and(|item| {
+                        let was_unread = !item.is_read();
+                        item.set_read();
+                        was_unread
+                    })
+            } else {
+                false
+            };
+            if changed
+                && runtime.items.iter().all(NotificationItem::is_read)
+                && runtime.next_cursor.is_none()
+            {
+                runtime.has_unread = false;
+            }
+            changed
+        };
+        {
+            let mut persisted = center
+                .persisted
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            record_read_receipt(
+                &mut persisted,
+                &notification_id,
+                is_announcement,
+                origin_account_key.as_deref(),
+            );
+        }
+        persist_receipts_best_effort(&center);
+        if projection_changed {
+            emit_snapshot(&app, &center);
+        }
+        center.wake.notify_one();
+        match target {
+            NotificationTarget::AppRoute { route } => {
+                let queue = app
+                    .state::<crate::app_route::ManagedAppRouteQueue>()
+                    .inner()
+                    .clone();
+                crate::app_route::enqueue(&app, &queue, route);
+            }
+            NotificationTarget::ExternalUrl { url } => match validate_external_url(&url) {
+                Ok(url) => {
+                    if let Err(error) = crate::browser::open_external(&url) {
+                        ulog_warn!(
+                            "[NotificationCenter] external target open failed: {}",
+                            error
+                        );
+                    }
+                }
+                Err(error) => {
+                    ulog_warn!("[NotificationCenter] rejected external target: {}", error)
+                }
+            },
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point(created_at: &str, id: &str) -> NotificationSortPoint {
+        NotificationSortPoint {
+            created_at: created_at.to_string(),
+            id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn cutoff_comparison_matches_cloud_tuple_semantics() {
+        let cutoff = point("2026-08-16T01:00:00.000Z", "m");
+        assert!(is_at_or_before(
+            &point("2026-08-15T23:00:00.000Z", "z"),
+            &cutoff
+        ));
+        assert!(is_at_or_before(
+            &point("2026-08-16T01:00:00.000Z", "a"),
+            &cutoff
+        ));
+        assert!(!is_at_or_before(
+            &point("2026-08-16T01:00:00.000Z", "z"),
+            &cutoff
+        ));
+    }
+
+    #[test]
+    fn first_authenticated_sync_never_walks_historical_pages() {
+        assert!(!should_scan_next_page(Some("account"), None, false, false,));
+        assert!(should_scan_next_page(None, None, false, false));
+        assert!(!should_scan_next_page(None, None, true, false));
+    }
+
+    #[test]
+    fn subsequent_scan_stops_only_after_unread_and_toast_boundaries_are_known() {
+        let old = point("2026-08-16T01:00:00.000Z", "m");
+        assert!(should_scan_next_page(
+            Some("account"),
+            Some(&old),
+            true,
+            false,
+        ));
+        assert!(!should_scan_next_page(
+            Some("account"),
+            Some(&old),
+            true,
+            true,
+        ));
+        assert!(should_scan_next_page(None, Some(&old), false, true,));
+        assert!(!should_scan_next_page(None, Some(&old), true, true,));
+    }
+
+    #[test]
+    fn baseline_cutoff_never_moves_backward() {
+        let mut runtime = RuntimeState::default();
+        let newest = point("2026-08-16T02:00:00.000Z", "z");
+        let older = point("2026-08-16T01:00:00.000Z", "z");
+        advance_baseline_without_toasts(&mut runtime, "account", &newest);
+        advance_baseline_without_toasts(&mut runtime, "account", &older);
+        assert_eq!(runtime.baselines["account"].cutoff, newest);
+    }
+
+    #[test]
+    fn reminded_ids_are_process_scoped_across_identities() {
+        let mut runtime = RuntimeState::default();
+        let old = point("2026-08-16T01:00:00.000Z", "a");
+        let newest = point("2026-08-16T02:00:00.000Z", "z");
+        let item: NotificationItem = serde_json::from_value(json!({
+            "id": "announcement-1",
+            "kind": "announcement",
+            "createdAt": "2026-08-16T02:00:00.000Z",
+            "isRead": false,
+            "summaryZh": "公告",
+            "summaryOther": null,
+            "target": { "kind": "external_url", "url": "https://example.com" }
+        }))
+        .expect("announcement");
+
+        runtime.baselines.insert(
+            "anonymous".to_string(),
+            Baseline {
+                cutoff: old.clone(),
+            },
+        );
+        assert_eq!(
+            update_baseline_and_collect_toasts(
+                &mut runtime,
+                "anonymous",
+                &newest,
+                std::slice::from_ref(&item),
+            )
+            .len(),
+            1
+        );
+        runtime
+            .baselines
+            .insert("account".to_string(), Baseline { cutoff: old });
+        assert!(
+            update_baseline_and_collect_toasts(&mut runtime, "account", &newest, &[item],)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn second_refresh_toasts_items_after_the_first_sync_baseline() {
+        let mut runtime = RuntimeState::default();
+        let first = point("2026-08-16T01:00:00.000Z", "a");
+        let second = point("2026-08-16T02:00:00.000Z", "z");
+        let item: NotificationItem = serde_json::from_value(json!({
+            "id": "announcement-new",
+            "kind": "announcement",
+            "createdAt": "2026-08-16T02:00:00.000Z",
+            "isRead": false,
+            "summaryZh": "新公告",
+            "summaryOther": null,
+            "target": { "kind": "external_url", "url": "https://example.com" }
+        }))
+        .expect("announcement");
+
+        assert!(collect_refresh_toasts(&mut runtime, "account", &first, &[], false).is_empty());
+        assert_eq!(
+            collect_refresh_toasts(&mut runtime, "account", &second, &[item], true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn persisted_shape_never_contains_private_feed_content() {
+        let mut state = PersistedNotificationState::default();
+        state.announcements.ids.push("announcement-1".to_string());
+        state.accounts.insert(
+            "hashed-account".to_string(),
+            AccountPendingState {
+                pending_ids: vec!["private-notification-1".to_string()],
+                ..AccountPendingState::default()
+            },
+        );
+        let json = serde_json::to_string(&state).expect("serialize");
+        for forbidden in ["excerpt", "issueTitle", "actor", "target", "https://"] {
+            assert!(
+                !json.contains(forbidden),
+                "persisted private field: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_receipts_are_monotonic_and_bounded() {
+        let mut state = PersistedNotificationState::default();
+        for index in 0..(MAX_ANNOUNCEMENT_RECEIPTS + 5) {
+            record_announcement_read(&mut state, &format!("a-{index}"));
+        }
+        record_announcement_read(&mut state, "a-10");
+        assert_eq!(state.announcements.ids.len(), MAX_ANNOUNCEMENT_RECEIPTS);
+        assert_eq!(
+            state.announcements.revision,
+            (MAX_ANNOUNCEMENT_RECEIPTS + 5) as u64
+        );
+    }
+
+    #[test]
+    fn toast_receipt_stays_bound_to_its_origin_account() {
+        let mut state = PersistedNotificationState::default();
+        record_read_receipt(&mut state, "private-1", false, Some("account-a"));
+        record_read_receipt(&mut state, "announcement-1", true, Some("account-a"));
+
+        assert_eq!(
+            state.accounts["account-a"].pending_ids,
+            vec!["private-1", "announcement-1"]
+        );
+        assert!(!state.accounts.contains_key("account-b"));
+        assert_eq!(state.announcements.ids, vec!["announcement-1"]);
+    }
+
+    #[test]
+    fn anonymous_toast_receipt_never_creates_an_account_queue() {
+        let mut state = PersistedNotificationState::default();
+        record_read_receipt(&mut state, "announcement-1", true, None);
+
+        assert_eq!(state.announcements.ids, vec!["announcement-1"]);
+        assert!(state.accounts.is_empty());
+    }
+
+    #[test]
+    fn external_urls_allow_only_absolute_http_and_https() {
+        assert!(validate_external_url("https://myagents.io/notices/1").is_ok());
+        assert!(validate_external_url("http://localhost:3000/notice").is_ok());
+        for value in [
+            "/notice",
+            "myagents://open/v1/spaces/a/issues/b",
+            "file:///tmp/x",
+        ] {
+            assert!(validate_external_url(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn deserializes_the_cloud_camel_case_feed_contract() {
+        let page: FeedPage = serde_json::from_value(json!({
+            "items": [
+                {
+                    "id": "announcement_1",
+                    "kind": "announcement",
+                    "createdAt": "2026-08-16T01:00:00.000Z",
+                    "isRead": false,
+                    "summaryZh": "系统公告",
+                    "summaryOther": null,
+                    "target": { "kind": "external_url", "url": "http://example.com/a" }
+                },
+                {
+                    "id": "comment_1",
+                    "kind": "space_issue_comment",
+                    "createdAt": "2026-08-16T00:59:00.000Z",
+                    "isRead": true,
+                    "commentId": "comment-1",
+                    "actor": { "type": "user", "id": "user-1", "displayName": "Ethan" },
+                    "spaceId": "space-1",
+                    "issue": { "id": "issue-1", "number": 7, "title": "通知中心" },
+                    "excerpt": "看起来不错",
+                    "target": {
+                        "kind": "app_route",
+                        "route": {
+                            "version": 1,
+                            "name": "space.issue",
+                            "params": { "spaceId": "space-1", "issueId": "issue-1" }
+                        }
+                    }
+                }
+            ],
+            "nextCursor": null,
+            "feedCutoff": { "createdAt": "2026-08-16T01:01:00.000Z", "id": "z" },
+            "hasUnread": true
+        }))
+        .expect("feed contract");
+        assert_eq!(page.items.len(), 2);
+        assert!(matches!(
+            page.items[1].target(),
+            NotificationTarget::AppRoute { .. }
+        ));
+    }
+}

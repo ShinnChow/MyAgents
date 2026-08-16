@@ -338,6 +338,30 @@
     "planModeTitle": "MyAgents - 方案审核",
     "planModeBody": "AI 等待您审核方案"
   },
+  "notificationCenter": {
+    "title": "消息中心",
+    "bell": "通知",
+    "bellUnread": "通知，有未读消息",
+    "accountScope": "公告与团队动态",
+    "publicScope": "官方公告",
+    "markAllRead": "全部已读",
+    "loading": "正在加载通知",
+    "empty": "暂无消息",
+    "emptyHint": "新的公告和团队动态会显示在这里。",
+    "loadFailed": "暂时无法获取通知",
+    "loadFailedHint": "请检查网络连接后重试。",
+    "reauthHint": "重新登录团队 Space 后可继续同步协作通知。",
+    "retry": "重试",
+    "loadMore": "加载更多",
+    "commentHeadline": "{{actor}} 评论了 {{issue}}",
+    "attachmentOnly": "发送了附件",
+    "read": "已读通知",
+    "unread": "未读通知",
+    "openFailed": "无法打开网页，可以复制链接后重试。",
+    "routeFailed": "暂时无法打开对应的 Issue。",
+    "copyLink": "复制链接",
+    "routeInvalid": "这个应用内链接无法识别"
+  },
   "contextUsage": {
     "windowDefault": "未配置上限，按默认 {{window}} 估算",
     "windowRuntime": "窗口 {{window}} · runtime 实时",
@@ -350,6 +374,11 @@
     "usedLabel": "已用 context 窗口"
   },
   "space": {
+    "route": {
+      "spaceUnavailable": "你已无法访问这条通知对应的 Space，或该 Space 已不存在。",
+      "openFailed": "无法打开这条 Issue：{{message}}",
+      "back": "返回 Space"
+    },
     "errors": {
       "toolsUnavailable": "当前服务暂不可用，请稍后重试。",
       "operations": {

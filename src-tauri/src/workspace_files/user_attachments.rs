@@ -27,7 +27,7 @@ pub struct PreparedUserImageAttachment {
     pub mime_type: String,
     pub size_bytes: u64,
     /// Relative path under `~/.myagents/attachments/`, suitable for
-    /// `myagents://attachment/<relativePath>`.
+    /// `myagents-resource://attachment/<relativePath>`.
     pub relative_path: String,
 }
 

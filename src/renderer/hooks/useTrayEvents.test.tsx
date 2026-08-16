@@ -9,7 +9,6 @@ const tauriWindow = vi.hoisted(() => ({
 
 const notification = vi.hoisted(() => ({
   setWindowVisible: vi.fn(),
-  consumePendingNotificationClick: vi.fn(),
 }));
 
 vi.mock('@/utils/browserMock', () => ({ isTauriEnvironment: () => true }));
@@ -37,11 +36,9 @@ describe('useTrayEvents window focus authority', () => {
       return tauriWindow.unlisten;
     });
     notification.setWindowVisible.mockReset();
-    notification.consumePendingNotificationClick.mockReset();
   });
 
-  it('projects both native focus states synchronously even when a notification click is consumed', async () => {
-    notification.consumePendingNotificationClick.mockResolvedValue(true);
+  it('projects native focus and focused callbacks synchronously without guessing toast clicks', async () => {
     const onWindowFocusChanged = vi.fn();
     const onWindowFocused = vi.fn();
     renderHook(() => useTrayEvents({
@@ -57,27 +54,7 @@ describe('useTrayEvents window focus authority', () => {
 
     act(() => tauriWindow.focusListener?.({ payload: true }));
     expect(onWindowFocusChanged).toHaveBeenLastCalledWith(true);
-    expect(onWindowFocusChanged.mock.invocationCallOrder.at(-1)).toBeLessThan(
-      notification.consumePendingNotificationClick.mock.invocationCallOrder.at(-1)!,
-    );
-    await waitFor(() => expect(notification.consumePendingNotificationClick).toHaveBeenCalledTimes(1));
-    expect(onWindowFocused).not.toHaveBeenCalled();
-  });
-
-  it('preserves the existing focused callback when no notification click is consumed', async () => {
-    notification.consumePendingNotificationClick.mockResolvedValue(false);
-    const onWindowFocusChanged = vi.fn();
-    const onWindowFocused = vi.fn();
-    renderHook(() => useTrayEvents({
-      minimizeToTray: false,
-      onWindowFocusChanged,
-      onWindowFocused,
-    }));
-    await waitFor(() => expect(tauriWindow.focusListener).toBeDefined());
-
-    act(() => tauriWindow.focusListener?.({ payload: true }));
-
-    expect(onWindowFocusChanged).toHaveBeenCalledWith(true);
-    await waitFor(() => expect(onWindowFocused).toHaveBeenCalledTimes(1));
+    expect(notification.setWindowVisible).toHaveBeenLastCalledWith(true);
+    expect(onWindowFocused).toHaveBeenCalledTimes(1);
   });
 });

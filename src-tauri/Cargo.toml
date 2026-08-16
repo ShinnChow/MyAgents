@@ -27,6 +27,8 @@ serde_json = "1.0"
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+url = "2"
+percent-encoding = "2"
 log = "0.4"
 # `macos-private-api` is required for transparent webview windows on macOS —
 # the floating ball / companion panels (PRD 0.2.35) are transparent NSPanels.
@@ -44,6 +46,7 @@ tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
+tauri-plugin-deep-link = "2"
 tauri-plugin-global-shortcut = "2"
 reqwest = { version = "0.13.1", features = ["stream", "json", "blocking", "multipart", "socks", "form"] }
 futures-util = "0.3.31"
@@ -104,8 +107,12 @@ get-selected-text = "0.1"
 # AXIsProcessTrusted probe + one-shot system prompt for the permission flow.
 macos-accessibility-client = "0.0.1"
 objc2 = "0.6"
+block2 = "0.6"
 objc2-foundation = { version = "0.3.2", features = ["NSString"] }
 objc2-web-kit = { version = "0.3.2", features = ["WKWebView", "block2"] }
+# UserNotifications owns per-request identifiers and the response delegate so
+# stacked notification clicks stay correlated to the exact route.
+objc2-user-notifications = "0.3.2"
 # Main-window traffic-light layout owner. Keep the feature surface limited to
 # the NSWindow chrome/view types used by `macos_traffic_light.rs`.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWindow", "NSView", "NSResponder", "NSButton", "NSControl", "std"] }
@@ -151,6 +158,12 @@ junction = "1.0"
 # the callback ourselves while still sharing the version locked in the dep
 # graph (notify-rust pulls 0.7.x transitively).
 tauri-winrt-notification = "0.7"
+
+# Freedesktop notification actions expose the exact notification handle that
+# was clicked. Keep this Linux-only: macOS uses UserNotifications above and
+# Windows uses WinRT.
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = "4.14"
 
 [dev-dependencies]
 tauri = { version = "2.11.2", features = ["test"] }

@@ -1,14 +1,17 @@
-// Custom `myagents://` URI scheme for binary attachment delivery.
+// Custom `myagents-resource://` URI scheme for binary attachment delivery.
 //
 // Regular user attachments are served directly from the app data directory.
 // Tool attachments are proxied to the session sidecar because the sidecar owns
 // the external-attachment registry and path validation logic.
 //
 // URL forms:
-//   macOS / Linux: myagents://attachment/<sessionId>/<filename.ext>
-//   Windows:       http://myagents.localhost/attachment/<sessionId>/<filename.ext>
-//   macOS / Linux: myagents://tool-attachment/<sessionId>/<turnId>/<filename.ext>
-//   Windows:       http://myagents.localhost/tool-attachment/<sessionId>/<turnId>/<filename.ext>
+//   macOS / Linux: myagents-resource://attachment/<sessionId>/<filename.ext>
+//   Windows:       http://myagents-resource.localhost/attachment/<sessionId>/<filename.ext>
+//   macOS / Linux: myagents-resource://tool-attachment/<sessionId>/<turnId>/<filename.ext>
+//   Windows:       http://myagents-resource.localhost/tool-attachment/<sessionId>/<turnId>/<filename.ext>
+//
+// The old `myagents://attachment` and `myagents://tool-attachment` forms are
+// accepted only by the separately registered WebView compatibility handler.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -275,19 +278,20 @@ mod tests {
 
     #[test]
     fn extract_macos_form() {
-        let r = extract_relative_path("myagents://attachment/abc/file.png").unwrap();
+        let r = extract_relative_path("myagents-resource://attachment/abc/file.png").unwrap();
         assert_eq!(r, "abc/file.png");
     }
 
     #[test]
     fn extract_windows_form() {
-        let r = extract_relative_path("http://myagents.localhost/attachment/abc/file.png").unwrap();
+        let r = extract_relative_path("http://myagents-resource.localhost/attachment/abc/file.png")
+            .unwrap();
         assert_eq!(r, "abc/file.png");
     }
 
     #[test]
     fn strips_query_string() {
-        let r = extract_relative_path("myagents://attachment/abc/file.png?v=1").unwrap();
+        let r = extract_relative_path("myagents-resource://attachment/abc/file.png?v=1").unwrap();
         assert_eq!(r, "abc/file.png");
     }
 
@@ -298,18 +302,21 @@ mod tests {
 
     #[test]
     fn rejects_non_attachment_uri() {
-        assert!(extract_relative_path("myagents://other/foo").is_none());
+        assert!(extract_relative_path("myagents-resource://other/foo").is_none());
     }
 
     #[test]
     fn regular_attachment_rejects_tool_attachment_uri() {
-        assert!(extract_relative_path("myagents://tool-attachment/s/t/file.png").is_none());
+        assert!(
+            extract_relative_path("myagents-resource://tool-attachment/s/t/file.png").is_none()
+        );
     }
 
     #[test]
     fn extracts_tool_macos_form() {
         let r =
-            extract_tool_attachment_segments("myagents://tool-attachment/s/t/file.png").unwrap();
+            extract_tool_attachment_segments("myagents-resource://tool-attachment/s/t/file.png")
+                .unwrap();
         assert_eq!(
             r,
             ("s".to_string(), "t".to_string(), "file.png".to_string())
@@ -319,7 +326,7 @@ mod tests {
     #[test]
     fn extracts_tool_windows_form() {
         let r = extract_tool_attachment_segments(
-            "http://myagents.localhost/tool-attachment/s/t/file.png",
+            "http://myagents-resource.localhost/tool-attachment/s/t/file.png",
         )
         .unwrap();
         assert_eq!(
@@ -330,13 +337,29 @@ mod tests {
 
     #[test]
     fn tool_attachment_rejects_unsafe_segment() {
-        assert!(
-            extract_tool_attachment_segments("myagents://tool-attachment/s/%2e%2e/file.png",)
-                .is_none()
+        assert!(extract_tool_attachment_segments(
+            "myagents-resource://tool-attachment/s/%2e%2e/file.png",
+        )
+        .is_none());
+        assert!(extract_tool_attachment_segments(
+            "myagents-resource://tool-attachment/s/t/bad%5Cname.png",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn legacy_resource_forms_remain_webview_compatible() {
+        assert_eq!(
+            extract_relative_path("myagents://attachment/abc/file.png").as_deref(),
+            Some("abc/file.png")
         );
-        assert!(
-            extract_tool_attachment_segments("myagents://tool-attachment/s/t/bad%5Cname.png",)
-                .is_none()
+        assert_eq!(
+            extract_tool_attachment_segments("myagents://tool-attachment/s/t/file.png"),
+            Some(("s".into(), "t".into(), "file.png".into()))
+        );
+        assert_eq!(
+            extract_relative_path("http://myagents.localhost/attachment/abc/file.png").as_deref(),
+            Some("abc/file.png")
         );
     }
 

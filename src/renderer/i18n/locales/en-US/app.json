@@ -338,6 +338,30 @@
     "planModeTitle": "MyAgents - Plan review",
     "planModeBody": "AI is waiting for you to review the plan"
   },
+  "notificationCenter": {
+    "title": "Notification Center",
+    "bell": "Notifications",
+    "bellUnread": "Notifications, unread items",
+    "accountScope": "Announcements and team activity",
+    "publicScope": "Official announcements",
+    "markAllRead": "Mark all read",
+    "loading": "Loading notifications",
+    "empty": "No notifications yet",
+    "emptyHint": "New announcements and team activity will appear here.",
+    "loadFailed": "Notifications are temporarily unavailable",
+    "loadFailedHint": "Check your connection and try again.",
+    "reauthHint": "Sign in to Team Space again to resume collaboration notifications.",
+    "retry": "Retry",
+    "loadMore": "Load more",
+    "commentHeadline": "{{actor}} commented on {{issue}}",
+    "attachmentOnly": "Sent an attachment",
+    "read": "Read notification",
+    "unread": "Unread notification",
+    "openFailed": "The page could not be opened. Copy the link and try again.",
+    "routeFailed": "The corresponding Issue could not be opened.",
+    "copyLink": "Copy link",
+    "routeInvalid": "This in-app link is not supported"
+  },
   "contextUsage": {
     "windowDefault": "No limit configured. Estimated with default {{window}}",
     "windowRuntime": "Window {{window}} · runtime live value",
@@ -350,6 +374,11 @@
     "usedLabel": "Used context window"
   },
   "space": {
+    "route": {
+      "spaceUnavailable": "You no longer have access to the Space for this notification, or it no longer exists.",
+      "openFailed": "Could not open this Issue: {{message}}",
+      "back": "Back to Space"
+    },
     "errors": {
       "toolsUnavailable": "This service is currently unavailable. Try again later.",
       "operations": {

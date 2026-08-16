@@ -157,8 +157,8 @@ vi.mock("@/pages/space/issues/CreateIssueDialog", () => ({
 }));
 
 vi.mock("@/pages/space/issues/IssueDetailDrawer", () => ({
-  IssueDetailDrawer: ({ onClose }: { onClose: () => void }) => (
-    <div role="dialog" aria-label="issue detail">
+  IssueDetailDrawer: ({ issueId, onClose }: { issueId: string; onClose: () => void }) => (
+    <div role="dialog" aria-label="issue detail" data-issue-id={issueId}>
       <button type="button" onClick={onClose}>
         close issue detail
       </button>
@@ -257,11 +257,119 @@ describe("Space switching", () => {
     harness.actions.refreshLocalAgents.mockClear();
     harness.actions.refreshRegisteredAgents.mockClear();
     harness.actions.syncEvents.mockClear();
+    Object.values(harness.toast).forEach((mock) => mock.mockClear());
     harness.data = snapshot("ma");
   });
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("opens the exact issue from an application route and consumes it once", async () => {
+    const onRouteConsumed = vi.fn();
+    render(
+      <Space
+        isActive
+        pendingRoute={{
+          generation: 11,
+          route: { version: 1, name: "space.issue", params: { spaceId: "id-ma", issueId: "issue-11" } },
+        }}
+        onRouteConsumed={onRouteConsumed}
+      />,
+    );
+
+    await act(async () => undefined);
+    expect(screen.getByRole("dialog", { name: "issue detail" }))
+      .toHaveAttribute("data-issue-id", "issue-11");
+    expect(onRouteConsumed).toHaveBeenCalledOnce();
+    expect(onRouteConsumed).toHaveBeenCalledWith(11);
+    expect(harness.actions.switchSpace).not.toHaveBeenCalled();
+  });
+
+  it("switches to the routed Space before opening its exact issue", async () => {
+    const target = sessionFor("space-team", "team");
+    const current = (harness.data.session as SpaceSession);
+    current.spaces = [{
+      ...target.space,
+      membership: target.membership,
+    }];
+    const onRouteConsumed = vi.fn();
+    render(
+      <Space
+        isActive
+        pendingRoute={{
+          generation: 12,
+          route: { version: 1, name: "space.issue", params: { spaceId: "space-team", issueId: "issue-12" } },
+        }}
+        onRouteConsumed={onRouteConsumed}
+      />,
+    );
+
+    await act(async () => undefined);
+    expect(harness.actions.switchSpace).toHaveBeenCalledWith(
+      "space-team",
+      expect.objectContaining({ id: "space-team" }),
+    );
+    expect(screen.getByRole("dialog", { name: "issue detail" }))
+      .toHaveAttribute("data-issue-id", "issue-12");
+    expect(onRouteConsumed).toHaveBeenCalledWith(12);
+  });
+
+  it("does not open a stale issue when the routed Space is authoritatively unavailable", async () => {
+    harness.actions.switchSpace.mockRejectedValueOnce({
+      code: "SPACE_NOT_FOUND",
+      message: "Space is unavailable",
+      retryable: false,
+    });
+    const onRouteConsumed = vi.fn();
+    render(
+      <Space
+        isActive
+        pendingRoute={{
+          generation: 13,
+          route: { version: 1, name: "space.issue", params: { spaceId: "missing", issueId: "issue-stale" } },
+        }}
+        onRouteConsumed={onRouteConsumed}
+      />,
+    );
+
+    await act(async () => undefined);
+    expect(screen.queryByRole("dialog", { name: "issue detail" })).not.toBeInTheDocument();
+    expect(screen.getByText(/已无法访问.*Space/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "返回 Space" })).toBeInTheDocument();
+    expect(harness.toast.error).toHaveBeenCalled();
+    expect(onRouteConsumed).toHaveBeenCalledWith(13);
+  });
+
+  it("retains the route when switching Space fails transiently", async () => {
+    harness.actions.switchSpace.mockRejectedValueOnce({
+      code: "SPACE_TRANSPORT_FAILED",
+      message: "Network unavailable",
+      retryable: true,
+    });
+    const onRouteConsumed = vi.fn();
+    render(
+      <Space
+        isActive
+        pendingRoute={{
+          generation: 14,
+          route: { version: 1, name: "space.issue", params: { spaceId: "offline", issueId: "issue-retry" } },
+        }}
+        onRouteConsumed={onRouteConsumed}
+      />,
+    );
+
+    await act(async () => undefined);
+    expect(harness.toast.error).toHaveBeenCalled();
+    expect(onRouteConsumed).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "issue detail" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await act(async () => undefined);
+    expect(harness.actions.switchSpace).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("dialog", { name: "issue detail" }))
+      .toHaveAttribute("data-issue-id", "issue-retry");
+    expect(onRouteConsumed).toHaveBeenCalledWith(14);
   });
 
   it("reloads Issues and resets the status when the active data scope changes", async () => {

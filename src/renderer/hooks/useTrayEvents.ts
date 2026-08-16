@@ -5,10 +5,7 @@ import { useEffect, useCallback, useRef } from 'react';
 import { emit } from '@tauri-apps/api/event';
 import { isTauriEnvironment } from '@/utils/browserMock';
 import { dismissTopmost } from '@/utils/closeLayer';
-import {
-  setWindowVisible,
-  consumePendingNotificationClick,
-} from '@/services/notificationService';
+import { setWindowVisible } from '@/services/notificationService';
 import { listenWithCleanup } from '@/utils/tauriListen';
 
 interface TrayEventsOptions {
@@ -84,12 +81,8 @@ export function useTrayEvents(options: TrayEventsOptions) {
         const window = getCurrentWindow();
 
         // window.onFocusChanged keeps the visibility tracker in sync (used by
-        // `shouldNotify()`). It also fires on macOS / Linux when the user
-        // clicks a banner that auto-activates the app — we ask Rust to flush
-        // any pending toast-click deep-link, since on those platforms the
-        // OS doesn't give us an in-process Activated callback. Windows
-        // doesn't need this hop: `Toast::on_activated` already emitted
-        // `notification:click` directly.
+        // `shouldNotify()`). Toast clicks are intentionally absent here: each
+        // OS path reports its exact notification activation directly.
         //
         // window.onFocusChanged is a Tauri window API (not Tauri event API),
         // so it isn't covered by `listenWithCleanup`. The hook still benefits
@@ -101,13 +94,7 @@ export function useTrayEvents(options: TrayEventsOptions) {
           console.debug('[useTrayEvents] Window focus changed:', focused);
           if (focused) {
             setWindowVisible(true);
-            void (async () => {
-              const consumedNotificationClick = await consumePendingNotificationClick();
-              if (ac.signal.aborted) return;
-              if (!consumedNotificationClick) {
-                optionsRef.current.onWindowFocused?.();
-              }
-            })();
+            optionsRef.current.onWindowFocused?.();
           } else {
             setWindowVisible(false);
           }

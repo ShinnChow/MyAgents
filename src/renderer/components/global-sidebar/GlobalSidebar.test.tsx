@@ -28,6 +28,20 @@ const mocks = vi.hoisted(() => ({
   isTauri: false,
   openExternal: vi.fn(async () => undefined),
   deleteSession: vi.fn(),
+  notificationSnapshot: {
+    loadState: 'ready',
+    authState: 'signed_out',
+    items: [] as Array<Record<string, unknown>>,
+    hasUnread: false,
+    hasMore: false,
+    isLoadingMore: false,
+    feedCutoff: null,
+    lastSyncedAt: null,
+    errorCode: null,
+  },
+  notificationRefresh: vi.fn(),
+  notificationLoadMore: vi.fn(async () => undefined),
+  notificationMarkAllRead: vi.fn(async () => undefined),
   toast: {
     error: vi.fn(),
     success: vi.fn(),
@@ -98,6 +112,15 @@ vi.mock('@/components/HistorySearchOverlayContent', () => ({
 
 vi.mock('@/components/FeedbackPopover', () => ({ default: () => null }));
 
+vi.mock('@/notifications/useNotificationCenter', () => ({
+  useNotificationCenter: () => ({
+    snapshot: mocks.notificationSnapshot,
+    refresh: mocks.notificationRefresh,
+    loadMore: mocks.notificationLoadMore,
+    markAllRead: mocks.notificationMarkAllRead,
+  }),
+}));
+
 vi.mock('@/components/Toast', () => ({
   useToast: () => mocks.toast,
 }));
@@ -161,6 +184,8 @@ describe('GlobalSidebar rail flyout', () => {
     mocks.configError = null;
     mocks.forcedRail = true;
     mocks.isTauri = false;
+    mocks.notificationSnapshot.hasUnread = false;
+    mocks.notificationSnapshot.items = [];
     mocks.touchProject.mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -185,6 +210,50 @@ describe('GlobalSidebar rail flyout', () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  it('keeps the notification bell visible, distinguishes unread, and opens one fixed panel', () => {
+    mocks.notificationSnapshot.hasUnread = true;
+    renderSidebar();
+
+    const bell = screen.getByRole('button', {
+      name: String(i18n.t('app:notificationCenter.bellUnread')),
+    });
+    expect(bell.querySelector('.bg-\\[var\\(--accent-warm\\)\\]')).toBeInTheDocument();
+    fireEvent.click(bell);
+
+    expect(mocks.notificationRefresh).toHaveBeenCalledOnce();
+    expect(screen.getByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).toBeInTheDocument();
+    expect(document.querySelectorAll('[data-notification-center-shell]')).toHaveLength(1);
+  });
+
+  it('keeps App Shell flyouts mutually exclusive in both directions', () => {
+    renderSidebar();
+    const bell = screen.getByRole('button', {
+      name: String(i18n.t('app:notificationCenter.bell')),
+    });
+    fireEvent.click(bell);
+    expect(screen.getByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', {
+      name: String(i18n.t('app:globalSidebar.helper')),
+    }));
+    expect(screen.queryByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).not.toBeInTheDocument();
+
+    fireEvent.click(bell);
+    const workspaceTrigger = screen.getByRole('button', { name: 'Agent 工作区' });
+    fireEvent.pointerEnter(workspaceTrigger);
+    act(() => vi.advanceTimersByTime(125));
+    expect(screen.queryByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Agent 工作区' })).toBeInTheDocument();
   });
 
   it('opens idempotently on click even after the hover delay has elapsed', () => {

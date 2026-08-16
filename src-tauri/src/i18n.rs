@@ -160,6 +160,8 @@ pub fn t<'a>(key: &'a str, locale: SupportedLocale) -> &'a str {
         (SupportedLocale::ZhCn, "notification.sessionStoppedBody") => "请您查看当前结果",
         (SupportedLocale::ZhCn, "notification.sessionErrorTitle") => "MyAgents - 任务失败",
         (SupportedLocale::ZhCn, "notification.sessionErrorBody") => "请您查看错误详情",
+        (SupportedLocale::ZhCn, "notification.centerAnnouncementTitle") => "MyAgents 公告",
+        (SupportedLocale::ZhCn, "notification.centerCommentTitle") => "Issue 有新评论",
         (SupportedLocale::EnUs, "tray.open") => "Open MyAgents",
         (SupportedLocale::EnUs, "tray.settings") => "Settings",
         (SupportedLocale::EnUs, "tray.forceWakeLock") => "Prevent computer sleep",
@@ -174,6 +176,8 @@ pub fn t<'a>(key: &'a str, locale: SupportedLocale) -> &'a str {
         (SupportedLocale::EnUs, "notification.sessionErrorBody") => {
             "Please review the error details"
         }
+        (SupportedLocale::EnUs, "notification.centerAnnouncementTitle") => "MyAgents announcement",
+        (SupportedLocale::EnUs, "notification.centerCommentTitle") => "New Issue comment",
         _ => key,
     }
 }

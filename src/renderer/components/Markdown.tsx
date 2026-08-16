@@ -30,6 +30,7 @@ import {
   MARKDOWN_REMARK_PLUGINS_WITH_BREAKS,
   convertFrontmatter,
 } from '@/utils/markdownPipeline';
+import { canonicalizeLegacyMyAgentsResourceUrl } from '@/utils/myagentsProtocol';
 
 // ── Streaming leading-edge fade ──
 // While streaming, wrap the LAST few characters of the last text node in a
@@ -462,7 +463,13 @@ function MarkdownImageInner({ src, alt, basePath, workspacePath }: {
 
   // Absolute URL: render directly (no state needed, always fresh from props)
   if (srcType === 'absolute') {
-    return <img src={src} alt={alt ?? ''} className="max-w-full" />;
+    return (
+      <img
+        src={canonicalizeLegacyMyAgentsResourceUrl(src!)}
+        alt={alt ?? ''}
+        className="max-w-full"
+      />
+    );
   }
 
   // Relative path: loading / error / loaded

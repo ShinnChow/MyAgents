@@ -127,6 +127,11 @@ import {
   nowForSpaceMetric,
   trackSpaceToolMutation,
 } from '@/pages/space/spaceMetrics';
+import {
+  serializeAppRoute,
+  type AppRoute,
+  type PendingAppRoute,
+} from '../shared/appRoute';
 
 // ============================================================
 // User Support Prompt Builder
@@ -288,6 +293,8 @@ interface TabContentProps {
   // Only read by the `taskcenter` tab; other tab views ignore it.
   taskCenterPendingIntent: { autofocusSearch?: boolean; nonce: number } | null;
   taskCenterCurrentSessionId?: string | null;
+  spacePendingRoute?: PendingAppRoute | null;
+  onSpaceRouteConsumed?: (generation: number) => void;
 }
 
 // Exported for focused content-mount behavior tests.
@@ -316,6 +323,8 @@ export const MemoizedTabContent = memo(function TabContent({
   sessionNotificationBadgeCounts,
   taskCenterPendingIntent,
   taskCenterCurrentSessionId,
+  spacePendingRoute,
+  onSpaceRouteConsumed,
 }: TabContentProps) {
   const kind = tabContentKind(tab, isDeferredMount);
   const handleLauncherWorkspaceChange = useCallback(
@@ -378,7 +387,11 @@ export const MemoizedTabContent = memo(function TabContent({
         </Suspense>
       ) : kind === 'space' ? (
         <Suspense fallback={PAGE_FALLBACK}>
-          <Space isActive={isActive} />
+          <Space
+            isActive={isActive}
+            pendingRoute={spacePendingRoute ?? null}
+            onRouteConsumed={onSpaceRouteConsumed}
+          />
         </Suspense>
       ) : (
         <TabProvider
@@ -453,7 +466,8 @@ export const MemoizedTabContent = memo(function TabContent({
     // returns true and the new `pendingIntent` prop never reaches the
     // TaskCenter tab. (v0.1.69 cross-review C1)
     prev.taskCenterPendingIntent === next.taskCenterPendingIntent &&
-    prev.taskCenterCurrentSessionId === next.taskCenterCurrentSessionId
+    prev.taskCenterCurrentSessionId === next.taskCenterCurrentSessionId &&
+    prev.spacePendingRoute === next.spacePendingRoute
   );
 });
 
@@ -518,6 +532,9 @@ export default function App() {
   const [tabs, setTabs] = useState<Tab[]>(() => [createNewTab()]);
   const [activeTabId, setActiveTabIdState] = useState<string | null>(() => tabs[0]?.id ?? null);
   const [externalNotificationBadges, setExternalNotificationBadges] = useState<NotificationBadgeItem[]>([]);
+  const [spacePendingRoute, setSpacePendingRoute] = useState<PendingAppRoute | null>(null);
+  const appRouteGenerationRef = useRef(0);
+  const spaceRouteTabIdRef = useRef<string | null>(null);
 
   // "恢复对话" pill (Issue #309). `restorePillCount > 0` shows it; the resolved
   // candidate is held in a ref (NOT localStorage — the persist effect clears
@@ -589,9 +606,17 @@ export default function App() {
   }, [revealDeferredActiveTabAfterPaint, syncRendererCorrelationForTab]);
 
   useEffect(() => {
-    if (configLoading || spaceBuildCapability.isLoading || teamSpaceAvailable) return;
-
+    if (configLoading || spaceBuildCapability.isLoading) return;
     const currentTabs = tabsRef.current;
+    const routeTabId = spaceRouteTabIdRef.current;
+    if (routeTabId && !currentTabs.some((tab) => tab.id === routeTabId && tab.view === 'space')) {
+      spaceRouteTabIdRef.current = null;
+    }
+    if (
+      spaceBuildCapability.available
+      && (teamSpaceAvailable || currentTabs.some((tab) => tab.id === routeTabId && tab.view === 'space'))
+    ) return;
+
     if (!currentTabs.some((tab) => tab.view === 'space')) return;
 
     const remainingTabs = currentTabs.filter((tab) => tab.view !== 'space');
@@ -603,7 +628,7 @@ export default function App() {
 
     setTabs(nextTabs);
     setActiveTabId(nextActiveId, nextTabs);
-  }, [configLoading, spaceBuildCapability.isLoading, teamSpaceAvailable, setActiveTabId]);
+  }, [configLoading, spaceBuildCapability.available, spaceBuildCapability.isLoading, teamSpaceAvailable, setActiveTabId]);
 
   // Persist open chat tabs after every structural change (Issue #232). This is
   // a POST-COMMIT effect — it flushes shortly after each tabs/activeTabId change
@@ -2779,6 +2804,108 @@ export default function App() {
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_TASK_CENTER, handler);
   }, [handleOpenTaskCenter]);
 
+  const lastNativeAppRouteGenerationRef = useRef(0);
+  const openedSpaceRouteGenerationRef = useRef(0);
+  const handleOpenAppRoute = useCallback((route: AppRoute, nativeGeneration?: number): boolean => {
+    try {
+      serializeAppRoute(route);
+    } catch {
+      toastRef.current.error(t('notificationCenter.routeInvalid'));
+      return false;
+    }
+    if (
+      nativeGeneration !== undefined
+      && nativeGeneration <= lastNativeAppRouteGenerationRef.current
+    ) {
+      return true;
+    }
+    if (!spaceBuildCapability.isLoading && !spaceBuildCapability.available) {
+      toastRef.current.info(spaceBuildCapability.reason ?? t('titlebar.teamBuildUnavailable'));
+      return false;
+    }
+    const existing = tabsRef.current.find((tab) => tab.view === 'space');
+    if (!existing && tabsRef.current.length >= MAX_TABS) {
+      toastRef.current.error(t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }));
+      return false;
+    }
+    if (nativeGeneration !== undefined) {
+      lastNativeAppRouteGenerationRef.current = nativeGeneration;
+    }
+    appRouteGenerationRef.current += 1;
+    setSpacePendingRoute({
+      generation: appRouteGenerationRef.current,
+      route,
+    });
+    return true;
+  }, [spaceBuildCapability.available, spaceBuildCapability.isLoading, spaceBuildCapability.reason, t]);
+
+  useEffect(() => {
+    if (!spacePendingRoute || spaceBuildCapability.isLoading) return;
+    if (!spaceBuildCapability.available) {
+      if (openedSpaceRouteGenerationRef.current < spacePendingRoute.generation) {
+        openedSpaceRouteGenerationRef.current = spacePendingRoute.generation;
+        toastRef.current.info(spaceBuildCapability.reason ?? t('titlebar.teamBuildUnavailable'));
+      }
+      setSpacePendingRoute((current) => (
+        current?.generation === spacePendingRoute.generation ? null : current
+      ));
+      return;
+    }
+    if (openedSpaceRouteGenerationRef.current >= spacePendingRoute.generation) return;
+    openedSpaceRouteGenerationRef.current = spacePendingRoute.generation;
+    const currentTabs = tabsRef.current;
+    const existing = currentTabs.find((tab) => tab.view === 'space');
+    if (existing) {
+      spaceRouteTabIdRef.current = existing.id;
+      setActiveTabId(existing.id);
+      return;
+    }
+    if (currentTabs.length >= MAX_TABS) {
+      toastRef.current.error(t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }));
+      setSpacePendingRoute((current) => (
+        current?.generation === spacePendingRoute.generation ? null : current
+      ));
+      return;
+    }
+    const routeTabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    spaceRouteTabIdRef.current = routeTabId;
+    openNewTabDeferred({
+      id: routeTabId,
+      agentDir: null,
+      sessionId: null,
+      view: 'space',
+      title: t('tabs.team'),
+      sidecarConfigDisposition: 'push',
+    });
+  }, [openNewTabDeferred, setActiveTabId, spaceBuildCapability.available, spaceBuildCapability.isLoading, spaceBuildCapability.reason, spacePendingRoute, t]);
+
+  const handleSpaceRouteConsumed = useCallback((generation: number) => {
+    setSpacePendingRoute((current) => (
+      current?.generation === generation ? null : current
+    ));
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    const ac = new AbortController();
+    const drain = async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const pending = await invoke<PendingAppRoute | null>('cmd_take_pending_app_route');
+        if (pending && !ac.signal.aborted) {
+          handleOpenAppRoute(pending.route, pending.generation);
+        }
+      } catch (error) {
+        console.warn('[AppRoute] Failed to consume native route:', error);
+      }
+    };
+    void drain();
+    void listenWithCleanup<number>('app-route:available', () => {
+      void drain();
+    }, ac.signal);
+    return () => ac.abort();
+  }, [handleOpenAppRoute]);
+
   const handleOpenSpace = useCallback(() => {
     if (spaceBuildCapability.isLoading) {
       toastRef.current.info(t('titlebar.teamLoading'));
@@ -3393,11 +3520,9 @@ export default function App() {
     },
   });
 
-  // Listen for notification clicks. Rust emits this from two paths:
-  // - Windows: directly from the WinRT toast `Activated` callback
-  // - macOS / Linux: when the front-end calls `cmd_consume_notification_click`
-  //   on focus-regain (handled inside `useTrayEvents`)
-  // Both converge here so routing has one entry point. Chat completion toasts
+  // Listen for notification clicks. Rust emits this from exact native
+  // per-toast callbacks on Windows, macOS, and Linux. All converge here so
+  // routing has one entry point. Chat completion toasts
   // usually carry a tabId and can jump directly; cron/background toasts carry
   // sessionId + workspacePath so they can open a session even when no Tab exists.
   useEffect(() => {
@@ -3459,6 +3584,7 @@ export default function App() {
         onNewTab={handleSidebarNewChat}
         onOpenTaskCenter={handleOpenTaskCenter}
         onOpenSpace={handleOpenSpace}
+        onOpenAppRoute={handleOpenAppRoute}
         onOpenCapabilities={handleOpenCapabilities}
         onOpenSettings={handleOpenGeneralSettings}
         onOpenBugReport={handleOpenBugReport}
@@ -3530,6 +3656,8 @@ export default function App() {
             sessionNotificationBadgeCounts={tab.id === activeTabId ? sessionNotificationBadgeCounts : undefined}
             taskCenterPendingIntent={taskCenterPendingIntent}
             taskCenterCurrentSessionId={taskCenterCurrentSessionId}
+            spacePendingRoute={tab.view === 'space' ? spacePendingRoute : null}
+            onSpaceRouteConsumed={handleSpaceRouteConsumed}
           />
         ))}
       </div>

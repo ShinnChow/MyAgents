@@ -10,6 +10,7 @@ use reqwest::header::{ACCEPT_LANGUAGE, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tauri::Manager;
 
 use crate::device_identity::{current_device_identity, DeviceIdentity};
 use crate::workspace_files::path_safety::open_regular_file_no_follow;
@@ -18,6 +19,7 @@ use crate::{ulog_info, ulog_warn};
 pub(crate) mod attachments;
 pub(crate) mod cli;
 pub(crate) mod delivery;
+pub(crate) mod notifications;
 pub(crate) mod registered_agents;
 pub(crate) mod skills;
 pub(crate) mod tools;
@@ -687,7 +689,10 @@ pub async fn cmd_space_auth_start() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn cmd_space_auth_poll(input: SpaceAuthPollInput) -> Result<Value, String> {
+pub async fn cmd_space_auth_poll(
+    app: tauri::AppHandle,
+    input: SpaceAuthPollInput,
+) -> Result<Value, String> {
     let capability = ensure_space_available()?;
     let base_url = capability_base_url(&capability)?;
     let client = http_client()?;
@@ -741,6 +746,11 @@ pub async fn cmd_space_auth_poll(input: SpaceAuthPollInput) -> Result<Value, Str
                 AuthenticatedSpaceSession::from_account(session, session_path)?,
                 identity,
             );
+            notifications::auth_boundary_changed(
+                &app,
+                app.state::<notifications::ManagedNotificationCenter>()
+                    .inner(),
+            );
         }
         if let Some(map) = data.as_object_mut() {
             map.remove("sessionToken");
@@ -767,9 +777,14 @@ pub async fn cmd_space_auth_ack(input: SpaceAuthPollInput) -> Result<(), String>
 }
 
 #[tauri::command]
-pub async fn cmd_space_logout() -> Result<(), String> {
+pub async fn cmd_space_logout(app: tauri::AppHandle) -> Result<(), String> {
     if crate::space_cloud_mock::is_enabled() {
         crate::space_cloud_mock::reset();
+        notifications::auth_boundary_changed(
+            &app,
+            app.state::<notifications::ManagedNotificationCenter>()
+                .inner(),
+        );
         return Ok(());
     }
     let capability = space_build_capability();
@@ -778,6 +793,11 @@ pub async fn cmd_space_logout() -> Result<(), String> {
         tauri::async_runtime::spawn_blocking(move || take_session_for_logout(&path))
             .await
             .map_err(|error| format!("remove Space session task failed: {error:?}"))??;
+    notifications::auth_boundary_changed(
+        &app,
+        app.state::<notifications::ManagedNotificationCenter>()
+            .inner(),
+    );
     let session_to_revoke = capability
         .available
         .then(|| capability_base_url(&capability).ok())
@@ -1579,6 +1599,7 @@ async fn parse_authorized_cloud_data(
                     "[space] user session moved to reauth_required: sessionBindingId={}",
                     session.session_binding_id()
                 );
+                notifications::user_session_invalidated();
             }
             Ok(false) => {
                 ulog_info!(
