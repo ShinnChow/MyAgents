@@ -853,7 +853,11 @@ function parseSdkFilePatchResult(tool: FilePatchToolLike): SdkFilePatchResult | 
     && (result.userModified === undefined || typeof result.userModified === 'boolean')
     && (type !== 'create' || result.originalFile === null)
     && (type !== 'update' || typeof result.originalFile === 'string');
-  if (!isCompleteEdit && !isCompleteWrite) return null;
+  // MultiEdit shares Edit's structuredPatch result shape but carries multiple
+  // edits (no single oldString/newString). Accept it so the authoritative
+  // applied diff renders instead of falling back to the input-side preview.
+  const isCompleteMultiEdit = tool.name === 'MultiEdit' && typeof result.filePath === 'string';
+  if (!isCompleteEdit && !isCompleteWrite && !isCompleteMultiEdit) return null;
 
   const gitDiff = isRecord(result.gitDiff) ? result.gitDiff : null;
   return {
@@ -1314,6 +1318,77 @@ function renderModelFromBuiltinInput(tool: FilePatchToolLike, input: ToolInputRe
       ...(hasHiddenContent ? { hasHiddenContent: true } : {}),
       summary: summaryFromRenderChanges([change]),
       changes: [change],
+    };
+  }
+
+  if (tool.name === 'MultiEdit') {
+    const filePath = getInputStringProp(input, 'file_path');
+    const edits = input.edits;
+    if (!Array.isArray(edits) || edits.length === 0) return null;
+    const changes: FilePatchRenderChange[] = [];
+    // Mirror the Codex multi-file projection budget: cap the number of
+    // materialized edits and the cumulative rows/characters, so a large edits
+    // array cannot grow the render model (and its React subtree) without bound.
+    let hasHiddenContent = edits.length > FILE_PATCH_MAX_FILE_BUDGET;
+    let remainingRows = FILE_PATCH_MAX_ROW_BUDGET;
+    let remainingCharacters = FILE_PATCH_MAX_CHARACTER_BUDGET;
+    let totalAdded = 0;
+    let totalRemoved = 0;
+    const projectedEditCount = Math.min(edits.length, FILE_PATCH_MAX_FILE_BUDGET);
+    for (let index = 0; index < projectedEditCount; index += 1) {
+      const rawEdit = edits[index];
+      if (!isRecord(rawEdit)) return null;
+      const oldText = getInputStringProp(rawEdit, 'old_string');
+      const newText = getInputStringProp(rawEdit, 'new_string');
+      if (oldText === undefined || newText === undefined) return null;
+      const combinedLength = oldText.length + newText.length;
+      if (combinedLength > remainingCharacters || remainingRows <= 0) {
+        hasHiddenContent = true;
+        remainingRows = 0;
+        remainingCharacters = 0;
+        continue;
+      }
+      const oldProjection = projectContentRows({
+        content: oldText,
+        scope: 'old',
+        kind: 'remove',
+        marker: '-',
+        rowBudget: remainingRows,
+      });
+      const newProjection = projectContentRows({
+        content: newText,
+        scope: 'new',
+        kind: 'add',
+        marker: '+',
+        rowBudget: Math.max(0, remainingRows - oldProjection.rows.length),
+        characterBudget: Math.max(0, remainingCharacters - oldProjection.projectedCharacters),
+      });
+      const editHidden = oldProjection.hasHiddenRows
+        || newProjection.hasHiddenRows
+        || combinedLength > FILE_PATCH_MAX_CHARACTER_BUDGET;
+      if (editHidden) hasHiddenContent = true;
+      totalAdded += newProjection.lineCount;
+      totalRemoved += oldProjection.lineCount;
+      remainingRows = Math.max(0, remainingRows - oldProjection.rows.length - newProjection.rows.length);
+      remainingCharacters = Math.max(0, remainingCharacters - oldProjection.projectedCharacters - newProjection.projectedCharacters);
+      changes.push(renderChangeFromRows({
+        kind: 'update',
+        path: filePath,
+        viewKind: 'old-new',
+        rows: [...oldProjection.rows, ...newProjection.rows],
+        rawPatch: '',
+        lineNumbers: 'unavailable',
+        hasHiddenContent: editHidden,
+        stats: { added: newProjection.lineCount, removed: oldProjection.lineCount },
+      }));
+    }
+    return {
+      kind: 'file_patch_render',
+      source: 'builtin',
+      ...(cleanStatus(resolvePatchStatus(tool)) ? { status: cleanStatus(resolvePatchStatus(tool)) } : {}),
+      ...(hasHiddenContent ? { hasHiddenContent: true } : {}),
+      summary: { files: 1, added: totalAdded, removed: totalRemoved },
+      changes,
     };
   }
 

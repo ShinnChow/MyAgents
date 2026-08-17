@@ -96,7 +96,7 @@ function BashTerminal({ model, t }: { model: BashTranscriptModel; t: ChatTransla
           aria-describedby={shouldOfferShowAll ? expandDescriptionId : isHardTruncated ? truncationId : undefined}
           className={`${shouldOfferShowAll ? 'max-h-96 overflow-y-hidden' : ''} min-w-0 overflow-x-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--focus-border)]/30`}
         >
-          {transcriptWindow.command && <ShellCommandView command={transcriptWindow.command} t={t} />}
+          {transcriptWindow.command && <ShellCommandView command={transcriptWindow.command} language={model.commandLanguage ?? 'bash'} t={t} />}
 
           {transcriptWindow.streams.map((stream, index) => (
             <TerminalStreamView
@@ -173,9 +173,11 @@ function BashStatus({ status, label }: { status: BashTranscriptStatus; label: st
 
 function ShellCommandView({
   command,
+  language,
   t,
 }: {
   command: NonNullable<BashTranscriptModel['command']>;
+  language: 'bash' | 'powershell';
   t: ChatTranslator;
 }) {
   const commandText = command.displayLines.join('\n');
@@ -201,7 +203,7 @@ function ShellCommandView({
               {command.source === 'command-actions' || index === 0 ? '$' : '›'}
             </span>
             {canHighlight ? (
-              <TerminalSyntax text={line || ' '} language="bash" />
+              <TerminalSyntax text={line || ' '} language={language} />
             ) : (
               <pre className="m-0 min-w-max whitespace-pre font-mono text-sm leading-6 text-[var(--code-text)]">{line}</pre>
             )}
@@ -253,7 +255,7 @@ function TerminalOutput({ text, format }: { text: string; format: BashStreamForm
   );
 }
 
-function TerminalSyntax({ text, language }: { text: string; language: 'bash' | 'json' | 'diff' }) {
+function TerminalSyntax({ text, language }: { text: string; language: 'bash' | 'powershell' | 'json' | 'diff' }) {
   const prismTheme = useResolvedTheme().adapters.prism;
   const syntaxTheme = useMemo<Record<string, CSSProperties>>(() => ({
     ...prismTheme,

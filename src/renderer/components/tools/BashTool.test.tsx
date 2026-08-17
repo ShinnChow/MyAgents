@@ -5,6 +5,7 @@ import { renderWithTheme as render } from '@/test/renderWithTheme';
 import type { ToolUseSimple } from '@/types/chat';
 
 import BashTool from './BashTool';
+import { resolveBashTranscriptModel } from './bashTranscript';
 
 function bashTool(overrides: Partial<ToolUseSimple> = {}): ToolUseSimple {
   return {
@@ -17,6 +18,13 @@ function bashTool(overrides: Partial<ToolUseSimple> = {}): ToolUseSimple {
     ...overrides,
   };
 }
+
+describe('BashTranscript command language', () => {
+  it('labels PowerShell commands as powershell and Bash commands as bash', () => {
+    expect(resolveBashTranscriptModel(bashTool()).commandLanguage).toBe('bash');
+    expect(resolveBashTranscriptModel(bashTool({ name: 'PowerShell', input: { command: 'Get-ChildItem' } })).commandLanguage).toBe('powershell');
+  });
+});
 
 describe('BashTool terminal transcript', () => {
   it('renders command, output, state, and metadata inside one terminal surface', () => {

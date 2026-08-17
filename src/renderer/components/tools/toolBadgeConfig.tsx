@@ -124,7 +124,8 @@ function getSubagentCallLabel(call: SubagentToolCall, t?: ToolChromeTranslator, 
   switch (name) {
     case 'Read':
     case 'Write':
-    case 'Edit': {
+    case 'Edit':
+    case 'MultiEdit': {
       const filePath = getSubagentStringProp(call, 'file_path');
       if (filePath) {
         const fileName = filePath.split(/[/\\]/).pop() || filePath;
@@ -132,7 +133,8 @@ function getSubagentCallLabel(call: SubagentToolCall, t?: ToolChromeTranslator, 
       }
       break;
     }
-    case 'Bash': {
+    case 'Bash':
+    case 'PowerShell': {
       const desc = getSubagentStringProp(call, 'description');
       if (desc) {
         label = desc;

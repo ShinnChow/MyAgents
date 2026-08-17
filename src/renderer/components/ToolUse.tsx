@@ -6,6 +6,7 @@ import BashOutputTool from './tools/BashOutputTool';
 import BashTool from './tools/BashTool';
 import { CollapsibleTool } from './tools/CollapsibleTool';
 import EditTool from './tools/EditTool';
+import FilePatchTool from './tools/FilePatchTool';
 import EdgeTtsTool from './tools/EdgeTtsTool';
 import GeminiImageTool from './tools/GeminiImageTool';
 import GlobTool from './tools/GlobTool';
@@ -69,7 +70,9 @@ export default function ToolUse({ tool: rawTool }: ToolUseProps) {
   // pre-clamping would corrupt their structured completion wrappers before the
   // authoritative parser can separate streams or applied file changes.
   const ownsBoundedProjection = rawTool.name === 'Bash'
+    || rawTool.name === 'PowerShell'
     || rawTool.name === 'Edit'
+    || rawTool.name === 'MultiEdit'
     || rawTool.name === 'Write';
   const tool = ownsBoundedProjection ? rawTool : clampResult(rawTool, t);
   // NOTE: tool.attachments are NOT rendered here. ToolUse lives inside
@@ -85,6 +88,7 @@ export default function ToolUse({ tool: rawTool }: ToolUseProps) {
 function renderToolBody(tool: ToolUseSimple): React.JSX.Element {
   switch (tool.name) {
     case 'Bash':
+    case 'PowerShell':
       return <BashTool tool={tool} />;
     case 'BashOutput':
       return <BashOutputTool tool={tool} />;
@@ -96,6 +100,8 @@ function renderToolBody(tool: ToolUseSimple): React.JSX.Element {
       return <WriteTool tool={tool} />;
     case 'Edit':
       return <EditTool tool={tool} />;
+    case 'MultiEdit':
+      return <FilePatchTool tool={tool} />;
     case 'Glob':
       return <GlobTool tool={tool} />;
     case 'Grep':
