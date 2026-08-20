@@ -10,7 +10,11 @@ import { listenWithCleanup } from '@/utils/tauriListen';
 import { copyPlainText } from '@/utils/clipboard';
 import { useToast } from '@/components/Toast';
 import { useConfig } from '@/hooks/useConfig';
-import { patchAgentConfig, invokeStartAgentChannel } from '@/config/services/agentConfigService';
+import {
+    applyAgentChannelCredentialProvisioning,
+    patchAgentConfig,
+    invokeStartAgentChannel,
+} from '@/config/services/agentConfigService';
 import { isDirtyChannelName } from '@/utils/channelDisplayName';
 import BotTokenInput from '../../ImSettings/components/BotTokenInput';
 import FeishuCredentialInput from '../../ImSettings/components/FeishuCredentialInput';
@@ -44,6 +48,10 @@ import {
     mergeOpenClawSchemaProperties,
     type OpenClawSchemaProperties,
 } from './openclawConfigScalars';
+import {
+    hasProvisionedCredentials,
+    runCredentialQrProvisioning,
+} from './credentialQrProvisioning';
 
 export const FEISHU_PERMISSIONS_JSON = `{
   "scopes": {
@@ -155,10 +163,7 @@ interface ChannelWizardProps {
     onCancel: () => void;
 }
 
-// WeCom QR polling constants — shared between effect logic and render display
-const WECOM_MAX_QR_REFRESHES = 5; // Auto-refresh up to 5 times on QR expiry, then error
-const WECOM_POLL_INTERVAL = 3000;
-const WECOM_MAX_POLLS_PER_QR = 200; // Defensive ~10min ceiling per QR in case server never returns terminal status
+const MAX_CREDENTIAL_QR_REFRESHES = 5;
 
 export default function ChannelWizard({
     agent,
@@ -188,6 +193,7 @@ export default function ChannelWizard({
     // isQrLogin is computed below after installedPlugin state is declared
     const isQrLoginFromPreset = promoted?.authType === 'qrLogin';
     const isDualConfig = promoted?.authType === 'dualConfig';
+    const credentialQrProvider = isDualConfig ? promoted?.credentialQrProvider : undefined;
     const totalStepsBase = isQrLoginFromPreset ? 2 : isOpenClaw ? 3 : (isFeishu || isDingtalk) ? 3 : 2;
 
     const [step, setStep] = useState(1);
@@ -242,18 +248,19 @@ export default function ChannelWizard({
         return () => { cancelled = true; };
     }, [qrDataUrl]);
 
-    // WeCom dualConfig state: QR scan OR manual config to obtain botId+secret
+    // dualConfig state: QR provisioning OR manual config to obtain credentials
     const [dualConfigMode, setDualConfigMode] = useState<'qr' | 'config'>('qr');
-    const [wecomQrStatus, setWecomQrStatus] = useState<'idle' | 'loading' | 'waiting' | 'success' | 'error'>('idle');
-    const [wecomQrBotId, setWecomQrBotId] = useState('');
-    const [wecomQrSecret, setWecomQrSecret] = useState('');
-    const wecomQrAbortRef = useRef(false);
-    const wecomQrStartedRef = useRef(false);
-    const [wecomQrRetryTrigger, setWecomQrRetryTrigger] = useState(0);
-    // Rendered QR image for WeCom (auth_url → QR code image)
-    const [wecomQrImageUrl, setWecomQrImageUrl] = useState<string | null>(null);
+    const [credentialQrStatus, setCredentialQrStatus] = useState<'idle' | 'loading' | 'waiting' | 'success' | 'error'>('idle');
+    const [provisionedConfigValues, setProvisionedConfigValues] = useState<Record<string, string>>({});
+    const [provisionedAllowedUserId, setProvisionedAllowedUserId] = useState<string | undefined>();
+    const credentialQrRunIdRef = useRef(0);
+    const credentialQrCompletedRef = useRef(false);
+    const [credentialQrRetryTrigger, setCredentialQrRetryTrigger] = useState(0);
+    const [credentialQrErrorReason, setCredentialQrErrorReason] = useState<'expired' | 'denied' | 'cancelled' | 'network' | 'invalid-response' | undefined>();
+    // Rendered QR image from the provider verification URL.
+    const [credentialQrImageUrl, setCredentialQrImageUrl] = useState<string | null>(null);
     // QR refresh count for display (e.g., "二维码已刷新 (2/5)")
-    const [wecomQrRefreshCount, setWecomQrRefreshCount] = useState(0);
+    const [credentialQrRefreshCount, setCredentialQrRefreshCount] = useState(0);
 
     // Derived: QR login detection (from preset or installed plugin's detected capability)
     const isQrLogin = isQrLoginFromPreset || (!promoted && installedPlugin?.supportsQrLogin === true);
@@ -263,125 +270,79 @@ export default function ChannelWizard({
     useEffect(() => {
         return () => {
             isMountedRef.current = false;
-            wecomQrAbortRef.current = true;
+            credentialQrRunIdRef.current += 1;
             if (copyTimeoutRef.current) clearTimeout(copyTimeoutRef.current);
         };
     }, []);
 
-    // WeCom dualConfig: auto-start QR flow when in QR mode on step 1
-    // Design: polling lifecycle is tied to QR validity. When a QR expires,
-    // auto-generate a new one and continue polling (up to WECOM_MAX_QR_REFRESHES auto-refreshes).
-    // After all refreshes exhausted → error state. User can click retry to restart.
+    // dualConfig: auto-start provider credential provisioning in QR mode.
+    // The run id ties every delayed result to the exact visible QR lifecycle;
+    // switching tabs, retrying, or closing the wizard invalidates older work.
     useEffect(() => {
-        if (!isDualConfig || dualConfigMode !== 'qr' || step !== 1 || wecomQrStartedRef.current) return;
+        if (!isDualConfig || !credentialQrProvider || dualConfigMode !== 'qr' || step !== 1 || credentialQrCompletedRef.current) return;
         if (!isTauriEnvironment()) return;
-        wecomQrStartedRef.current = true;
-        let cancelled = false;
-
-        // Helper: generate QR and render as image
-        const generateQr = async (invoke: typeof import('@tauri-apps/api/core').invoke) => {
-            const result = await invoke<{ scode: string; auth_url: string }>('cmd_wecom_qr_generate');
-            if (cancelled || !isMountedRef.current) return null;
-            const dataUrl = await QRCode.toDataURL(result.auth_url, {
-                width: 200, margin: 2,
-                color: { dark: '#000000', light: '#ffffff' },
-            });
-            if (cancelled || !isMountedRef.current) return null;
-            setWecomQrImageUrl(dataUrl);
-            return result.scode;
-        };
+        const runId = ++credentialQrRunIdRef.current;
+        const isCancelled = () => !isMountedRef.current || credentialQrRunIdRef.current !== runId;
 
         (async () => {
-            try {
-                setWecomQrStatus('loading');
-                setWecomQrRefreshCount(0);
-                const { invoke } = await import('@tauri-apps/api/core');
-                let scode = await generateQr(invoke);
-                if (!scode) return;
-                setWecomQrStatus('waiting');
-
-                let qrRefreshCount = 0;
-                let globalPollIndex = 0;
-
-                // Outer loop: one iteration per QR code (initial + up to N refreshes)
-                while (qrRefreshCount <= WECOM_MAX_QR_REFRESHES) {
-                    let pollsThisQr = 0;
-                    // Inner loop: poll until success, terminal state, or per-QR ceiling
-                    while (pollsThisQr < WECOM_MAX_POLLS_PER_QR) {
-                        if (cancelled || !isMountedRef.current || wecomQrAbortRef.current) return;
-                        await new Promise(r => setTimeout(r, WECOM_POLL_INTERVAL));
-                        if (cancelled || !isMountedRef.current || wecomQrAbortRef.current) return;
-
-                        const poll = await invoke<{ status: string; bot_id?: string; secret?: string }>(
-                            'cmd_wecom_qr_poll', { scode, pollIndex: globalPollIndex }
-                        );
-                        globalPollIndex++;
-                        pollsThisQr++;
-
-                        if (poll.status === 'success' && poll.bot_id && poll.secret) {
-                            if (cancelled || !isMountedRef.current) return;
-                            setWecomQrBotId(poll.bot_id);
-                            setWecomQrSecret(poll.secret);
-                            setWecomQrStatus('success');
-                            return;
-                        }
-
-                        // QR expired → auto-refresh
-                        if (poll.status === 'expired') {
-                            qrRefreshCount++;
-                            if (qrRefreshCount > WECOM_MAX_QR_REFRESHES) break; // → error
-                            if (cancelled || !isMountedRef.current) return;
-                            setWecomQrRefreshCount(qrRefreshCount);
-                            setWecomQrStatus('loading');
-                            scode = await generateQr(invoke);
-                            if (!scode) return;
-                            setWecomQrStatus('waiting');
-                            break; // restart inner poll loop with new scode
-                        }
-
-                        // User cancelled or denied on WeCom side → error
-                        if (poll.status === 'cancelled' || poll.status === 'denied') {
-                            if (!cancelled && isMountedRef.current) setWecomQrStatus('error');
-                            return;
-                        }
-                        // Otherwise "waiting" — continue polling
-                    }
-                    // If inner loop hit the per-QR ceiling without a terminal status,
-                    // treat it as if the QR expired (auto-refresh)
-                    if (pollsThisQr >= WECOM_MAX_POLLS_PER_QR) {
-                        qrRefreshCount++;
-                        if (qrRefreshCount > WECOM_MAX_QR_REFRESHES) break;
-                        if (cancelled || !isMountedRef.current) return;
-                        setWecomQrRefreshCount(qrRefreshCount);
-                        setWecomQrStatus('loading');
-                        scode = await generateQr(invoke);
-                        if (!scode) return;
-                        setWecomQrStatus('waiting');
-                    }
-                }
-
-                // Exhausted all QR refreshes
-                if (!cancelled && isMountedRef.current) setWecomQrStatus('error');
-            } catch (err) {
-                console.error('[ChannelWizard] WeCom QR flow error:', err);
-                if (!cancelled && isMountedRef.current) setWecomQrStatus('error');
+            setCredentialQrStatus('idle');
+            setCredentialQrImageUrl(null);
+            setProvisionedConfigValues({});
+            setProvisionedAllowedUserId(undefined);
+            credentialQrCompletedRef.current = false;
+            setCredentialQrErrorReason(undefined);
+            setCredentialQrRefreshCount(0);
+            const { invoke } = await import('@tauri-apps/api/core');
+            const result = await runCredentialQrProvisioning({
+                provider: credentialQrProvider,
+                invoke,
+                isCancelled,
+                maxRefreshes: MAX_CREDENTIAL_QR_REFRESHES,
+                onPhase: (phase, refreshCount) => {
+                    if (isCancelled()) return;
+                    setCredentialQrRefreshCount(refreshCount);
+                    setCredentialQrStatus(phase);
+                },
+                onQrUrl: async (url) => {
+                    const dataUrl = await QRCode.toDataURL(url, {
+                        width: 200,
+                        margin: 2,
+                        color: { dark: '#000000', light: '#ffffff' },
+                    });
+                    if (!isCancelled()) setCredentialQrImageUrl(dataUrl);
+                },
+            });
+            if (isCancelled() || result.kind === 'cancelled') return;
+            if (result.kind === 'success') {
+                setProvisionedConfigValues(result.result.configValues);
+                setProvisionedAllowedUserId(result.result.allowedUserId);
+                credentialQrCompletedRef.current = true;
+                if (result.result.allowedUserId) setAllowedUsers([result.result.allowedUserId]);
+                setCredentialQrStatus('success');
+                return;
             }
+            setCredentialQrRefreshCount(result.refreshCount);
+            setCredentialQrErrorReason(result.reason);
+            setCredentialQrStatus('error');
         })();
 
-        return () => { cancelled = true; };
-    }, [isDualConfig, dualConfigMode, step, wecomQrRetryTrigger]);
+        return () => { credentialQrRunIdRef.current += 1; };
+    }, [credentialQrProvider, credentialQrRetryTrigger, dualConfigMode, isDualConfig, step]);
 
     // Reset QR state when switching to QR mode (always re-trigger, even after prior success)
     const handleDualModeSwitch = useCallback((mode: 'qr' | 'config') => {
+        credentialQrRunIdRef.current += 1;
         setDualConfigMode(mode);
+        setCredentialQrStatus('idle');
+        setCredentialQrImageUrl(null);
+        setProvisionedConfigValues({});
+        setProvisionedAllowedUserId(undefined);
+        credentialQrCompletedRef.current = false;
+        setCredentialQrErrorReason(undefined);
+        setCredentialQrRefreshCount(0);
+        setAllowedUsers([]);
         if (mode === 'qr') {
-            wecomQrStartedRef.current = false;
-            wecomQrAbortRef.current = false;
-            setWecomQrStatus('idle');
-            setWecomQrImageUrl(null);
-            setWecomQrBotId('');
-            setWecomQrSecret('');
-            setWecomQrRefreshCount(0);
+            setCredentialQrRetryTrigger(current => current + 1);
         }
     }, []);
 
@@ -494,10 +455,10 @@ export default function ChannelWizard({
     // Check if credentials are filled
     const hasCredentials = isDualConfig
         ? (dualConfigMode === 'qr'
-            ? wecomQrStatus === 'success' // QR scan returned botId+secret
-            : !!(
-                String(openclawSchemaValues['botId'] ?? '').trim()
-                && String(openclawSchemaValues['secret'] ?? '').trim()
+            ? credentialQrStatus === 'success'
+                && hasProvisionedCredentials(promoted?.requiredFields ?? [], provisionedConfigValues)
+            : (promoted?.requiredFields ?? []).every(
+                key => String(openclawSchemaValues[key] ?? '').trim().length > 0,
             ))
         : isOpenClaw
             ? true // OpenClaw uses its own validation
@@ -512,9 +473,8 @@ export default function ChannelWizard({
         if (isOpenClaw) {
             const pluginConfig = buildOpenclawConfig();
             // For dualConfig QR mode, inject the QR-obtained credentials
-            if (isDualConfig && dualConfigMode === 'qr' && wecomQrBotId && wecomQrSecret) {
-                pluginConfig.botId = wecomQrBotId;
-                pluginConfig.secret = wecomQrSecret;
+            if (isDualConfig && dualConfigMode === 'qr') {
+                Object.assign(pluginConfig, provisionedConfigValues);
             }
             // Merge promoted plugin defaults (e.g. dmPolicy: 'open') under user values
             const mergedConfig = { ...(promoted?.defaultConfig ?? {}), ...pluginConfig };
@@ -536,7 +496,7 @@ export default function ChannelWizard({
                 type: platform,
                 name: pluginName,
                 enabled: true,
-                allowedUsers: [],
+                allowedUsers: provisionedAllowedUserId ? [provisionedAllowedUserId] : [],
                 setupCompleted: false,
                 openclawPluginId: openclawPluginId,
                 openclawNpmSpec: installedPlugin?.npmSpec,
@@ -557,7 +517,7 @@ export default function ChannelWizard({
             allowedUsers: [],
             setupCompleted: false,
         };
-    }, [channelId, platform, isFeishu, isDingtalk, isOpenClaw, isDualConfig, dualConfigMode, wecomQrBotId, wecomQrSecret, botToken, feishuAppId, feishuAppSecret, dingtalkClientId, dingtalkClientSecret, openclawPluginId, promoted, installedPlugin, buildOpenclawConfig]);
+    }, [channelId, platform, isFeishu, isDingtalk, isOpenClaw, isDualConfig, dualConfigMode, provisionedConfigValues, provisionedAllowedUserId, botToken, feishuAppId, feishuAppSecret, dingtalkClientId, dingtalkClientSecret, openclawPluginId, promoted, installedPlugin, buildOpenclawConfig]);
 
     // Start channel via shared utility (resolves MCP + overrides)
     const startChannel = useCallback(async (channelCfg: ChannelConfig) => {
@@ -575,15 +535,29 @@ export default function ChannelWizard({
         try {
             const channelCfg = { ...buildChannelConfig(), setupCompleted: true };
 
-            // Save channel to agent config (dedup: replace if same ID exists from a previous attempt)
-            const existingChannels = (agent.channels ?? []).filter(ch => ch.id !== channelCfg.id);
-            await patchAgentConfig(agent.id, {
-                channels: [...existingChannels, channelCfg],
-            });
+            // QR provisioning can take minutes. Create/merge that result against
+            // disk-latest channels so another surface adding a Channel while the
+            // scanner is open is never overwritten by this renderer snapshot.
+            let persistedChannel: ChannelConfig;
+            if (isDualConfig && dualConfigMode === 'qr') {
+                persistedChannel = await applyAgentChannelCredentialProvisioning(
+                    agent.id,
+                    channelCfg.id,
+                    provisionedConfigValues,
+                    provisionedAllowedUserId,
+                    channelCfg,
+                );
+            } else {
+                const existingChannels = (agent.channels ?? []).filter(ch => ch.id !== channelCfg.id);
+                await patchAgentConfig(agent.id, {
+                    channels: [...existingChannels, channelCfg],
+                });
+                persistedChannel = channelCfg;
+            }
             await refreshConfig();
 
             // Start the channel
-            await startChannel(channelCfg);
+            await startChannel(persistedChannel);
 
             if (isMountedRef.current) {
                 track('agent_channel_create', { source: 'desktop', platform });
@@ -597,7 +571,7 @@ export default function ChannelWizard({
         } finally {
             if (isMountedRef.current) setStarting(false);
         }
-    }, [buildChannelConfig, agent, platform, startChannel, refreshConfig, bindingStep, t]);
+    }, [buildChannelConfig, agent, platform, startChannel, refreshConfig, bindingStep, t, isDualConfig, dualConfigMode, provisionedConfigValues, provisionedAllowedUserId]);
 
     // QR Login: start channel then initiate QR login flow
     const startQrLogin = useCallback(async () => {
@@ -980,6 +954,53 @@ export default function ChannelWizard({
         </div>
     );
 
+    const renderPromotedSetupGuide = () => {
+        const steps = promoted?.setupGuide?.steps;
+        if (!steps?.length) return null;
+        return (
+            <div className="rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)] p-5">
+                <p className="text-sm font-medium text-[var(--ink)]">{t('agentSettings.channelWizard.config.setupGuide')}</p>
+                {steps.map((guideStep, i) => {
+                    const linkText = guideStep.captionLinkText;
+                    const linkUrl = guideStep.captionLinkUrl;
+                    const splitIdx = linkText ? guideStep.caption.indexOf(linkText) : -1;
+                    return (
+                        <div key={i} className={i > 0 ? 'mt-5' : 'mt-3'}>
+                            <p className="text-xs text-[var(--ink-muted)]">
+                                {splitIdx >= 0 && linkText && linkUrl ? (
+                                    <>
+                                        {guideStep.caption.slice(0, splitIdx)}
+                                        <a
+                                            href={linkUrl}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex items-center gap-0.5 text-[var(--button-primary-bg)] hover:underline"
+                                            onClick={(e) => {
+                                                if (isTauriEnvironment()) {
+                                                    e.preventDefault();
+                                                    import('@tauri-apps/plugin-shell').then(({ open }) => open(linkUrl));
+                                                }
+                                            }}
+                                        >
+                                            {linkText}
+                                            <ExternalLink className="inline h-3 w-3" />
+                                        </a>
+                                        {guideStep.caption.slice(splitIdx + linkText.length)}
+                                    </>
+                                ) : guideStep.caption}
+                            </p>
+                            <img
+                                src={guideStep.image}
+                                alt={guideStep.alt}
+                                className="mt-2 w-full rounded-lg border border-[var(--line)]"
+                            />
+                        </div>
+                    );
+                })}
+            </div>
+        );
+    };
+
     return (
         <div className="space-y-6">
             {/* Header: platform badge + title + step indicator */}
@@ -1103,8 +1124,15 @@ export default function ChannelWizard({
                     </div>
 
                     {/* Mode switcher: pill tab */}
-                    <div className="flex gap-1 rounded-lg bg-[var(--paper-inset)] p-1">
+                    <div
+                        className="flex gap-1 rounded-lg bg-[var(--paper-inset)] p-1"
+                        role="tablist"
+                        aria-label={t('agentSettings.channelWizard.dual.modeLabel')}
+                    >
                         <button
+                            type="button"
+                            role="tab"
+                            aria-selected={dualConfigMode === 'qr'}
                             className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
                                 dualConfigMode === 'qr'
                                     ? 'bg-[var(--paper-elevated)] text-[var(--ink)] shadow-xs'
@@ -1115,6 +1143,9 @@ export default function ChannelWizard({
                             {t('agentSettings.channelWizard.dual.scanMode')}
                         </button>
                         <button
+                            type="button"
+                            role="tab"
+                            aria-selected={dualConfigMode === 'config'}
                             className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
                                 dualConfigMode === 'config'
                                     ? 'bg-[var(--paper-elevated)] text-[var(--ink)] shadow-xs'
@@ -1137,37 +1168,44 @@ export default function ChannelWizard({
                             </p>
 
                             <div className="mt-5 flex flex-col items-center py-4">
-                                {wecomQrStatus === 'loading' && (
+                                {credentialQrStatus === 'loading' && (
                                     <div className="flex h-[200px] w-[200px] items-center justify-center rounded-xl border border-[var(--line)] bg-white">
                                         <Loader2 className="h-6 w-6 animate-spin text-[var(--ink-muted)]" />
                                     </div>
                                 )}
-                                {wecomQrStatus === 'waiting' && wecomQrImageUrl && (
+                                {credentialQrStatus === 'waiting' && credentialQrImageUrl && (
                                     <div className="rounded-xl border border-[var(--line)] bg-white p-1.5">
-                                        <img src={wecomQrImageUrl} alt={t('agentSettings.channelWizard.dual.wecomScanAlt')} className="h-[200px] w-[200px] rounded-lg" />
+                                        <img
+                                            src={credentialQrImageUrl}
+                                            alt={t('agentSettings.channelWizard.dual.scanAlt', { app: promoted?.name ?? openclawPluginName })}
+                                            className="h-[200px] w-[200px] rounded-lg"
+                                        />
                                     </div>
                                 )}
-                                {wecomQrStatus === 'success' && (
+                                {credentialQrStatus === 'success' && (
                                     <div className="flex h-[200px] w-[200px] flex-col items-center justify-center rounded-xl border border-[var(--success)] bg-[var(--success-bg)]">
                                         <Check className="h-8 w-8 text-[var(--success)]" />
                                         <p className="mt-2 text-sm font-medium text-[var(--success)]">{t('agentSettings.channelWizard.dual.scanSuccess')}</p>
                                         <p className="mt-1 text-xs text-[var(--success)]">{t('agentSettings.channelWizard.dual.credentialsReceived')}</p>
                                     </div>
                                 )}
-                                {wecomQrStatus === 'error' && (
+                                {credentialQrStatus === 'error' && (
                                     <div className="flex h-[200px] w-[200px] flex-col items-center justify-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--paper-inset)]">
                                         <p className="text-sm text-[var(--ink-muted)]">
-                                            {wecomQrRefreshCount > 0
-                                                ? t('agentSettings.channelWizard.dual.qrExpiredMultiple')
-                                                : t('agentSettings.channelWizard.qr.loadFailed')}
+                                            {credentialQrErrorReason === 'denied' || credentialQrErrorReason === 'cancelled'
+                                                ? t('agentSettings.channelWizard.dual.scanDenied')
+                                                : credentialQrRefreshCount > 0
+                                                    ? t('agentSettings.channelWizard.dual.qrExpiredMultiple')
+                                                    : t('agentSettings.channelWizard.qr.loadFailed')}
                                         </p>
                                         <button
                                             onClick={() => {
-                                                wecomQrStartedRef.current = false;
-                                                wecomQrAbortRef.current = false;
-                                                setWecomQrStatus('idle');
-                                                setWecomQrRefreshCount(0);
-                                                setWecomQrRetryTrigger(n => n + 1);
+                                                credentialQrRunIdRef.current += 1;
+                                                credentialQrCompletedRef.current = false;
+                                                setCredentialQrStatus('idle');
+                                                setCredentialQrErrorReason(undefined);
+                                                setCredentialQrRefreshCount(0);
+                                                setCredentialQrRetryTrigger(n => n + 1);
                                             }}
                                             className="text-xs text-[var(--accent-warm)] hover:underline"
                                         >
@@ -1175,83 +1213,88 @@ export default function ChannelWizard({
                                         </button>
                                     </div>
                                 )}
-                                {wecomQrStatus === 'idle' && (
+                                {credentialQrStatus === 'idle' && (
                                     <div className="flex h-[200px] w-[200px] items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--paper-inset)]">
                                         <Loader2 className="h-6 w-6 animate-spin text-[var(--ink-muted)]" />
                                     </div>
                                 )}
 
                                 <p className="mt-3 text-xs text-[var(--ink-muted)]">
-                                    {wecomQrStatus === 'loading' && (wecomQrRefreshCount > 0
-                                        ? t('agentSettings.channelWizard.dual.qrExpiredRefreshing', { current: wecomQrRefreshCount, max: WECOM_MAX_QR_REFRESHES })
+                                    {credentialQrStatus === 'loading' && (credentialQrRefreshCount > 0
+                                        ? t('agentSettings.channelWizard.dual.qrExpiredRefreshing', { current: credentialQrRefreshCount, max: MAX_CREDENTIAL_QR_REFRESHES })
                                         : t('agentSettings.channelWizard.qr.loading'))}
-                                    {wecomQrStatus === 'waiting' && t('agentSettings.channelWizard.dual.scanWithWecom')}
-                                    {wecomQrStatus === 'success' && t('agentSettings.channelWizard.dual.credentialsReady')}
-                                    {wecomQrStatus === 'error' && (wecomQrRefreshCount > 0
+                                    {credentialQrStatus === 'waiting' && t('agentSettings.channelWizard.dual.scanWithApp', { app: promoted?.name ?? openclawPluginName })}
+                                    {credentialQrStatus === 'success' && t('agentSettings.channelWizard.dual.credentialsReady')}
+                                    {credentialQrStatus === 'error' && (credentialQrRefreshCount > 0
                                         ? t('agentSettings.channelWizard.dual.qrExpiredRetry')
                                         : t('agentSettings.channelWizard.dual.networkRetry'))}
                                 </p>
                             </div>
 
                             <p className="mt-2 text-xs text-[var(--ink-subtle)]">
-                                {t('agentSettings.channelWizard.dual.scanNote')}
+                                {t('agentSettings.channelWizard.dual.scanNote', { app: promoted?.name ?? openclawPluginName })}
                             </p>
                         </div>
                     )}
 
                     {/* Manual config mode */}
                     {dualConfigMode === 'config' && (
-                        <div className="rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)] p-5">
-                            <h3 className="text-sm font-medium text-[var(--ink)]">
-                                {promoted?.setupGuide?.credentialTitle || t('agentSettings.channelWizard.config.pluginConfig')}
-                            </h3>
-                            <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
-                                {promoted?.setupGuide?.credentialHintLink ? (
-                                    <>
-                                        {t('agentSettings.channelWizard.config.goToPrefix')}
-                                        <a
-                                            href={promoted.setupGuide.credentialHintLink}
-                                            target="_blank"
-                                            rel="noopener noreferrer"
-                                            className="inline-flex items-center gap-0.5 text-[var(--button-primary-bg)] hover:underline"
-                                            onClick={(e) => {
-                                                if (isTauriEnvironment()) {
-                                                    e.preventDefault();
-                                                    import('@tauri-apps/plugin-shell').then(({ open }) => open(promoted!.setupGuide!.credentialHintLink!));
-                                                }
-                                            }}
-                                        >
-                                            {t('agentSettings.channelWizard.dual.wecomAdmin')}
-                                            <ExternalLink className="inline h-3 w-3" />
-                                        </a>
-                                        {t('agentSettings.channelWizard.dual.wecomCredentialSuffix')}
-                                    </>
-                                ) : (
-                                    promoted?.setupGuide?.credentialHint || t('agentSettings.channelWizard.config.inputPluginParams')
+                        <div className="space-y-6">
+                            <div className="rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)] p-5">
+                                <h3 className="text-sm font-medium text-[var(--ink)]">
+                                    {promoted?.setupGuide?.credentialTitle || t('agentSettings.channelWizard.config.pluginConfig')}
+                                </h3>
+                                <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
+                                    {promoted?.setupGuide?.credentialHintLink ? (
+                                        <>
+                                            <a
+                                                href={promoted.setupGuide.credentialHintLink}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="inline-flex items-center gap-0.5 text-[var(--button-primary-bg)] hover:underline"
+                                                onClick={(e) => {
+                                                    if (isTauriEnvironment()) {
+                                                        e.preventDefault();
+                                                        import('@tauri-apps/plugin-shell').then(({ open }) => open(promoted!.setupGuide!.credentialHintLink!));
+                                                    }
+                                                }}
+                                            >
+                                                {promoted.setupGuide.credentialHint}
+                                                <ExternalLink className="inline h-3 w-3" />
+                                            </a>
+                                        </>
+                                    ) : (
+                                        promoted?.setupGuide?.credentialHint || t('agentSettings.channelWizard.config.inputPluginParams')
                                 )}
-                            </p>
+                                </p>
 
-                            <div className="mt-4 space-y-3">
-                                {(promoted?.requiredFields ?? []).map((key) => (
-                                    <div key={key}>
-                                        <label className="mb-1.5 block text-sm font-medium text-[var(--ink)]">
-                                            {key}
-                                            <span className="ml-1 text-[var(--error)]">*</span>
-                                        </label>
-                                        <input
-                                            type={/secret|token|password|key/i.test(key) ? 'password' : 'text'}
-                                            value={String(openclawSchemaValues[key] ?? '')}
-                                            onChange={(e) => setOpenclawSchemaValues(prev => ({ ...prev, [key]: e.target.value }))}
-                                            placeholder={t('agentSettings.channelWizard.config.fieldPlaceholder', { field: key })}
-                                            className="w-full rounded-[var(--radius-sm)] border border-[var(--line)] bg-transparent px-3 py-2.5 text-sm text-[var(--ink)] placeholder:text-[var(--ink-muted)] focus:border-[var(--button-primary-bg)] focus:outline-none transition-colors"
-                                        />
-                                    </div>
-                                ))}
+                                <div className="mt-4 space-y-3">
+                                    {(promoted?.requiredFields ?? []).map((key) => (
+                                        <div key={key}>
+                                            <label
+                                                htmlFor={`channel-config-${channelId}-${key}`}
+                                                className="mb-1.5 block text-sm font-medium text-[var(--ink)]"
+                                            >
+                                                {key}
+                                                <span className="ml-1 text-[var(--error)]">*</span>
+                                            </label>
+                                            <input
+                                                id={`channel-config-${channelId}-${key}`}
+                                                type={/secret|token|password|key/i.test(key) ? 'password' : 'text'}
+                                                value={String(openclawSchemaValues[key] ?? '')}
+                                                onChange={(e) => setOpenclawSchemaValues(prev => ({ ...prev, [key]: e.target.value }))}
+                                                placeholder={t('agentSettings.channelWizard.config.fieldPlaceholder', { field: key })}
+                                                className="w-full rounded-[var(--radius-sm)] border border-[var(--line)] bg-transparent px-3 py-2.5 text-sm text-[var(--ink)] placeholder:text-[var(--ink-muted)] focus:border-[var(--button-primary-bg)] focus:outline-none transition-colors"
+                                            />
+                                        </div>
+                                    ))}
+                                </div>
+
+                                <p className="mt-4 text-xs text-[var(--ink-subtle)]">
+                                    {t(`agentSettings.channelWizard.dual.manualMethod.${credentialQrProvider ?? 'wecom'}`)}
+                                </p>
                             </div>
-
-                            <p className="mt-4 text-xs text-[var(--ink-subtle)]">
-                                {t('agentSettings.channelWizard.dual.manualMethod')}
-                            </p>
+                            {renderPromotedSetupGuide()}
                         </div>
                     )}
                 </div>
@@ -1396,48 +1439,7 @@ export default function ChannelWizard({
                     </div>
 
                     {/* Step-by-step image guide (promoted plugins only) */}
-                    {promoted?.setupGuide?.steps && promoted.setupGuide.steps.length > 0 && (
-                        <div className="rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)] p-5">
-                            <p className="text-sm font-medium text-[var(--ink)]">{t('agentSettings.channelWizard.config.setupGuide')}</p>
-                            {promoted.setupGuide.steps.map((guideStep, i) => {
-                                const linkText = guideStep.captionLinkText;
-                                const linkUrl = guideStep.captionLinkUrl;
-                                const splitIdx = linkText ? guideStep.caption.indexOf(linkText) : -1;
-                                return (
-                                    <div key={i} className={i > 0 ? 'mt-5' : 'mt-3'}>
-                                        <p className="text-xs text-[var(--ink-muted)]">
-                                            {splitIdx >= 0 && linkUrl ? (
-                                                <>
-                                                    {guideStep.caption.slice(0, splitIdx)}
-                                                    <a
-                                                        href={linkUrl}
-                                                        target="_blank"
-                                                        rel="noopener noreferrer"
-                                                        className="inline-flex items-center gap-0.5 text-[var(--button-primary-bg)] hover:underline"
-                                                        onClick={(e) => {
-                                                            if (isTauriEnvironment()) {
-                                                                e.preventDefault();
-                                                                import('@tauri-apps/plugin-shell').then(({ open }) => open(linkUrl));
-                                                            }
-                                                        }}
-                                                    >
-                                                        {linkText}
-                                                        <ExternalLink className="inline h-3 w-3" />
-                                                    </a>
-                                                    {guideStep.caption.slice(splitIdx + linkText!.length)}
-                                                </>
-                                            ) : guideStep.caption}
-                                        </p>
-                                        <img
-                                            src={guideStep.image}
-                                            alt={guideStep.alt}
-                                            className="mt-2 w-full rounded-lg border border-[var(--line)]"
-                                        />
-                                    </div>
-                                );
-                            })}
-                        </div>
-                    )}
+                    {renderPromotedSetupGuide()}
                 </div>
             )}
 
@@ -1698,16 +1700,22 @@ export default function ChannelWizard({
                         <div className="rounded-xl border border-[var(--line)] bg-[var(--paper-inset)] px-4 py-3">
                             <div className="flex items-center gap-2 text-sm text-[var(--ink)]">
                                 <Check className="h-4 w-4 text-[var(--success)]" />
-                                <span>{t('agentSettings.channelWizard.openclaw.credentialsEntered', { name: openclawPluginName })}</span>
+                                <span>
+                                    {isDualConfig && dualConfigMode === 'qr'
+                                        ? t('agentSettings.channelWizard.openclaw.larkBotProvisioned')
+                                        : t('agentSettings.channelWizard.openclaw.credentialsEntered', { name: openclawPluginName })}
+                                </span>
                             </div>
                             <p className="mt-1.5 pl-6 text-xs text-[var(--ink-muted)]">
-                                {t('agentSettings.channelWizard.openclaw.larkNextHint')}
+                                {isDualConfig && dualConfigMode === 'qr'
+                                    ? t('agentSettings.channelWizard.openclaw.larkProvisionedNextHint')
+                                    : t('agentSettings.channelWizard.openclaw.larkNextHint')}
                             </p>
                         </div>
                     )}
 
-                    {/* Feishu-specific: Permissions + Events + Publish guide (reuse built-in feishu setup) */}
-                    {promoted?.pluginId === 'openclaw-lark' && (
+                    {/* Manual Feishu setup still needs permissions/events/publish; QR provisioning creates the configured PersonalAgent. */}
+                    {promoted?.pluginId === 'openclaw-lark' && (!isDualConfig || dualConfigMode === 'config') && (
                         <>
                             <div className="rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)] p-5">
                                 <h3 className="text-sm font-medium text-[var(--ink)]">

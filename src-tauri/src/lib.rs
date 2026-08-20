@@ -558,6 +558,8 @@ pub fn run() {
             im::commands::cmd_plugin_qr_login_start,
             im::commands::cmd_plugin_qr_login_wait,
             im::commands::cmd_plugin_restart_gateway,
+            im::credential_provisioning::cmd_channel_credential_qr_start,
+            im::credential_provisioning::cmd_channel_credential_qr_poll,
             // Agent commands (v0.1.41)
             im::commands::cmd_start_agent_channel,
             im::commands::cmd_stop_agent_channel,

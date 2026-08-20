@@ -2588,11 +2588,9 @@ pub async fn cmd_wecom_qr_poll(
                     secret,
                 })
             } else {
-                // Log raw response for debugging unexpected format
                 ulog_error!(
-                    "[wecom-qr] Poll #{} status=success but bot_info incomplete: {}",
-                    idx,
-                    resp
+                    "[wecom-qr] Poll #{} status=success but bot_info is incomplete",
+                    idx
                 );
                 Err("WeCom QR scan succeeded but bot_info is incomplete".into())
             }

@@ -18,6 +18,7 @@ import { useConfig } from '@/hooks/useConfig';
 import { CODEX_SUBSCRIPTION_PROVIDER_ID, XAI_SUBSCRIPTION_PROVIDER_ID, getEffectiveModelAliases, getProviderModels, isProviderEnabled } from '@/config/types';
 import { isProviderAvailable } from '@/config/services/providerService';
 import {
+    applyAgentChannelCredentialProvisioning,
     channelHasCredentials,
     invokeStartAgentChannel,
     patchAgentChannelConfig,
@@ -64,6 +65,10 @@ import {
     mergeOpenClawSchemaProperties,
     type OpenClawSchemaProperties,
 } from './openclawConfigScalars';
+import {
+    restartProvisionedChannelIfRunning,
+    runCredentialQrProvisioning,
+} from './credentialQrProvisioning';
 
 // ===== OpenClaw Plugin Config Editor =====
 export function OpenClawConfigEditor({
@@ -251,6 +256,10 @@ export default function ChannelDetailView({
     const [overridesExpanded, setOverridesExpanded] = useState(false);
     const [pluginMissing, setPluginMissing] = useState(false);
     const [installedPlugin, setInstalledPlugin] = useState<InstalledPlugin | null>(null);
+    const [dualDetailMode, setDualDetailMode] = useState<'view' | 'qr' | 'edit'>('view');
+    const [credentialQrImageUrl, setCredentialQrImageUrl] = useState<string | null>(null);
+    const [credentialQrStatus, setCredentialQrStatus] = useState<'idle' | 'loading' | 'waiting' | 'success' | 'error' | 'restart-error'>('idle');
+    const credentialQrRunIdRef = useRef(0);
 
     // Whether credentials are filled
     const hasCredentials = channel
@@ -270,7 +279,7 @@ export default function ChannelDetailView({
 
     useEffect(() => {
         const mountedRef = isMountedRef;
-        const qrRunIdRef = wecomQrRunIdRef;
+        const qrRunIdRef = credentialQrRunIdRef;
         return () => { mountedRef.current = false; qrRunIdRef.current++; };
     }, []);
 
@@ -567,67 +576,78 @@ export default function ChannelDetailView({
     );
     const isQrLoginPlugin = promoted?.authType === 'qrLogin' || installedPlugin?.supportsQrLogin === true;
     const isDualConfigPlugin = promoted?.authType === 'dualConfig';
+    const credentialQrProvider = isDualConfigPlugin ? promoted?.credentialQrProvider : undefined;
 
-    // WeCom dualConfig: inline QR re-scan state
-    const [dualDetailMode, setDualDetailMode] = useState<'view' | 'qr' | 'edit'>('view');
-    const [wecomQrImageUrl, setWecomQrImageUrl] = useState<string | null>(null);
-    const [wecomQrStatus, setWecomQrStatus] = useState<'idle' | 'loading' | 'waiting' | 'success' | 'error'>('idle');
-    const wecomQrRunIdRef = useRef(0);
-
-    const startWecomQrRescan = useCallback(async () => {
-        if (!isTauriEnvironment()) return;
-        const runId = ++wecomQrRunIdRef.current;
-        setWecomQrStatus('loading');
+    // Existing credentials remain authoritative until a complete new
+    // provisioning result commits atomically.
+    const startCredentialQrRescan = useCallback(async () => {
+        if (!isTauriEnvironment() || !credentialQrProvider) return;
+        const runId = ++credentialQrRunIdRef.current;
+        const isCancelled = () => !isMountedRef.current || credentialQrRunIdRef.current !== runId;
+        let credentialsPersisted = false;
+        setCredentialQrStatus('loading');
+        setCredentialQrImageUrl(null);
         setDualDetailMode('qr');
         try {
             const { invoke } = await import('@tauri-apps/api/core');
-            const result = await invoke<{ scode: string; auth_url: string }>('cmd_wecom_qr_generate');
-            if (!isMountedRef.current || wecomQrRunIdRef.current !== runId) return;
-            const dataUrl = await QRCode.toDataURL(result.auth_url, { width: 200, margin: 2, color: { dark: '#000000', light: '#ffffff' } });
-            if (!isMountedRef.current || wecomQrRunIdRef.current !== runId) return;
-            setWecomQrImageUrl(dataUrl);
-            setWecomQrStatus('waiting');
-
-            const POLL_INTERVAL = 3000;
-            const MAX_POLLS = 100;
-            for (let i = 0; i < MAX_POLLS; i++) {
-                if (!isMountedRef.current || wecomQrRunIdRef.current !== runId) return;
-                await new Promise(r => setTimeout(r, POLL_INTERVAL));
-                if (!isMountedRef.current || wecomQrRunIdRef.current !== runId) return;
-                const poll = await invoke<{ status: string; bot_id?: string; secret?: string }>('cmd_wecom_qr_poll', { scode: result.scode });
-                // Terminal states — QR expired or user denied
-                if (poll.status === 'expired' || poll.status === 'cancelled' || poll.status === 'denied') {
-                    if (isMountedRef.current && wecomQrRunIdRef.current === runId) setWecomQrStatus('error');
-                    return;
-                }
-                if (poll.status === 'success' && poll.bot_id && poll.secret) {
-                    if (!isMountedRef.current || wecomQrRunIdRef.current !== runId) return;
-                    await patchAgentChannelOpenClawConfig(
-                        agent.id,
-                        channelId,
-                        { type: 'set', key: 'botId', value: poll.bot_id },
-                    );
-                    const updatedChannel = await patchAgentChannelOpenClawConfig(
-                        agent.id,
-                        channelId,
-                        { type: 'set', key: 'secret', value: poll.secret },
-                    );
-                    // Restart the channel so it reconnects with new credentials
-                    try {
-                        await invoke('cmd_stop_agent_channel', { agentId: agent.id, channelId });
-                        await invokeStartAgentChannel(agent, updatedChannel);
-                    } catch { /* best-effort restart */ }
-                    setWecomQrStatus('success');
-                    toastRef.current.success(t('agentSettings.channelDetail.wecomCredentialsUpdated'));
-                    setDualDetailMode('view');
-                    return;
+            const result = await runCredentialQrProvisioning({
+                provider: credentialQrProvider,
+                invoke,
+                isCancelled,
+                onPhase: phase => {
+                    if (!isCancelled()) setCredentialQrStatus(phase);
+                },
+                onQrUrl: async url => {
+                    const dataUrl = await QRCode.toDataURL(url, {
+                        width: 200,
+                        margin: 2,
+                        color: { dark: '#000000', light: '#ffffff' },
+                    });
+                    if (!isCancelled()) setCredentialQrImageUrl(dataUrl);
+                },
+            });
+            if (isCancelled() || result.kind === 'cancelled') return;
+            if (result.kind === 'success') {
+                // Runtime status is an execution-layer fact. Read it at commit
+                // time instead of using the potentially minutes-old render
+                // snapshot captured before the user scanned the QR code.
+                const currentStatus = await invoke<ChannelStatusData | null>(
+                    'cmd_agent_channel_status',
+                    { agentId: agent.id, channelId },
+                );
+                if (isCancelled()) return;
+                const updatedChannel = await applyAgentChannelCredentialProvisioning(
+                    agent.id,
+                    channelId,
+                    result.result.configValues,
+                    result.result.allowedUserId,
+                );
+                credentialsPersisted = true;
+                if (isMountedRef.current) onChanged();
+                if (isCancelled()) return;
+                await restartProvisionedChannelIfRunning(
+                    currentStatus,
+                    () => invoke<void>('cmd_stop_agent_channel', { agentId: agent.id, channelId }),
+                    () => invokeStartAgentChannel(agent, updatedChannel),
+                );
+                setCredentialQrStatus('success');
+                toastRef.current.success(t('agentSettings.channelDetail.credentialsUpdated'));
+                setDualDetailMode('view');
+                return;
+            }
+            setCredentialQrStatus('error');
+        } catch (error) {
+            if (!isCancelled()) {
+                if (credentialsPersisted) {
+                    setCredentialQrStatus('restart-error');
+                    toastRef.current.error(t('agentSettings.channelDetail.credentialsUpdatedRestartFailed', { message: String(error) }));
+                } else {
+                    setCredentialQrStatus('error');
+                    toastRef.current.error(t('agentSettings.channelDetail.operationFailed', { message: String(error) }));
                 }
             }
-            if (isMountedRef.current) setWecomQrStatus('error');
-        } catch {
-            if (isMountedRef.current) setWecomQrStatus('error');
         }
-    }, [agent, channelId, t]);
+    }, [agent, channelId, credentialQrProvider, onChanged, t]);
 
     // QR Login state — must be declared before any early return (rules-of-hooks)
     const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
@@ -847,7 +867,7 @@ export default function ChannelDetailView({
                 {isCredentialsExpanded && (
                     <div className="px-5 pb-5">
                         {isOpenClaw && isDualConfigPlugin ? (
-                            /* WeCom dualConfig: summary view + rescan/edit actions */
+                            /* dualConfig: existing summary by default, with explicit re-provision/edit actions */
                             <div className="space-y-4">
                                 {dualDetailMode === 'view' && (
                                     <>
@@ -868,7 +888,8 @@ export default function ChannelDetailView({
                                         </div>
                                         <div className="flex gap-2">
                                             <button
-                                                onClick={startWecomQrRescan}
+                                                onClick={startCredentialQrRescan}
+                                                disabled={!credentialQrProvider}
                                                 className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
                                             >
                                                 {t('agentSettings.channelDetail.rescan')}
@@ -884,21 +905,30 @@ export default function ChannelDetailView({
                                 )}
                                 {dualDetailMode === 'qr' && (
                                     <div className="flex flex-col items-center gap-3 rounded-xl border border-dashed border-[var(--line)] bg-[var(--paper-inset)] p-4">
-                                        {wecomQrStatus === 'loading' && <Loader2 className="h-6 w-6 animate-spin text-[var(--ink-muted)]" />}
-                                        {wecomQrStatus === 'waiting' && wecomQrImageUrl && (
+                                        {credentialQrStatus === 'loading' && <Loader2 className="h-6 w-6 animate-spin text-[var(--ink-muted)]" />}
+                                        {credentialQrStatus === 'waiting' && credentialQrImageUrl && (
                                             <div className="rounded-xl border border-[var(--line)] bg-white p-1">
-                                                <img src={wecomQrImageUrl} alt={t('agentSettings.channelDetail.qrAlt')} className="h-[180px] w-[180px] rounded-lg" />
+                                                <img src={credentialQrImageUrl} alt={t('agentSettings.channelDetail.qrAlt')} className="h-[180px] w-[180px] rounded-lg" />
                                             </div>
                                         )}
-                                        {wecomQrStatus === 'error' && <p className="text-sm text-[var(--error)]">{t('agentSettings.channelDetail.qrFailed')}</p>}
+                                        {credentialQrStatus === 'error' && <p className="text-sm text-[var(--error)]">{t('agentSettings.channelDetail.qrFailed')}</p>}
+                                        {credentialQrStatus === 'restart-error' && (
+                                            <p className="text-sm text-[var(--warning)]">{t('agentSettings.channelDetail.credentialsUpdatedRestartFailedInline')}</p>
+                                        )}
                                         <p className="text-xs text-[var(--ink-muted)]">
-                                            {wecomQrStatus === 'loading' ? t('agentSettings.channelDetail.loadingQr') : wecomQrStatus === 'waiting' ? t('agentSettings.channelDetail.scanWithApp') : ''}
+                                            {credentialQrStatus === 'loading'
+                                                ? t('agentSettings.channelDetail.loadingQr')
+                                                : credentialQrStatus === 'waiting'
+                                                    ? t('agentSettings.channelDetail.scanWithNamedApp', { app: promoted?.name })
+                                                    : ''}
                                         </p>
                                         <button
-                                            onClick={() => { wecomQrRunIdRef.current++; setDualDetailMode('view'); }}
+                                            onClick={() => { credentialQrRunIdRef.current++; setDualDetailMode('view'); }}
                                             className="text-xs text-[var(--ink-muted)] hover:text-[var(--ink)] hover:underline"
                                         >
-                                            {t('agentSettings.channelDetail.cancel')}
+                                            {credentialQrStatus === 'restart-error'
+                                                ? t('agentSettings.channelDetail.back')
+                                                : t('agentSettings.channelDetail.cancel')}
                                         </button>
                                     </div>
                                 )}

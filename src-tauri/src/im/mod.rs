@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod buffer;
 pub(crate) mod commands;
 pub(crate) mod config_store;
+pub(crate) mod credential_provisioning;
 pub mod dingtalk;
 pub(crate) mod enqueue;
 pub mod event_consumer;

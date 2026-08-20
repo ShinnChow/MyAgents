@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AppConfig } from '../types';
+import type { ChannelConfig } from '../../../shared/types/agent';
 
 const configState = vi.hoisted(() => ({ current: undefined as unknown }));
 
@@ -13,6 +14,7 @@ vi.mock('./appConfigService', () => ({
 }));
 
 import {
+  applyAgentChannelCredentialProvisioning,
   patchAgentChannelConfig,
   patchAgentChannelOpenClawConfig,
 } from './agentConfigService';
@@ -65,6 +67,73 @@ describe('disk-latest Agent channel patches', () => {
       groupActivation: 'always',
       openclawPluginConfig: { streaming: true },
     });
+  });
+
+  it('atomically merges provisioned credentials and the scanning user into disk-latest state', async () => {
+    (configState.current as AppConfig).agents![0].channels![0] = {
+      ...(configState.current as AppConfig).agents![0].channels![0],
+      openclawPluginConfig: { streaming: true, preserved: 'yes' },
+      allowedUsers: ['ou_existing'],
+    };
+
+    const updated = await applyAgentChannelCredentialProvisioning(
+      'agent-1',
+      'channel-1',
+      { appId: 'cli_app', appSecret: 'secret', domain: 'lark' },
+      'ou_scanner',
+    );
+
+    expect(updated.openclawPluginConfig).toEqual({
+      streaming: true,
+      preserved: 'yes',
+      appId: 'cli_app',
+      appSecret: 'secret',
+      domain: 'lark',
+    });
+    expect(updated.allowedUsers).toEqual(['ou_existing', 'ou_scanner']);
+  });
+
+  it('atomically creates a provisioned channel without replacing concurrently persisted channels', async () => {
+    (configState.current as AppConfig).agents![0].channels!.push({
+      id: 'channel-concurrent',
+      name: 'Concurrent Channel',
+      type: 'telegram',
+      enabled: false,
+      botToken: 'preserve-me',
+    });
+    const initialChannel = {
+      id: 'channel-new',
+      name: 'Feishu',
+      type: 'openclaw:openclaw-lark',
+      enabled: true,
+      setupCompleted: true,
+      openclawPluginConfig: { streaming: true },
+      allowedUsers: [],
+    } satisfies ChannelConfig;
+
+    const updated = await applyAgentChannelCredentialProvisioning(
+      'agent-1',
+      'channel-new',
+      { appId: 'cli_app', appSecret: 'secret', domain: 'feishu' },
+      'ou_scanner',
+      initialChannel,
+    );
+
+    expect(updated).toMatchObject({
+      id: 'channel-new',
+      openclawPluginConfig: {
+        streaming: true,
+        appId: 'cli_app',
+        appSecret: 'secret',
+        domain: 'feishu',
+      },
+      allowedUsers: ['ou_scanner'],
+    });
+    expect((configState.current as AppConfig).agents?.[0].channels).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'channel-1' }),
+      expect.objectContaining({ id: 'channel-concurrent', botToken: 'preserve-me' }),
+      expect.objectContaining({ id: 'channel-new' }),
+    ]));
   });
 
   it('accepts only the native permission vocabulary for a system Runtime channel', async () => {

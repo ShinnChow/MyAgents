@@ -855,7 +855,11 @@ async function modifyAgentChannelConfig(
   agentId: string,
   channelId: string,
   modify: (channel: ChannelConfig) => ChannelConfig,
+  initialChannel?: ChannelConfig,
 ): Promise<ChannelConfig> {
+  if (initialChannel && initialChannel.id !== channelId) {
+    throw new Error(`Initial Channel id mismatch: expected=${channelId} actual=${initialChannel.id}`);
+  }
   let updatedChannel: ChannelConfig | undefined;
   let authoritativeChannels: ChannelConfig[] | undefined;
   await atomicModifyConfig(config => {
@@ -865,9 +869,9 @@ async function modifyAgentChannelConfig(
 
     const channels = [...(agents[agentIndex].channels ?? [])];
     const channelIndex = channels.findIndex(channel => channel.id === channelId);
-    if (channelIndex < 0) return config;
+    if (channelIndex < 0 && !initialChannel) return config;
 
-    const currentChannel = channels[channelIndex];
+    const currentChannel = channelIndex >= 0 ? channels[channelIndex] : initialChannel!;
     updatedChannel = modify(currentChannel);
     const currentPermission = currentChannel.overrides?.permissionMode;
     const updatedPermission = updatedChannel.overrides?.permissionMode;
@@ -886,7 +890,8 @@ async function modifyAgentChannelConfig(
         throw new Error(`Invalid Channel permissionMode '${updatedPermission}' for its Runtime identity.`);
       }
     }
-    channels[channelIndex] = updatedChannel;
+    if (channelIndex >= 0) channels[channelIndex] = updatedChannel;
+    else channels.push(updatedChannel);
     authoritativeChannels = channels;
     agents[agentIndex] = { ...agents[agentIndex], channels };
     return { ...config, agents };
@@ -941,6 +946,30 @@ export function patchAgentChannelOpenClawConfig(
       mutation,
     ),
   }));
+}
+
+/**
+ * Commit one QR provisioning result against the disk-latest Channel.
+ * Credentials and the scanning user's allowlist admission are one product
+ * event, so they must not be persisted through separate renderer snapshots.
+ */
+export function applyAgentChannelCredentialProvisioning(
+  agentId: string,
+  channelId: string,
+  configValues: Readonly<Record<string, string>>,
+  allowedUserId?: string,
+  initialChannel?: ChannelConfig,
+): Promise<ChannelConfig> {
+  return modifyAgentChannelConfig(agentId, channelId, channel => ({
+    ...channel,
+    openclawPluginConfig: {
+      ...(channel.openclawPluginConfig ?? {}),
+      ...configValues,
+    },
+    allowedUsers: allowedUserId
+      ? [...new Set([...(channel.allowedUsers ?? []), allowedUserId])]
+      : channel.allowedUsers,
+  }), initialChannel);
 }
 
 /** Stop Channel runtime for workspace archival without changing Channel intent. */

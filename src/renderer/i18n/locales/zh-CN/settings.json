@@ -962,8 +962,11 @@
       "editCredentials": "编辑凭证",
       "qrAlt": "扫码登录",
       "qrFailed": "获取二维码失败",
+      "credentialsUpdatedRestartFailed": "新凭证已保存，但 Channel 重启失败：{{message}}。请返回后手动启动。",
+      "credentialsUpdatedRestartFailedInline": "新凭证已保存，但 Channel 重启失败。请返回后手动启动。",
       "loadingQr": "正在获取二维码...",
       "scanWithApp": "请使用 App 扫描",
+      "scanWithNamedApp": "请使用 {{app}} App 扫描二维码",
       "cancel": "取消",
       "back": "返回",
       "userBound": "用户 {{name}} 已通过二维码绑定",
@@ -990,7 +993,7 @@
       "loginFailed": "登录失败: {{message}}",
       "qrRefreshed": "二维码已刷新 ({{current}}/{{max}})，请扫描",
       "detailQrFailed": "失败: {{message}}",
-      "wecomCredentialsUpdated": "扫码成功，凭证已更新，正在重连...",
+      "credentialsUpdated": "扫码成功，凭证已安全更新",
       "start": "启动",
       "stop": "停止",
       "credentialTitleFeishu": "飞书应用凭证",
@@ -1093,23 +1096,26 @@
         "stepIndicator": "步骤 {{step}}/{{total}}: {{label}}"
       },
       "dual": {
+        "modeLabel": "机器人配置方式",
         "scanMode": "扫码添加",
         "manualMode": "手动配置",
         "scanCreateBot": "扫码创建机器人",
         "scanDescription": "使用 {{app}} App 扫描下方二维码，一键创建机器人并自动获取凭证",
-        "wecomScanAlt": "企业微信扫码",
+        "scanAlt": "使用 {{app}} 扫码创建机器人",
         "scanSuccess": "扫码成功",
-        "credentialsReceived": "Bot ID 和 Secret 已自动获取",
+        "credentialsReceived": "应用凭证已安全获取",
+        "scanDenied": "扫码授权已取消或被拒绝",
         "qrExpiredMultiple": "二维码多次过期",
         "qrExpiredRefreshing": "二维码已过期，正在刷新 ({{current}}/{{max}})...",
-        "scanWithWecom": "请使用企业微信 App 扫描二维码",
+        "scanWithApp": "请使用 {{app}} App 扫描二维码",
         "credentialsReady": "凭证已就绪，点击「下一步」继续",
         "qrExpiredRetry": "二维码多次过期，请检查网络后重试",
         "networkRetry": "请检查网络后重试",
-        "scanNote": "扫码后将创建新的智能机器人。如需关联已有机器人，请切换到「手动配置」",
-        "wecomAdmin": "企业微信管理后台",
-        "wecomCredentialSuffix": " 创建智能机器人，获取凭证",
-        "manualMethod": "创建方法：企微客户端 → 工作台 → 智能机器人 → 创建机器人 → 手动创建 → API 模式创建 → 使用长连接"
+        "scanNote": "扫码后将创建新的 {{app}} 机器人。如需关联已有机器人，请切换到「手动配置」",
+        "manualMethod": {
+          "wecom": "创建方法：企微客户端 → 工作台 → 智能机器人 → 创建机器人 → 手动创建 → API 模式创建 → 使用长连接",
+          "feishu": "在飞书开放平台创建企业自建应用，添加机器人能力，并配置权限、长连接事件与版本发布"
+        }
       },
       "config": {
         "pluginConfig": "插件配置",
@@ -1128,6 +1134,8 @@
       },
       "openclaw": {
         "credentialsEntered": "已填入 {{name}} 凭证",
+        "larkBotProvisioned": "飞书机器人已创建，应用凭证已就绪",
+        "larkProvisionedNextHint": "扫码创建流程已完成机器人能力与应用配置，点击上方「启动 Channel」验证并连接。",
         "larkNextHint": "按照下面 3 步在飞书开放平台完成权限、事件订阅、添加机器人能力，全部完成后点上方「启动 Channel」验证并启动。",
         "confirmTitle": "确认配置",
         "confirmDescription": "确认以上设置完成后，点击「启动 Channel」",
