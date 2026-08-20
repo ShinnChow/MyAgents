@@ -5,6 +5,7 @@ import type { PermissionMode } from '@/config/types';
 import type { CronSchedule, CronEndConditions, CronDelivery, ScheduledTaskKind } from '@/types/cronTask';
 import type { RuntimeBackedProviderIdentity } from '../../shared/providerExecution';
 import type { OfficialToolId } from '../../shared/official-tools';
+import type { SessionOrigin } from '../../shared/session-origin';
 
 /** Cron settings drafted in the launcher input. Sent forward via
  *  `InitialMessage.cron` and consumed by Chat's `autoSend` to switch from
@@ -88,7 +89,8 @@ export interface InitialMessage {
  * persistence has refreshed App.configRef.
  */
 export interface LaunchSessionBirthHint {
-    permissionMode?: PermissionMode | string;
+    /** Product-facing permission; App converts it to runtime vocabulary at birth. */
+    permissionMode?: PermissionMode;
     mcpEnabledServers?: string[];
     enabledPluginIds?: string[];
     enabledOfficialToolIds?: OfficialToolId[];
@@ -96,6 +98,8 @@ export interface LaunchSessionBirthHint {
     runtimeModel?: string;
     providerExecutionIdentity?: RuntimeBackedProviderIdentity;
     reasoningEffort?: string;
+    /** Explicit metadata origin when a non-Launcher surface delegates birth to App. */
+    origin?: SessionOrigin;
 }
 
 /**

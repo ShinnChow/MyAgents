@@ -515,6 +515,31 @@ describe('App helper launch', () => {
     };
   }
 
+  function latestChatProps() {
+    const props = mocks.chatProps.at(-1);
+    if (!props) throw new Error('Chat props were not captured');
+    return props as {
+      onLaunchRuntimeBackedProviderSession: (
+        project: typeof mocks.project,
+        sessionBirthHint: {
+          providerExecutionIdentity: {
+            kind: 'runtime-backed-provider';
+            providerId: string;
+            runtime: 'codex';
+            runtimeSource: 'managed-provider';
+            model: string;
+          };
+          permissionMode?: string;
+          reasoningEffort?: string;
+          mcpEnabledServers?: string[];
+          enabledPluginIds?: string[];
+          origin?: { kind: 'desktop'; surface: 'session_fork' };
+        },
+        title: string,
+      ) => Promise<string | null>;
+    };
+  }
+
   function latestSidebarProps() {
     const props = mocks.sidebarProps.at(-1);
     if (!props) throw new Error('GlobalSidebar props were not captured');
@@ -734,6 +759,84 @@ describe('App helper launch', () => {
         }),
       );
     });
+  });
+
+  it('opens a provider-switched Managed Codex session through the prepared App launch path', async () => {
+    const providerExecutionIdentity = {
+      kind: 'runtime-backed-provider' as const,
+      providerId: CODEX_SUBSCRIPTION_PROVIDER_ID,
+      runtime: 'codex' as const,
+      runtimeSource: 'managed-provider' as const,
+      model: 'gpt-5.5',
+    };
+
+    render(<App />);
+    await act(async () => {
+      await latestLauncherProps().onLaunchProject(mocks.project);
+    });
+    await waitFor(() => expect(mocks.chatProps.length).toBeGreaterThan(0));
+    const sourceTab = latestTabbarProps().tabs.find(
+      (tab) => tab.id === latestTabbarProps().activeTabId,
+    );
+    expect(sourceTab?.view).toBe('chat');
+
+    mocks.createSession.mockClear();
+    mocks.ensureSessionSidecar.mockClear();
+    mocks.reconcileSessionTabActivation.mockClear();
+
+    let openedSessionId: string | null = null;
+    await act(async () => {
+      openedSessionId = await latestChatProps().onLaunchRuntimeBackedProviderSession(
+        mocks.project,
+        {
+          providerExecutionIdentity,
+          permissionMode: 'fullAgency',
+          reasoningEffort: 'xhigh',
+          mcpEnabledServers: ['filesystem'],
+          enabledPluginIds: ['plugin-a'],
+          origin: { kind: 'desktop', surface: 'session_fork' },
+        },
+        'Codex Subscription 会话',
+      );
+    });
+
+    expect(openedSessionId).toBe('prepared-managed-session');
+    expect(mocks.createSession).toHaveBeenCalledWith(
+      mocks.project.path,
+      'codex',
+      expect.objectContaining({
+        runtimeSource: 'managed-provider',
+        providerExecutionIdentity,
+        providerId: CODEX_SUBSCRIPTION_PROVIDER_ID,
+        model: 'gpt-5.5',
+        permissionMode: 'no-restrictions',
+        reasoningEffort: 'xhigh',
+        mcpEnabledServers: ['filesystem'],
+        enabledPluginIds: ['plugin-a'],
+        origin: { kind: 'desktop', surface: 'session_fork' },
+        prepareForFirstUserMessage: true,
+        materializationSourceSessionId: expect.stringMatching(/^pending-/),
+      }),
+    );
+    const active = latestTabbarProps().tabs.find(
+      (tab) => tab.id === latestTabbarProps().activeTabId,
+    );
+    expect(latestTabbarProps().tabs).toHaveLength(2);
+    expect(active?.id).not.toBe(sourceTab?.id);
+    expect(active?.sessionId).toBe('prepared-managed-session');
+    expect(active?.view).toBe('chat');
+    expect(active?.title).toBe('Codex Subscription 会话');
+    expect(mocks.ensureSessionSidecar).toHaveBeenCalledWith(
+      'prepared-managed-session',
+      mocks.project.path,
+      'tab',
+      active?.id,
+    );
+    expect(mocks.reconcileSessionTabActivation).toHaveBeenCalledWith(
+      'prepared-managed-session',
+      active?.id,
+    );
+    expect(latestTabbarProps().tabs.find((tab) => tab.id === sourceTab?.id)).toEqual(sourceTab);
   });
 
   it('opens a sidebar Session from a no-workspace functional Tab and reconciles the exact same Tab owner on reopen', async () => {

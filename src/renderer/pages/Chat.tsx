@@ -84,7 +84,7 @@ import { runtimeModelCatalogPath } from '@/utils/runtimeModelCatalog';
 import { launchSupportDiagnostics } from '@/utils/supportDiagnostics';
 import { createDefaultSessionGoalDraftConfig } from '@/utils/sessionGoalDraft';
 import { MANAGED_CODEX_COMPACT_SLASH_COMMAND } from '@/utils/slashActions';
-import { CODEX_SUBSCRIPTION_PROVIDER_ID, type PermissionMode, type McpServerDefinition, type Provider, getEffectiveModelAliases } from '@/config/types';
+import { CODEX_SUBSCRIPTION_PROVIDER_ID, type PermissionMode, type McpServerDefinition, type Project, type Provider, getEffectiveModelAliases } from '@/config/types';
 import { syncMcpServerNames } from '@/components/tools/toolBadgeConfig';
 import {
   getAllMcpServers,
@@ -133,7 +133,7 @@ import {
   projectPermissionModeForRuntime,
 } from '../../shared/types/runtime';
 import type { RuntimeType, RuntimeDetections, RuntimeConfig, RuntimeDiagnostics, RuntimeExtensionDiagnostics } from '../../shared/types/runtime';
-import type { FilePreviewIntent, InitialMessage, SidecarConfigDisposition } from '@/types/tab';
+import type { FilePreviewIntent, InitialMessage, LaunchSessionBirthHint, SidecarConfigDisposition } from '@/types/tab';
 import type { FilePreviewFocusTarget } from '@/types/filePreview';
 import { shouldAutoSendInitialMessage } from '@/utils/initialMessageAutoSend';
 import {
@@ -472,6 +472,12 @@ interface ChatProps {
   onRenameSession?: (newTitle: string) => void;
   /** Called when user forks session at a specific assistant message — App creates new tab */
   onForkSession?: (newSessionId: string, agentDir: string, title: string, initialMessage?: string) => Promise<boolean>;
+  /** App-owned fresh-session launch for a runtime-backed provider switch. */
+  onLaunchRuntimeBackedProviderSession?: (
+    project: Project,
+    sessionBirthHint: LaunchSessionBirthHint & { providerExecutionIdentity: RuntimeBackedProviderIdentity },
+    title: string,
+  ) => Promise<string | null>;
   /** Runtime-only request from App/floating-ball to open a file preview once. */
   pendingFilePreview?: FilePreviewIntent;
   onFilePreviewIntentConsumed?: (intentId: string) => void;
@@ -482,7 +488,7 @@ function isCurrentSessionGoal(goal: SessionGoal | null | undefined): goal is Ses
   return Boolean(goal);
 }
 
-export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
+export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
   // Get state from TabContext (required - Chat must be inside TabProvider)
   const {
     tabId,
@@ -4133,7 +4139,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     }
     const pending = pendingProviderSwitch;
     setPendingProviderSwitch(null);
-    if (!pending || !agentDir || !onForkSession) return;
+    if (!pending || !agentDir) return;
     const boundChannel = channelSurfaceRef.current;
 
     let forkTabOpened = false;
@@ -4147,30 +4153,57 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     }
 
     try {
-      const { createSession } = await import('@/api/sessionClient');
-      const birth = buildProviderSwitchSessionBirth({
-        targetIntent,
-        providerId: pending.providerId,
-        model: targetModel,
-        permissionMode: inputChromePermissionMode,
-        reasoningEffort,
-        mcpEnabledServers: workspaceMcpEnabled,
-        enabledPluginIds: workspaceEnabledPlugins,
-        enabledOfficialToolIds: workspaceOfficialToolEnabled,
-      });
-      const session = await createSession(
-        agentDir,
-        birth.runtime,
-        { ...birth.opts, origin: DESKTOP_SESSION_FORK_ORIGIN },
-      );
-      const opened = await onForkSession(
-        session.id,
-        agentDir,
-        `${newProvider?.name ?? 'Claude'} 会话`,
-      );
-      if (!opened) {
-        await deleteUnopenedForkSession(session.id);
-        throw new Error('Fork tab failed to open');
+      const sessionTitle = `${newProvider.name} 会话`;
+      let openedSessionId: string;
+      if (targetIntent.kind === 'runtime-backed-provider') {
+        if (!currentProject || !onLaunchRuntimeBackedProviderSession) {
+          throw new Error('App runtime-backed provider launch owner is unavailable');
+        }
+        const launchedSessionId = await onLaunchRuntimeBackedProviderSession(
+          currentProject,
+          {
+            providerExecutionIdentity: targetIntent,
+            // LaunchSessionBirthHint carries product-facing values. App is the
+            // sole birth owner and converts them to runtime vocabulary once.
+            permissionMode: inputChromePermissionMode,
+            reasoningEffort,
+            mcpEnabledServers: workspaceMcpEnabled,
+            enabledPluginIds: workspaceEnabledPlugins,
+            enabledOfficialToolIds: workspaceOfficialToolEnabled,
+            origin: DESKTOP_SESSION_FORK_ORIGIN,
+          },
+          sessionTitle,
+        );
+        if (!launchedSessionId) {
+          throw new Error('App failed to open runtime-backed provider Session');
+        }
+        openedSessionId = launchedSessionId;
+      } else {
+        if (!onForkSession) {
+          throw new Error('App fork owner is unavailable');
+        }
+        const birth = buildProviderSwitchSessionBirth({
+          targetIntent,
+          providerId: pending.providerId,
+          model: targetModel,
+          permissionMode: inputChromePermissionMode,
+          reasoningEffort,
+          mcpEnabledServers: workspaceMcpEnabled,
+          enabledPluginIds: workspaceEnabledPlugins,
+          enabledOfficialToolIds: workspaceOfficialToolEnabled,
+        });
+        const { createSession } = await import('@/api/sessionClient');
+        const session = await createSession(
+          agentDir,
+          birth.runtime,
+          { ...birth.opts, origin: DESKTOP_SESSION_FORK_ORIGIN },
+        );
+        const opened = await onForkSession(session.id, agentDir, sessionTitle);
+        if (!opened) {
+          await deleteUnopenedForkSession(session.id);
+          throw new Error('Fork tab failed to open');
+        }
+        openedSessionId = session.id;
       }
       forkTabOpened = true;
       if (currentProject) {
@@ -4202,7 +4235,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
         }
       }
       if (boundChannel) {
-        await transferBindingToForkedSession(boundChannel, session.id);
+        await transferBindingToForkedSession(boundChannel, openedSessionId);
       }
     } catch (err) {
       console.error('[chat] Failed to create cross-provider session:', err);
@@ -4212,7 +4245,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
           : t('shell.toasts.createNewSessionFailed'),
       );
     }
-  }, [pendingProviderSwitch, agentDir, onForkSession, providers, transferBindingToForkedSession, deleteUnopenedForkSession, inputChromePermissionMode, reasoningEffort, workspaceMcpEnabled, workspaceEnabledPlugins, workspaceOfficialToolEnabled, currentProject, currentAgent, patchProject, refreshConfig, guardCronConfigMutation, t]);
+  }, [pendingProviderSwitch, agentDir, onForkSession, onLaunchRuntimeBackedProviderSession, providers, transferBindingToForkedSession, deleteUnopenedForkSession, inputChromePermissionMode, reasoningEffort, workspaceMcpEnabled, workspaceEnabledPlugins, workspaceOfficialToolEnabled, currentProject, currentAgent, patchProject, refreshConfig, guardCronConfigMutation, t]);
 
   // Cross-runtime confirm: create new session in new tab and send the pending message
   const confirmCrossRuntimeSend = useCallback(async () => {

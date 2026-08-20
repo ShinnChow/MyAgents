@@ -269,6 +269,11 @@ interface TabContentProps {
   // Chat callbacks
   onOpenHistorySession: (tabId: string, sessionId: string, title: string, historyEntrySource?: HistoryEntrySource) => Promise<void>;
   onNewSession: (tabId: string) => Promise<boolean>;
+  onLaunchRuntimeBackedProviderSession: (
+    project: Project,
+    sessionBirthHint: LaunchSessionBirthHint & { providerExecutionIdentity: RuntimeBackedProviderIdentity },
+    title: string,
+  ) => Promise<string | null>;
   onUpdateGenerating: (tabId: string, isGenerating: boolean) => void;
   onUpdateTitle: (tabId: string, title: string) => void;
   onUpdateUnread: (tabId: string, hasUnread: boolean) => void;
@@ -300,7 +305,7 @@ interface TabContentProps {
 // Exported for focused content-mount behavior tests.
 export const MemoizedTabContent = memo(function TabContent({
   tab, isActive, isWindowFocused, isLoading, error, isDeferredMount,
-  onLaunchProject, onOpenHistorySession, onNewSession,
+  onLaunchProject, onOpenHistorySession, onNewSession, onLaunchRuntimeBackedProviderSession,
   onUpdateGenerating, onUpdateTitle, onUpdateUnread, onRenameSession, onForkSession, onUpdateSessionId, onClearInitialMessage,
   claimSessionOpeningTransition,
   onSidecarConfigAdopted, onFilePreviewIntentConsumed,
@@ -415,6 +420,7 @@ export const MemoizedTabContent = memo(function TabContent({
                 onOpenSession={(sessionId, title, historyEntrySource) => onOpenHistorySession(tab.id, sessionId, title, historyEntrySource)}
                 onOpenSessionInNewTab={(sessionId, title) => onOpenHistorySession(tab.id, sessionId, title, 'chat_dropdown_new_tab')}
                 onNewSession={() => onNewSession(tab.id)}
+                onLaunchRuntimeBackedProviderSession={onLaunchRuntimeBackedProviderSession}
                 initialMessage={tab.initialMessage}
                 onInitialMessageConsumed={() => onClearInitialMessage(tab.id)}
                 sidecarConfigDisposition={tab.sidecarConfigDisposition}
@@ -1870,7 +1876,7 @@ export default function App() {
           );
           const prepared = await createSession(project.path, birth.runtime, {
             ...birth.opts,
-            origin: originFromDesktopSurface(pendingSurfaceForLaunch?.surface),
+            origin: sessionBirthHint?.origin ?? originFromDesktopSurface(pendingSurfaceForLaunch?.surface),
             prepareForFirstUserMessage: true,
             materializationSourceSessionId: effectiveSessionId,
           });
@@ -1992,6 +1998,53 @@ export default function App() {
       setLoadingTabs((prev) => ({ ...prev, [activeTabId]: false, [targetTabId]: false }));
     }
   }, [configProjects, setActiveTabId, t]);
+
+  /**
+   * Runtime-backed provider switches are fresh-session launches, not transcript
+   * forks. App owns the launcher Tab, prepared metadata birth, Sidecar owner,
+   * and activation as one canonical lifecycle transaction.
+   */
+  const handleLaunchRuntimeBackedProviderSession = useCallback(async (
+    project: Project,
+    sessionBirthHint: LaunchSessionBirthHint & { providerExecutionIdentity: RuntimeBackedProviderIdentity },
+    title: string,
+  ): Promise<string | null> => {
+    if (tabsRef.current.length >= MAX_TABS) {
+      toastRef.current.error(t('appChrome.tabLimitReached'));
+      return null;
+    }
+
+    const launchTab = createNewTab();
+    openLaunchTabNow(launchTab);
+    try {
+      const opened = await handleLaunchProject(
+        project,
+        undefined,
+        { surface: 'unknown', entryIntent: 'fork' },
+        sessionBirthHint,
+      );
+      if (!opened) {
+        removeUnusedPrecreatedLaunchTab(launchTab.id);
+        return null;
+      }
+
+      const launchedTab = tabsRef.current.find((tab) => tab.id === launchTab.id);
+      const launchedSessionId = launchedTab?.sessionId;
+      if (!launchedSessionId || isPendingSessionId(launchedSessionId)) {
+        console.error('[App] Runtime-backed provider launch completed without a materialized Session id');
+        return null;
+      }
+
+      setTabs((current) => current.map((tab) => (
+        tab.id === launchTab.id ? { ...tab, title } : tab
+      )));
+      return launchedSessionId;
+    } catch (error) {
+      console.error('[App] Failed to launch runtime-backed provider Session:', error);
+      removeUnusedPrecreatedLaunchTab(launchTab.id);
+      return null;
+    }
+  }, [handleLaunchProject, openLaunchTabNow, removeUnusedPrecreatedLaunchTab, t]);
 
   // Clear initialMessage from a tab after it has been consumed by Chat
   const clearInitialMessage = useCallback((tabId: string) => {
@@ -3643,6 +3696,7 @@ export default function App() {
             onLaunchProject={handleLaunchProject}
             onOpenHistorySession={handleOpenChatHistorySession}
             onNewSession={handleNewSession}
+            onLaunchRuntimeBackedProviderSession={handleLaunchRuntimeBackedProviderSession}
             onUpdateGenerating={updateTabGenerating}
             onUpdateTitle={updateTabTitle}
             onUpdateUnread={updateTabUnread}
