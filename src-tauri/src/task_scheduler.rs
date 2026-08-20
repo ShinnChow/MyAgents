@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::RwLock;
 
 use crate::cron_task::CronRunRecord;
@@ -1138,6 +1138,51 @@ impl TaskSchedulerController {
         execution_is_authorized(&self.executions, task_id, queue_id).await
     }
 
+    /// Commit an ordinary Task↔Session relation only after the exact Runtime
+    /// queue accepted its first Task turn, then flush comments that were
+    /// waiting for the first usable execution Session.
+    pub async fn confirm_turn_admitted(
+        &self,
+        task_id: &str,
+        queue_id: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        let _control = acquire_task_control(task_id).await;
+        let exact = self
+            .executions
+            .read()
+            .await
+            .get(task_id)
+            .is_some_and(|execution| {
+                execution.queue_id == queue_id
+                    && !execution.canceled
+                    && execution.session_id.as_deref() == Some(session_id)
+            });
+        if !exact {
+            return Ok(false);
+        }
+        let store = crate::task::get_task_store()
+            .ok_or_else(|| "task store not initialized".to_string())?;
+        let (_, claimed_comments) = store
+            .append_session_and_claim_pending_comments(task_id, session_id)
+            .await?;
+        if let Some(handle) = self.app_handle.read().await.clone() {
+            if let Some(manager) = handle.try_state::<crate::sidecar::ManagedSidecarManager>() {
+                crate::task_application::TaskApplication::new(store.as_ref(), None)
+                    .deliver_claimed_comments(
+                        &handle,
+                        manager.inner(),
+                        task_id,
+                        session_id,
+                        claimed_comments,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(true)
+    }
+
     /// Publish the concrete Session currently used by a local managed Task
     /// batch. Exact queue authority gates the write, so a stop that wins first
     /// prevents later Session dispatch; once published, `/task/stop` can target
@@ -1384,19 +1429,19 @@ async fn reserve_claimed_execution_session(
             let replacement_session_id = uuid::Uuid::new_v4().to_string();
             let replacement_lifecycle =
                 crate::sidecar::acquire_session_lifecycle(&[&replacement_session_id]).await;
-            store
-                .set_execution_session_with_lifecycle_held(
-                    &task.id,
-                    replacement_session_id.clone(),
-                    Some(&selected_session_id),
-                )
-                .await?;
             drop(selected_lifecycle);
             (replacement_session_id, replacement_lifecycle, true)
         } else {
-            store
-                .append_session_with_lifecycle_held(&task.id, &selected_session_id)
-                .await?;
+            // An explicitly preselected Session is already a user-confirmed
+            // relation. A freshly minted ordinary execution Session remains
+            // transient until Runtime dispatch acceptance.
+            if !selected_was_bound
+                && task.preselected_session_id.as_deref() == Some(selected_session_id.as_str())
+            {
+                store
+                    .append_session_with_lifecycle_held(&task.id, &selected_session_id)
+                    .await?;
+            }
             (
                 selected_session_id,
                 selected_lifecycle,
@@ -2595,6 +2640,25 @@ async fn run_one_claimed(
             None,
         ),
     };
+
+    // Terminal transport response is the idempotent compensation path when
+    // Node's immediate admitted callback was lost after Runtime acceptance.
+    if let Some(outcome) = outcome.as_ref().filter(|outcome| outcome.turn_dispatched) {
+        if let Some(session_id) = outcome.session_id.as_deref() {
+            if let Err(error) = get_task_scheduler()
+                .confirm_turn_admitted(task_id, queue_id, session_id)
+                .await
+            {
+                ulog_warn!(
+                    "[task-comment] terminal admission compensation failed task={} queue={} session={}: {}",
+                    task_id,
+                    queue_id,
+                    session_id,
+                    error
+                );
+            }
+        }
+    }
 
     if let Some(outcome) = outcome
         .as_ref()

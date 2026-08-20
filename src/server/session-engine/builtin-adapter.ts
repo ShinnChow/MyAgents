@@ -390,6 +390,13 @@ export function createBuiltinSessionEngine(): SessionEngine {
       if (routed.error) {
         return { success: false, error: routed.error, status: routed.status };
       }
+      const beforeDispatch = request.requiredSystemSkill
+        ? createScheduledDispatchGuard({
+            preceding: request.beforeDispatch ?? acceptInjectedTurnDispatch,
+            requiredSystemSkill: request.requiredSystemSkill,
+            requireNativeSystemSkill: skill => requireCurrentBuiltinSkill(skill),
+          })
+        : request.beforeDispatch;
       const result = await enqueueUserMessage(
         request.text,
         request.images,
@@ -409,7 +416,7 @@ export function createBuiltinSessionEngine(): SessionEngine {
           turnOwner: request.turnOwner,
           onTerminal: request.onTerminal,
           ...(request.turnBoundaryOnly ? { queueResponseModeOverride: 'turn' as const } : {}),
-          beforeDispatch: request.beforeDispatch,
+          beforeDispatch,
           channelDelivery: DESKTOP_CHANNEL_DELIVERY,
         },
       );
@@ -788,6 +795,11 @@ export function createBuiltinSessionEngine(): SessionEngine {
           error: dispatchAcceptance.error ?? 'Injected turn was rejected before dispatch',
           status: 409,
         };
+      }
+      try {
+        await request.onDispatched?.(queueId, request.sessionId);
+      } catch (error) {
+        console.warn('[session-engine] builtin onDispatched callback failed; terminal compensation remains available:', error);
       }
       const outcome = await waitForDeadline(terminal, Math.max(0, deadline - Date.now()));
       if (!outcome) {

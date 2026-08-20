@@ -14,11 +14,11 @@ describe('required builtin Skill readiness', () => {
     const initialization = new Promise<void>(resolve => { finishInitialization = resolve; });
     const query = {
       initializationResult: vi.fn(() => initialization),
-      reloadSkills: vi.fn(async () => ({ skills: [{ name: 'task-alignment' }] })),
+      reloadSkills: vi.fn(async () => ({ skills: [{ name: 'myagents-task-alignment' }] })),
     };
     setQuerySession(query as never);
 
-    const readiness = requireCurrentBuiltinSkill('task-alignment');
+    const readiness = requireCurrentBuiltinSkill('myagents-task-alignment');
     await Promise.resolve();
     expect(query.reloadSkills).not.toHaveBeenCalled();
 
@@ -35,8 +35,8 @@ describe('required builtin Skill readiness', () => {
     setQuerySession(query as never);
     setSdkControlReady(true);
 
-    await expect(requireCurrentBuiltinSkill('task-alignment')).rejects.toThrow(
-      'builtin Runtime did not load required system skill task-alignment',
+    await expect(requireCurrentBuiltinSkill('myagents-task-alignment')).rejects.toThrow(
+      'builtin Runtime did not load required system skill myagents-task-alignment',
     );
   });
 });

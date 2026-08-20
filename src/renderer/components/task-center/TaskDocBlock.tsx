@@ -25,6 +25,7 @@ import { ChevronDown, ChevronUp, FolderOpen } from 'lucide-react';
 
 import Markdown from '@/components/Markdown';
 import { taskOpenDocsDir, taskReadDoc, type TaskDocName } from '@/api/taskCenter';
+import { openExternal } from '@/utils/openExternal';
 import type { Task } from '@/../shared/types/task';
 import { extractErrorMessage } from './errors';
 
@@ -46,6 +47,8 @@ interface Props {
   /** If true, render nothing when the file is empty (progress.md uses this
    *  so new tasks don't show a dashed empty-box). */
   hideWhenEmpty?: boolean;
+  /** Detail Drawer shows the canonical task.md in full; legacy documents may collapse. */
+  collapsible?: boolean;
   /** Signal: task refetched externally → reload content. */
   reloadKey?: unknown;
   onError: (msg: string) => void;
@@ -57,6 +60,7 @@ export function TaskDocBlock({
   title,
   emptyHint,
   hideWhenEmpty = false,
+  collapsible = true,
   reloadKey,
   onError,
 }: Props) {
@@ -136,7 +140,17 @@ export function TaskDocBlock({
   // edit modes don't diverge visually. Declared before the
   // hideWhenEmpty short-circuit so the useCallback hook call order
   // stays stable across renders (rules-of-hooks).
-  const path = `~/.myagents/tasks/${task.id}/${doc}.md`;
+  const path = doc === 'task'
+    ? task.docs?.taskMd
+    : doc === 'verify'
+      ? task.docs?.verifyMd
+      : task.docs?.progressMd;
+  const displayPath = path ?? `~/.myagents/tasks/${task.id}/${doc}.md`;
+  const handleOpenFile = useCallback(() => {
+    if (!path) return;
+    void openExternal(path, { workspace: task.workspacePath })
+      .catch((e) => onError(extractErrorMessage(e)));
+  }, [onError, path, task.workspacePath]);
   const handleOpenFolder = useCallback(() => {
     void taskOpenDocsDir(task.id).catch((e) => onError(extractErrorMessage(e)));
   }, [task.id, onError]);
@@ -146,7 +160,7 @@ export function TaskDocBlock({
   // see the block during initial fetch (prevents jumpy layout).
   if (hideWhenEmpty && loaded && !content) return null;
 
-  const showCollapseAffordance = loaded && !!content && overflows;
+  const showCollapseAffordance = collapsible && loaded && !!content && overflows;
   const showFade = showCollapseAffordance && !expanded;
 
   return (
@@ -156,12 +170,15 @@ export function TaskDocBlock({
       <h3 className="text-sm font-semibold text-[var(--ink)]">{title}</h3>
       {/* Path + 打开文件夹 on a dedicated row below the title. */}
       <div className="mb-2 mt-1 flex items-center gap-2">
-        <span
-          className="min-w-0 flex-1 truncate font-mono text-xs text-[var(--ink-muted)]/70"
-          title={path}
+        <button
+          type="button"
+          disabled={!path}
+          onClick={handleOpenFile}
+          className="min-w-0 flex-1 truncate text-left font-mono text-xs text-[var(--ink-muted)]/70 enabled:hover:text-[var(--ink)] enabled:hover:underline"
+          title={displayPath}
         >
-          {path}
-        </span>
+          {displayPath}
+        </button>
         <button
           type="button"
           onClick={handleOpenFolder}

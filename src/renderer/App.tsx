@@ -3,6 +3,7 @@ import { flushSync } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import ChatBootOverlay from '@/components/ChatBootOverlay';
 import { arrayMove } from '@dnd-kit/sortable';
+import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 
 import {
   initAnalytics,
@@ -19,6 +20,7 @@ import type { AssistantEntry, EntryIntent, HistoryEntrySource, PendingSessionBir
 import { stopTabSidecar, startGlobalSidecar, initGlobalSidecarReadyPromise, markGlobalSidecarReady, ensureSessionSidecar, releaseTabSession, reconcileSessionTabActivation, upgradeSessionId, hasSessionSidecar, getSessionGeneration, stopSseProxy, startBackgroundCompletion, startBackgroundCompletionForDeletion, canRestoreSession, getUserSchedulerLifecycleSnapshot, querySessionHasPersistentOwners, sessionHasPersistentOwners, setAppActiveCorrelation } from '@/api/tauriClient';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import BugReportOverlay from '@/components/BugReportOverlay';
+import { DispatchTaskDialog } from '@/components/task-center/DispatchTaskDialog';
 import CustomTitleBar from '@/components/CustomTitleBar';
 import GlobalSidebar, { type CapabilitySection } from '@/components/global-sidebar/GlobalSidebar';
 import LinkContextMenuProvider from '@/components/LinkContextMenuProvider';
@@ -101,6 +103,14 @@ import { getSessionDisplayText } from '@/utils/sessionDisplay';
 import { listenWithCleanup } from '@/utils/tauriListen';
 import { migrateFloatingBallSessionBinding } from '@/floating-ball/sessionBinding';
 import { CUSTOM_EVENTS, createPendingSessionId, isPendingSessionId } from '../shared/constants';
+import { buildTaskDiscussionReminder } from '../shared/systemReminder';
+import { TASK_ALIGNMENT_SKILL_REQUIREMENT } from '../shared/systemSkills';
+import type {
+  PreparedTaskDiscussion,
+  TaskCreateIntent,
+  TaskCreateRequest,
+  TaskDiscussionRequest,
+} from '../shared/taskDiscussion';
 import { normalizeOfficialToolIds, type OfficialToolId } from '../shared/official-tools';
 import { CODEX_SUBSCRIPTION_PROVIDER_ID, getManagedCodexProviderReadiness } from '../shared/config-types';
 import { workspacePathsEqual } from '../shared/workspacePath';
@@ -298,6 +308,8 @@ interface TabContentProps {
   // Only read by the `taskcenter` tab; other tab views ignore it.
   taskCenterPendingIntent: { autofocusSearch?: boolean; nonce: number } | null;
   taskCenterCurrentSessionId?: string | null;
+  taskPendingRoute?: PendingAppRoute | null;
+  onTaskRouteConsumed?: (generation: number) => void;
   spacePendingRoute?: PendingAppRoute | null;
   onSpaceRouteConsumed?: (generation: number) => void;
 }
@@ -328,6 +340,8 @@ export const MemoizedTabContent = memo(function TabContent({
   sessionNotificationBadgeCounts,
   taskCenterPendingIntent,
   taskCenterCurrentSessionId,
+  taskPendingRoute,
+  onTaskRouteConsumed,
   spacePendingRoute,
   onSpaceRouteConsumed,
 }: TabContentProps) {
@@ -388,6 +402,8 @@ export const MemoizedTabContent = memo(function TabContent({
             isActive={isActive}
             pendingIntent={taskCenterPendingIntent}
             currentSessionId={taskCenterCurrentSessionId}
+            pendingRoute={taskPendingRoute ?? null}
+            onRouteConsumed={onTaskRouteConsumed}
           />
         </Suspense>
       ) : kind === 'space' ? (
@@ -539,6 +555,7 @@ export default function App() {
   const [activeTabId, setActiveTabIdState] = useState<string | null>(() => tabs[0]?.id ?? null);
   const [externalNotificationBadges, setExternalNotificationBadges] = useState<NotificationBadgeItem[]>([]);
   const [spacePendingRoute, setSpacePendingRoute] = useState<PendingAppRoute | null>(null);
+  const [taskPendingRoute, setTaskPendingRoute] = useState<PendingAppRoute | null>(null);
   const appRouteGenerationRef = useRef(0);
   const spaceRouteTabIdRef = useRef<string | null>(null);
 
@@ -2832,6 +2849,21 @@ export default function App() {
     { autofocusSearch?: boolean; nonce: number } | null
   >(null);
   const [taskCenterCurrentSessionId, setTaskCenterCurrentSessionId] = useState<string | null>(null);
+  const [taskCreateIntent, setTaskCreateIntent] = useState<TaskCreateIntent | null>(null);
+
+  const handleOpenTaskCreate = useCallback((request: TaskCreateRequest) => {
+    setTaskCreateIntent({
+      ...request,
+      id: `task-create-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    });
+  }, []);
+  const handleSidebarCreateTask = useCallback(() => {
+    handleOpenTaskCreate({
+      initialMode: 'smart',
+      source: 'sidebar',
+      currentSessionId: taskCenterCurrentSessionId,
+    });
+  }, [handleOpenTaskCreate, taskCenterCurrentSessionId]);
 
   // Listen for OPEN_TASK_CENTER custom event from child components
   useEffect(() => {
@@ -2857,6 +2889,17 @@ export default function App() {
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_TASK_CENTER, handler);
   }, [handleOpenTaskCenter]);
 
+  useEffect(() => {
+    const handler = (raw: Event) => {
+      const request = (raw as CustomEvent<TaskCreateRequest>).detail;
+      if (!request || !['smart', 'manual'].includes(request.initialMode)) return;
+      if (!['sidebar', 'task-center', 'thought'].includes(request.source)) return;
+      handleOpenTaskCreate(request);
+    };
+    window.addEventListener(CUSTOM_EVENTS.OPEN_TASK_CREATE, handler);
+    return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_TASK_CREATE, handler);
+  }, [handleOpenTaskCreate]);
+
   const lastNativeAppRouteGenerationRef = useRef(0);
   const openedSpaceRouteGenerationRef = useRef(0);
   const handleOpenAppRoute = useCallback((route: AppRoute, nativeGeneration?: number): boolean => {
@@ -2870,6 +2913,21 @@ export default function App() {
       nativeGeneration !== undefined
       && nativeGeneration <= lastNativeAppRouteGenerationRef.current
     ) {
+      return true;
+    }
+    if (route.name === 'task.comment') {
+      const currentTabs = tabsRef.current;
+      const existing = currentTabs.find((tab) => tab.view === 'taskcenter');
+      if (!existing && currentTabs.length >= MAX_TABS) {
+        toastRef.current.error(t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }));
+        return false;
+      }
+      if (nativeGeneration !== undefined) {
+        lastNativeAppRouteGenerationRef.current = nativeGeneration;
+      }
+      appRouteGenerationRef.current += 1;
+      setTaskPendingRoute({ generation: appRouteGenerationRef.current, route });
+      handleOpenTaskCenter();
       return true;
     }
     if (!spaceBuildCapability.isLoading && !spaceBuildCapability.available) {
@@ -2890,7 +2948,7 @@ export default function App() {
       route,
     });
     return true;
-  }, [spaceBuildCapability.available, spaceBuildCapability.isLoading, spaceBuildCapability.reason, t]);
+  }, [handleOpenTaskCenter, spaceBuildCapability.available, spaceBuildCapability.isLoading, spaceBuildCapability.reason, t]);
 
   useEffect(() => {
     if (!spacePendingRoute || spaceBuildCapability.isLoading) return;
@@ -2938,13 +2996,18 @@ export default function App() {
     ));
   }, []);
 
+  const handleTaskRouteConsumed = useCallback((generation: number) => {
+    setTaskPendingRoute((current) => (
+      current?.generation === generation ? null : current
+    ));
+  }, []);
+
   useEffect(() => {
     if (!isTauriEnvironment()) return;
     const ac = new AbortController();
     const drain = async () => {
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const pending = await invoke<PendingAppRoute | null>('cmd_take_pending_app_route');
+        const pending = await tauriInvoke<PendingAppRoute | null>('cmd_take_pending_app_route');
         if (pending && !ac.signal.aborted) {
           handleOpenAppRoute(pending.route, pending.generation);
         }
@@ -2999,43 +3062,44 @@ export default function App() {
   }, [handleOpenSpace]);
 
 
-  // PRD §8.3 — "AI 讨论" flow. Open a new Chat tab, auto-dispatch the
-  // `/task-alignment` skill with the thought content + instructions to call
-  // `myagents task create-from-alignment` at the end.
-  useEffect(() => {
-    const handler = async (raw: Event) => {
-      const event = raw as CustomEvent<{
-        thoughtId: string;
-        content: string;
-        tags: string[];
+  // All Task discussion entry points converge here. The visible user text is
+  // carried after a hidden product reminder, while the exact app-owned Skill
+  // contract is admitted again at the moment the first turn is dispatched.
+  const handleStartTaskDiscussion = useCallback(async ({
+    thoughtId,
+    content,
+    tags = [],
+    workspaceId,
+  }: {
+    thoughtId?: string;
+    content: string;
+    tags?: string[];
         /** Explicit workspace pick from the ThoughtCard popover (v0.1.69
          *  polish). When present we use it directly; when absent (old
          *  callers or programmatic triggers) we fall back to the smart
          *  tag→project match so behavior degrades gracefully. */
-        workspaceId?: string;
-      }>;
-      const { thoughtId, content, tags, workspaceId } = event.detail ?? {
-        thoughtId: '',
-        content: '',
-        tags: [],
-      };
-      if (!thoughtId || !content) return;
+    workspaceId?: string;
+  }): Promise<boolean> => {
+      if (!content?.trim()) {
+        toastRef.current?.error(t('appChrome.taskDiscussionContentRequired'));
+        return false;
+      }
 
       try {
         const currentTabs = tabsRef.current;
         if (currentTabs.length >= MAX_TABS) {
           toastRef.current?.error(t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }));
-          return;
+          return false;
         }
 
         const projects = configProjectsRef.current.filter(isProjectVisibleToUser);
         if (projects.length === 0) {
           toastRef.current?.error(t('appChrome.noWorkspaceForDiscussion'));
-          return;
+          return false;
         }
         // Prefer the explicit pick; fall back to smart default for legacy
         // callers / programmatic use.
-        const lowerTags = tags.map((t) => t.toLowerCase());
+        const lowerTags = (tags ?? []).map((tag) => tag.toLowerCase());
         const workspace =
           (workspaceId ? projects.find((p) => p.id === workspaceId) : undefined) ??
           projects.find((p) => lowerTags.includes(p.name.toLowerCase())) ??
@@ -3050,78 +3114,45 @@ export default function App() {
         const workspaceAgent = workspace.agentId && configRef.current
           ? getAgentById(configRef.current, workspace.agentId)
           : undefined;
-        const sel = resolveBuiltinSelection(
-          { agent: workspaceAgent, workspace },
-          configRef.current!,
-          appProvidersRef.current,
-          appApiKeysRef.current,
-          appProviderVerifyStatusRef.current,
+        const workspaceRuntime = resolveEffectiveRuntime(
+          workspaceAgent?.runtime,
+          Boolean(configRef.current?.multiAgentRuntime),
         );
-        if (!sel) {
+        const sel = workspaceRuntime === 'builtin'
+          ? resolveBuiltinSelection(
+              { agent: workspaceAgent, workspace },
+              configRef.current!,
+              appProvidersRef.current,
+              appApiKeysRef.current,
+              appProviderVerifyStatusRef.current,
+            )
+          : undefined;
+        if (workspaceRuntime === 'builtin' && !sel) {
           toastRef.current?.error(t('appChrome.noModelProviderForDiscussion'));
-          return;
+          return false;
         }
 
-        // Pre-mint the alignment session id (CC review W8) so the AI doesn't
-        // have to infer a placeholder. This becomes the subdir under
-        // `~/.myagents/tasks/<id>/` where alignment.md/task.md/verify.md/
-        // progress.md land, and the exact value the
-        // `task create-from-alignment` CLI takes (it renames that directory
-        // to `~/.myagents/tasks/<newTaskId>/` on promotion).
-        //
-        // v0.1.69 relocation: the task-alignment skill writes via the `Write`
-        // tool using the absolute home-dir path (task docs moved out of the
-        // workspace so moving/renaming the workspace doesn't orphan them).
-        const alignmentSessionId = `align-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-
-        // Persist the workspace/thought context to
-        // `~/.myagents/tasks/<alignmentSessionId>/metadata.json` so that
-        // when the AI later calls `myagents task create-from-alignment`
-        // it only needs to pass `--name`; the backend inherits the rest
-        // from this file. Without this, the AI had to re-type 3 long
-        // UUIDs that it already had in its prompt context — fragile
-        // (one typo → task hung on wrong workspace, silently).
-        // Fire-and-forget is safe: the prompt still carries the same
-        // context as a fallback, so even if the write fails the AI can
-        // pass the params explicitly and the flow still works.
-        if (isTauriEnvironment()) {
-          try {
-            const { invoke } = await import('@tauri-apps/api/core');
-            await invoke('cmd_task_write_alignment_metadata', {
-              alignmentSessionId,
-              workspaceId: workspace.id,
-              workspacePath: workspace.path,
-              sourceThoughtId: thoughtId,
-            });
-          } catch (err) {
-            console.warn(
-              '[App] OPEN_AI_DISCUSSION: write alignment metadata failed, AI will need to pass params explicitly:',
-              err,
-            );
-          }
+        if (!isTauriEnvironment()) {
+          throw new Error('Task discussion requires the desktop Task store');
         }
+        const discussionId = `discussion-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+        const prepared = await tauriInvoke<PreparedTaskDiscussion>('cmd_task_prepare_discussion', {
+          discussionId,
+          workspaceId: workspace.id,
+          workspacePath: workspace.path,
+          sourceThoughtId: thoughtId || undefined,
+          sourceThoughtTags: tags ?? [],
+        });
+        const discussionPrompt = buildTaskDiscussionReminder({
+          ...prepared,
+          workspaceId: workspace.id,
+          workspacePath: workspace.path,
+          sourceThoughtId: thoughtId || undefined,
+          sourceThoughtTags: tags ?? [],
+          visibleUserMessage: content,
+        });
 
-        // Prompt stays minimal by design — operational details (how to
-        // write the four docs, when to call `create-from-alignment`, what
-        // each of the 4 discussion outcomes looks like, CLI syntax) ALL
-        // live in `bundled-skills/task-alignment/SKILL.md`. The prompt
-        // only carries per-conversation data the skill can't know: the
-        // original thought text + four context-parameter values. Fewer
-        // instructions here means the AI doesn't get steered into "write
-        // files first" before the alignment dialog actually happens.
-        const alignmentPrompt = [
-          '我有一个想法希望进行讨论，请使用 Skill `/task-alignment` 与我讨论对齐。',
-          '本次上下文参数：',
-          `- alignmentSessionId: ${alignmentSessionId}`,
-          `- workspaceId: ${workspace.id}`,
-          `- workspacePath: ${workspace.path}`,
-          `- sourceThoughtId: ${thoughtId}`,
-          '',
-          '[我的想法]',
-          content,
-        ].join('\n');
-
-        const alignmentProviderIntent = isRuntimeBackedProvider(sel.provider)
+        const alignmentProviderIntent = sel && isRuntimeBackedProvider(sel.provider)
           ? toProviderExecutionIntent(sel.provider, sel.model)
           : undefined;
         const alignmentProviderExecutionIdentity = alignmentProviderIntent?.kind === 'runtime-backed-provider'
@@ -3133,14 +3164,17 @@ export default function App() {
           defaultPermissionMode: configRef.current?.defaultPermissionMode,
         });
         const initialMessage: InitialMessage = {
-          text: alignmentPrompt,
+          text: discussionPrompt,
+          requiredSystemSkill: TASK_ALIGNMENT_SKILL_REQUIREMENT,
           ...(alignmentPermissionMode ? { permissionMode: alignmentPermissionMode } : {}),
           ...(alignmentProviderExecutionIdentity
             ? {
                 providerExecutionIdentity: alignmentProviderExecutionIdentity,
                 runtimeModel: alignmentProviderExecutionIdentity.model,
               }
-            : { builtinSelection: { providerId: sel.provider.id, model: sel.model } }),
+            : sel
+              ? { builtinSelection: { providerId: sel.provider.id, model: sel.model } }
+              : {}),
         };
 
         // Pre-seed the tab as a Chat tab before awaiting sidecar startup.
@@ -3166,11 +3200,12 @@ export default function App() {
           setActiveTabId(newTab.id);
         }
 
-        await handleLaunchProject(
+        const launched = await handleLaunchProject(
           workspace,
           initialMessage,
           { surface: 'task_center', entryIntent: 'thought_alignment' },
         );
+        if (!launched) return false;
 
         // handleLaunchProject's internal setTabs overwrites `title` with the
         // workspace display name. Restore the "任务讨论" title afterwards so
@@ -3181,15 +3216,37 @@ export default function App() {
             tab.id === newTab.id ? { ...tab, title: t('appChrome.discussionTabTitle') } : tab,
           ),
         );
+        return true;
       } catch (err) {
         console.error('[App] OPEN_AI_DISCUSSION failed:', err);
+        toastRef.current?.error(
+          err instanceof Error ? err.message : t('appChrome.taskDiscussionStartFailed'),
+        );
+        return false;
       }
+  }, [handleLaunchProject, openLaunchTabNow, setActiveTabId, t]);
+
+  const handleCreateDialogDiscussion = useCallback(async (request: TaskDiscussionRequest) => {
+    const opened = await handleStartTaskDiscussion({
+      thoughtId: request.sourceThoughtId,
+      content: request.content,
+      tags: request.sourceThoughtTags,
+      workspaceId: request.workspaceId,
+    });
+    if (opened) setTaskCreateIntent(null);
+    return opened;
+  }, [handleStartTaskDiscussion]);
+
+  useEffect(() => {
+    const handler = (raw: Event) => {
+      const detail = (raw as CustomEvent<Parameters<typeof handleStartTaskDiscussion>[0]>).detail;
+      if (!detail) return;
+      void handleStartTaskDiscussion(detail).catch(() => undefined);
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, handler);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, handler);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- stable via refs
-  }, [setActiveTabId, t]);
+  }, [handleStartTaskDiscussion]);
 
   // DOM/Tauri ingress adapter for Task, notification, and Companion opens.
   // App's canonical history owner still decides jump / revive / spawn.
@@ -3636,6 +3693,7 @@ export default function App() {
         teamSpaceAvailable={teamSpaceAvailable}
         onNewTab={handleSidebarNewChat}
         onOpenTaskCenter={handleOpenTaskCenter}
+        onCreateTask={handleSidebarCreateTask}
         onOpenSpace={handleOpenSpace}
         onOpenAppRoute={handleOpenAppRoute}
         onOpenCapabilities={handleOpenCapabilities}
@@ -3710,12 +3768,34 @@ export default function App() {
             sessionNotificationBadgeCounts={tab.id === activeTabId ? sessionNotificationBadgeCounts : undefined}
             taskCenterPendingIntent={taskCenterPendingIntent}
             taskCenterCurrentSessionId={taskCenterCurrentSessionId}
+            taskPendingRoute={tab.view === 'taskcenter' ? taskPendingRoute : null}
+            onTaskRouteConsumed={handleTaskRouteConsumed}
             spacePendingRoute={tab.view === 'space' ? spacePendingRoute : null}
             onSpaceRouteConsumed={handleSpaceRouteConsumed}
           />
         ))}
       </div>
       </div>
+
+      {taskCreateIntent && (
+        <DispatchTaskDialog
+          key={taskCreateIntent.id}
+          thought={taskCreateIntent.thought}
+          defaultWorkspacePath={taskCreateIntent.defaultWorkspacePath}
+          currentSessionId={taskCreateIntent.currentSessionId ?? null}
+          initialMode={taskCreateIntent.initialMode}
+          onClose={() => setTaskCreateIntent(null)}
+          onDiscuss={handleCreateDialogDiscussion}
+          onDispatched={(created) => {
+            track('task_create', {
+              source: 'desktop',
+              origin: taskCreateIntent.source,
+              has_workspace: !!created.workspacePath,
+            });
+            setTaskCreateIntent(null);
+          }}
+        />
+      )}
 
       {/* Exit confirmation dialog for running cron tasks */}
       {exitConfirmState && (

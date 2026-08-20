@@ -135,6 +135,12 @@ export function SummaryCard({ task, stats }: Props) {
 
   const [detailsOpen, setDetailsOpen] = useState(false);
   const toggleDetails = useCallback(() => setDetailsOpen((v) => !v), []);
+  const hasExecutionOverride = task.providerId !== undefined
+    || task.model !== undefined
+    || task.permissionMode !== undefined
+    || task.runtime !== undefined
+    || task.runtimeConfig !== undefined
+    || task.mcpEnabledServers !== undefined;
 
   return (
     <div className="rounded-[var(--radius-lg)] border border-[var(--line)] bg-[var(--paper)] px-4 py-3.5">
@@ -232,12 +238,44 @@ export function SummaryCard({ task, stats }: Props) {
           {task.runMode === 'single-session' && task.preselectedSessionId && (
             <MetaRow k={t('trigger.targetSession')} v={task.preselectedSessionId} mono />
           )}
-          {task.model && <MetaRow k={t('summary.modelOverride')} v={task.model} mono />}
-          {task.permissionMode && task.permissionMode !== 'auto' && (
+          {!hasExecutionOverride && (
+            <MetaRow k={t('summary.executionOverrides')} v={t('summary.followAgent')} />
+          )}
+          {task.providerId !== undefined && (
+            <MetaRow
+              k={t('summary.providerOverride')}
+              v={task.providerId || t('summary.explicitEmpty')}
+              mono
+            />
+          )}
+          {task.model !== undefined && (
+            <MetaRow
+              k={t('summary.modelOverride')}
+              v={task.model || t('summary.explicitEmpty')}
+              mono
+            />
+          )}
+          {task.permissionMode !== undefined && (
             <MetaRow k={t('summary.permissionOverride')} v={task.permissionMode} mono />
           )}
-          {task.runtime && task.runtime !== 'builtin' && (
-            <MetaRow k="Runtime" v={task.runtime} mono />
+          {task.runtime !== undefined && (
+            <MetaRow k={t('summary.runtimeOverride')} v={task.runtime} mono />
+          )}
+          {task.runtimeConfig !== undefined && (
+            <MetaRow
+              k={t('summary.runtimeConfigOverride')}
+              v={JSON.stringify(task.runtimeConfig)}
+              mono
+            />
+          )}
+          {task.mcpEnabledServers !== undefined && (
+            <MetaRow
+              k={t('summary.mcpOverride')}
+              v={task.mcpEnabledServers.length > 0
+                ? task.mcpEnabledServers.join(', ')
+                : t('summary.noMcpServers')}
+              mono
+            />
           )}
           {stats?.schedulerStatus && (
             <MetaRow k={t('summary.scheduler')} v={stats.schedulerStatus} mono />

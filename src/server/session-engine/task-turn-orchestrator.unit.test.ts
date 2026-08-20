@@ -85,6 +85,14 @@ function fakeEngine(options: {
     if (accepted && !accepted.accepted) {
       return { success: false, enqueued: false, error: accepted.error, status: 409 };
     }
+    try {
+      if (request.queueId && request.sessionId) {
+        await request.onDispatched?.(request.queueId, request.sessionId);
+      }
+    } catch {
+      // Adapters keep the admitted turn alive; terminal compensation owns a
+      // failed durable receipt. Mirror that behavior in this fake.
+    }
     return { success: true, enqueued: true, text: 'done', ...options.turnResult };
   });
   const engine = {
@@ -158,6 +166,11 @@ describe('Task turn orchestrator', () => {
       providerRoutingRecovery: "Session 'session-1' owns this frozen route.",
     }));
     expect(mocks.authorize).toHaveBeenCalledWith('/api/task/turn/authorize', 'POST', {
+      taskId: 'task-1',
+      queueId: 'queue-1',
+      sessionId: 'session-1',
+    });
+    expect(mocks.authorize).toHaveBeenCalledWith('/api/task/turn/admitted', 'POST', {
       taskId: 'task-1',
       queueId: 'queue-1',
       sessionId: 'session-1',

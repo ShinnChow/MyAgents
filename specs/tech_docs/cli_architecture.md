@@ -492,7 +492,7 @@ Agent 使用说明由 required system Skill `/myagents-anydoc` 渐进加载；`m
 
 ## Task 创建链路（关键机制）
 
-`task create-direct` / `task create-from-alignment` 是任务中心的重点命令，链路比其他命令长一层 —— create-direct 先补齐当前 workspace 与 CLI caller provenance，再在转发给 Rust 前做一次 **pre-flight 验证**：
+`task create-direct` 是 ordinary Task 的唯一通用创建命令。手动表单、产品级 Task 讨论与其它 Agent 工作流都在确认最终 `task.md` 和参数后进入它；CLI 先补齐当前 workspace 与 caller provenance，再在转发给 Rust 前做一次 **pre-flight 验证**：
 
 ```
 CLI → /api/admin/task/create-direct → resolveTaskWorkspace(payload)
@@ -518,6 +518,10 @@ CLI → /api/admin/task/create-direct → resolveTaskWorkspace(payload)
 3. `--model` — 外部 runtime 走 `queryRuntimeModels()`；builtin 不做本地校验（model 由 Provider 决定）
 
 **effective runtime 解析**：`--runtime` 显式传 → 用之；否则从 `workspacePath` / `workspaceId` 查 Agent 默认；都查不到就拒绝（避免静默 trust）。
+
+长正文使用 `--taskMdFile <path>`，读取的是 mutation 当下的文件内容；`create-from-alignment` 已退休，候选目录不是 Task row，也没有四文档 mint policy。创建成功后是否调用 `task run/start` 必须来自用户已经确认的动作，不能由来源类型隐式决定。
+
+`task comments <taskId>` 与 `task comment [taskId] --body-file ... [--reply-to ...]` 是本地协作面。显式 Task ID 始终可用；只有带 `MYAGENTS_SESSION_ID` 且该 Session 有 Task execution context 的首轮 Task turn 才可省略 ID。用户 Comment 注入的后续 turn 必须使用 reminder 中的显式 ID，防止把回复写到碰巧最近的 Task。CLI 只调用 Task Application；Comment 的目标 Session、持久化、admission 和通知不在 Node 参数层推断。
 
 **单一真相源**：`VALID_RUNTIMES` 常量在 `src/shared/types/runtime.ts` 定义，`HELP_TEXTS` 模板字符串、validator、factory 全部从此读取；并用一个 type-level assertion (`_exhaustiveRuntimeCheck`) 在 `typecheck` 阶段拦截 `RuntimeType` 联合与 `VALID_RUNTIMES` 元组的漂移。
 

@@ -311,23 +311,52 @@ describe('myagents CLI Task notification updates', () => {
   });
 });
 
+describe('myagents CLI Task comments', () => {
+  it('keeps an explicit Task identity for injected follow-up turns', () => {
+    process.env.MYAGENTS_SESSION_ID = 'session-comment';
+    expect(buildRequestBody('task', 'comment', ['task-1'], {
+      body: 'Verification passed.',
+      replyTo: 'comment-user',
+    })).toEqual({
+      id: 'task-1',
+      body: 'Verification passed.',
+      replyToCommentId: 'comment-user',
+    });
+  });
+
+  it('lets the Session Sidecar resolve Task identity only for an active Task turn', () => {
+    process.env.MYAGENTS_SESSION_ID = 'session-task-turn';
+    expect(buildRequestBody('task', 'comment', [], { body: 'Work completed.' })).toEqual({
+      id: undefined,
+      body: 'Work completed.',
+      replyToCommentId: undefined,
+    });
+  });
+});
+
 describe('myagents CLI Task provider overrides', () => {
-  it('forwards providerId with model through both Task creation paths', () => {
+  it('forwards the original task.md file path so Rust can re-read app-owned discussion candidates', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'myagents-task-candidate-'));
+    const file = join(dir, 'task.md');
+    writeFileSync(file, '# Current candidate\n');
+    try {
+      expect(buildRequestBody('task', 'create-direct', ['review'], {
+        taskMdFile: file,
+      })).toMatchObject({
+        taskMdContent: '# Current candidate\n',
+        taskMdFile: file,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards providerId with model through Task creation', () => {
     expect(buildRequestBody('task', 'create-direct', ['review'], {
       providerId: 'deepseek',
       model: 'deepseek-chat',
       taskMdContent: 'Review the workspace.',
     })).toMatchObject({
-      providerId: 'deepseek',
-      model: 'deepseek-chat',
-    });
-
-    expect(buildRequestBody('task', 'create-from-alignment', ['session-1'], {
-      name: 'Aligned review',
-      providerId: 'deepseek',
-      model: 'deepseek-chat',
-    })).toMatchObject({
-      alignmentSessionId: 'session-1',
       providerId: 'deepseek',
       model: 'deepseek-chat',
     });

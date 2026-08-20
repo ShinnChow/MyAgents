@@ -164,10 +164,6 @@ pub async fn start_management_api() -> Result<u16, String> {
         .route("/api/task/get", get(task_get_handler))
         .route("/api/task/create-direct", post(task_create_direct_handler))
         .route(
-            "/api/task/create-from-alignment",
-            post(task_create_from_alignment_handler),
-        )
-        .route(
             "/api/task/create-attached",
             post(task_create_attached_handler),
         )
@@ -177,6 +173,9 @@ pub async fn start_management_api() -> Result<u16, String> {
             "/api/task/turn/authorize",
             post(task_turn_authorize_handler),
         )
+        .route("/api/task/turn/admitted", post(task_turn_admitted_handler))
+        .route("/api/task/comments", get(task_comments_handler))
+        .route("/api/task/comment", post(task_comment_handler))
         .route(
             "/api/task/append-session",
             post(task_append_session_handler),
@@ -2598,14 +2597,14 @@ async fn task_get_handler(Query(q): Query<TaskGetQuery>) -> Json<serde_json::Val
             "error": "task store not initialized"
         }));
     };
+    if let Err(error) = store.ensure_legacy_verify_merged(&q.id).await {
+        return Json(serde_json::json!({ "ok": false, "error": error }));
+    }
     match store.get_ordinary(&q.id).await {
         Ok(t) => {
-            // Attach task.docs (four absolute paths) so the AI / CLI
-            // reading this response knows where task.md / verify.md /
-            // progress.md / alignment.md live without having to
-            // re-derive the layout from convention. See
-            // `task::build_task_docs` for semantics of the optional
-            // fields (only existing files are surfaced).
+            // task.md is the single editable contract. Optional legacy paths
+            // remain visible for diagnostics only; verify.md has already been
+            // merged above before any CLI consumer can observe the Task.
             let docs = match task::build_task_docs(&t.id) {
                 Ok(d) => d,
                 Err(e) => {
@@ -2683,14 +2682,29 @@ struct TaskCreateDirectApiRequest {
     #[serde(flatten)]
     input: task::TaskCreateDirectInput,
     #[serde(default)]
+    task_md_file: Option<String>,
+    #[serde(default)]
     actor: Option<task::TransitionActor>,
     #[serde(default)]
     source: Option<task::TransitionSource>,
 }
 
 async fn task_create_direct_handler(
-    Json(req): Json<TaskCreateDirectApiRequest>,
+    Json(mut req): Json<TaskCreateDirectApiRequest>,
 ) -> Json<serde_json::Value> {
+    if let Some(candidate_path) = req.task_md_file.as_deref() {
+        match task::read_owned_discussion_candidate(candidate_path) {
+            Ok(Some(current_content)) => req.input.task_md_content = current_content,
+            Ok(None) => {}
+            Err(error) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "code": "invalid_task_discussion_candidate",
+                    "error": error,
+                }));
+            }
+        }
+    }
     let application = match crate::task_application::TaskApplication::from_globals() {
         Ok(application) => application,
         Err(error) => return task_application_error_response(error),
@@ -2983,6 +2997,122 @@ async fn task_turn_authorize_handler(
         }));
     }
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn task_turn_admitted_handler(
+    headers: HeaderMap,
+    Json(req): Json<TaskTurnAuthorizeRequest>,
+) -> Json<serde_json::Value> {
+    let generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(response) => return response,
+    };
+    let Some(sidecars) = get_sidecar_state() else {
+        return Json(
+            serde_json::json!({ "ok": false, "error": "Sidecar manager is not initialized" }),
+        );
+    };
+    let live = sidecars
+        .lock()
+        .map(|manager| manager.is_live(&req.session_id, generation))
+        .unwrap_or(false);
+    if !live {
+        return Json(serde_json::json!({
+            "ok": false,
+            "code": "stale_sidecar",
+            "error": "Task admission came from a stale Sidecar",
+        }));
+    }
+    match crate::task_scheduler::get_task_scheduler()
+        .confirm_turn_admitted(&req.task_id, &req.queue_id, &req.session_id)
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({ "ok": true })),
+        Ok(false) => Json(serde_json::json!({
+            "ok": false,
+            "code": "stale_execution",
+            "error": "Task admission no longer belongs to the active execution",
+        })),
+        Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskCommentsQuery {
+    id: String,
+    before: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn task_comments_handler(Query(query): Query<TaskCommentsQuery>) -> Json<serde_json::Value> {
+    let Some(store) = crate::task::get_task_store() else {
+        return Json(serde_json::json!({ "ok": false, "error": "task store not initialized" }));
+    };
+    match store
+        .list_comments(
+            &query.id,
+            query.before.as_deref(),
+            query.limit.unwrap_or(50),
+        )
+        .await
+    {
+        Ok(page) => Json(serde_json::json!({ "ok": true, "page": page })),
+        Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskAgentCommentRequest {
+    id: String,
+    body: String,
+    session_id: String,
+    reply_to_comment_id: Option<String>,
+}
+
+async fn task_comment_handler(
+    headers: HeaderMap,
+    Json(req): Json<TaskAgentCommentRequest>,
+) -> Json<serde_json::Value> {
+    let generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(response) => return response,
+    };
+    let Some(sidecars) = get_sidecar_state() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    let live = sidecars
+        .lock()
+        .map(|manager| manager.is_live(&req.session_id, generation))
+        .unwrap_or(false);
+    if !live {
+        return Json(serde_json::json!({
+            "ok": false,
+            "code": "stale_sidecar",
+            "error": "Task comment came from a stale Sidecar",
+        }));
+    }
+    let application = match crate::task_application::TaskApplication::from_globals() {
+        Ok(application) => application,
+        Err(error) => return task_application_error_response(error),
+    };
+    match application
+        .append_agent_comment(
+            &req.id,
+            &req.session_id,
+            &req.body,
+            req.reply_to_comment_id.as_deref(),
+        )
+        .await
+    {
+        Ok(comment) => Json(serde_json::json!({ "ok": true, "comment": comment })),
+        Err(error) => task_application_error_response(error),
+    }
 }
 
 async fn task_update_status_handler(
@@ -3402,40 +3532,6 @@ async fn space_attachment_inspect_handler(
 // Task Center execution handlers (v0.1.69)
 // ========================================================================
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TaskCreateFromAlignmentApiRequest {
-    #[serde(flatten)]
-    input: task::TaskCreateFromAlignmentInput,
-    #[serde(default)]
-    actor: Option<task::TransitionActor>,
-    #[serde(default)]
-    source: Option<task::TransitionSource>,
-}
-
-async fn task_create_from_alignment_handler(
-    Json(req): Json<TaskCreateFromAlignmentApiRequest>,
-) -> Json<serde_json::Value> {
-    let application = match crate::task_application::TaskApplication::from_globals() {
-        Ok(application) => application,
-        Err(error) => return task_application_error_response(error),
-    };
-    match application
-        .create_from_alignment_with_origin(
-            req.input,
-            req.actor.unwrap_or(task::TransitionActor::User),
-            req.source.or(Some(task::TransitionSource::Cli)),
-        )
-        .await
-    {
-        Ok(task) => Json(serde_json::json!({
-            "ok": true,
-            "task": task::project_task(task).await,
-        })),
-        Err(error) => task_application_error_response(error),
-    }
-}
-
 /// PRD §10.2.2 `POST /api/task/run` — trigger execution of an existing Task.
 ///
 /// The Task row is the sole scheduling authority. Starting persists Running,
@@ -3561,12 +3657,12 @@ async fn task_read_doc_handler(
 #[serde(rename_all = "camelCase")]
 struct TaskWriteDocRequest {
     id: String,
-    /// `task` | `verify` — `progress` is agent-only and rejected here.
+    /// Only `task` is writable; other documents are legacy read surfaces.
     doc: String,
     content: String,
 }
 
-/// `POST /api/task/write-doc` — write `task.md` or `verify.md` for a Task.
+/// `POST /api/task/write-doc` — write the canonical `task.md` for a Task.
 /// Delegates to `TaskStore::write_doc`, which enforces the running/verifying
 /// lock atomically with the file write (PRD §9.4). `progress.md` is
 /// explicitly rejected here — only the runtime agent appends to it.
@@ -3574,27 +3670,20 @@ async fn task_write_doc_handler(Json(req): Json<TaskWriteDocRequest>) -> Json<se
     let Some(store) = task::get_task_store() else {
         return Json(serde_json::json!({ "ok": false, "error": "task store not initialized" }));
     };
-    // Central whitelist via `task::task_doc_filename` — same contract as
-    // read-doc. Then refuse writing progress.md / alignment.md (the Tauri
-    // `cmd_task_write_doc` enforces the same rule, keeping both entry
-    // points aligned).
-    let filename = match task::task_doc_filename(&req.doc) {
-        Ok(f) => f,
-        Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
-    };
-    if filename == "progress.md" || filename == "alignment.md" {
+    if req.doc != "task" {
+        let filename = match task::task_doc_filename(&req.doc) {
+            Ok(filename) => filename,
+            Err(error) => return Json(serde_json::json!({ "ok": false, "error": error })),
+        };
         return Json(serde_json::json!({
             "ok": false,
-            "error": format!(
-                "{} is not writable via this API (progress=agent-appended, alignment=skill-written)",
-                filename
-            ),
+            "error": format!("{} is a read-only legacy document; edit task.md instead", filename),
         }));
     }
     if let Err(error) = store.get_ordinary(&req.id).await {
         return Json(serde_json::json!({ "ok": false, "error": error }));
     }
-    match store.write_doc(&req.id, filename, &req.content).await {
+    match store.write_doc(&req.id, "task.md", &req.content).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })),
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
     }
@@ -4354,6 +4443,7 @@ mod tests {
             "workspaceId": "workspace",
             "workspacePath": "/tmp/workspace",
             "taskMdContent": "Do the work",
+            "taskMdFile": "/tmp/task-discussions/d/candidates/c/task.md",
             "executionMode": "once",
             "actor": "agent",
             "source": "cli"
@@ -4361,25 +4451,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.input.workspace_id, "workspace");
+        assert_eq!(
+            request.task_md_file.as_deref(),
+            Some("/tmp/task-discussions/d/candidates/c/task.md")
+        );
         assert_eq!(request.actor, Some(task::TransitionActor::Agent));
         assert_eq!(request.source, Some(task::TransitionSource::Cli));
     }
 
     #[test]
-    fn alignment_and_lifecycle_requests_preserve_cli_origin() {
-        let alignment: TaskCreateFromAlignmentApiRequest =
-            serde_json::from_value(serde_json::json!({
-                "name": "aligned",
-                "executor": "agent",
-                "alignmentSessionId": "alignment-1",
-                "executionMode": "once",
-                "actor": "user",
-                "source": "cli"
-            }))
-            .unwrap();
-        assert_eq!(alignment.actor, Some(task::TransitionActor::User));
-        assert_eq!(alignment.source, Some(task::TransitionSource::Cli));
-
+    fn lifecycle_requests_preserve_cli_origin() {
         let lifecycle: TaskIdApiRequest = serde_json::from_value(serde_json::json!({
             "id": "task-1",
             "actor": "agent",

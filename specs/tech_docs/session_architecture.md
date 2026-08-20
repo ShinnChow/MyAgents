@@ -146,6 +146,10 @@ token、恢复状态机、配置 fingerprint 或跨文件事务。
 | `watch.completed` | watch 注册时目标正在运行，该 turn 正常 terminal 后回推结果 | 目标 Sidecar pending watch registry → Management API → watcher Sidecar |
 | `watch.error` | 被 watch 的目标 turn 中止、错误或无法确认正常完成 | 同 `watch.completed` |
 
+本地 Task Comment 复用同一 Inbox/SessionEngine admission 与 Session 内 FIFO，但不使用通用 `send.result` 回传，也不新增 Delivery owner。TaskApplication 先持久化 Comment 并冻结 exact Session，再投递 `sessionEvent.type='task.comment'`、`replyBack=false`；drain handler 将它渲染为 leading `<system-reminder><TASK_COMMENT>...` + 用户可见正文。提醒必须说明 query 来自本地 Task、canonical `task.md` 路径、Comment/Session identity，以及显式 `myagents task comment <taskId> --body-file ... --reply-to <commentId>` 回复方式。普通 assistant 输出不会自动复制回 Task。
+
+Task 首轮 query 的 Session relation 以 adapter 的真实 queue acceptance 为边界：`onDispatched(queueId, sessionId)` 经 TaskApplication 幂等持久化后，才允许 pending comments 依序进入该 Session。提前看到 metadata、Sidecar 或准备完成都不能写 relation；评论投送也不能触发 Task run/rerun 或状态迁移。
+
 所有事件的结构化 prompt 都位于隐藏的 `system-reminder` envelope 内。renderer
 仅对 `send.request` 建立展示投影：读取 `<payload>` 与 `source_label` 形成目标
 session 的用户气泡；`event-summary`、session id 等协议元数据不得进入气泡。

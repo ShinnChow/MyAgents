@@ -423,6 +423,7 @@ export function createExternalSessionEngine(): SessionEngine {
           turnOwner: request.turnOwner,
           onTerminal: request.onTerminal,
           beforeDispatch: request.beforeDispatch,
+          requiredSystemSkill: request.requiredSystemSkill,
           channelDelivery: DESKTOP_CHANNEL_DELIVERY,
         },
       );
@@ -747,6 +748,11 @@ export function createExternalSessionEngine(): SessionEngine {
           error: result.error ?? 'Failed to start external runtime turn',
           status: 503,
         };
+      }
+      try {
+        await request.onDispatched?.(queueId, request.sessionId);
+      } catch (error) {
+        console.warn('[session-engine] external onDispatched callback failed; terminal compensation remains available:', error);
       }
       const outcome = await waitForDeadline(terminal, deadline - Date.now());
       if (!outcome) {

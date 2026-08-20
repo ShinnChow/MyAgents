@@ -77,7 +77,9 @@ TaskScheduler reads current Task
 -> task-turn-orchestrator.ts owns Task preparation and execution lifecycle
 -> SessionEngine selector chooses builtin/external adapter
 -> adapter.prepareScheduledTurn binds the Session and applies runtime-native initial config
--> runInjectedTurn enqueues one Task turn with per-turn permission
+-> runInjectedTurn enqueues the complete canonical task.md with per-turn permission
+-> adapter acceptance invokes onDispatched(queueId, sessionId) exactly once
+-> TaskApplication persists the Session relation and flushes pending Task comments
 -> wait for real terminal result
 -> persist Task outcome/history
 -> release Task owner on terminal/stop/delete
@@ -88,6 +90,8 @@ TaskScheduler reads current Task
 `routes/scheduled-turns.ts` 只处理 JSON 解析、字段校验、HTTP 状态和响应结构。Task 的 Session 准备、dispatch guard、reminder/exit 处理与终态判定属于 `task-turn-orchestrator.ts`；Builtin/External 的 Session binding、配置和 MCP 准备属于各自 adapter 的 `prepareScheduledTurn()`。Route 不直接实现 Runtime 分支。
 
 对已有 Session，Node 如果无法切换到 payload 指定的 Session，必须 fail closed；禁止退回“当前碰巧打开的 Session”继续执行。
+
+`dispatchOrigin` 只记录 provenance，不能选择不同 Prompt 或 executor Skill；手动与 AI 讨论后创建的 ordinary Task 共用这条路径。admission callback 是 queue 接纳后的回执，不替代既有 dispatch guard；回执持久化失败由 terminal settlement 幂等补偿，不能重放已经接纳的 Turn。
 
 ## 4. 新 Session 初始化
 

@@ -273,7 +273,6 @@ describe('admin-api help registry', () => {
       ['task', 'list'],
       ['task', 'get'],
       ['task', 'create-direct'],
-      ['task', 'create-from-alignment'],
       ['task', 'create-attached'],
       ['task', 'update'],
       ['task', 'run'],
@@ -1172,6 +1171,84 @@ describe('admin-api Task Agent experience', () => {
       'POST',
       { id: 'task-1', actor: 'agent', source: 'cli' },
     );
+  });
+
+  it('resolves an omitted comment Task ID from the exact active Session context', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      comment: { id: 'comment-agent' },
+    });
+    const { setCronTaskContext } = await import('./tools/cron-tools');
+    const { handleTaskComment } = await import('./admin-api');
+    const previousSessionId = process.env.MYAGENTS_SESSION_ID;
+    process.env.MYAGENTS_SESSION_ID = 'session-active';
+    setCronTaskContext('task-active', false, 'session-active');
+
+    try {
+      expect(await handleTaskComment({
+        body: 'Completed with verification evidence.',
+      })).toMatchObject({ success: true });
+      expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+        '/api/task/comment',
+        'POST',
+        {
+          id: 'task-active',
+          body: 'Completed with verification evidence.',
+          replyToCommentId: undefined,
+          sessionId: 'session-active',
+        },
+      );
+    } finally {
+      setCronTaskContext(null, false, 'session-active');
+      if (previousSessionId === undefined) delete process.env.MYAGENTS_SESSION_ID;
+      else process.env.MYAGENTS_SESSION_ID = previousSessionId;
+    }
+  });
+
+  it('rejects an omitted comment Task ID outside an active Task turn', async () => {
+    const { handleTaskComment } = await import('./admin-api');
+    const previousSessionId = process.env.MYAGENTS_SESSION_ID;
+    process.env.MYAGENTS_SESSION_ID = 'session-idle';
+    try {
+      expect(await handleTaskComment({ body: 'Ambiguous result.' })).toMatchObject({
+        success: false,
+        error: expect.stringContaining('Task ID is required'),
+      });
+      expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+    } finally {
+      if (previousSessionId === undefined) delete process.env.MYAGENTS_SESSION_ID;
+      else process.env.MYAGENTS_SESSION_ID = previousSessionId;
+    }
+  });
+
+  it('ignores a forged client Session id and uses only the Sidecar identity', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      comment: { id: 'comment-agent' },
+    });
+    const { handleTaskComment } = await import('./admin-api');
+    const previousSessionId = process.env.MYAGENTS_SESSION_ID;
+    process.env.MYAGENTS_SESSION_ID = 'session-trusted';
+    try {
+      await handleTaskComment({
+        id: 'task-1',
+        body: 'Persist this result.',
+        sessionId: 'session-forged',
+      } as Parameters<typeof handleTaskComment>[0] & { sessionId: string });
+      expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+        '/api/task/comment',
+        'POST',
+        {
+          id: 'task-1',
+          body: 'Persist this result.',
+          replyToCommentId: undefined,
+          sessionId: 'session-trusted',
+        },
+      );
+    } finally {
+      if (previousSessionId === undefined) delete process.env.MYAGENTS_SESSION_ID;
+      else process.env.MYAGENTS_SESSION_ID = previousSessionId;
+    }
   });
 });
 

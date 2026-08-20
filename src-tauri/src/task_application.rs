@@ -6,10 +6,12 @@
 //! handler module.
 
 use serde::Serialize;
+use tauri::{AppHandle, Manager};
 
 use crate::task::{
-    StatusTransition, Task, TaskCreateAttachedInput, TaskCreateDirectInput,
-    TaskCreateFromAlignmentInput, TaskStatus, TaskStore, TaskUpdateInput, TaskUpdateStatusInput,
+    StatusTransition, Task, TaskComment, TaskCommentAdmissionState, TaskCommentAuthor,
+    TaskCreateAttachedInput, TaskCreateDirectInput, TaskStatus, TaskStore, TaskUpdateInput,
+    TaskUpdateStatusInput,
 };
 use crate::task_scheduler::TaskControlGuard;
 use crate::thought::ThoughtStore;
@@ -226,33 +228,6 @@ impl<'a> TaskApplication<'a> {
             .map_err(TaskApplicationError::mutation)
     }
 
-    pub async fn create_from_alignment(
-        &self,
-        input: TaskCreateFromAlignmentInput,
-    ) -> Result<Task, TaskApplicationError> {
-        self.create_from_alignment_with_origin(
-            input,
-            crate::task::TransitionActor::Agent,
-            Some(crate::task::TransitionSource::Cli),
-        )
-        .await
-    }
-
-    pub async fn create_from_alignment_with_origin(
-        &self,
-        input: TaskCreateFromAlignmentInput,
-        actor: crate::task::TransitionActor,
-        source: Option<crate::task::TransitionSource>,
-    ) -> Result<Task, TaskApplicationError> {
-        let task = self
-            .tasks
-            .create_from_alignment_with_origin(input, actor, source)
-            .await
-            .map_err(TaskApplicationError::mutation)?;
-        self.link_source_thought(&task).await;
-        Ok(task)
-    }
-
     pub async fn create_attached(
         &self,
         input: TaskCreateAttachedInput,
@@ -284,6 +259,281 @@ impl<'a> TaskApplication<'a> {
             .append_session(task_id, session_id)
             .await
             .map_err(TaskApplicationError::mutation)
+    }
+
+    async fn deliver_user_comment(
+        &self,
+        app_handle: &AppHandle,
+        manager: &crate::sidecar::ManagedSidecarManager,
+        comment: TaskComment,
+    ) -> Result<TaskComment, TaskApplicationError> {
+        let Some(target_session_id) = comment
+            .admission
+            .as_ref()
+            .and_then(|admission| admission.target_session_id.clone())
+        else {
+            return Ok(comment);
+        };
+        let task = self.any_task(&comment.task_id).await?;
+        let task_md_path = crate::task::build_task_docs(&task.id)
+            .map_err(TaskApplicationError::mutation)?
+            .task_md;
+        let reply_context = if let Some(parent_id) = comment.reply_to_comment_id.as_deref() {
+            let page = self
+                .tasks
+                .comment_context(&task.id, parent_id, 1)
+                .await
+                .map_err(TaskApplicationError::mutation)?;
+            page.items
+                .into_iter()
+                .find(|candidate| candidate.id == parent_id)
+                .map(|parent| {
+                    let mut points = parent.body.trim().chars();
+                    let quote: String = points.by_ref().take(30).collect();
+                    let quote = if points.next().is_some() {
+                        format!("{quote}…")
+                    } else {
+                        quote
+                    };
+                    let author = match parent.author {
+                        TaskCommentAuthor::User { label } => {
+                            label.unwrap_or_else(|| "User".to_string())
+                        }
+                        TaskCommentAuthor::Agent { label, .. } => {
+                            label.unwrap_or_else(|| "Agent".to_string())
+                        }
+                    };
+                    serde_json::json!({
+                        "commentId": parent.id,
+                        "author": author,
+                        "createdAt": chrono::DateTime::from_timestamp_millis(parent.created_at)
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_else(|| parent.created_at.to_string()),
+                        "quote": quote,
+                    })
+                })
+        } else {
+            None
+        };
+        let mut event = serde_json::json!({
+            "version": 1,
+            "type": "task.comment",
+            "eventId": comment.id,
+            "createdAt": chrono::DateTime::from_timestamp_millis(comment.created_at)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| comment.created_at.to_string()),
+            "sourceSessionId": format!("task:{}", task.id),
+            "sourceLabel": task.name,
+            "targetSessionId": target_session_id,
+            "taskId": task.id,
+            "taskName": task.name,
+            "taskMdPath": task_md_path,
+            "commentId": comment.id,
+        });
+        if let Some(reply_context) = reply_context {
+            event["replyContext"] = reply_context;
+        }
+        let message = crate::inbox::PendingInboxMessage {
+            message_id: comment.id.clone(),
+            from_session_id: format!("task:{}", comment.task_id),
+            from_label: "Task comment".to_string(),
+            to_session_id: target_session_id,
+            text: comment.body.clone(),
+            reply_back: false,
+            timestamp_ms: comment.created_at,
+            kind: crate::inbox::InboxMessageKind::Event,
+            in_reply_to: comment.reply_to_comment_id.clone(),
+            session_event: Some(event),
+        };
+        let outcome = crate::inbox::deliver::deliver_with_resume(
+            app_handle,
+            manager,
+            message,
+            Some(std::path::PathBuf::from(&task.workspace_path)),
+        )
+        .await;
+        let (state, error) = match outcome {
+            crate::inbox::deliver::DeliverOutcome::Delivered { .. } => {
+                (TaskCommentAdmissionState::Accepted, None)
+            }
+            crate::inbox::deliver::DeliverOutcome::SessionNotFound => (
+                TaskCommentAdmissionState::Failed,
+                Some("Target Session no longer exists".to_string()),
+            ),
+            crate::inbox::deliver::DeliverOutcome::DeliveryFailed { reason }
+            | crate::inbox::deliver::DeliverOutcome::Rejected { reason } => {
+                (TaskCommentAdmissionState::Failed, Some(reason))
+            }
+        };
+        match self
+            .tasks
+            .update_comment_admission(&comment.task_id, &comment.id, state, error)
+            .await
+        {
+            Ok(updated) => Ok(updated),
+            Err(receipt_error) => {
+                // The inbox admission may already have happened. Losing only
+                // the receipt must not turn a persisted comment into a failed
+                // create response (which would invite duplicate retries).
+                ulog_warn!(
+                    "[TaskApplication] comment admission receipt was not persisted task={} comment={} error={}",
+                    comment.task_id,
+                    comment.id,
+                    receipt_error
+                );
+                let mut projection = comment;
+                if let Some(admission) = projection.admission.as_mut() {
+                    admission.state = TaskCommentAdmissionState::Unknown;
+                    admission.accepted_at = None;
+                    admission.error = Some(
+                        "Delivery outcome is unknown because its local receipt could not be saved"
+                            .to_string(),
+                    );
+                }
+                Ok(projection)
+            }
+        }
+    }
+
+    async fn project_persisted_delivery_failure(
+        &self,
+        mut comment: TaskComment,
+        error: &TaskApplicationError,
+    ) -> TaskComment {
+        let message = error.to_string();
+        match self
+            .tasks
+            .update_comment_admission(
+                &comment.task_id,
+                &comment.id,
+                TaskCommentAdmissionState::Failed,
+                Some(message.clone()),
+            )
+            .await
+        {
+            Ok(updated) => updated,
+            Err(receipt_error) => {
+                ulog_warn!(
+                    "[TaskApplication] persisted comment could not record delivery failure task={} comment={} delivery_error={} receipt_error={}",
+                    comment.task_id,
+                    comment.id,
+                    message,
+                    receipt_error
+                );
+                if let Some(admission) = comment.admission.as_mut() {
+                    admission.state = TaskCommentAdmissionState::Unknown;
+                    admission.accepted_at = None;
+                    admission.error = Some(message.chars().take(500).collect());
+                }
+                comment
+            }
+        }
+    }
+
+    pub async fn create_user_comment(
+        &self,
+        app_handle: &AppHandle,
+        manager: &crate::sidecar::ManagedSidecarManager,
+        task_id: &str,
+        body: &str,
+        reply_to_comment_id: Option<&str>,
+    ) -> Result<TaskComment, TaskApplicationError> {
+        // Reuse the Task mutation coordinator as the admission fence. The
+        // scheduler holds the same guard while it publishes a first Session
+        // and flushes older pending comments, so a newly-created comment
+        // cannot overtake that chronological backlog at the Session Inbox.
+        let _control = crate::task_scheduler::acquire_task_control(task_id).await;
+        self.any_task(task_id).await?;
+        let comment = self
+            .tasks
+            .create_user_comment(task_id, body, reply_to_comment_id)
+            .await
+            .map_err(TaskApplicationError::mutation)?;
+        match self
+            .deliver_user_comment(app_handle, manager, comment.clone())
+            .await
+        {
+            Ok(updated) => Ok(updated),
+            Err(error) => Ok(self
+                .project_persisted_delivery_failure(comment, &error)
+                .await),
+        }
+    }
+
+    pub async fn retry_user_comment(
+        &self,
+        app_handle: &AppHandle,
+        manager: &crate::sidecar::ManagedSidecarManager,
+        task_id: &str,
+        comment_id: &str,
+    ) -> Result<TaskComment, TaskApplicationError> {
+        let _control = crate::task_scheduler::acquire_task_control(task_id).await;
+        self.any_task(task_id).await?;
+        let comment = self
+            .tasks
+            .retry_comment(task_id, comment_id)
+            .await
+            .map_err(TaskApplicationError::mutation)?;
+        match self
+            .deliver_user_comment(app_handle, manager, comment.clone())
+            .await
+        {
+            Ok(updated) => Ok(updated),
+            Err(error) => Ok(self
+                .project_persisted_delivery_failure(comment, &error)
+                .await),
+        }
+    }
+
+    pub async fn append_agent_comment(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        body: &str,
+        reply_to_comment_id: Option<&str>,
+    ) -> Result<TaskComment, TaskApplicationError> {
+        self.any_task(task_id).await?;
+        let comment = self
+            .tasks
+            .append_agent_comment(task_id, session_id, body, reply_to_comment_id)
+            .await
+            .map_err(TaskApplicationError::mutation)?;
+        if let Some(app) = crate::logger::get_app_handle() {
+            if let Some(center) =
+                app.try_state::<crate::space_cloud::notifications::ManagedNotificationCenter>()
+            {
+                crate::space_cloud::notifications::agent_comment_appended(
+                    app,
+                    center.inner(),
+                    &format!("task-comment:{}", comment.id),
+                );
+            }
+        }
+        Ok(comment)
+    }
+
+    pub async fn deliver_claimed_comments(
+        &self,
+        app_handle: &AppHandle,
+        manager: &crate::sidecar::ManagedSidecarManager,
+        task_id: &str,
+        session_id: &str,
+        comments: Vec<TaskComment>,
+    ) -> Result<(), TaskApplicationError> {
+        for comment in comments {
+            if let Err(error) = self
+                .deliver_user_comment(app_handle, manager, comment)
+                .await
+            {
+                crate::ulog_warn!(
+                    "[task-comment] pending flush failed task={} session={}: {}",
+                    task_id,
+                    session_id,
+                    error
+                );
+            }
+        }
+        Ok(())
     }
 
     pub async fn update_status_ordinary(

@@ -38,7 +38,27 @@ export interface CommentNotificationItem {
   target: NotificationTarget;
 }
 
-export type NotificationItem = AnnouncementNotificationItem | CommentNotificationItem;
+export interface TaskAgentCommentNotificationItem {
+  id: string;
+  kind: 'task_agent_comment';
+  createdAt: string;
+  isRead: boolean;
+  taskId: string;
+  taskName: string;
+  commentId: string;
+  agent: {
+    type: 'registered_agent';
+    id: string;
+    displayName: string;
+  };
+  excerpt: string;
+  target: NotificationTarget;
+}
+
+export type NotificationItem =
+  | AnnouncementNotificationItem
+  | CommentNotificationItem
+  | TaskAgentCommentNotificationItem;
 
 export type NotificationLoadState = 'idle' | 'loading' | 'ready' | 'error' | 'unavailable';
 export type NotificationAuthState = 'signed_out' | 'authenticated' | 'reauth_required';

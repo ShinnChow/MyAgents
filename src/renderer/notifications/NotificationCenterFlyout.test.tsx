@@ -42,6 +42,22 @@ const comment = {
   },
 };
 
+const taskComment = {
+  id: 'task-comment:comment-9',
+  kind: 'task_agent_comment' as const,
+  createdAt: '2026-08-16T08:03:00.000Z',
+  isRead: false,
+  taskId: 'task-3',
+  taskName: '升级依赖',
+  commentId: 'comment-9',
+  agent: { type: 'registered_agent' as const, id: 'session-3', displayName: 'Agent' },
+  excerpt: '发现两个高危依赖，建议先升级解析器。',
+  target: {
+    kind: 'app_route' as const,
+    route: { version: 1 as const, name: 'task.comment' as const, params: { taskId: 'task-3', commentId: 'comment-9' } },
+  },
+};
+
 function snapshot(overrides: Partial<NotificationSnapshot> = {}): NotificationSnapshot {
   return {
     loadState: 'ready',
@@ -127,6 +143,20 @@ describe('NotificationCenterFlyout', () => {
     fireEvent.click(screen.getByRole('button', { name: /Ethan/ }));
     await waitFor(() => expect(onOpenAppRoute).toHaveBeenCalledWith(comment.target.route));
     expect(props.onClose).toHaveBeenCalledOnce();
+  });
+
+  it('renders a local Agent task comment and opens its exact typed route', async () => {
+    mocks.invoke.mockResolvedValueOnce({ notificationId: taskComment.id, target: taskComment.target });
+    const onOpenAppRoute = vi.fn(async () => true);
+    renderFlyout({
+      snapshot: snapshot({ items: [taskComment], feedCutoff: { createdAt: taskComment.createdAt, id: taskComment.id } }),
+      onOpenAppRoute,
+    });
+
+    expect(screen.queryByText(String(i18n.t('app:notificationCenter.accountScope')))).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Agent.*升级依赖/ }));
+    await waitFor(() => expect(onOpenAppRoute).toHaveBeenCalledWith(taskComment.target.route));
+    expect(screen.getByText(taskComment.excerpt)).toBeInTheDocument();
   });
 
   it('marks all read against the loaded feed cutoff without activating a row', async () => {

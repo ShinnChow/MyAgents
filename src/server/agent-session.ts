@@ -115,7 +115,15 @@ import {
 } from './utils/context-occupancy';
 import type { SystemInitInfo } from '../shared/types/system';
 import type { SlashCommand as UiSlashCommand } from '../shared/slashCommands';
-import type { EffectiveProjectCapabilitySnapshot } from '../shared/projectCapabilities';
+import {
+  assertProductSystemSkillCandidate,
+  type EffectiveProjectCapabilitySnapshot,
+} from '../shared/projectCapabilities';
+import {
+  assertKnownProductSystemSkillRequirement,
+  isProductSystemSkillRequirement,
+  type SystemSkillAdmissionRequirement,
+} from '../shared/systemSkills';
 import type { OfficialToolId } from '../shared/official-tools';
 import { claimPreparedSessionForTurnAdmission, commitPreparedSessionForFirstUserTurn, migratePendingSessionIdentity, resolvePendingConversationMutation, saveSessionMetadata, updateSessionTitleFromMessage, updateSessionMetadata, getSessionMetadata, getSessionData, loadSessionTranscript } from './SessionStore';
 import { firePostTurnTitleHook } from './turn-hooks';
@@ -631,13 +639,30 @@ export function syncProjectUserConfig(
  * await the Query's existing initialization promise before reading the native
  * registry; this rejects only the dependent turn, never Session startup.
  */
-export async function requireCurrentBuiltinSkill(skillName: string): Promise<void> {
+export async function requireCurrentBuiltinSkill(
+  requirement: SystemSkillAdmissionRequirement,
+): Promise<void> {
+  const skillName = isProductSystemSkillRequirement(requirement)
+    ? assertKnownProductSystemSkillRequirement(requirement).name
+    : requirement;
   const query = lifecycleState.query;
   if (!query) throw new Error(`builtin Runtime is unavailable for required system skill ${skillName}`);
   if (!lifecycleState.sdkControlReady) {
     await query.initializationResult();
     if (lifecycleState.query !== query) {
       throw new Error(`builtin Runtime changed before loading required system skill ${skillName}`);
+    }
+  }
+
+  if (isProductSystemSkillRequirement(requirement)) {
+    const admitted = configState.currentCapabilitySnapshot;
+    if (!admitted) {
+      throw new Error(`builtin Runtime has no capability admission for product Skill ${skillName}`);
+    }
+    assertProductSystemSkillCandidate(admitted, requirement);
+    const currentInventory = createGlobalSkillInventorySnapshot();
+    if (currentInventory.integrityRevision !== admitted.integrityRevision) {
+      throw new Error(`builtin Runtime inventory changed before product Skill ${skillName} dispatch`);
     }
   }
 

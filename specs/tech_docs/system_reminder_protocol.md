@@ -130,6 +130,8 @@ instruction、cron output 都只给模型看。
 | `myagents-space-issue` | Space issue | Space IssueDelivery |
 | `GOAL_CONTINUATION` | 目标模式 | Goal 自动续跑 / Goal 第一轮启动 |
 | `GOAL_CONTEXT` | 目标模式 | Goal 运行中用户普通 query 的 hidden context |
+| `TASK_DISCUSSION` | 任务讨论 | 智能创建 / Thought AI 讨论首轮 |
+| `TASK_COMMENT` | Task 评论 | 本地 Task 时间线向 exact Session 注入 query |
 
 `MEMORY_UPDATE` 当前是内部纯隐藏场景，不属于有 badge 的可复用展示协议。若要让它
 或新 tag 出现在用户气泡上，先补 `systemTagLabel()`、文案资源和渲染测试。
@@ -141,6 +143,8 @@ instruction、cron output 都只给模型看。
 | 入口 | Builder / 位置 | 结构 |
 |------|----------------|------|
 | Scheduled Task 执行 | `src/server/utils/cron-reminder.ts::buildCronTaskReminder` | `<system-reminder><CRON_TASK>...</CRON_TASK></system-reminder>` + 原 task prompt；tag/wire name 为历史兼容 |
+| Task 讨论首轮 | `src/shared/systemReminder.ts::buildTaskDiscussionReminder`，调用方 App Shell | `<system-reminder><TASK_DISCUSSION>...</TASK_DISCUSSION></system-reminder>` + 用户原始目标；hidden 只携带 discussion/workspace/可选 Thought identity，required Skill 另走 admission 字段 |
+| Task 本地评论 | `src/shared/systemReminder.ts::buildTaskCommentReminder`，调用方 Inbox `task.comment` event drain | `<system-reminder><TASK_COMMENT>...</TASK_COMMENT></system-reminder>` + 用户评论；包含 exact Task/Comment/Session、task.md 路径与显式 CLI 回复 instruction |
 | Goal 第一轮启动 | `src/shared/systemReminder.ts::buildGoalContinuationReminder`，调用方 `src/server/session-engine/goal-orchestrator.ts::goalContext` | `<system-reminder><GOAL_CONTINUATION>...</GOAL_CONTINUATION></system-reminder>` + 原始 Goal query visible tail；用户气泡显示原文与 Goal badge |
 | Goal 自动续跑 | 同一 builder，调用方 `/goal/execute-sync` | `<system-reminder><GOAL_CONTINUATION>...</GOAL_CONTINUATION></system-reminder>`，第二轮起纯隐藏 |
 | Goal 普通 query context | `src/shared/systemReminder.ts::buildGoalContextReminder`，调用方 Goal-aware chat enqueue 路径 | `<system-reminder><GOAL_CONTEXT>...</GOAL_CONTEXT></system-reminder>` + 用户 visible query |
@@ -149,6 +153,8 @@ instruction、cron output 都只给模型看。
 | Cron 结果投送 IM session | `src/server/utils/cron-event-relay.ts::buildCronEventRelayMessage` | `<system-reminder><HEARTBEAT>...</HEARTBEAT></system-reminder>` + `[System]收到来自系统投送的信息` |
 
 command Trigger 命中时仍使用 `CRON_TASK` 这一兼容 tag；builder 在 hidden payload 中追加规范化 `<activation-event>`，只包含 event id/kind/time、reason code 与 untrusted handoff。Detector checkpoint、stderr、命令路径和 harness error 永不进入 Session。handoff 来自外部事实，必须被 XML escape 并明确作为不可信上下文；它不能覆盖 `task.md`、消息 role 或 Session/Runtime 配置。没有 Activation Event 的 always Task 保持原 reminder wire shape。
+
+`TASK_COMMENT` 与 `myagents-space-issue` 是相互独立的回复契约：前者只指向本地 `myagents task comment`，后者继续指向 Cloud Issue 命令。即使两种 query 进入同一个 Attached Task Session，也不得根据 Task 类型改写来源 reminder、自动镜像或双写。
 
 相关但不是完整复用模板的入口：
 

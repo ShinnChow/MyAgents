@@ -299,7 +299,7 @@ pub fn run() {
     let proxy_spill_state = Arc::new(proxy_spill::ProxySpillManager::new(data_dir.join("refs")));
     let app_route_queue = app_route::create_queue();
     let app_route_queue_for_single_instance = app_route_queue.clone();
-    let notification_center = space_cloud::notifications::create_state();
+    let notification_center = space_cloud::notifications::create_state(task_state.clone());
     let notification_center_for_window_events = notification_center.clone();
 
     // Build the app first, then run with event handler
@@ -454,7 +454,7 @@ pub fn run() {
             commands::cmd_remove_template_folder,
             // Admin agent sync
             commands::cmd_sync_admin_agent,
-            // System skills sync (task-alignment / task-implement etc.)
+            // Product-owned system Skill sync (including task discussion).
             commands::cmd_sync_system_skills,
             memory_evolution::cmd_configure_memory_evolution_tasks,
             memory_evolution::cmd_get_memory_evolution_status,
@@ -669,7 +669,6 @@ pub fn run() {
             thought::cmd_thought_set_archived,
             // Task Center — Task commands (v0.1.69)
             task::cmd_task_create_direct,
-            task::cmd_task_create_from_alignment,
             task::cmd_task_create_attached,
             task::cmd_task_list,
             task::cmd_task_get,
@@ -681,7 +680,11 @@ pub fn run() {
             task::cmd_task_update,
             task::cmd_task_update_status,
             task::cmd_task_append_session,
-            task::cmd_task_write_alignment_metadata,
+            task::cmd_task_list_comments,
+            task::cmd_task_get_comment_context,
+            task::cmd_task_create_user_comment,
+            task::cmd_task_retry_comment,
+            task::cmd_task_prepare_discussion,
             task::cmd_task_archive,
             task::cmd_task_delete,
             task::cmd_task_read_doc,

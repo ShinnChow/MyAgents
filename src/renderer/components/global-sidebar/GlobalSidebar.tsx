@@ -154,6 +154,7 @@ interface GlobalSidebarProps {
   teamSpaceAvailable: boolean;
   onNewTab: () => void;
   onOpenTaskCenter: () => void;
+  onCreateTask: () => void;
   onOpenSpace: () => void;
   onOpenAppRoute?: (route: AppRoute) => Promise<boolean> | boolean;
   onOpenCapabilities: (section?: CapabilitySection) => void;
@@ -343,6 +344,7 @@ export default memo(function GlobalSidebar({
   teamSpaceAvailable,
   onNewTab,
   onOpenTaskCenter,
+  onCreateTask,
   onOpenSpace,
   onOpenAppRoute,
   onOpenCapabilities,
@@ -1074,13 +1076,34 @@ export default memo(function GlobalSidebar({
               onClick={handleSearchOpen}
             />
           )}
-          <SidebarNavButton
-            expanded={expanded}
-            active={activeView === 'taskcenter'}
-            icon={<CheckSquare className="h-4 w-4" />}
-            label={t('globalSidebar.tasks')}
-            onClick={handleOpenTaskCenter}
-          />
+          <div className="group/task-create relative">
+            <SidebarNavButton
+              expanded={expanded}
+              active={activeView === 'taskcenter'}
+              icon={<CheckSquare className="h-4 w-4" />}
+              label={t('globalSidebar.tasks')}
+              onClick={handleOpenTaskCenter}
+            />
+            {expanded && (
+              <Tip
+                label={t('globalSidebar.createTask')}
+                position="right"
+                className="absolute right-1 top-1"
+              >
+                <button
+                  type="button"
+                  onClick={event => {
+                    event.stopPropagation();
+                    onCreateTask();
+                  }}
+                  aria-label={t('globalSidebar.createTask')}
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--ink-muted)] opacity-0 transition-[opacity,color,background-color] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] group-hover/task-create:opacity-100 group-focus-within/task-create:opacity-100"
+                >
+                  <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
+                </button>
+              </Tip>
+            )}
+          </div>
           {teamSpaceAvailable && (
             <SidebarNavButton
               expanded={expanded}
@@ -1269,7 +1292,7 @@ export default memo(function GlobalSidebar({
               : 'calc(var(--global-sidebar-rail-width) + var(--space-2))',
             bottom: 'var(--space-5)',
             width: 'min(380px, calc(100vw - var(--global-sidebar-rail-width) - var(--space-5)))',
-            height: 'min(620px, calc(100vh - var(--space-8)))',
+              height: 'min(440px, calc(100vh - var(--space-8)))',
           }}
           data-notification-center-shell
         >

@@ -63,6 +63,7 @@ import type { SlashCommand } from '../../shared/slashCommands';
 import type { LogEntry } from '@/types/log';
 import { applySubagentLifecycleToContent } from '@/components/tools/subagentActivity';
 import type { ProviderRoute } from '../../shared/providerRoute';
+import type { ProductSystemSkillRequirement } from '../../shared/systemSkills';
 import { stripLeadingSystemReminder } from '../../shared/systemReminder';
 import { deriveSessionTitle } from '../../shared/sessionTitle';
 import {
@@ -4287,6 +4288,7 @@ export default function TabProvider({
         // net mirroring `model` (the /api/reasoning-effort/set push is primary).
         reasoningEffort?: string,
         providerRoute?: ProviderRoute,
+        requiredSystemSkill?: ProductSystemSkillRequirement,
     ): Promise<boolean> => {
         const trimmed = text.trim();
         if (!trimmed && (!images || images.length === 0)) return false;
@@ -4374,6 +4376,7 @@ export default function TabProvider({
             model,
             reasoningEffort,
             providerRoute,
+            requiredSystemSkill,
             ...(birthOrigin ? { birthOrigin } : {}),
             ...(providerRoute ? {} : { providerEnv: providerEnv ?? 'subscription' }),
         };

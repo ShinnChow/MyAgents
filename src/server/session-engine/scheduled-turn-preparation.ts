@@ -1,6 +1,6 @@
 import type { RuntimeConfig, RuntimeSource, RuntimeType } from '../../shared/types/runtime';
 import { coerceModelForRuntime } from '../../shared/types/runtime';
-import type { RequiredSystemSkill } from '../../shared/systemSkills';
+import type { SystemSkillAdmissionRequirement } from '../../shared/systemSkills';
 import type { DispatchGuard } from '../session-core/turn-queue';
 
 export function runtimeConfigModel(
@@ -20,8 +20,8 @@ export function runtimeConfigSource(
 
 export function createScheduledDispatchGuard(input: {
   preceding: DispatchGuard;
-  requiredSystemSkill?: RequiredSystemSkill;
-  requireNativeSystemSkill?: (skill: RequiredSystemSkill) => Promise<void>;
+  requiredSystemSkill?: SystemSkillAdmissionRequirement;
+  requireNativeSystemSkill?: (skill: SystemSkillAdmissionRequirement) => Promise<void>;
 }): DispatchGuard {
   const requiredSystemSkill = input.requiredSystemSkill;
   if (!requiredSystemSkill) return input.preceding;

@@ -354,6 +354,8 @@ Tab 内 MUST 用 `useTabState()` 的 `apiGet` / `apiPost`，禁止全局 `apiPos
 
 `GlobalSidebar` 挂在 `App` 的 Tab Workspace 之外，是应用级导航和资源投影，不是新的页面容器或 Session owner。顶部 Tab 仍是所有主内容页面的唯一 authority：active、关闭、恢复、拖拽、Sidecar owner token 与 pending-session birth 都继续由现有 Tab 状态机管理。
 
+App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Thought 只提交创建/讨论意图，不各自挂第二个 modal；`task.detail` / `task.comment` route 都由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
+
 - 桌面主窗口 focus 以 Tauri `onFocusChanged` 为持续事件 authority；`App` 启动时用 renderer 当前 foreground 状态播种一次，之后只持有一个布尔投影并只让 active Chat 响应。focus 只负责保存/恢复滚动意图，不能充当窗口可见性或 geometry authority：仍在展示的 active Chat 即使失焦也持续把 live 消息交给 Virtuoso。只有 App 确实以 `content-visibility:hidden` 隐藏的 internal inactive Tab 才冻结 Virtuoso 输入；TabProvider/Sidecar 生命周期始终不受两者影响。
 - 侧栏只从既有 `ConfigProvider`、任务中心 store、Session 索引与当前 Tab 派生工作区/Session 展示；active 高亮是 projection，不持久化第二份“当前页面”。该投影保持单一持久选中面：Launcher 选择工作区时高亮工作区行，Chat 已进入具体 Session 时只高亮 Session 行，父工作区仅保留层级上下文而不同时涂底或声明 `aria-current`。工作区配置和 Session mutation 分别调用现有 Config / Task Center authority，不在侧栏另存领域状态。
 - 侧栏与顶部 Title/Tab chrome 是同一 App Shell material surface：三者只读取完整 Theme 必需的 `--global-sidebar-bg`，该 Token 由每套 Theme 的 light/dark package 拥有；页面内容与卡片/弹层继续使用既有 `--paper / --paper-elevated / --paper-inset` 语义。App Shell chrome 不再依赖与内容区的分割线，常规 leading inset 为 8px，手动 rail 的 52px 预留同时容纳固定 toggle 与其后 8px 留白；Tab active/hover 复用全局 `--hover-bg`。不能为制造分区而翻转通用 Paper 层级、在组件内混色或为 Tab Chrome 复制一套局部 palette。
@@ -727,21 +729,25 @@ installer.ts         — 扫描 SKILL.md / marketplace.json → InstallAnalysis
 
 ### 16. 任务中心 (`src-tauri/src/task.rs` + `src-tauri/src/thought.rs` + `src/renderer/components/task-center/`)
 
-把"想法速记 → 对齐 → 派发 → 执行 → 验收 → 审计"的完整工作流一等公民化。
+把“想法/粗略目标 → 讨论或创建 → 调度 → Session 执行 → 本地协作 → 审计”的工作流一等公民化。
 
 **两个持久化 Store：**
 - `ThoughtStore` —— `~/.myagents/thoughts/<YYYY-MM>/<id>.md`
-- `TaskStore` —— `~/.myagents/tasks.jsonl` + `~/.myagents/tasks/<id>/{task.md, verify.md, progress.md, alignment/}`
+- `TaskStore` —— `~/.myagents/tasks.jsonl` + canonical `~/.myagents/tasks/<id>/task.md` + 可选 `comments.jsonl`；旧 `verify.md/progress.md/alignment.md` 仅兼容读取
 
 **关键设计：**
 - Task 状态机 + 审计链（每次状态变更原子写入 `statusHistory`）
 - TaskStore 是 schedule/status/config 唯一权威；TaskScheduler 直接触发并在每次 tick 动态读取 `task.md`
+- 普通 Task 的执行 prompt 永远读取完整 `task.md`，`dispatchOrigin` 只保留来源，不选择 executor Skill；旧 `verify.md` 在首次读取/编辑/执行前按字面 `# verify.md` 章节一次性并入 `task.md`
+- Task Comment 先由 TaskStore 持久化，再由 TaskApplication 冻结至多一个 exact Session 并复用既有 Inbox/FIFO 接纳；首轮 Task query 真正 admission 后才追加 Session relation 并 flush pending comments
+- Agent 只有显式 `myagents task comment` 才写回本地时间线；普通 assistant 输出不自动归档。Attached Task 的 Cloud Issue 与本地评论由本轮 reminder 决定回复通道，不镜像或双写
 - 每个 Task 最多一个 time Activation Trigger；缺失等价 `always`。command Trigger 配置写 Task row，高频 checkpoint/health/pending event 写 `tasks/<id>/trigger-state.json`，两者都只由 TaskStore 读写
 - command Detector 的合法业务结果只有 `quiet | activate`；只有 durable `activate` 才建立 Session/Sidecar/Runtime 工作，failure 在 harness 内诊断、退避或阻塞
 - `TaskApplication` 统一编排 Task 的创建、状态、删除和 run/rerun；current-session Task 只在真实 Session 创建完成后才持久化，通知字段在 TaskStore 写锁内合并，成功的 run/rerun 由同一操作返回从 1 开始计数的 `attemptOrdinal`，供 GUI/CLI 上报 analytics
 - Task/Session identity protection 由 per-Session lifecycle guard 串行化：任何 durable mutation（含 legacy migration）只要让 Task 进入受保护状态或新增受保护 Session binding，都与 Session 删除遵循 `lifecycle → TaskStore` 锁序；scheduler active execution 覆盖 Session id 已 claim、Sidecar `Task` owner 尚未附着的窗口，birth guard 只保留到权威 Session metadata 出现（不持满整轮），shared-session joiner 不得提前 adopt。metadata creator 由该 reservation 决定，不绑定 Sidecar `isNew`；被删除的 fixed Session 换新 UUID，不复活旧 identity
 - 同一 Task 的 status、timer、execution claim 与 stop side effect 由 keyed Task-control lifecycle 串行化；stop 使用现有 `queueId` 精确停止当前 Turn。持久 `Running/Stopped` 只表达 scheduler intent，具体 Turn 以非持久 `running/stopping/stop_failed` 投影；stop 未确认时禁止 rerun。Attached Space Task 的终态不能 generic rerun，必须由新的 claim/reopen 创建新 Attached Task
-- AI 讨论路径：想法卡 →「AI 讨论」打开新 Tab + 注入 `task-alignment` Skill → 完成后 `myagents task create-from-alignment`
+- AI 讨论路径：智能创建或 Thought「AI 讨论」→ 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`
+- Agent comment 的本地有界 locator index 由 TaskStore 从 `comments.jsonl` 异步重建并增量维护；App 级通知投影与 Cloud source 合并排序、source-aware 已读和 typed route，但不复制评论正文 authority
 - 状态变更广播 Tauri event `task:status-changed`（非 SSE），所有打开的任务中心 Tab 实时同步
 
 详见 `tech_docs/task_center.md`。

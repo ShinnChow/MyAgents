@@ -7,9 +7,13 @@ import { CUSTOM_EVENTS } from '../shared/constants';
 import { SessionDeletionContext } from '@/context/SessionDeletionContext';
 import { useTabStateOptional } from '@/context/TabContext';
 
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: vi.fn(async () => undefined),
+const tauriCoreMocks = vi.hoisted(() => ({
+  invoke: vi.fn<(command: string, args?: Record<string, unknown>) => Promise<unknown>>(
+    async () => undefined,
+  ),
 }));
+
+vi.mock('@tauri-apps/api/core', () => tauriCoreMocks);
 
 const mocks = vi.hoisted(() => {
   const project = {
@@ -467,6 +471,7 @@ describe('App helper launch', () => {
     mocks.useRealTabProvider = false;
     mocks.tauriEnvironment = false;
     mocks.listeners.clear();
+    tauriCoreMocks.invoke.mockImplementation(async () => undefined);
     mocks.sessionSidecarFetch.mockReset();
     mocks.agent.runtime = 'builtin';
     mocks.agent.providerId = undefined;
@@ -1883,6 +1888,47 @@ describe('App helper launch', () => {
       mocks.project.path,
       'tab',
       expect.stringMatching(/^tab-/),
+    );
+  });
+
+  it('starts Task discussion with the workspace external Runtime without requiring a builtin provider', async () => {
+    mocks.tauriEnvironment = true;
+    mocks.multiAgentRuntime = true;
+    mocks.agent.runtime = 'codex';
+    mocks.resolveBuiltinSelection.mockReturnValue(undefined);
+    tauriCoreMocks.invoke.mockImplementation(async (command) => {
+      if (command === 'cmd_task_prepare_discussion') {
+        return {
+          discussionId: 'discussion-external',
+          discussionDir: '/tmp/task-discussions/discussion-external',
+          candidatesDir: '/tmp/task-discussions/discussion-external/candidates',
+        };
+      }
+      return undefined;
+    });
+
+    render(<App />);
+    act(() => {
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
+        detail: {
+          content: '梳理并创建一个周期任务',
+          workspaceId: mocks.project.id,
+          tags: [],
+        },
+      }));
+    });
+
+    await waitFor(() => expect(mocks.ensureSessionSidecar).toHaveBeenCalled());
+    expect(mocks.resolveBuiltinSelection).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.ensureSessionSidecar).toHaveBeenCalledWith(
+      expect.stringMatching(/^pending-tab-/),
+      mocks.project.path,
+      'tab',
+      expect.stringMatching(/^tab-/),
+    );
+    expect(mocks.toast.error).not.toHaveBeenCalledWith(
+      expect.stringContaining('provider'),
     );
   });
 

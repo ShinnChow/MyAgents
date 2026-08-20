@@ -22,6 +22,7 @@ import type { SessionEvent } from './session-event';
 import type { InteractionScenario } from '../system-prompt';
 import type { DispatchGuard } from '../session-core/turn-queue';
 import type { InboxAdmissionResult } from '../session-engine/types';
+import { buildTaskCommentReminder } from '../../shared/systemReminder';
 
 function nowIsoFromMessage(msg: PendingInboxMessage): string {
   return new Date(msg.timestampMs || Date.now()).toISOString();
@@ -59,6 +60,17 @@ function legacySendResultEvent(msg: PendingInboxMessage): SessionEvent {
 export function buildSessionEventPrompt(msg: PendingInboxMessage): string {
   if (msg.kind === 'event' && msg.sessionEvent?.type === 'space.issue_delivery') {
     return msg.text;
+  }
+  if (msg.kind === 'event' && msg.sessionEvent?.type === 'task.comment') {
+    return buildTaskCommentReminder({
+      taskId: msg.sessionEvent.taskId,
+      taskName: msg.sessionEvent.taskName,
+      taskMdPath: msg.sessionEvent.taskMdPath,
+      commentId: msg.sessionEvent.commentId,
+      targetSessionId: msg.sessionEvent.targetSessionId,
+      replyContext: msg.sessionEvent.replyContext,
+      visibleUserMessage: msg.text,
+    });
   }
   if (msg.sessionEvent) {
     return renderSessionEventPrompt(msg.sessionEvent);
@@ -151,7 +163,8 @@ export async function handleInboxDrain(
       const prompt = buildSessionEventPrompt(msg);
       const meta = buildTurnMeta(msg);
       const allowLazySessionMaterialization =
-        msg.kind === 'event' && msg.sessionEvent?.type === 'space.issue_delivery';
+        msg.kind === 'event'
+        && (msg.sessionEvent?.type === 'space.issue_delivery' || msg.sessionEvent?.type === 'task.comment');
       const scenario = scenarioForInboxMessage(msg);
       const result = await injector(prompt, meta, { allowLazySessionMaterialization, scenario });
       // PRD 0.2.18 cross-review fix (Codex):

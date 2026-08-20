@@ -290,9 +290,11 @@ myagents task create-direct --name "..." \
     [--taskMdFile <path> | --taskMdContent "..."] \
     [--runtime X --providerId X --model X --permissionMode X --runtimeConfig <jsonStr> --mcpEnabledServers a,b] \
     [--executor agent --executionMode once --runMode X --tags x,y --sourceThoughtId X]
-myagents task create-from-alignment <alignmentSessionId> --name "..." [--run] [其它同 create-direct]
-                                                        # 从 AI 对齐会话物化任务（workspaceId/Path/sourceThoughtId 自动继承）
-                                                        # --run 创建后立刻派发，省一步
+                                                        # 从完整 task.md 物化普通任务（当前 workspace 可自动继承）
+myagents task comments <taskId> [--limit 50 --before <cursor>]
+                                                        # 读取本地线性评论时间线
+myagents task comment [<taskId>] --body-file <path> [--reply-to <commentId>]
+                                                        # Agent 显式写回本地 Task；执行上下文可继承 taskId
 myagents task run <taskId>                              # 派发 todo 任务
 myagents task start <taskId>                            # 按保留 anchor 恢复，以 nextExecutionAt 为准
 myagents task stop <taskId>                             # 暂停 schedule 并停止活跃执行
@@ -310,7 +312,7 @@ myagents task delete <taskId>                           # 不可恢复地移出�
 
 创建 scheduled/recurring Task 可用 `--deadline <ISO-8601-with-offset>`、`--maxExecutions <正整数>`、`--aiCanExit true|false` 设置结束条件；quiet Detector 检查不消耗 maxExecutions。固定 interval 第一次 `run` 默认约 2 秒后产生首次 tick；要延后首次机会时传 `--startAt <ISO-8601-with-offset>`。Cron 等下一个墙钟点，scheduled 等 `dispatchAt`。
 
-**任务级 runtime/provider/model/permissionMode 覆盖**：`create-direct` / `create-from-alignment` 支持仅对该任务生效的覆盖 flag，**不会改 Agent 工作区默认**。典型场景："实现用 Claude Code、review 用 Codex" → 创两个任务，`--runtime` 不一样，工作区配置不变。
+**任务级 runtime/provider/model/permissionMode 覆盖**：`create-direct` 支持仅对该任务生效的覆盖 flag，**不会改 Agent 工作区默认**。典型场景："实现用 Claude Code、review 用 Codex" → 创两个任务，`--runtime` 不一样，工作区配置不变。
 
 | Flag | 语义 |
 |------|------|
@@ -325,9 +327,11 @@ myagents task delete <taskId>                           # 不可恢复地移出�
 
 **何时用：**
 - "看我还有啥没做完的" → `task list --status running` / `task list`
-- "这个想法派发出去" → `task create-from-alignment <sessionId> --name "..." --run`
+- "这个想法派发出去" → 先将完整任务上下文写入 `task.md`，再用 `task create-direct --taskMdFile ...` 创建；是否立即 `task run` 取决于用户已确认的动作
 - "创个 review PR 的任务用 codex" → `task create-direct ... --runtime codex --model gpt-5.2 --permissionMode full-auto`
 - "任务过程中我开了个新对话登记一下" → `task append-session <taskId> <sessionId>`
+- "把重要结果回复到本地任务" → 将正文写入文件，再用 `task comment <taskId> --body-file ...`；普通 assistant 输出不会自动复制到 Task
+- 正在执行 Task turn 时可以省略 `<taskId>`，Sidecar 会从当前 Session 的精确 Task 上下文解析；收到用户 Task 评论后的后续 turn 应使用隐藏提醒里给出的显式 `<taskId>`，不得猜测
 - "标记完成" → `task update-status <taskId> done --message "..."`
 - "重新跑一遍" → `task rerun <taskId>`
 - `task list --json` 只返回紧凑发现字段和 `sessionCount`，不会展开历史 `sessionIds`；拿到 ID 后用 `task get` 读取完整状态与各 `.md` 文档路径

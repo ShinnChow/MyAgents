@@ -3067,7 +3067,6 @@ Commands:
   list                            Compact current-workspace list (--query / --limit supported)
   get <taskId>                    Task metadata + .task/ doc paths
   create-direct <name>            Create a task with inline task.md content
-  create-from-alignment <sid>     Materialize a task from an alignment session
   create-attached                 Create a running task attached to the current AI session
   update <taskId>                 Patch task fields (schedule / notification /
                                   prompt / overrides). Rejected while running.
@@ -3149,15 +3148,6 @@ Per-task RUNTIME overrides (all optional; omit to inherit workspace defaults):
   --runtimeConfig      JSON string for runtime-specific extra config
   --mcpEnabledServers  Comma-separated MCP ids; "" means explicit no MCP
 
-Options for 'create-from-alignment' (identical override flags):
-  Positional: <alignmentSessionId>
-  --name               Task name (required)
-  --executor --description --workspaceId --workspacePath
-  --executionMode --runMode --tags --sourceThoughtId
-  --preselectedSessionId current|<id> --trigger-file <path>
-  --deadline <ISO-with-offset> --maxExecutions <n> --aiCanExit true|false
-  --runtime --providerId --model --permissionMode --runtimeConfig --mcpEnabledServers
-
 Options for 'create-attached':
   --name                  Task name (required)
   --workspaceId           Workspace id (required)
@@ -3210,14 +3200,13 @@ Output:
 Examples:
   myagents task list --query "review" --limit 20
   myagents task create-direct --name "review PR" \\
-      --taskMdContent "Review the latest PR and file findings in progress.md" \\
+      --taskMdContent "Review the latest PR and verify the acceptance criteria" \\
       --runtime codex --model gpt-5.2 --permissionMode full-auto
   # Recurring + IM push — was GUI-only before issue #205
   myagents task create-direct --name "issue triage" \\
       --taskMdFile /tmp/triage-prompt.md \\
       --executionMode recurring --intervalMinutes 180 \\
       --notificationBotChannelId feishu_main
-  myagents task create-from-alignment sess_abc --name "Ship feature X" --runtime claude-code
   myagents task create-attached --name "Space Issue #123" \\
       --workspaceId my-proj --workspacePath /path/to/my-proj \\
       --taskMdContent-file task.md --source space-issue --sourceIssueId iss_123
@@ -3261,17 +3250,6 @@ Related:
     output: 'Persisted Task, caller audit provenance, docs path, overrides, nextExecutionAt, and next-step commands.',
     example: 'myagents task create-direct --name "daily review" --taskMdFile task-action.md --executionMode recurring --cronExpression "0 9 * * *" --json',
     recovery: 'Run task get <id> to verify. agent current is diagnostic, not a prerequisite.',
-  }),
-
-  'task/create-from-alignment': taskLeafHelp({
-    usage: 'myagents task create-from-alignment <alignmentSessionId> --name <name> — Materialize aligned work',
-    when: 'After the task-alignment flow has produced a reviewed Task directory.',
-    effect: 'Moves the alignment artifacts into one ordinary Task and inherits workspace metadata from the alignment Session.',
-    options: '  <alignmentSessionId> Required alignment Session id\n  --name <name>         Required Task name\n  --providerId <id> --model <id>  Optional builtin route pair\n  --run                 Dispatch after successful creation',
-    mutation: 'Creates a once Task; --run also starts its asynchronous AI execution.',
-    output: 'Persisted Task/docs plus optional run result.',
-    example: 'myagents task create-from-alignment <sessionId> --name "ship feature" --run --json',
-    recovery: 'If metadata is missing, pass explicit workspace fields or repair the alignment artifacts.',
   }),
 
   'task/create-attached': taskLeafHelp({
@@ -4393,6 +4371,49 @@ export async function handleTaskGet(payload: { id: string }): Promise<AdminRespo
   return mgmtError(resp, 'Failed to get task');
 }
 
+export async function handleTaskComments(payload: {
+  id: string;
+  before?: string;
+  limit?: number;
+}): Promise<AdminResponse> {
+  const resp = await managementApi(
+    `/api/task/comments${qsFrom(payload as Record<string, string | number | undefined>)}`,
+  );
+  if (resp.ok) return { success: true, data: resp.page };
+  return mgmtError(resp, 'Failed to list Task comments');
+}
+
+export async function handleTaskComment(payload: {
+  id?: string;
+  body: string;
+  replyToCommentId?: string;
+}): Promise<AdminResponse> {
+  // Session identity belongs to this Sidecar process. Never accept a
+  // client-provided value: a CLI payload is untrusted and could otherwise
+  // impersonate another Task-bound Session.
+  const sessionId = process.env.MYAGENTS_SESSION_ID?.trim();
+  if (!sessionId) {
+    return {
+      success: false,
+      error: 'Task Agent comments require MYAGENTS_SESSION_ID; run this command inside the associated Task Session.',
+    };
+  }
+  const taskId = payload.id?.trim() || getCronTaskContext(sessionId).taskId;
+  if (!taskId) {
+    return {
+      success: false,
+      error: 'Task ID is required outside an active Task turn. Pass <taskId> from the Task comment reminder.',
+    };
+  }
+  const resp = await managementApi('/api/task/comment', 'POST', {
+    id: taskId,
+    body: payload.body,
+    replyToCommentId: payload.replyToCommentId,
+    sessionId,
+  });
+  return wrapMgmtResponse(resp);
+}
+
 export async function handleTaskCreateDirect(
   payload: Record<string, unknown>,
 ): Promise<AdminResponse> {
@@ -4420,26 +4441,6 @@ export async function handleTaskCreateDirect(
       source: taskCliAnalyticsSource(request as TaskCliCaller),
       origin: 'manual',
       has_workspace: true,
-    });
-  }
-  return enriched;
-}
-
-export async function handleTaskCreateFromAlignment(
-  payload: Record<string, unknown>,
-): Promise<AdminResponse> {
-  const validationError = await validateTaskOverrides(payload);
-  if (validationError) return validationError;
-
-  const overridden = computeOverriddenFields(payload);
-  const resp = await managementApi('/api/task/create-from-alignment', 'POST', payload);
-  const wrapped = wrapMgmtResponse(resp);
-  const enriched = enrichTaskCreateResponse(wrapped, payload, overridden);
-  if (enriched.success) {
-    trackServer('task_create', {
-      source: taskCliAnalyticsSource(payload as TaskCliCaller),
-      origin: 'thought_dispatch',
-      has_workspace: typeof payload.workspacePath === 'string' && payload.workspacePath.length > 0,
     });
   }
   return enriched;
@@ -4586,8 +4587,7 @@ function enrichTaskCreateResponse(
           : undefined;
 
   // Read the overrides from the persisted Task, NOT from the request payload.
-  // If serde dropped a field (e.g., prior to v0.1.69 when `TaskCreateFromAlignmentInput`
-  // lacked model/permission_mode), we want the mismatch to be visible here.
+  // Read persisted values so a DTO mismatch cannot masquerade as success.
   const persistedOverrides = {
     runtime: (persistedTask.runtime as string | undefined) ?? null,
     providerId: (persistedTask.providerId as string | undefined) ?? null,
@@ -4740,8 +4740,8 @@ export async function handleTaskDelete(payload: {
 }
 
 /**
- * Read a task's markdown doc (`task.md` / `verify.md` / `progress.md` /
- * `alignment.md`). Missing files return `{ ok: true, content: "" }` so
+ * Read a task's canonical `task.md` or a retained legacy markdown doc.
+ * Missing legacy files return `{ ok: true, content: "" }` so
  * CLI scripting is idempotent. Task docs live under `~/.myagents/tasks/<id>/`
  * since v0.1.69 — this endpoint is the agent-facing read path because the
  * AI runs in the workspace cwd and can't know the user-profile dir.
@@ -4760,9 +4760,8 @@ export async function handleTaskReadDoc(payload: {
 }
 
 /**
- * Write `task.md` or `verify.md`. `progress.md` is agent-appended during
- * runs and rejected here; `alignment.md` is written by the alignment
- * skill via direct file-system access (not through this API).
+ * Write canonical `task.md` or retained legacy `verify.md`. Legacy
+ * `progress.md` / `alignment.md` remain read-only through this API.
  */
 export async function handleTaskWriteDoc(payload: {
   id: string;

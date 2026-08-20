@@ -330,6 +330,16 @@ export function createTaskTurnOrchestrator() {
               turnOwner: { kind: 'task', id: payload.taskId },
               beforeDispatch: prepared.beforeDispatch ?? dispatchGuard,
               requiredSystemSkill: prepared.requiredSystemSkill,
+              onDispatched: async (acceptedQueueId, acceptedSessionId) => {
+                const admitted = await managementApi('/api/task/turn/admitted', 'POST', {
+                  taskId: payload.taskId,
+                  queueId: acceptedQueueId,
+                  sessionId: acceptedSessionId,
+                });
+                if (admitted.ok !== true) {
+                  throw new Error(String(admitted.error ?? 'Task admission receipt was rejected'));
+                }
+              },
             });
             if (!turnResult.success) {
               return {

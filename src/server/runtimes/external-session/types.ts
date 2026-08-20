@@ -15,7 +15,7 @@ import type {
   TurnTerminalObserver,
 } from '../../session-core/turn-queue';
 import type { TurnChannelDelivery } from '../../session-core/channel-delivery';
-import type { RequiredSystemSkill } from '../../../shared/systemSkills';
+import type { SystemSkillAdmissionRequirement } from '../../../shared/systemSkills';
 import type { SubagentLifecycle } from '../../../shared/types/subagent-lifecycle';
 
 export interface PersistToolResultMeta {
@@ -198,7 +198,7 @@ export interface ExternalSendContext {
   onTerminal?: TurnTerminalObserver;
   beforeDispatch?: DispatchGuard;
   /** Dependent automation contract, checked against Runtime-native read-back before dispatch. */
-  requiredSystemSkill?: RequiredSystemSkill;
+  requiredSystemSkill?: SystemSkillAdmissionRequirement;
   channelDelivery: TurnChannelDelivery;
 }
 

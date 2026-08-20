@@ -14,6 +14,7 @@ import type { OfficialToolId } from '../../shared/official-tools';
 import type { RegisteredAgentSessionOrigin, SessionOrigin } from '../../shared/session-origin';
 import type { SessionCompletionTerminal } from '../../shared/sessionCompletion';
 import type { RequiredSystemSkill } from '../../shared/systemSkills';
+import type { ProductSystemSkillRequirement } from '../../shared/systemSkills';
 import type {
   DispatchGuard,
   DesktopDeliveryMode,
@@ -52,6 +53,8 @@ export type DesktopMessageRequest = {
   turnOwner?: TurnOwner;
   onTerminal?: TurnTerminalObserver;
   beforeDispatch?: DispatchGuard;
+  /** Strong app-owned Skill admission for product workflow turns. */
+  requiredSystemSkill?: ProductSystemSkillRequirement;
 };
 
 export type DesktopAdmissionResult = {
@@ -169,6 +172,8 @@ export type InjectedTurnRequest = {
   queueId?: string;
   turnOwner?: TurnOwner;
   onTerminal?: TurnTerminalObserver;
+  /** Fires once after the exact Runtime queue accepts this turn. */
+  onDispatched?: (queueId: string, sessionId: string) => Promise<void> | void;
   /** Final authority check at the runtime promotion boundary. */
   beforeDispatch?: DispatchGuard;
   requiredSystemSkill?: RequiredSystemSkill;

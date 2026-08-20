@@ -16,6 +16,12 @@ pub enum AppRoute {
         #[serde(rename = "params")]
         params: SpaceIssueRouteParams,
     },
+    #[serde(rename = "task.comment")]
+    TaskComment {
+        version: u8,
+        #[serde(rename = "params")]
+        params: TaskCommentRouteParams,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,6 +29,13 @@ pub enum AppRoute {
 pub struct SpaceIssueRouteParams {
     pub space_id: String,
     pub issue_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCommentRouteParams {
+    pub task_id: String,
+    pub comment_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -113,11 +126,30 @@ impl AppRoute {
         })
     }
 
+    pub fn task_comment(task_id: impl Into<String>, comment_id: impl Into<String>) -> Option<Self> {
+        let task_id = task_id.into();
+        let comment_id = comment_id.into();
+        if !is_route_id(&task_id) || !is_route_id(&comment_id) {
+            return None;
+        }
+        Some(Self::TaskComment {
+            version: 1,
+            params: TaskCommentRouteParams {
+                task_id,
+                comment_id,
+            },
+        })
+    }
+
     pub fn to_deep_link(&self) -> String {
         match self {
             Self::SpaceIssue { params, .. } => format!(
                 "myagents://open/v1/spaces/{}/issues/{}",
                 params.space_id, params.issue_id
+            ),
+            Self::TaskComment { params, .. } => format!(
+                "myagents://open/v1/tasks/{}/comments/{}",
+                params.task_id, params.comment_id
             ),
         }
     }
@@ -155,14 +187,16 @@ pub fn parse_deep_link(raw: &str) -> Option<AppRoute> {
         return None;
     }
     let segments = path.split('/').collect::<Vec<_>>();
-    if segments.len() != 5
-        || segments[0] != "v1"
-        || segments[1] != "spaces"
-        || segments[3] != "issues"
-    {
+    if segments.len() != 5 || segments[0] != "v1" {
         return None;
     }
-    AppRoute::space_issue(decode_segment(segments[2])?, decode_segment(segments[4])?)
+    let parent_id = decode_segment(segments[2])?;
+    let child_id = decode_segment(segments[4])?;
+    match (segments[1], segments[3]) {
+        ("spaces", "issues") => AppRoute::space_issue(parent_id, child_id),
+        ("tasks", "comments") => AppRoute::task_comment(parent_id, child_id),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -170,12 +204,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_serializes_the_single_supported_route() {
+    fn parses_and_serializes_supported_routes() {
         let route = parse_deep_link("myagents://open/v1/spaces/space_1/issues/issue-2")
             .expect("valid route");
         assert_eq!(
             route.to_deep_link(),
             "myagents://open/v1/spaces/space_1/issues/issue-2"
+        );
+        let comment = parse_deep_link("myagents://open/v1/tasks/task_1/comments/comment-2")
+            .expect("valid task comment route");
+        assert_eq!(
+            comment,
+            AppRoute::task_comment("task_1", "comment-2").expect("valid ids")
+        );
+        assert_eq!(
+            comment.to_deep_link(),
+            "myagents://open/v1/tasks/task_1/comments/comment-2"
         );
         assert_eq!(
             route,
@@ -192,6 +236,8 @@ mod tests {
             "myagents://evil/v1/spaces/a/issues/b",
             "myagents://open/v2/spaces/a/issues/b",
             "myagents://open/v1/spaces/a/issues/b/extra",
+            "myagents://open/v1/tasks/a/comments/b/extra",
+            "myagents://open/v1/tasks/a/issues/b",
             "myagents://open//v1/spaces/a/issues/b",
             "myagents://open/v1/spaces/a/issues/b?prompt=run",
             "myagents://open/v1/spaces/a/issues/b#fragment",
@@ -208,6 +254,7 @@ mod tests {
     fn bounds_route_identifiers() {
         assert_eq!(AppRoute::space_issue("", "issue"), None);
         assert_eq!(AppRoute::space_issue("space", "x".repeat(201)), None);
+        assert_eq!(AppRoute::task_comment("task", ""), None);
     }
 
     #[test]

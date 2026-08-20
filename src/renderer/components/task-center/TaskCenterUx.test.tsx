@@ -142,7 +142,7 @@ describe('Task Center UX refinements', () => {
   it('defaults the task panel to list view when no preference is stored', async () => {
     window.localStorage.removeItem('myagents:task-center:view');
 
-    render(<TaskListPanel />);
+    render(<TaskListPanel onCreateTask={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByTitle(/列表视图|List view/)).toHaveAttribute('aria-pressed', 'true');
@@ -153,7 +153,7 @@ describe('Task Center UX refinements', () => {
   it('keeps an explicit card preference and persists a later list choice', async () => {
     window.localStorage.setItem('myagents:task-center:view', 'card');
 
-    render(<TaskListPanel />);
+    render(<TaskListPanel onCreateTask={vi.fn()} />);
 
     await waitFor(() => {
       expect(screen.getByTitle(/卡片视图|Card view/)).toHaveAttribute('aria-pressed', 'true');
@@ -180,7 +180,7 @@ describe('Task Center UX refinements', () => {
     ]);
     taskApiMocks.taskRun.mockResolvedValueOnce({ task: accepted, attemptOrdinal: 6 });
 
-    render(<TaskListPanel />);
+    render(<TaskListPanel onCreateTask={vi.fn()} />);
 
     await screen.findByText('每日 AI 行业新闻与暴论');
     fireEvent.click(screen.getByTitle(/更多操作|More actions/));
@@ -199,7 +199,7 @@ describe('Task Center UX refinements', () => {
     ]);
     taskApiMocks.taskRun.mockRejectedValueOnce(new Error('task is busy'));
 
-    render(<TaskListPanel />);
+    render(<TaskListPanel onCreateTask={vi.fn()} />);
 
     await screen.findByText('每日 AI 行业新闻与暴论');
     fireEvent.click(screen.getByTitle(/更多操作|More actions/));
@@ -221,7 +221,7 @@ describe('Task Center UX refinements', () => {
       attemptOrdinal: 5,
     });
 
-    render(<TaskListPanel />);
+    render(<TaskListPanel onCreateTask={vi.fn()} />);
 
     await screen.findByText('每日 AI 行业新闻与暴论');
     fireEvent.click(screen.getByTitle(/更多操作|More actions/));
@@ -338,8 +338,10 @@ describe('Task Center UX refinements', () => {
     render(
       <DispatchTaskDialog
         defaultWorkspacePath="/Users/me/mino"
+        initialMode="manual"
         onClose={vi.fn()}
         onDispatched={vi.fn()}
+        onDiscuss={vi.fn()}
       />,
     );
 
@@ -363,6 +365,75 @@ describe('Task Center UX refinements', () => {
     });
   });
 
+  it('defaults to the accessible smart flow and retains its draft when launch is rejected', async () => {
+    const onClose = vi.fn();
+    const onDiscuss = vi.fn().mockResolvedValue(false);
+    render(
+      <DispatchTaskDialog
+        defaultWorkspacePath="/Users/me/mino"
+        onClose={onClose}
+        onDispatched={vi.fn()}
+        onDiscuss={onDiscuss}
+      />,
+    );
+
+    expect(screen.getByRole('dialog', { name: '新建任务' })).toBeInTheDocument();
+    const smartTab = screen.getByRole('tab', { name: '智能' });
+    expect(smartTab).toHaveAttribute('aria-selected', 'true');
+    const prompt = screen.getByPlaceholderText(/请输入您希望创建或推进任务/);
+    fireEvent.change(prompt, { target: { value: '每天检查高危依赖' } });
+    fireEvent.click(screen.getByRole('button', { name: '与 AI 讨论' }));
+
+    await waitFor(() => expect(onDiscuss).toHaveBeenCalledWith(expect.objectContaining({
+      content: '每天检查高危依赖',
+      workspaceId: 'workspace-1',
+      workspacePath: '/Users/me/mino',
+    })));
+    await waitFor(() => expect(screen.getByRole('button', { name: '与 AI 讨论' })).toBeEnabled());
+    expect(prompt).toHaveValue('每天检查高危依赖');
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(smartTab, { key: 'ArrowRight' });
+    expect(screen.getByRole('tab', { name: '手动' })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('merges the optional manual acceptance checklist into the one task.md payload', async () => {
+    taskApiMocks.taskCreateDirect.mockResolvedValue(task({
+      name: '整理交付清单',
+      executionMode: 'once',
+      status: 'todo',
+    }));
+    taskApiMocks.taskRun.mockResolvedValue(true);
+    render(
+      <DispatchTaskDialog
+        defaultWorkspacePath="/Users/me/mino"
+        initialMode="manual"
+        onClose={vi.fn()}
+        onDispatched={vi.fn()}
+        onDiscuss={vi.fn().mockResolvedValue(true)}
+      />,
+    );
+
+    fireEvent.change(screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'), {
+      target: { value: '整理交付清单' },
+    });
+    fireEvent.change(screen.getByPlaceholderText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。'), {
+      target: { value: '# 目标\n整理本周交付。' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: /验收清单/ }));
+    fireEvent.change(screen.getByPlaceholderText(/curl \/health 返回 200/), {
+      target: { value: '- npm test 全绿' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '创建任务' }));
+
+    await waitFor(() => expect(taskApiMocks.taskCreateDirect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        taskMdContent: '# 目标\n整理本周交付。\n\n# verify.md\n\n- npm test 全绿',
+      }),
+    ));
+    expect(taskApiMocks.taskWriteDoc).not.toHaveBeenCalled();
+  });
+
   it('creates a blank task without exposing or synthesizing tags', async () => {
     taskApiMocks.taskCreateDirect.mockResolvedValue(task({
       name: '整理交付清单',
@@ -374,8 +445,10 @@ describe('Task Center UX refinements', () => {
     render(
       <DispatchTaskDialog
         defaultWorkspacePath="/Users/me/mino"
+        initialMode="manual"
         onClose={vi.fn()}
         onDispatched={vi.fn()}
+        onDiscuss={vi.fn()}
       />,
     );
 
@@ -422,8 +495,10 @@ describe('Task Center UX refinements', () => {
       <DispatchTaskDialog
         defaultWorkspacePath="/Users/me/mino"
         currentSessionId="session-existing"
+        initialMode="manual"
         onClose={vi.fn()}
         onDispatched={vi.fn()}
+        onDiscuss={vi.fn()}
       />,
     );
     fireEvent.change(screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'), {

@@ -9,7 +9,9 @@
 | Store | 文件 | Owner |
 |---|---|---|
 | `ThoughtStore` | `thoughts/<YYYY-MM>/<id>.md` | 想法与 Task 关联 |
-| `TaskStore` | `tasks.jsonl` + `tasks/<id>/{task.md,verify.md,progress.md,alignment/...}` | Task 身份、状态、调度配置、运行统计与审计 |
+| `TaskStore` | `tasks.jsonl` + `tasks/<id>/task.md` + 可选 `comments.jsonl` | Task 身份、状态、调度、完整任务契约、本地评论、运行统计与审计 |
+
+新 Task 的唯一语义文档是完整 `task.md`。旧 `verify.md/progress.md/alignment.md` 仍可读取；其中旧 `verify.md` 在 task read/edit/dispatch 前通过 TaskStore 的幂等迁移原样追加为 `# verify.md` 章节。新建和编辑不得继续维持平行四文档协议。
 
 `TaskStore` 是 Task 的唯一真相。不存在 `Task.cronTaskId`、关联 `CronTask` 副本、schedule 双写或启动时反向修补。
 
@@ -23,6 +25,7 @@ Task 的核心职责：
 - 新执行 Session 的 runtime/provider/model/MCP 初始配置，以及每轮 permission policy。
 - notification、关联 Session、执行次数与最近执行时间。
 - 一个 time Activation Trigger：缺失/`always` 直接执行 AI，`command` 先做低成本二元判断。
+- 可选、线性、纯文本的本地 Comment 时间线；Comment admission 与 Task schedule/status 正交。
 
 `Loop` 已退出 Task 模型：新建/编辑拒绝，旧 Loop 启动时转 `Stopped`，不转换为 Goal。
 
@@ -64,6 +67,8 @@ timer handle 只负责“何时触发”。真正的 AI Turn 是独立执行作�
 
 每次执行前都重新读取 `task.md`，用户修改会在下一次执行生效。运行历史继续写 `cron_runs/<taskId>.jsonl`，这是查询/审计投影，不是 Task 状态权威。
 
+普通 Task 不再按 `dispatchOrigin` 选择不同的内容 executor。Scheduler 对 direct、AI 讨论后创建及 legacy provenance 都构造同一份完整 `task.md` 首轮 query；Agent 使用工作区、Skill 和工具自行执行与验证。Task status/outcome 仍由 TaskApplication/scheduler 裁决，Agent 不通过内容型 Skill 重写生命周期。
+
 ### Activation Trigger 与 Detector
 
 每个 Task 最多一个 Trigger，Source 固定复用现有时间调度，不能在 Trigger 内复制 interval/cron/timezone。旧 Task 没有 `trigger` 时按 `time + always` 解释，不批量回写。`command` 配置是结构化 `executable + args + cwd + timeoutMs`；Rust 不拼 shell 字符串，bare `node`/`node.exe` 固定解析为 bundled Node.js v24，其他 bare executable 走系统二进制发现。
@@ -98,6 +103,16 @@ Task 执行统一经过 `task_execution.rs` -> Rust Sidecar bridge -> Node `Sess
 - 执行期间使用 `SidecarOwner::Task(taskId)`；terminal/stop/delete 对称释放。
 - Task turn 的 completion descriptor 保留 `{ kind: 'task', id: taskId }` owner；Rust 通用 Session completion policy 据此抑制 generic toast，Task outcome/notification 仍由 Task domain lifecycle 唯一负责，attached/headless 都不因 Tab 是否存在而改变归属。
 - Rust 每次 ensure attempt 只解析一次 owner-aware `RuntimeIdentity(runtime + runtimeSource)`，复用校验与 spawn 必须消费同一快照；Node 创建 Task metadata 时再从 live `SessionEngine.getRuntimeIdentity()` 取一次实际进程身份，并与同一 live config snapshot 绑定，禁止用 payload 中可能漂移的 runtime 反写。
+
+Task ↔ Session relation 只在 Runtime adapter 已接纳首轮 query 后，由 `onDispatched(queueId, sessionId)` 回调经 `/api/task/turn/admitted` 幂等提交。metadata 存在、Sidecar 已启动或 HTTP 请求已发出都不是 admission 证据。pending Comment 必须在该 relation 持久化后才按创建顺序进入同一 Session 的既有队列。
+
+### 本地评论与全局通知
+
+`comments.jsonl` 是 Comment 语义 authority；记录 author、时间、可选 reply 关系、冻结的 `conversationSessionId` 与最小 admission receipt。用户 Comment 先持久化，再选择至多一个目标：直接评论取最近一次已接纳 Session；回复有 Session 的历史 Comment 固定回该 Session；没有 Session 时保留 `pending_session`，之后不得自动改投另一个 Session。投送复用 Inbox/SessionEngine FIFO，不增加本地 Delivery、poll 或 ACK。
+
+Agent 只能从已绑定 Session 显式调用 `myagents task comment` 写回；普通 assistant 输出不自动形成 Comment。Task 首轮可以从运行上下文安全解析当前 Task ID，用户 Comment 注入的后续轮必须使用 `TASK_COMMENT` reminder 中的显式 ID。Attached Task 使用同一本地时间线，但 Cloud IssueDelivery 与本地 Comment 各自保留自己的 reminder/CLI 回复通道，不镜像或双写。
+
+TaskStore 维护可重建、最多 5000 条的 Agent Comment locator/excerpt index：启动异步扫描，之后 append/rename/delete 增量维护。全局通知 owner 只读取该 source、保存有界本地已读 receipt，并与 Cloud source 合并排序/分页；不复制 Comment 正文。通知目标使用 typed `task.comment` AppRoute，打开同一个 Task detail Drawer 并 focus exact Comment。
 
 完整 provider/runtime/MCP 规则见 `task_provider_routing.md`。
 
@@ -180,10 +195,12 @@ Goal 是 Session 状态，不是 Task execution mode：
 
 - Rust：`src-tauri/src/task.rs`、`task_application.rs`、`task_scheduler.rs`、`task_execution.rs`
 - Legacy compatibility：`src-tauri/src/cron_task/*`、`legacy_upgrade.rs`
-- Management API：`/api/task/*`（含 trigger validate/test/check-now/reset 与 run-now）及兼容 `/api/cron/*`
-- CLI：`myagents task ...` 是 Agent-facing canonical surface，覆盖创建、启停、历史、exit、Trigger test/check-now/run-now/reset；`myagents cron ...` 只保留外部兼容
+- Management API：`/api/task/*`（含 comment/list/context/retry、turn admitted、trigger validate/test/check-now/reset 与 run-now）及兼容 `/api/cron/*`
+- CLI：`myagents task ...` 是 Agent-facing canonical surface，覆盖通用 `create-direct`、评论写回、创建/启停、历史、exit、Trigger test/check-now/run-now/reset；`myagents cron ...` 只保留外部兼容
 - Renderer：`src/renderer/components/task-center/`、`useCronTask`（兼容展示 hook）
 
-新建/从想法派发共用 `DispatchTaskDialog`。创建面板不提供手工标签输入；空白新建写入空标签，从想法派发则原样继承来源想法的标签作为 provenance。既有 Task 的标签字段、列表过滤、详情展示与编辑兼容能力保持不变，`TaskStore` schema 不因这项表单收敛而改变。
+App Shell 只挂一个 `DispatchTaskDialog`：侧边栏和 Task Center 默认智能 Tab，Thought 派发默认手动 Tab。智能 Tab 与 Thought AI 讨论共用 Task discussion builder、runtime selection、required product Skill 和新 Chat launch；确认前不写 Task。手动验收输入通过 shared helper 合并进 `task.md`，不单写 `verify.md`。既有 Task 的标签字段、列表过滤和编辑兼容能力保持不变。
+
+Task detail 是全高、可路由的大 Drawer：主栏阅读完整 `task.md` 并承载 Comment 时间线；右栏展示状态、schedule/trigger、workspace/runtime/Session 和运行审计。编辑是 Drawer 内独立表单 sheet，dirty close 必须确认。Task list、Bell、OS toast 与 deep link 都进入这一 surface。
 
 Task Center 在创建/编辑中提供 always/command、结构化 argv、cwd、timeout 和无提交 test；command Task 显示标识与 runtime health/checkpoint/pending/error 投影，并把 test、check-now、run-now、reset 明确分成四个动作。新建 `single-session` Task 必须先 materialize 并持久化一个真实 `preselectedSessionId`，可选择当前或任意已有 Session。

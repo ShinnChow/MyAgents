@@ -94,7 +94,9 @@ import {
 } from '../shared/slashCommands';
 import { sanitizeFolderName, isWindowsReservedName } from '../shared/utils';
 import {
+  assertKnownProductSystemSkillRequirement,
   isRequiredSystemSkill,
+  type ProductSystemSkillRequirement,
   withoutRequiredSystemSkills,
 } from '../shared/systemSkills';
 import { resolveSkillUrl, type ResolvedSkillSource } from './skills/url-resolver';
@@ -613,6 +615,8 @@ type SendMessagePayload = {
   analyticsSource?: TurnAnalyticsSource;
   /** Stable session birth origin, present only when this desktop send creates/materializes a session. */
   birthOrigin?: unknown;
+  /** Product workflow admission; validated against the compiled contract. */
+  requiredSystemSkill?: unknown;
   // 'subscription' = explicit switch to Anthropic subscription (from desktop)
   // undefined/missing = "keep current provider" (safe default for IM/Task callers)
   // object = use this specific third-party provider
@@ -922,8 +926,7 @@ function resolveBundledSkillsDir(): string | null {
  * genuine user skill named identically.
  */
 const SYSTEM_SKILLS: readonly string[] = [
-  'task-alignment',
-  'task-implement',
+  'myagents-task-alignment',
   // v10: ultra-research removed — not generic enough.
   'download-anything',
   // v9: myagents-cli — global skill that exposes the entire `myagents`
@@ -1418,8 +1421,9 @@ async function routeAdminApi(
   // Task Center — thoughts + tasks (v0.1.69)
   if (route === 'task/list') return await api.handleTaskList(payload as Parameters<typeof api.handleTaskList>[0]);
   if (route === 'task/get') return await api.handleTaskGet(payload as Parameters<typeof api.handleTaskGet>[0]);
+  if (route === 'task/comments') return await api.handleTaskComments(payload as Parameters<typeof api.handleTaskComments>[0]);
+  if (route === 'task/comment') return await api.handleTaskComment(payload as Parameters<typeof api.handleTaskComment>[0]);
   if (route === 'task/create-direct') return await api.handleTaskCreateDirect(payload);
-  if (route === 'task/create-from-alignment') return await api.handleTaskCreateFromAlignment(payload);
   if (route === 'task/create-attached') return await api.handleTaskCreateAttached(payload);
   if (route === 'task/run') return await api.handleTaskRun(payload as Parameters<typeof api.handleTaskRun>[0]);
   if (route === 'task/run-now') return await api.handleTaskRunNow(payload as Parameters<typeof api.handleTaskRunNow>[0]);
@@ -2197,6 +2201,19 @@ async function main() {
           scenarioType: interactionScenario.type,
           desktopSurface: interactionScenario.surface,
         });
+        let requiredSystemSkill: ProductSystemSkillRequirement | undefined;
+        if (payload.requiredSystemSkill !== undefined) {
+          try {
+            requiredSystemSkill = assertKnownProductSystemSkillRequirement(
+              payload.requiredSystemSkill,
+            );
+          } catch (error) {
+            return jsonResponse({
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            }, 400);
+          }
+        }
 
         // Allow sending with just images or just text
         if (!text && images.length === 0) {
@@ -2228,6 +2245,7 @@ async function main() {
             analyticsSource,
             analyticsOrigin,
             birthOrigin,
+            requiredSystemSkill,
           });
           if (result.error) {
             return jsonResponse({ success: false, error: result.error }, result.status ?? 500);

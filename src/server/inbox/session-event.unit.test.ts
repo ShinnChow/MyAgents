@@ -90,7 +90,7 @@ describe('Session Event Protocol v1 renderer', () => {
       goalId: 'goal_123',
       goalPathLabel: 'Root / Delivery',
       notificationVersion: 3,
-    })).toThrow('space.issue_delivery prompts are rendered by Rust');
+    })).toThrow('space.issue_delivery prompts must bypass renderSessionEventPrompt');
   });
 
   it('neutralizes legacy inbox tags as well as v1 tags', () => {

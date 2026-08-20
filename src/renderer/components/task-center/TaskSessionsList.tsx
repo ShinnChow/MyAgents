@@ -1,11 +1,9 @@
 // TaskSessionsList — "任务执行" section inside Task Detail overlay.
 //
 // Renders the sessions on which a task has actually executed. Population is
-// driven by Rust `cron_task.rs::execute_task_directly` calling
-// `task_store.append_session` after it picks the `effective_session_id` for
-// each tick — one new entry per tick for new_session mode, one dedup'd
-// stable row for single_session mode. See the append block around
-// `cron_task.rs:2130` for the contract; `append_session` is idempotent.
+// driven by the execution adapter's admission callback, after the target
+// Session has accepted the first Task turn. This keeps Task ↔ Session
+// relations durable without exposing speculative, pre-admission rows.
 //
 // Clicking a row fires `OPEN_SESSION_IN_NEW_TAB`, routed by App.tsx to a
 // freshly pre-seeded Chat tab (never hijacks the active tab). Clicking
@@ -142,9 +140,9 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
       ) : (
         <div className="space-y-0.5">
           {visible.map((session) => (
-            <div
+            <button
               key={session.id}
-              role="button"
+              type="button"
               onClick={() => handleOpen(session.id)}
               title={t('sessions.openTitle', { id: session.id })}
               className="group flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
@@ -156,7 +154,7 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
               <span className="min-w-0 flex-1 truncate text-sm text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
                 {getSessionDisplayText(session)}
               </span>
-            </div>
+            </button>
           ))}
           {sessions.length > MAX_VISIBLE && !expanded && (
             <button

@@ -154,6 +154,7 @@ function sidebar(overrides: Partial<SidebarProps> = {}) {
       teamSpaceAvailable
       onNewTab={vi.fn()}
       onOpenTaskCenter={vi.fn()}
+      onCreateTask={vi.fn()}
       onOpenSpace={vi.fn()}
       onOpenCapabilities={vi.fn()}
       onOpenSettings={vi.fn()}
@@ -711,6 +712,26 @@ describe('GlobalSidebar rail flyout', () => {
     fireEvent.mouseLeave(taskButton.parentElement!);
     fireEvent.click(screen.getByRole('button', { name: '小助理' }));
     expect(screen.queryByRole('tooltip', { name: '小助理' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the hover Task-create tooltip trigger out of the nav document flow', () => {
+    mocks.forcedRail = false;
+    window.localStorage.setItem(
+      GLOBAL_SIDEBAR_PREFERENCE_KEY,
+      JSON.stringify({
+        version: 1,
+        preferredMode: 'expanded',
+        expandedWorkspaceKeys: [],
+        hasSeededDefaultExpansion: true,
+        showAutomationSessions: true,
+        sessionView: 'all',
+      }),
+    );
+    renderSidebar();
+
+    const createButton = screen.getByRole('button', { name: '创建任务' });
+    expect(createButton.parentElement).toHaveClass('absolute', 'right-1', 'top-1');
+    expect(createButton).not.toHaveClass('absolute');
   });
 
   it('keeps the workspace surface open when Session navigation is rejected', async () => {

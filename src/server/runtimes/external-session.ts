@@ -80,7 +80,15 @@ import { isManagedCodexProviderReady } from '../utils/managed-codex-readiness';
 import { findProjectAgentByWorkspacePath, getEffectiveOfficialToolIdsForSession, isCliToolRegistryEnabled, loadConfig as loadAdminConfig, resolveWorkspaceConfig } from '../utils/admin-config';
 import type { AgentConfig } from '../../shared/types/agent';
 import { resolveEffectiveProjectCapabilities } from '../project-capabilities';
-import type { EffectiveProjectCapabilitySnapshot } from '../../shared/projectCapabilities';
+import {
+  assertProductSystemSkillCandidate,
+  type EffectiveProjectCapabilitySnapshot,
+} from '../../shared/projectCapabilities';
+import {
+  assertKnownProductSystemSkillRequirement,
+  isProductSystemSkillRequirement,
+  type SystemSkillAdmissionRequirement,
+} from '../../shared/systemSkills';
 import {
   createGlobalSkillInventorySnapshot,
   type GlobalSkillInventorySnapshot,
@@ -2649,13 +2657,37 @@ export function getManagedCodexExtensionConfigSnapshot(): {
 
 class ExternalRequiredSkillUnavailableError extends Error {
   constructor(skillName: string) {
-    super(`Managed Codex did not load required system skill ${skillName}`);
+    super(`External Runtime did not admit required system skill ${skillName}`);
     this.name = 'ExternalRequiredSkillUnavailableError';
   }
 }
 
 /** Reject only a dependent Managed Codex operation when native read-back omitted its Skill. */
-export async function requireCurrentExternalSkill(skillName: string): Promise<void> {
+export async function requireCurrentExternalSkill(
+  requirement: SystemSkillAdmissionRequirement,
+  admission?: ExternalSkillAdmission,
+): Promise<void> {
+  const skillName = isProductSystemSkillRequirement(requirement)
+    ? assertKnownProductSystemSkillRequirement(requirement).name
+    : requirement;
+  if (isProductSystemSkillRequirement(requirement)) {
+    const admitted = admission ?? buildCurrentExternalSkillAdmission(
+      getExternalLifecycleWorkspacePath() ?? '',
+    );
+    if (admitted.unavailableSkillNames.includes(skillName)) {
+      throw new ExternalRequiredSkillUnavailableError(skillName);
+    }
+    assertProductSystemSkillCandidate(admitted.capabilitySnapshot, requirement);
+    if (admitted.capabilitySnapshot.integrityRevision !== admitted.globalSkillInventory.integrityRevision) {
+      throw new Error(`external Runtime product Skill ${skillName} inventory is inconsistent`);
+    }
+    if (getExternalActiveCapabilityRevision() !== admitted.revision) {
+      throw new Error(`external Runtime inventory changed before product Skill ${skillName} dispatch`);
+    }
+  }
+  // Native loaded-Skill read-back is currently available only for managed
+  // Codex. Every external Runtime still passes the product-owned candidate,
+  // integrity, and revision admission above before a dependent turn starts.
   if (!isManagedCodexProductRuntime()) return;
   const process = getExternalActiveProcess();
   if (!process?.loadedSkillNames?.includes(skillName)) {
@@ -2896,7 +2928,7 @@ export async function startExternalSession(options: {
   messageOperation?: ExternalMessageOperation;
   /** Reuse the exact admission already built at this message boundary. */
   skillAdmission?: ExternalSkillAdmission;
-  requiredSystemSkill?: import('../../shared/systemSkills').RequiredSystemSkill;
+  requiredSystemSkill?: SystemSkillAdmissionRequirement;
 }): Promise<void> {
   // Concurrency guard — wait for any in-flight start to finish
   await awaitExternalLifecycleStarting();
@@ -2943,7 +2975,7 @@ async function _doStartExternalSession(options: {
   onDispatchAccepted?: () => void;
   messageOperation?: ExternalMessageOperation;
   skillAdmission?: ExternalSkillAdmission;
-  requiredSystemSkill?: import('../../shared/systemSkills').RequiredSystemSkill;
+  requiredSystemSkill?: SystemSkillAdmissionRequirement;
 }): Promise<void> {
 
   const runtimeType = getCurrentRuntimeType();
@@ -3376,7 +3408,7 @@ async function _doStartExternalSession(options: {
       throw new ExternalTurnPromotionCanceledError();
     }
     if (options.requiredSystemSkill) {
-      await requireCurrentExternalSkill(options.requiredSystemSkill);
+      await requireCurrentExternalSkill(options.requiredSystemSkill, externalSkillAdmission);
     }
     if (deferRequiredAdmission) {
       await admitInitialMessage();
@@ -3913,7 +3945,7 @@ async function dispatchExternalMessageOperation(
   const admittedProcess = getExternalActiveProcess();
   if (context?.requiredSystemSkill && admittedProcess && !admittedProcess.exited) {
     try {
-      await requireCurrentExternalSkill(context.requiredSystemSkill);
+      await requireCurrentExternalSkill(context.requiredSystemSkill, skillAdmission);
     } catch (error) {
       if (dispatchPromotion) finishExternalTurnPromotion(dispatchPromotion);
       return { queued: false, error: error instanceof Error ? error.message : String(error) };

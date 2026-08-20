@@ -1,4 +1,5 @@
 import { isRequiredSystemSkill } from './systemSkills';
+import type { ProductSystemSkillRequirement } from './systemSkills';
 import type { SkillIntegrityIssue } from './skillIntegrity';
 
 export const PROJECT_CAPABILITY_SELECTION_VERSION = 1 as const;
@@ -39,6 +40,37 @@ export interface EffectiveProjectCapabilitySnapshot {
   candidates: ProjectCapabilityCandidate[];
   enabledSkills: ProjectCapabilityCandidate[];
   enabledCommands: ProjectCapabilityCandidate[];
+}
+
+/**
+ * Prove that the effective winner is the exact app-owned Skill requested by a
+ * product workflow. A project Skill with the same name remains valid for
+ * ordinary conversations, but cannot impersonate this admission contract.
+ */
+export function assertProductSystemSkillCandidate(
+  snapshot: EffectiveProjectCapabilitySnapshot,
+  requirement: ProductSystemSkillRequirement,
+): ProjectCapabilityCandidate {
+  const winner = snapshot.enabledSkills.find(
+    candidate => candidate.canonicalName === requirement.name,
+  );
+  if (!winner) {
+    throw new Error(`required product Skill ${requirement.name} is unavailable`);
+  }
+  if (
+    winner.source !== 'global'
+    || winner.sourceLocalId !== requirement.sourceLocalId
+    || !winner.systemOwned
+  ) {
+    throw new Error(`required product Skill ${requirement.name} is not the app-owned global winner`);
+  }
+  if (winner.contentSha256 !== requirement.contentSha256) {
+    throw new Error(`required product Skill ${requirement.name} does not match the app bundle`);
+  }
+  if (!snapshot.revision || !snapshot.integrityRevision) {
+    throw new Error(`required product Skill ${requirement.name} has no admitted inventory revision`);
+  }
+  return winner;
 }
 
 function hasControlCharacter(value: string): boolean {

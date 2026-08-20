@@ -7,7 +7,16 @@ export interface SpaceIssueAppRoute {
   };
 }
 
-export type AppRoute = SpaceIssueAppRoute;
+export interface TaskCommentAppRoute {
+  version: 1;
+  name: 'task.comment';
+  params: {
+    taskId: string;
+    commentId: string;
+  };
+}
+
+export type AppRoute = SpaceIssueAppRoute | TaskCommentAppRoute;
 
 export interface PendingAppRoute {
   generation: number;
@@ -31,16 +40,31 @@ export function createSpaceIssueAppRoute(spaceId: string, issueId: string): Spac
   };
 }
 
+export function createTaskCommentAppRoute(taskId: string, commentId: string): TaskCommentAppRoute {
+  if (!isAppRouteId(taskId) || !isAppRouteId(commentId)) {
+    throw new Error('App route contains an invalid identifier');
+  }
+  return {
+    version: 1,
+    name: 'task.comment',
+    params: { taskId, commentId },
+  };
+}
+
 export function serializeAppRoute(route: AppRoute): string {
-  if (
-    route.version !== 1
-    || route.name !== 'space.issue'
-    || !isAppRouteId(route.params.spaceId)
-    || !isAppRouteId(route.params.issueId)
-  ) {
+  if (route.version !== 1) {
     throw new Error('Unsupported app route');
   }
-  return `myagents://open/v1/spaces/${encodeURIComponent(route.params.spaceId)}/issues/${encodeURIComponent(route.params.issueId)}`;
+  if (route.name === 'space.issue') {
+    if (!isAppRouteId(route.params.spaceId) || !isAppRouteId(route.params.issueId)) {
+      throw new Error('Unsupported app route');
+    }
+    return `myagents://open/v1/spaces/${encodeURIComponent(route.params.spaceId)}/issues/${encodeURIComponent(route.params.issueId)}`;
+  }
+  if (!isAppRouteId(route.params.taskId) || !isAppRouteId(route.params.commentId)) {
+    throw new Error('Unsupported app route');
+  }
+  return `myagents://open/v1/tasks/${encodeURIComponent(route.params.taskId)}/comments/${encodeURIComponent(route.params.commentId)}`;
 }
 
 export function parseAppRouteUrl(raw: string): AppRoute | null {
@@ -62,19 +86,20 @@ export function parseAppRouteUrl(raw: string): AppRoute | null {
     return null;
   }
   const segments = url.pathname.split('/').slice(1);
-  if (
-    segments.length !== 5
-    || segments[0] !== 'v1'
-    || segments[1] !== 'spaces'
-    || segments[3] !== 'issues'
-  ) {
+  if (segments.length !== 5 || segments[0] !== 'v1') {
     return null;
   }
   try {
-    const spaceId = decodeURIComponent(segments[2]);
-    const issueId = decodeURIComponent(segments[4]);
-    if (!isAppRouteId(spaceId) || !isAppRouteId(issueId)) return null;
-    return createSpaceIssueAppRoute(spaceId, issueId);
+    const parentId = decodeURIComponent(segments[2]);
+    const childId = decodeURIComponent(segments[4]);
+    if (!isAppRouteId(parentId) || !isAppRouteId(childId)) return null;
+    if (segments[1] === 'spaces' && segments[3] === 'issues') {
+      return createSpaceIssueAppRoute(parentId, childId);
+    }
+    if (segments[1] === 'tasks' && segments[3] === 'comments') {
+      return createTaskCommentAppRoute(parentId, childId);
+    }
+    return null;
   } catch {
     return null;
   }

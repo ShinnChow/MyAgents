@@ -15,6 +15,7 @@ import { useTranslation } from 'react-i18next';
 import {
   taskCenterAvailable,
   taskDelete,
+  taskGet,
   taskList,
   taskRerun,
   taskRun,
@@ -29,13 +30,14 @@ import WorkspaceIcon from '@/components/launcher/WorkspaceIcon';
 import { isProjectActiveForUser } from '@/config/types';
 import { isManagedScheduledJob } from '@/../shared/managedScheduledJob';
 import type { Task, TaskStatus } from '@/../shared/types/task';
+import type { PendingAppRoute } from '@/../shared/appRoute';
 import { normalizeWorkspacePathIdentity, workspacePathsEqual } from '@/../shared/workspacePath';
-import { DispatchTaskDialog } from './DispatchTaskDialog';
 import { LegacyCronOverlay } from './LegacyCronOverlay';
 import { TaskDetailOverlay } from './TaskDetailOverlay';
 import { TaskCardItem } from './views/TaskCardItem';
 import { TaskListRow } from './views/TaskListRow';
 import { SearchPill } from './SearchPill';
+import { extractErrorMessage } from './errors';
 import { shouldAddOrphanWorkspacePath } from './taskListPanelWorkspace';
 import { ViewToggle, type TaskView } from './views/ViewToggle';
 import type { LegacyCronRow } from './views/types';
@@ -47,7 +49,7 @@ type TaskCardLike =
 
 interface Props {
   highlightTaskId?: string | null;
-  currentSessionId?: string | null;
+  onCreateTask: () => void;
   /** Bumped by parent to trigger re-fetch (tab activation, post-dispatch). */
   refreshKey?: unknown;
   /** Intent forwarded from `App.tsx`'s `OPEN_TASK_CENTER` event handler.
@@ -57,6 +59,8 @@ interface Props {
    *  Launcher search icon twice) requires the `nonce` to change — it's
    *  the dependency `useEffect` watches. */
   pendingIntent?: { autofocusSearch?: boolean; nonce: number } | null;
+  pendingRoute?: PendingAppRoute | null;
+  onRouteConsumed?: (generation: number) => void;
 }
 
 type Bucket = 'pending' | 'active' | 'finished';
@@ -80,7 +84,14 @@ function loadStoredView(): TaskView {
   return raw === 'card' ? 'card' : 'list';
 }
 
-export function TaskListPanel({ highlightTaskId, refreshKey, pendingIntent, currentSessionId }: Props) {
+export function TaskListPanel({
+  highlightTaskId,
+  refreshKey,
+  pendingIntent,
+  pendingRoute,
+  onRouteConsumed,
+  onCreateTask,
+}: Props) {
   const toast = useToast();
   const { t } = useTranslation('task');
   const toastRef = useRef(toast);
@@ -108,15 +119,48 @@ export function TaskListPanel({ highlightTaskId, refreshKey, pendingIntent, curr
   // card/row "编辑" menu item so the user lands straight on the editor
   // instead of the read-only detail view.
   const [selectedTaskStartEditing, setSelectedTaskStartEditing] = useState(false);
+  const [targetCommentId, setTargetCommentId] = useState<string | null>(null);
+  const [targetRouteGeneration, setTargetRouteGeneration] = useState<number | null>(null);
+  const [routeLoadError, setRouteLoadError] = useState<string | null>(null);
+  const [routeRetryNonce, setRouteRetryNonce] = useState(0);
   const [selectedLegacy, setSelectedLegacy] = useState<LegacyCronRow | null>(null);
   const [view, setView] = useState<TaskView>(loadStoredView);
-  // Inline "新建任务" modal — opened by the header "+ 新建" button.
-  // Renders `DispatchTaskDialog` without a `thought` prop so it enters
-  // the dialog's blank-state branch (default once-mode).
-  const [showCreateModal, setShowCreateModal] = useState(false);
   // Per-id busy flag so only the affected card/row greys out during an action,
   // instead of locking the whole panel.
   const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
+
+  useEffect(() => {
+    if (!pendingRoute || pendingRoute.route.name !== 'task.comment') return;
+    let cancelled = false;
+    const { taskId, commentId } = pendingRoute.route.params;
+    setRouteLoadError(null);
+    setSelectedTask(null);
+    setTargetCommentId(null);
+    setTargetRouteGeneration(null);
+    void taskGet(taskId)
+      .then(fresh => {
+        if (cancelled) return;
+        if (!fresh) {
+          toastRef.current.error(t('comments.taskNotFound'));
+          onRouteConsumed?.(pendingRoute.generation);
+          return;
+        }
+        setRouteLoadError(null);
+        setSelectedTask(fresh);
+        setSelectedTaskStartEditing(false);
+        setTargetCommentId(commentId);
+        setTargetRouteGeneration(pendingRoute.generation);
+      })
+      .catch(error => {
+        if (cancelled) return;
+        const message = extractErrorMessage(error);
+        setRouteLoadError(message);
+        toastRef.current.error(message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onRouteConsumed, pendingRoute, routeRetryNonce, t]);
 
   const updateView = useCallback((next: TaskView) => {
     setView(next);
@@ -495,9 +539,7 @@ export function TaskListPanel({ highlightTaskId, refreshKey, pendingIntent, curr
             {t('tasks.title')}
           </span>
           {/* v0.1.69 — inline "+ 新建" entry point so users aren't forced
-              to enter the Task Center flow via a thought first. Opens
-              `DispatchTaskDialog` with no `thought` prop (dialog's
-              "新建任务" branch, defaulting to once-mode). Visual matches
+              to enter the Task Center flow via a thought first. Visual matches
               the SearchPill's rounded-full pill + ghost treatment so
               both affordances read as one header row of toolbelt actions.
               Uses the same dark-pill tooltip pattern as ThoughtPanel's
@@ -507,7 +549,7 @@ export function TaskListPanel({ highlightTaskId, refreshKey, pendingIntent, curr
           <div className="group/newTask relative ml-1">
             <button
               type="button"
-              onClick={() => setShowCreateModal(true)}
+              onClick={onCreateTask}
               aria-label={t('tasks.newTask')}
               className="inline-flex h-7 w-7 items-center justify-center rounded-full text-xs text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] @[720px]:w-auto @[720px]:gap-1 @[720px]:px-2.5"
             >
@@ -558,6 +600,21 @@ export function TaskListPanel({ highlightTaskId, refreshKey, pendingIntent, curr
           share the same left/right gutter; the list row component
           (`TaskListRow`) keeps its own `px-3` for row-internal content. */}
       <div className="@container flex-1 overflow-y-auto px-4 py-3">
+        {routeLoadError && pendingRoute?.route.name === 'task.comment' && (
+          <div
+            className="mb-3 flex items-center gap-3 rounded-lg border border-[var(--error)]/30 bg-[var(--error-bg)] px-3 py-2 text-xs text-[var(--error)]"
+            role="alert"
+          >
+            <span className="min-w-0 flex-1">{routeLoadError}</span>
+            <button
+              type="button"
+              className="shrink-0 font-medium underline underline-offset-2"
+              onClick={() => setRouteRetryNonce(value => value + 1)}
+            >
+              {t('comments.retryLoad')}
+            </button>
+          </div>
+        )}
         {loading ? (
           <div className="py-8 text-center text-sm text-[var(--ink-muted)]">
             {t('common.loading')}
@@ -591,11 +648,21 @@ export function TaskListPanel({ highlightTaskId, refreshKey, pendingIntent, curr
 
       {selectedTask && (
         <TaskDetailOverlay
+          key={selectedTask.id}
           task={selectedTask}
           startEditing={selectedTaskStartEditing}
           onClose={() => {
             setSelectedTask(null);
             setSelectedTaskStartEditing(false);
+            setTargetCommentId(null);
+            if (targetRouteGeneration !== null) onRouteConsumed?.(targetRouteGeneration);
+            setTargetRouteGeneration(null);
+          }}
+          targetCommentId={targetCommentId}
+          onTargetCommentReady={found => {
+            if (!found) toastRef.current.info(t('comments.commentNotFound'));
+            if (targetRouteGeneration !== null) onRouteConsumed?.(targetRouteGeneration);
+            setTargetRouteGeneration(null);
           }}
           onChanged={(next) => {
             if (next === null) {
@@ -621,22 +688,6 @@ export function TaskListPanel({ highlightTaskId, refreshKey, pendingIntent, curr
         />
       )}
 
-      {showCreateModal && (
-        <DispatchTaskDialog
-          currentSessionId={currentSessionId ?? null}
-          onClose={() => setShowCreateModal(false)}
-          onDispatched={(created) => {
-            setShowCreateModal(false);
-            track('task_create', {
-              source: 'desktop',
-              origin: 'manual',
-              has_workspace: !!created.workspacePath,
-            });
-            toastRef.current.success(t('tasks.created', { name: created.name }));
-            void reload();
-          }}
-        />
-      )}
     </div>
   );
 }

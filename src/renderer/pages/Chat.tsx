@@ -1745,7 +1745,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     // (PRD 0.2.7 §4.5) can reference them when restoring the launcher draft.
     const builtinSel = launchMessage.builtinSelection;
     // #244 (cross-review W2): when the initialMessage carries no explicit
-    // permissionMode (internal producers — task-alignment / support / fork —
+    // permissionMode (internal producers — Task discussion / support / fork —
     // unlike the launcher, don't set it), derive the builtin mode from config
     // rather than the raw `permissionMode` state, which is still the mount-time
     // 'auto' default if useConfig() hasn't resolved yet. projectSynced:false
@@ -1939,6 +1939,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
             // message must already carry the launcher's choice.
             isExternalRuntime ? undefined : (launchMessage.reasoningEffort ?? reasoningEffort),
             isExternalRuntime ? undefined : providerRoute,
+            launchMessage.requiredSystemSkill,
           );
         }
 

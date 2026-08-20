@@ -40,6 +40,19 @@ vi.mock('./TaskSessionsList', () => ({ TaskSessionsList: () => <div /> }));
 vi.mock('./SummaryCard', () => ({ SummaryCard: () => <div /> }));
 vi.mock('./TaskDocBlock', () => ({ TaskDocBlock: () => <div /> }));
 vi.mock('./TaskEditPanel', () => ({ TaskEditPanel: () => <div /> }));
+vi.mock('./TaskCommentTimeline', () => ({
+  TaskCommentTimeline: ({
+    targetCommentId,
+    onTargetReady,
+  }: {
+    targetCommentId?: string | null;
+    onTargetReady?: (found: boolean) => void;
+  }) => (
+    <button type="button" onClick={() => onTargetReady?.(true)}>
+      comment target: {targetCommentId ?? 'none'}
+    </button>
+  ),
+}));
 
 function commandTask(): Task {
   return {
@@ -115,6 +128,25 @@ beforeEach(() => {
 });
 
 describe('TriggerRuntimeSection', () => {
+  it('renders Task detail as one accessible Drawer and passes the exact comment target', async () => {
+    const task = commandTask();
+    const onTargetReady = vi.fn();
+    detailApiMocks.taskGet.mockResolvedValue(task);
+
+    render(
+      <TaskDetailOverlay
+        task={task}
+        targetCommentId="comment-exact"
+        onTargetCommentReady={onTargetReady}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('dialog', { name: '任务详情' })).toHaveAttribute('aria-modal', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'comment target: comment-exact' }));
+    expect(onTargetReady).toHaveBeenCalledWith(true);
+  });
+
   it('shows health, split statistics, checkpoint, pending event, and error', () => {
     render(
       <TriggerRuntimeSection

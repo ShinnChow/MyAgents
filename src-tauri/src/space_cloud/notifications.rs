@@ -95,36 +95,50 @@ pub enum NotificationItem {
         excerpt: Option<String>,
         target: NotificationTarget,
     },
+    #[serde(rename = "task_agent_comment")]
+    TaskAgentComment {
+        id: String,
+        created_at: String,
+        is_read: bool,
+        task_id: String,
+        task_name: String,
+        comment_id: String,
+        agent: NotificationActor,
+        excerpt: String,
+        target: NotificationTarget,
+    },
 }
 
 impl NotificationItem {
     fn id(&self) -> &str {
         match self {
-            Self::Announcement { id, .. } | Self::SpaceIssueComment { id, .. } => id,
+            Self::Announcement { id, .. }
+            | Self::SpaceIssueComment { id, .. }
+            | Self::TaskAgentComment { id, .. } => id,
         }
     }
 
     fn created_at(&self) -> &str {
         match self {
-            Self::Announcement { created_at, .. } | Self::SpaceIssueComment { created_at, .. } => {
-                created_at
-            }
+            Self::Announcement { created_at, .. }
+            | Self::SpaceIssueComment { created_at, .. }
+            | Self::TaskAgentComment { created_at, .. } => created_at,
         }
     }
 
     fn is_read(&self) -> bool {
         match self {
-            Self::Announcement { is_read, .. } | Self::SpaceIssueComment { is_read, .. } => {
-                *is_read
-            }
+            Self::Announcement { is_read, .. }
+            | Self::SpaceIssueComment { is_read, .. }
+            | Self::TaskAgentComment { is_read, .. } => *is_read,
         }
     }
 
     fn set_read(&mut self) {
         match self {
-            Self::Announcement { is_read, .. } | Self::SpaceIssueComment { is_read, .. } => {
-                *is_read = true
-            }
+            Self::Announcement { is_read, .. }
+            | Self::SpaceIssueComment { is_read, .. }
+            | Self::TaskAgentComment { is_read, .. } => *is_read = true,
         }
     }
 
@@ -134,9 +148,9 @@ impl NotificationItem {
 
     fn target(&self) -> NotificationTarget {
         match self {
-            Self::Announcement { target, .. } | Self::SpaceIssueComment { target, .. } => {
-                target.clone()
-            }
+            Self::Announcement { target, .. }
+            | Self::SpaceIssueComment { target, .. }
+            | Self::TaskAgentComment { target, .. } => target.clone(),
         }
     }
 
@@ -220,6 +234,20 @@ struct AccountPendingState {
     touched_at: i64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalTaskReceipts {
+    #[serde(default)]
+    ids: Vec<String>,
+    /// Sort points let the local owner expire receipts by the same 90-day
+    /// visibility window without dropping an older-but-still-visible read fact
+    /// merely because the bounded source index temporarily omitted it.
+    #[serde(default)]
+    points: BTreeMap<String, NotificationSortPoint>,
+    #[serde(default)]
+    cutoff: Option<NotificationSortPoint>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedNotificationState {
@@ -228,6 +256,8 @@ struct PersistedNotificationState {
     announcements: AnnouncementReceipts,
     #[serde(default)]
     accounts: BTreeMap<String, AccountPendingState>,
+    #[serde(default)]
+    local_tasks: LocalTaskReceipts,
 }
 
 impl Default for PersistedNotificationState {
@@ -236,6 +266,7 @@ impl Default for PersistedNotificationState {
             version: 1,
             announcements: AnnouncementReceipts::default(),
             accounts: BTreeMap::new(),
+            local_tasks: LocalTaskReceipts::default(),
         }
     }
 }
@@ -256,6 +287,7 @@ struct RuntimeState {
     feed_cutoff: Option<NotificationSortPoint>,
     has_unread: bool,
     is_loading_more: bool,
+    visible_limit: usize,
     last_synced_at: Option<String>,
     error_code: Option<String>,
     baselines: HashMap<String, Baseline>,
@@ -274,26 +306,11 @@ impl Default for RuntimeState {
             feed_cutoff: None,
             has_unread: false,
             is_loading_more: false,
+            visible_limit: PAGE_SIZE,
             last_synced_at: None,
             error_code: None,
             baselines: HashMap::new(),
             reminded_ids: HashSet::new(),
-        }
-    }
-}
-
-impl RuntimeState {
-    fn snapshot(&self) -> NotificationSnapshot {
-        NotificationSnapshot {
-            load_state: self.load_state,
-            auth_state: self.auth_state,
-            items: self.items.clone(),
-            has_unread: self.has_unread,
-            has_more: self.next_cursor.is_some(),
-            is_loading_more: self.is_loading_more,
-            feed_cutoff: self.feed_cutoff.clone(),
-            last_synced_at: self.last_synced_at.clone(),
-            error_code: self.error_code.clone(),
         }
     }
 }
@@ -304,9 +321,124 @@ pub struct NotificationCenter {
     persisted: Mutex<PersistedNotificationState>,
     sync_gate: AsyncMutex<()>,
     wake: Notify,
+    task_store: crate::task::ManagedTaskStore,
 }
 
 pub type ManagedNotificationCenter = Arc<NotificationCenter>;
+
+const LOCAL_NOTIFICATION_WINDOW_DAYS: i64 = 90;
+
+impl NotificationCenter {
+    fn local_items(
+        &self,
+        persisted: &PersistedNotificationState,
+    ) -> (bool, bool, Vec<NotificationItem>) {
+        let source = self.task_store.agent_comment_notification_source();
+        let cutoff_ms = Utc::now().timestamp_millis()
+            - chrono::Duration::days(LOCAL_NOTIFICATION_WINDOW_DAYS).num_milliseconds();
+        let items = source
+            .items
+            .into_iter()
+            .filter(|locator| locator.created_at >= cutoff_ms)
+            .filter_map(|locator| {
+                let created_at =
+                    chrono::DateTime::<Utc>::from_timestamp_millis(locator.created_at)?
+                        .to_rfc3339();
+                let point = NotificationSortPoint {
+                    created_at: created_at.clone(),
+                    id: locator.notification_id.clone(),
+                };
+                let is_read = persisted
+                    .local_tasks
+                    .ids
+                    .iter()
+                    .any(|id| id == &locator.notification_id)
+                    || persisted
+                        .local_tasks
+                        .cutoff
+                        .as_ref()
+                        .is_some_and(|cutoff| is_at_or_before(&point, cutoff));
+                let route = AppRoute::task_comment(&locator.task_id, &locator.comment_id)?;
+                Some(NotificationItem::TaskAgentComment {
+                    id: locator.notification_id,
+                    created_at,
+                    is_read,
+                    task_id: locator.task_id,
+                    task_name: locator.task_name,
+                    comment_id: locator.comment_id,
+                    agent: NotificationActor {
+                        actor_type: "registered_agent".to_string(),
+                        id: locator.session_id,
+                        display_name: locator.agent_label.unwrap_or_else(|| "Agent".to_string()),
+                    },
+                    excerpt: locator.excerpt,
+                    target: NotificationTarget::AppRoute { route },
+                })
+            })
+            .collect();
+        (source.ready, source.partial_error, items)
+    }
+
+    fn snapshot(&self) -> NotificationSnapshot {
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let persisted = self
+            .persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (local_ready, local_partial, local_items) = self.local_items(&persisted);
+        let mut items = runtime.items.clone();
+        items.extend(local_items);
+        items.sort_by(|left, right| {
+            right
+                .created_at()
+                .cmp(left.created_at())
+                .then_with(|| right.id().cmp(left.id()))
+        });
+        items.dedup_by(|left, right| left.id() == right.id());
+        let total_items = items.len();
+        let has_any_unread = items.iter().any(|item| !item.is_read());
+        let local_cutoff = items
+            .iter()
+            .find(|item| matches!(item, NotificationItem::TaskAgentComment { .. }))
+            .map(NotificationItem::point);
+        let feed_cutoff = match (runtime.feed_cutoff.clone(), local_cutoff) {
+            (Some(cloud), Some(local)) => Some(later_cutoff(Some(cloud), local)),
+            (cloud, None) => cloud,
+            (None, local) => local,
+        };
+        let load_state = if local_ready
+            && !items.is_empty()
+            && matches!(
+                runtime.load_state,
+                NotificationLoadState::Error | NotificationLoadState::Unavailable
+            ) {
+            NotificationLoadState::Ready
+        } else if !local_ready && runtime.load_state == NotificationLoadState::Idle {
+            NotificationLoadState::Loading
+        } else {
+            runtime.load_state
+        };
+        let visible_limit = runtime.visible_limit.max(PAGE_SIZE);
+        items.truncate(visible_limit);
+        NotificationSnapshot {
+            load_state,
+            auth_state: runtime.auth_state,
+            has_unread: runtime.has_unread || has_any_unread,
+            has_more: runtime.next_cursor.is_some() || total_items > visible_limit,
+            is_loading_more: runtime.is_loading_more,
+            feed_cutoff,
+            last_synced_at: runtime.last_synced_at.clone(),
+            error_code: runtime
+                .error_code
+                .clone()
+                .or_else(|| local_partial.then(|| "task_source_partial".to_string())),
+            items,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SyncContext {
@@ -366,7 +498,7 @@ fn load_persisted(path: &Path) -> PersistedNotificationState {
     }
 }
 
-pub fn create_state() -> ManagedNotificationCenter {
+pub fn create_state(task_store: crate::task::ManagedTaskStore) -> ManagedNotificationCenter {
     let path = state_path();
     Arc::new(NotificationCenter {
         persisted: Mutex::new(load_persisted(&path)),
@@ -374,6 +506,7 @@ pub fn create_state() -> ManagedNotificationCenter {
         runtime: Mutex::new(RuntimeState::default()),
         sync_gate: AsyncMutex::new(()),
         wake: Notify::new(),
+        task_store,
     })
 }
 
@@ -383,6 +516,23 @@ fn persist(center: &NotificationCenter) -> Result<(), String> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     write_private_json_unlocked(&center.path, &*persisted)
+}
+
+fn mutate_persisted<T>(
+    center: &NotificationCenter,
+    mutate: impl FnOnce(&mut PersistedNotificationState) -> T,
+) -> Result<T, String> {
+    let mut persisted = center
+        .persisted
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let before = persisted.clone();
+    let result = mutate(&mut persisted);
+    if let Err(error) = write_private_json_unlocked(&center.path, &*persisted) {
+        *persisted = before;
+        return Err(error);
+    }
+    Ok(result)
 }
 
 fn current_context() -> Result<SyncContext, String> {
@@ -435,6 +585,7 @@ fn reset_projection_for_identity(center: &NotificationCenter, context: &SyncCont
         runtime.next_cursor = None;
         runtime.feed_cutoff = None;
         runtime.has_unread = false;
+        runtime.visible_limit = PAGE_SIZE;
         runtime.last_synced_at = None;
         runtime.error_code = None;
         // Entering an identity always establishes a fresh no-toast baseline.
@@ -450,11 +601,7 @@ fn reset_projection_for_identity(center: &NotificationCenter, context: &SyncCont
 }
 
 fn emit_snapshot<R: tauri::Runtime>(app: &AppHandle<R>, center: &NotificationCenter) {
-    let snapshot = center
-        .runtime
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .snapshot();
+    let snapshot = center.snapshot();
     if let Err(error) = app.emit(UPDATED_EVENT, snapshot) {
         ulog_debug!(
             "[NotificationCenter] renderer update not delivered: {}",
@@ -787,10 +934,19 @@ fn toast_text(item: &NotificationItem) -> (String, String) {
             crate::i18n::t("notification.centerCommentTitle", locale).to_string(),
             format!("{} · {}", actor.display_name, issue.title),
         ),
+        NotificationItem::TaskAgentComment {
+            agent,
+            task_name,
+            excerpt,
+            ..
+        } => (
+            crate::i18n::t("notification.centerCommentTitle", locale).to_string(),
+            format!("{} · {} · {}", agent.display_name, task_name, excerpt),
+        ),
     }
 }
 
-fn main_window_unfocused(app: &AppHandle) -> bool {
+fn main_window_unfocused<R: tauri::Runtime>(app: &AppHandle<R>) -> bool {
     app.get_webview_window("main")
         .map(|window| {
             !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false)
@@ -884,6 +1040,12 @@ async fn refresh_once(
     app: &AppHandle,
     center: &NotificationCenter,
 ) -> Result<(), SpaceCommandError> {
+    // Retry any in-memory receipt whose previous disk checkpoint failed.
+    persist_receipts_best_effort(center);
+    center
+        .task_store
+        .retry_comment_notification_index_if_partial()
+        .await;
     let context = current_context().map_err(SpaceCommandError::from)?;
     let identity_changed = reset_projection_for_identity(center, &context);
     emit_snapshot(app, center);
@@ -1097,6 +1259,37 @@ pub fn wake(center: &ManagedNotificationCenter) {
     center.wake.notify_one();
 }
 
+/// Producer hook for a newly persisted local Agent comment. Comment success
+/// never depends on notification projection; this only refreshes the shared
+/// snapshot and optionally shows the same exact-route OS toast surface.
+pub fn agent_comment_appended<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    center: &ManagedNotificationCenter,
+    notification_id: &str,
+) {
+    emit_snapshot(app, center);
+    if main_window_unfocused(app) {
+        if let Some(item) = center
+            .snapshot()
+            .items
+            .into_iter()
+            .find(|item| item.id() == notification_id)
+        {
+            let (title, body) = toast_text(&item);
+            crate::notification::show_cloud_notification(
+                app,
+                &title,
+                &body,
+                item.id().to_string(),
+                item.target(),
+                false,
+                None,
+            );
+        }
+    }
+    center.wake.notify_one();
+}
+
 /// Clear the current projection synchronously at login/logout boundaries.
 /// The following network refresh may be slow or offline; private text must not
 /// survive in Renderer memory while that request is pending.
@@ -1116,6 +1309,7 @@ pub fn auth_boundary_changed<R: tauri::Runtime>(
         runtime.next_cursor = None;
         runtime.feed_cutoff = None;
         runtime.has_unread = false;
+        runtime.visible_limit = PAGE_SIZE;
         runtime.identity_key = None;
         runtime.account_key = None;
         runtime.auth_state = auth_state;
@@ -1145,11 +1339,7 @@ pub fn user_session_invalidated() {
 pub fn cmd_notification_get_snapshot(
     state: tauri::State<'_, ManagedNotificationCenter>,
 ) -> NotificationSnapshot {
-    state
-        .runtime
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .snapshot()
+    state.snapshot()
 }
 
 #[tauri::command]
@@ -1164,22 +1354,44 @@ pub async fn cmd_notification_load_more(
 ) -> Result<NotificationSnapshot, String> {
     let center = state.inner().clone();
     let _guard = center.sync_gate.lock().await;
-    let context = current_context()?;
     let cursor = {
         let mut runtime = center
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if runtime.identity_key.as_deref() != Some(context.identity_key.as_str()) {
-            return Err("Notification identity changed".to_string());
-        }
         let cursor = runtime.next_cursor.clone();
-        if cursor.is_none() {
-            return Ok(runtime.snapshot());
+        runtime.visible_limit = runtime.visible_limit.saturating_add(PAGE_SIZE);
+        if cursor.is_some() {
+            runtime.is_loading_more = true;
         }
-        runtime.is_loading_more = true;
         cursor
     };
+    if cursor.is_none() {
+        return Ok(center.snapshot());
+    }
+    let context = match current_context() {
+        Ok(context) => context,
+        Err(error) => {
+            let mut runtime = center
+                .runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            runtime.is_loading_more = false;
+            runtime.error_code = Some(error);
+            drop(runtime);
+            return Ok(center.snapshot());
+        }
+    };
+    {
+        let mut runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if runtime.identity_key.as_deref() != Some(context.identity_key.as_str()) {
+            runtime.is_loading_more = false;
+            return Err("Notification identity changed".to_string());
+        }
+    }
     emit_snapshot(&app, &center);
     let result = fetch_page(&context, cursor.as_deref()).await;
     let mut runtime = center
@@ -1208,8 +1420,8 @@ pub async fn cmd_notification_load_more(
             runtime.error_code = Some(classify_error(&error));
         }
     }
-    let snapshot = runtime.snapshot();
     drop(runtime);
+    let snapshot = center.snapshot();
     if let Err(error) = app.emit(UPDATED_EVENT, snapshot.clone()) {
         ulog_debug!(
             "[NotificationCenter] load-more update not delivered: {}",
@@ -1269,6 +1481,105 @@ fn record_read_receipt(
     account.pending_ids.push(notification_id.to_string());
 }
 
+fn record_local_task_read(
+    persisted: &mut PersistedNotificationState,
+    notification_id: &str,
+    point: NotificationSortPoint,
+) {
+    let already_recorded = persisted.local_tasks.points.contains_key(notification_id)
+        || persisted
+            .local_tasks
+            .ids
+            .iter()
+            .any(|id| id == notification_id);
+    if !already_recorded {
+        persisted.local_tasks.ids.push(notification_id.to_string());
+    }
+    persisted
+        .local_tasks
+        .points
+        .insert(notification_id.to_string(), point);
+
+    // Expiry is a temporal bound, not a count bound. Amortize the scan so a
+    // large burst of individually-read notifications remains O(n log n).
+    if persisted.local_tasks.points.len() % 256 != 0 {
+        return;
+    }
+    let expiry = Utc::now() - chrono::Duration::days(LOCAL_NOTIFICATION_WINDOW_DAYS);
+    let expired = persisted
+        .local_tasks
+        .points
+        .iter()
+        .filter_map(|(id, point)| {
+            chrono::DateTime::parse_from_rfc3339(&point.created_at)
+                .ok()
+                .filter(|created_at| created_at.with_timezone(&Utc) < expiry)
+                .map(|_| id.clone())
+        })
+        .collect::<HashSet<_>>();
+    if !expired.is_empty() {
+        persisted.local_tasks.ids.retain(|id| !expired.contains(id));
+        persisted
+            .local_tasks
+            .points
+            .retain(|id, _| !expired.contains(id));
+    }
+}
+
+fn local_task_notification_point(
+    center: &NotificationCenter,
+    notification_id: &str,
+) -> Option<NotificationSortPoint> {
+    center
+        .task_store
+        .agent_comment_notification_source()
+        .items
+        .into_iter()
+        .find(|item| item.notification_id == notification_id)
+        .and_then(|item| {
+            chrono::DateTime::<Utc>::from_timestamp_millis(item.created_at).map(|created_at| {
+                NotificationSortPoint {
+                    created_at: created_at.to_rfc3339(),
+                    id: item.notification_id,
+                }
+            })
+        })
+}
+
+const TASK_RECEIPT_PERSIST_ERROR: &str = "task_receipt_persist_failed";
+
+fn set_task_receipt_persist_error(center: &NotificationCenter, failed: bool) {
+    let mut runtime = center
+        .runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if failed {
+        runtime.error_code = Some(TASK_RECEIPT_PERSIST_ERROR.to_string());
+    } else if runtime.error_code.as_deref() == Some(TASK_RECEIPT_PERSIST_ERROR) {
+        runtime.error_code = None;
+    }
+}
+
+fn persist_local_task_read(
+    center: &NotificationCenter,
+    notification_id: &str,
+    point: NotificationSortPoint,
+) -> Result<(), String> {
+    mutate_persisted(center, |persisted| {
+        record_local_task_read(persisted, notification_id, point);
+    })
+}
+
+fn commit_local_task_read(
+    center: &NotificationCenter,
+    notification_id: &str,
+    point: NotificationSortPoint,
+) -> Result<(), String> {
+    let result = persist_local_task_read(center, notification_id, point);
+    set_task_receipt_persist_error(center, result.is_err());
+    result
+}
+
 fn persist_receipts_best_effort(center: &NotificationCenter) {
     if let Err(error) = persist(center) {
         // The in-memory pending operation is still eligible for this process'
@@ -1285,38 +1596,64 @@ async fn mark_read_local<R: tauri::Runtime>(
     center: &NotificationCenter,
     notification_id: &str,
 ) -> Result<NotificationActivation, String> {
+    if notification_id.starts_with("task-comment:") {
+        let item = center
+            .snapshot()
+            .items
+            .into_iter()
+            .find(|item| item.id() == notification_id)
+            .filter(|item| matches!(item, NotificationItem::TaskAgentComment { .. }))
+            .ok_or_else(|| "Notification is no longer available".to_string())?;
+        let target = item.target();
+        let point = item.point();
+        if let Err(error) = commit_local_task_read(center, notification_id, point) {
+            emit_snapshot(app, center);
+            return Err(error);
+        }
+        emit_snapshot(app, center);
+        return Ok(NotificationActivation {
+            notification_id: notification_id.to_string(),
+            target,
+        });
+    }
     let (target, is_announcement, account_key) = {
-        let mut runtime = center
+        let runtime = center
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let item = runtime
             .items
-            .iter_mut()
+            .iter()
             .find(|item| item.id() == notification_id)
             .ok_or_else(|| "Notification is no longer available".to_string())?;
         let target = item.target();
         let is_announcement = item.is_announcement();
-        item.set_read();
-        let no_loaded_unread = runtime.items.iter().all(NotificationItem::is_read);
-        if no_loaded_unread && runtime.next_cursor.is_none() {
-            runtime.has_unread = false;
-        }
         (target, is_announcement, runtime.account_key.clone())
     };
-    {
-        let mut persisted = center
-            .persisted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    mutate_persisted(center, |persisted| {
         record_read_receipt(
-            &mut persisted,
+            persisted,
             notification_id,
             is_announcement,
             account_key.as_deref(),
         );
+    })?;
+    {
+        let mut runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(item) = runtime
+            .items
+            .iter_mut()
+            .find(|item| item.id() == notification_id)
+        {
+            item.set_read();
+        }
+        if runtime.items.iter().all(NotificationItem::is_read) && runtime.next_cursor.is_none() {
+            runtime.has_unread = false;
+        }
     }
-    persist_receipts_best_effort(center);
     emit_snapshot(app, center);
     center.wake.notify_one();
     Ok(NotificationActivation {
@@ -1344,42 +1681,57 @@ pub fn cmd_notification_mark_all_read(
     state: tauri::State<'_, ManagedNotificationCenter>,
 ) -> Result<NotificationSnapshot, String> {
     let center = state.inner();
-    let (cutoff, account_key) = {
+    let (cloud_cutoff, account_key) = {
+        let runtime = center
+            .runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cutoff = runtime.feed_cutoff.clone();
+        (cutoff, runtime.account_key.clone())
+    };
+    let local_cutoff = {
+        let persisted = center
+            .persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        center
+            .local_items(&persisted)
+            .2
+            .first()
+            .map(NotificationItem::point)
+    };
+    if cloud_cutoff.is_none() && local_cutoff.is_none() {
+        return Err("Notification snapshot is not ready".to_string());
+    }
+    mutate_persisted(center, |persisted| {
+        if let Some(cutoff) = local_cutoff {
+            persisted.local_tasks.cutoff =
+                Some(later_cutoff(persisted.local_tasks.cutoff.take(), cutoff));
+        }
+        if let Some(cutoff) = cloud_cutoff.clone() {
+            persisted.announcements.cutoff = Some(later_cutoff(
+                persisted.announcements.cutoff.take(),
+                cutoff.clone(),
+            ));
+            persisted.announcements.revision = persisted.announcements.revision.saturating_add(1);
+            if let Some(key) = account_key.as_deref() {
+                let account = touch_account(persisted, key);
+                account.pending_read_all =
+                    Some(later_cutoff(account.pending_read_all.take(), cutoff));
+            }
+        }
+    })?;
+    {
         let mut runtime = center
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cutoff = runtime
-            .feed_cutoff
-            .clone()
-            .ok_or_else(|| "Notification snapshot is not ready".to_string())?;
         for item in &mut runtime.items {
             item.set_read();
         }
         runtime.has_unread = false;
-        (cutoff, runtime.account_key.clone())
-    };
-    {
-        let mut persisted = center
-            .persisted
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        persisted.announcements.cutoff = Some(later_cutoff(
-            persisted.announcements.cutoff.take(),
-            cutoff.clone(),
-        ));
-        persisted.announcements.revision = persisted.announcements.revision.saturating_add(1);
-        if let Some(key) = account_key.as_deref() {
-            let account = touch_account(&mut persisted, key);
-            account.pending_read_all = Some(later_cutoff(account.pending_read_all.take(), cutoff));
-        }
     }
-    persist_receipts_best_effort(center);
-    let snapshot = center
-        .runtime
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .snapshot();
+    let snapshot = center.snapshot();
     if let Err(error) = app.emit(UPDATED_EVENT, snapshot.clone()) {
         ulog_debug!(
             "[NotificationCenter] read-all update not delivered: {}",
@@ -1416,6 +1768,27 @@ pub fn activate_from_toast<R: tauri::Runtime>(
 ) {
     let center = app.state::<ManagedNotificationCenter>().inner().clone();
     tauri::async_runtime::spawn(async move {
+        if notification_id.starts_with("task-comment:") {
+            let result = local_task_notification_point(&center, &notification_id)
+                .ok_or_else(|| "Task notification is no longer available".to_string())
+                .and_then(|point| commit_local_task_read(&center, &notification_id, point));
+            if let Err(error) = result {
+                ulog_warn!(
+                    "[NotificationCenter] failed to persist Task toast receipt id={}: {}",
+                    notification_id,
+                    error
+                );
+            }
+            emit_snapshot(&app, &center);
+            if let NotificationTarget::AppRoute { route } = target {
+                let queue = app
+                    .state::<crate::app_route::ManagedAppRouteQueue>()
+                    .inner()
+                    .clone();
+                crate::app_route::enqueue(&app, &queue, route);
+            }
+            return;
+        }
         // A delivered banner can outlive a feed refresh, logout, or account
         // switch. Its closure captures the origin account so an old private
         // toast can never be ACKed against the newly active account.
@@ -1637,7 +2010,42 @@ mod tests {
     }
 
     #[test]
-    fn local_receipts_are_monotonic_and_bounded() {
+    fn receipt_persistence_failure_rolls_back_the_in_memory_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_path = dir.path().join("notification-state.json");
+        std::fs::create_dir_all(&blocked_path).unwrap();
+        let task_store = Arc::new(crate::task::TaskStore::new(dir.path().join("task-data")));
+        let center = NotificationCenter {
+            path: blocked_path,
+            runtime: Mutex::new(RuntimeState::default()),
+            persisted: Mutex::new(PersistedNotificationState::default()),
+            sync_gate: AsyncMutex::new(()),
+            wake: Notify::new(),
+            task_store,
+        };
+
+        let result = commit_local_task_read(
+            &center,
+            "task-comment:1",
+            point("2026-08-16T01:00:00.000Z", "task-comment:1"),
+        );
+
+        assert!(result.is_err());
+        assert!(center
+            .persisted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .local_tasks
+            .ids
+            .is_empty());
+        assert_eq!(
+            center.snapshot().error_code.as_deref(),
+            Some(TASK_RECEIPT_PERSIST_ERROR)
+        );
+    }
+
+    #[test]
+    fn local_receipts_remain_monotonic_when_the_source_index_rotates() {
         let mut state = PersistedNotificationState::default();
         for index in 0..(MAX_ANNOUNCEMENT_RECEIPTS + 5) {
             record_announcement_read(&mut state, &format!("a-{index}"));
@@ -1648,6 +2056,23 @@ mod tests {
             state.announcements.revision,
             (MAX_ANNOUNCEMENT_RECEIPTS + 5) as u64
         );
+
+        for index in 0..5_005 {
+            let id = format!("task-comment-{index}");
+            record_local_task_read(&mut state, &id, point(&Utc::now().to_rfc3339(), &id));
+        }
+        record_local_task_read(
+            &mut state,
+            "task-comment-10",
+            point(&Utc::now().to_rfc3339(), "task-comment-10"),
+        );
+        assert_eq!(state.local_tasks.ids.len(), 5_005);
+        assert!(state
+            .local_tasks
+            .ids
+            .iter()
+            .any(|id| id == "task-comment-0"));
+        assert_eq!(state.local_tasks.points.len(), 5_005);
     }
 
     #[test]
