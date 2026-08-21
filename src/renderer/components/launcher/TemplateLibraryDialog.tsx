@@ -274,7 +274,7 @@ export default memo(function TemplateLibraryDialog({
         <OverlayBackdrop onClose={onClose} className="z-[200]">
             <div className="flex w-[640px] max-h-[80vh] flex-col rounded-2xl bg-[var(--paper-elevated)] shadow-lg" onKeyDown={handleKeyDown}>
                 {/* Header */}
-                <div className="flex items-center justify-between border-b border-[var(--line)] px-6 py-4">
+                <div className="flex shrink-0 items-center justify-between border-b border-[var(--line)] px-6 py-4">
                     <h2 className="text-lg font-semibold text-[var(--ink)]">{t('templateLibrary.title')}</h2>
                     <button
                         onClick={onClose}
@@ -287,9 +287,9 @@ export default memo(function TemplateLibraryDialog({
                 </div>
 
                 {/* Body */}
-                <div className="flex flex-1 overflow-hidden">
+                <div className="flex min-h-0 flex-1 overflow-hidden">
                     {/* Left: Template list */}
-                    <div className="flex w-[220px] flex-col border-r border-[var(--line)]">
+                    <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--line)]">
                         <div className="flex-1 overflow-y-auto overscroll-contain p-3">
                             <div className="mb-2 px-1">
                                 <span className="text-sm font-semibold tracking-[0.04em] text-[var(--ink-muted)]">
@@ -337,7 +337,7 @@ export default memo(function TemplateLibraryDialog({
                         </div>
 
                         {/* Add template button */}
-                        <div className="border-t border-[var(--line)] p-3">
+                        <div className="shrink-0 border-t border-[var(--line)] p-3">
                             <button
                                 type="button"
                                 onClick={handleAddTemplate}
@@ -355,9 +355,10 @@ export default memo(function TemplateLibraryDialog({
                     </div>
 
                     {/* Right: Template details & create form */}
-                    <div className="flex min-h-[420px] flex-1 flex-col p-6">
+                    <div className="flex min-h-[420px] min-w-0 flex-1 flex-col overflow-hidden">
                         {selectedTemplate ? (
                             <>
+                                <div className="min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain p-6 pb-4">
                                 {/* Template preview — icon, name & description editable for user templates */}
                                 <div className="mb-6">
                                     <div className="flex items-start gap-3">
@@ -430,7 +431,7 @@ export default memo(function TemplateLibraryDialog({
                                                 />
                                             ) : (
                                                 <h3
-                                                    className={`text-base font-semibold leading-tight text-[var(--ink)] ${
+                                                    className={`min-w-0 break-words text-base font-semibold leading-tight text-[var(--ink)] ${
                                                         selectedTemplate.isBuiltin ? '' : 'cursor-pointer rounded px-1.5 py-0.5 -ml-1.5 transition-colors hover:bg-[var(--hover-bg)]'
                                                     }`}
                                                     onClick={() => {
@@ -446,7 +447,7 @@ export default memo(function TemplateLibraryDialog({
                                             )}
                                             {/* Description — inline editable for user templates */}
                                             {selectedTemplate.isBuiltin ? (
-                                                <p className="mt-1 min-h-[20px] text-sm leading-snug text-[var(--ink-muted)]">
+                                                <p className="mt-1 min-h-[20px] break-words text-sm leading-snug text-[var(--ink-muted)]">
                                                     {getTemplateDescription(selectedTemplate)}
                                                 </p>
                                             ) : editingDesc ? (
@@ -470,7 +471,7 @@ export default memo(function TemplateLibraryDialog({
                                                 />
                                             ) : (
                                                 <p
-                                                    className="mt-1 min-h-[20px] cursor-pointer rounded px-1.5 py-0.5 -ml-1.5 text-sm leading-snug text-[var(--ink-muted)] transition-colors hover:bg-[var(--hover-bg)]"
+                                                    className="mt-1 min-h-[20px] cursor-pointer break-words rounded px-1.5 py-0.5 -ml-1.5 text-sm leading-snug text-[var(--ink-muted)] transition-colors hover:bg-[var(--hover-bg)]"
                                                     onClick={() => {
                                                         setDescDraft(selectedTemplate.description || '');
                                                         setEditingDesc(true);
@@ -507,7 +508,7 @@ export default memo(function TemplateLibraryDialog({
                                             {projectName && (
                                                 <>
                                                     <ChevronRight className="mx-1 h-3 w-3 shrink-0 text-[var(--ink-subtle)]" />
-                                                    <span className="shrink-0 text-sm font-medium text-[var(--ink)]">
+                                                    <span className="min-w-0 truncate text-sm font-medium text-[var(--ink)]">
                                                         {projectName}
                                                     </span>
                                                 </>
@@ -533,11 +534,12 @@ export default memo(function TemplateLibraryDialog({
 
                                 {/* Error */}
                                 {error && (
-                                    <p className="mb-4 text-xs text-[var(--error)]">{error}</p>
+                                    <p className="mb-4 break-words text-xs text-[var(--error)]">{error}</p>
                                 )}
+                                </div>
 
                                 {/* Create button */}
-                                <div className="mt-auto flex justify-end">
+                                <div className="flex shrink-0 justify-end px-6 pb-6 pt-2">
                                     <button
                                         type="button"
                                         onClick={handleCreate}
