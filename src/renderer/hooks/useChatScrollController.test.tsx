@@ -4,6 +4,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useChatScrollController } from './useChatScrollController';
 import { projectVisibleChatTimelineRows } from '@/utils/chatTimelineRows';
 import type { Message } from '@/types/chat';
+import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
+
+const AVAILABLE_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 0 };
+const SUSPENDED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: false, generation: 1 };
+const RESTORED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 1 };
 
 const controls = vi.hoisted(() => ({
   scrollToIndex: vi.fn(),
@@ -15,10 +20,13 @@ const controls = vi.hoisted(() => ({
   virtuosoRef: { current: null as null | { scrollToIndex: ReturnType<typeof vi.fn>; scrollBy: ReturnType<typeof vi.fn> } },
   scrollerRef: { current: null as HTMLElement | null },
   followEnabledRef: { current: true as boolean | 'force' },
+  onUserScrollIntent: undefined as (() => void) | undefined,
 }));
 
 vi.mock('@/hooks/useVirtuosoScroll', () => ({
-  useVirtuosoScroll: () => ({
+  useVirtuosoScroll: (options?: { onUserScrollIntent?: () => void }) => {
+    controls.onUserScrollIntent = options?.onUserScrollIntent;
+    return {
     virtuosoRef: controls.virtuosoRef,
     scrollerRef: controls.scrollerRef,
     followEnabledRef: controls.followEnabledRef,
@@ -26,7 +34,8 @@ vi.mock('@/hooks/useVirtuosoScroll', () => ({
     pauseAutoScroll: controls.pauseAutoScroll,
     handleAtBottomChange: controls.handleAtBottomChange,
     attachScroller: controls.attachScroller,
-  }),
+    };
+  },
 }));
 
 function msg(id: string, content = 'text'): Message {
@@ -64,6 +73,7 @@ describe('useChatScrollController', () => {
     };
     controls.scrollerRef.current = null;
     controls.followEnabledRef.current = true;
+    controls.onUserScrollIntent = undefined;
   });
 
   it('scrollToMessage pauses follow and delegates to Virtuoso inside the controller', () => {
@@ -149,6 +159,7 @@ describe('useChatScrollController', () => {
     }));
 
     act(() => {
+      result.current.onViewportAdmissionChanged(true, 0);
       result.current.onRowLayoutChanged('m1', 'tool-complete');
     });
 
@@ -167,6 +178,7 @@ describe('useChatScrollController', () => {
       }));
 
       act(() => {
+        result.current.onViewportAdmissionChanged(true, 0);
         result.current.onRowLayoutChanged('m1', reason);
       });
 
@@ -184,6 +196,7 @@ describe('useChatScrollController', () => {
     }));
 
     act(() => {
+      result.current.onViewportAdmissionChanged(true, 0);
       result.current.onRowLayoutChanged('m1', 'attachment-settle');
     });
 
@@ -212,6 +225,7 @@ describe('useChatScrollController', () => {
     }));
 
     act(() => {
+      result.current.onViewportAdmissionChanged(true, 0);
       result.current.onRowLayoutChanged('m1', reason);
       // Emulate the same React commit growing or shrinking the virtualized row.
       setRect(row, { top: 80, bottom: 150 });
@@ -237,6 +251,7 @@ describe('useChatScrollController', () => {
       isActive: true,
     }));
 
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
     const anchor = result.current.captureAnchor('test');
     expect(anchor).toMatchObject({ messageId: 'm1', offsetFromViewportTop: 20 });
 
@@ -249,36 +264,46 @@ describe('useChatScrollController', () => {
   });
 
   it.each([true, 'force'] as const)(
-    'restores %s follow intent to the latest background output on window focus',
+    'restores %s follow intent once after a suspended viewport becomes renderable',
     (followMode) => {
       controls.followEnabledRef.current = followMode;
       const initial = [msg('m1')];
-      const { rerender } = renderHook(
-        ({ messages, focused }) => useChatScrollController({
+      const { result, rerender } = renderHook(
+        ({ messages, presentation }: {
+          messages: Message[];
+          presentation: MainWindowPresentation;
+        }) => useChatScrollController({
           messages,
           isActive: true,
-          isWindowFocused: focused,
+          windowPresentation: presentation,
           sessionId: 's1',
         }),
-        { initialProps: { messages: initial, focused: true } },
+        { initialProps: { messages: initial, presentation: AVAILABLE_PRESENTATION } },
       );
 
-      rerender({ messages: initial, focused: false });
-      // Simulate a stale background callback changing the live ref while the
-      // controller's blur snapshot remains authoritative.
-      controls.followEnabledRef.current = false;
-      rerender({ messages: [...initial, msg('m2', 'finished in background')], focused: false });
+      act(() => result.current.onViewportAdmissionChanged(true, 0));
+      rerender({ messages: initial, presentation: SUSPENDED_PRESENTATION });
+      act(() => result.current.onViewportAdmissionChanged(false, 1));
+      rerender({
+        messages: [...initial, msg('m2', 'finished while minimized')],
+        presentation: SUSPENDED_PRESENTATION,
+      });
       controls.scrollToBottom.mockClear();
 
-      rerender({ messages: [...initial, msg('m2', 'finished in background')], focused: true });
+      rerender({
+        messages: [...initial, msg('m2', 'finished while minimized')],
+        presentation: RESTORED_PRESENTATION,
+      });
+      act(() => result.current.onViewportAdmissionChanged(true, 1));
 
       expect(controls.scrollToBottom).toHaveBeenCalledTimes(1);
       expect(controls.scrollToBottom).toHaveBeenCalledWith('auto');
       expect(controls.scrollBy).not.toHaveBeenCalled();
+      expect(result.current.isViewportRecoveryFenced).toBe(false);
     },
   );
 
-  it('restores the same message anchor when a scrolled-up reader returns', () => {
+  it('restores the same message anchor when a scrolled-up reader returns from suspension', () => {
     const scroller = document.createElement('div');
     const row = document.createElement('div');
     row.setAttribute('data-chat-search-scope', '');
@@ -290,38 +315,76 @@ describe('useChatScrollController', () => {
     controls.followEnabledRef.current = false;
 
     const initial = [msg('m1')];
-    const { rerender } = renderHook(
-      ({ messages, focused }) => useChatScrollController({
+    const { result, rerender } = renderHook(
+      ({ messages, presentation }: {
+        messages: Message[];
+        presentation: MainWindowPresentation;
+      }) => useChatScrollController({
         messages,
         isActive: true,
-        isWindowFocused: focused,
+        windowPresentation: presentation,
         sessionId: 's1',
       }),
-      { initialProps: { messages: initial, focused: true } },
+      { initialProps: { messages: initial, presentation: AVAILABLE_PRESENTATION } },
     );
 
-    rerender({ messages: initial, focused: false });
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    rerender({ messages: initial, presentation: SUSPENDED_PRESENTATION });
+    act(() => result.current.onViewportAdmissionChanged(false, 1));
     setRect(row, { top: 80, bottom: 150 });
-    rerender({ messages: [...initial, msg('m2', 'new output below')], focused: false });
+    rerender({
+      messages: [...initial, msg('m2', 'new output below')],
+      presentation: SUSPENDED_PRESENTATION,
+    });
 
-    rerender({ messages: [...initial, msg('m2', 'new output below')], focused: true });
+    rerender({
+      messages: [...initial, msg('m2', 'new output below')],
+      presentation: RESTORED_PRESENTATION,
+    });
+    act(() => result.current.onViewportAdmissionChanged(true, 1));
 
     expect(controls.scrollToBottom).not.toHaveBeenCalled();
     expect(controls.scrollBy).toHaveBeenCalledTimes(1);
     expect(controls.scrollBy).toHaveBeenCalledWith({ top: 50, behavior: 'auto' });
     expect(controls.followEnabledRef.current).toBe(false);
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
   });
 
-  it('handles row layout changes while the active Chat window is unfocused', () => {
+  it('preserves a negative intra-message offset for one long assistant row', () => {
+    const scroller = document.createElement('div');
+    const row = document.createElement('div');
+    row.setAttribute('data-chat-search-scope', '');
+    row.setAttribute('data-message-id', 'long');
+    scroller.appendChild(row);
+    setRect(scroller, { top: 10, bottom: 410 });
+    setRect(row, { top: -300, bottom: 900 });
+    controls.scrollerRef.current = scroller;
+    controls.followEnabledRef.current = false;
+    const { result } = renderHook(() => useChatScrollController({
+      messages: [msg('long')],
+      isActive: true,
+      sessionId: 's1',
+    }));
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    setRect(row, { top: -250, bottom: 950 });
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+
+    expect(controls.scrollBy).toHaveBeenCalledWith({ top: 50, behavior: 'auto' });
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
+  });
+
+  it('handles row layout changes whenever the active viewport remains admitted', () => {
     controls.followEnabledRef.current = true;
     const { result } = renderHook(() => useChatScrollController({
       messages: [msg('m1')],
       isActive: true,
-      isWindowFocused: false,
       sessionId: 's1',
     }));
 
     act(() => {
+      result.current.onViewportAdmissionChanged(true, 0);
       result.current.onRowLayoutChanged('m1', 'tool-complete');
     });
 
@@ -331,101 +394,25 @@ describe('useChatScrollController', () => {
     expect(controls.scrollToIndex).not.toHaveBeenCalled();
   });
 
-  it('invalidates a blur snapshot when the Session changes before focus returns', () => {
+  it('rejects a delayed admission callback from an older presentation generation', () => {
     controls.followEnabledRef.current = true;
-    const { rerender } = renderHook(
-      ({ focused, sessionId }) => useChatScrollController({
-        messages: [msg('m1')],
-        isActive: true,
-        isWindowFocused: focused,
-        sessionId,
-      }),
-      { initialProps: { focused: true, sessionId: 's1' } },
-    );
+    const { result } = renderHook(() => useChatScrollController({
+      messages: [msg('m1')],
+      isActive: true,
+      windowPresentation: { surfaceAvailable: true, generation: 2 },
+      sessionId: 's1',
+    }));
 
-    rerender({ focused: false, sessionId: 's1' });
-    controls.scrollToBottom.mockClear();
-    rerender({ focused: false, sessionId: 's2' });
-    rerender({ focused: true, sessionId: 's2' });
-
+    act(() => result.current.onViewportAdmissionChanged(true, 1));
+    act(() => result.current.onRowLayoutChanged('m1', 'tool-complete'));
     expect(controls.scrollToBottom).not.toHaveBeenCalled();
-    expect(controls.scrollBy).not.toHaveBeenCalled();
-    expect(controls.scrollToIndex).not.toHaveBeenCalled();
-  });
 
-  it('consumes only the latest snapshot across consecutive blur and focus transitions', () => {
-    controls.followEnabledRef.current = true;
-    const { rerender } = renderHook(
-      ({ focused }) => useChatScrollController({
-        messages: [msg('m1')],
-        isActive: true,
-        isWindowFocused: focused,
-        sessionId: 's1',
-      }),
-      { initialProps: { focused: true } },
-    );
-
-    rerender({ focused: false });
-    rerender({ focused: true });
+    act(() => result.current.onViewportAdmissionChanged(true, 2));
+    act(() => result.current.onRowLayoutChanged('m1', 'tool-complete'));
     expect(controls.scrollToBottom).toHaveBeenCalledTimes(1);
-
-    controls.followEnabledRef.current = true;
-    rerender({ focused: false });
-    rerender({ focused: true });
-    expect(controls.scrollToBottom).toHaveBeenCalledTimes(2);
   });
 
-  it('drops a delayed anchor correction after the Session changes', () => {
-    let correctionFrame: FrameRequestCallback | null = null;
-    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
-      correctionFrame = callback;
-      return 1;
-    });
-    const scroller = document.createElement('div');
-    setRect(scroller, { top: 10, bottom: 410 });
-    controls.scrollerRef.current = scroller;
-
-    const { result, rerender } = renderHook(
-      ({ sessionId }) => useChatScrollController({
-        messages: [msg('m1')],
-        isActive: true,
-        isWindowFocused: true,
-        sessionId,
-      }),
-      { initialProps: { sessionId: 's1' } },
-    );
-
-    act(() => {
-      result.current.restoreAnchorAfterNextCommit({
-        messageId: 'm1',
-        offsetFromViewportTop: 20,
-        label: 'window-blur',
-      });
-    });
-    expect(controls.scrollToIndex).toHaveBeenCalledWith({
-      index: 0,
-      align: 'start',
-      behavior: 'auto',
-    });
-
-    const row = document.createElement('div');
-    row.setAttribute('data-chat-search-scope', '');
-    row.setAttribute('data-message-id', 'm1');
-    setRect(row, { top: 80, bottom: 150 });
-    scroller.appendChild(row);
-    rerender({ sessionId: 's2' });
-    act(() => correctionFrame?.(1_000));
-
-    expect(controls.scrollBy).not.toHaveBeenCalled();
-    vi.unstubAllGlobals();
-  });
-
-  it('drops an older delayed correction after a newer focus recovery in the same Session', () => {
-    const correctionFrames: FrameRequestCallback[] = [];
-    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
-      correctionFrames.push(callback);
-      return correctionFrames.length;
-    });
+  it('fences stale geometry callbacks as soon as the presentation generation advances', () => {
     const scroller = document.createElement('div');
     const row = document.createElement('div');
     row.setAttribute('data-chat-search-scope', '');
@@ -436,35 +423,285 @@ describe('useChatScrollController', () => {
     controls.scrollerRef.current = scroller;
     controls.followEnabledRef.current = false;
 
-    const { rerender } = renderHook(
-      ({ focused }) => useChatScrollController({
+    const { result, rerender } = renderHook(
+      ({ presentation }: { presentation: MainWindowPresentation }) => useChatScrollController({
         messages: [msg('m1')],
         isActive: true,
-        isWindowFocused: focused,
+        windowPresentation: presentation,
         sessionId: 's1',
       }),
-      { initialProps: { focused: true } },
+      { initialProps: { presentation: AVAILABLE_PRESENTATION } },
     );
 
-    rerender({ focused: false });
+    act(() => {
+      result.current.attachScroller(scroller);
+      result.current.onViewportAdmissionChanged(true, 0);
+      result.current.onViewportAdmissionChanged(false, 0);
+    });
     row.remove();
-    rerender({ focused: true });
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    expect(result.current.isViewportRecoveryFenced).toBe(true);
+    expect(controls.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    // App has committed generation 1, but the MessageList layout effect has
+    // not published false admission yet. Every old-generation geometry path
+    // must already fail closed in this parent/child effect gap.
+    rerender({ presentation: SUSPENDED_PRESENTATION });
+    setRect(row, { top: 130, bottom: 200 });
+    scroller.appendChild(row);
+    controls.scrollBy.mockClear();
+    controls.scrollToBottom.mockClear();
+    controls.handleAtBottomChange.mockClear();
+    act(() => {
+      scroller.dispatchEvent(new Event('scroll'));
+      result.current.handleAtBottomChange(false);
+      result.current.onRowLayoutChanged('m1', 'tool-complete');
+      result.current.onItemsRendered();
+    });
+
+    expect(controls.scrollBy).not.toHaveBeenCalled();
+    expect(controls.scrollToBottom).not.toHaveBeenCalled();
+    expect(controls.handleAtBottomChange).not.toHaveBeenCalled();
+    expect(result.current.isViewportRecoveryFenced).toBe(true);
+
+    act(() => result.current.onViewportAdmissionChanged(false, 1));
+    setRect(row, { top: 80, bottom: 150 });
+    rerender({ presentation: RESTORED_PRESENTATION });
+    act(() => result.current.onViewportAdmissionChanged(true, 1));
+
+    expect(controls.scrollBy).toHaveBeenCalledTimes(1);
+    expect(controls.scrollBy).toHaveBeenCalledWith({ top: 50, behavior: 'auto' });
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
+  });
+
+  it('invalidates a suspended continuity transaction when the Session changes', () => {
+    controls.followEnabledRef.current = true;
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useChatScrollController({
+        messages: [msg('m1')],
+        isActive: true,
+        sessionId,
+      }),
+      { initialProps: { sessionId: 's1' } },
+    );
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    controls.scrollToBottom.mockClear();
+    rerender({ sessionId: 's2' });
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+
+    expect(controls.scrollToBottom).not.toHaveBeenCalled();
+    expect(controls.scrollBy).not.toHaveBeenCalled();
+    expect(controls.scrollToIndex).not.toHaveBeenCalled();
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
+  });
+
+  it('drops a pending recovery callback when the Tab becomes inactive', () => {
+    const scroller = document.createElement('div');
+    const row = document.createElement('div');
+    row.setAttribute('data-chat-search-scope', '');
+    row.setAttribute('data-message-id', 'm1');
+    scroller.appendChild(row);
+    setRect(scroller, { top: 10, bottom: 410 });
+    setRect(row, { top: 30, bottom: 100 });
+    controls.scrollerRef.current = scroller;
+    controls.followEnabledRef.current = false;
+    const { result } = renderHook(() => useChatScrollController({
+      messages: [msg('m1')],
+      isActive: true,
+      sessionId: 's1',
+    }));
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    row.remove();
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    expect(result.current.isViewportRecoveryFenced).toBe(true);
+
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    setRect(row, { top: 80, bottom: 150 });
+    scroller.appendChild(row);
+    act(() => result.current.onItemsRendered());
+    expect(controls.scrollBy).not.toHaveBeenCalled();
+  });
+
+  it('coalesces inactive-Tab and native-surface suspension into one recovery', () => {
+    controls.followEnabledRef.current = true;
+    const { result, rerender } = renderHook(
+      ({ presentation }: { presentation: MainWindowPresentation }) => useChatScrollController({
+        messages: [msg('m1')],
+        isActive: true,
+        windowPresentation: presentation,
+        sessionId: 's1',
+      }),
+      { initialProps: { presentation: AVAILABLE_PRESENTATION } },
+    );
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    rerender({ presentation: SUSPENDED_PRESENTATION });
+    act(() => result.current.onViewportAdmissionChanged(false, 1));
+    rerender({ presentation: RESTORED_PRESENTATION });
+    act(() => result.current.onViewportAdmissionChanged(false, 1));
+    controls.scrollToBottom.mockClear();
+    act(() => result.current.onViewportAdmissionChanged(true, 1));
+
+    expect(controls.scrollToBottom).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the first suspended intent authoritative across duplicate unavailable signals', () => {
+    controls.followEnabledRef.current = true;
+    const { result } = renderHook(() => useChatScrollController({
+      messages: [msg('m1')],
+      isActive: true,
+      sessionId: 's1',
+    }));
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    controls.followEnabledRef.current = false;
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    controls.scrollToBottom.mockClear();
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+
+    expect(controls.scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(controls.followEnabledRef.current).toBe(true);
+  });
+
+  it('settles an unmounted continuity anchor from itemsRendered without a timer guess', () => {
+    const scroller = document.createElement('div');
+    const row = document.createElement('div');
+    row.setAttribute('data-chat-search-scope', '');
+    row.setAttribute('data-message-id', 'm1');
+    scroller.appendChild(row);
+    setRect(scroller, { top: 10, bottom: 410 });
+    setRect(row, { top: 30, bottom: 100 });
+    controls.scrollerRef.current = scroller;
+    controls.followEnabledRef.current = false;
+
+    const { result } = renderHook(() => useChatScrollController({
+        messages: [msg('m1')],
+        isActive: true,
+        sessionId: 's1',
+      }));
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    row.remove();
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+
+    expect(controls.scrollToIndex).toHaveBeenCalledWith({
+      index: 0,
+      align: 'start',
+      behavior: 'auto',
+    });
+    expect(result.current.isViewportRecoveryFenced).toBe(true);
 
     setRect(row, { top: 80, bottom: 150 });
     scroller.appendChild(row);
-    rerender({ focused: false });
-    row.remove();
-    rerender({ focused: true });
+    act(() => result.current.onItemsRendered());
 
-    setRect(row, { top: 130, bottom: 200 });
-    scroller.appendChild(row);
-    expect(correctionFrames).toHaveLength(2);
-    act(() => correctionFrames[0](1_000));
-    expect(controls.scrollBy).not.toHaveBeenCalled();
-
-    act(() => correctionFrames[1](1_001));
     expect(controls.scrollBy).toHaveBeenCalledTimes(1);
     expect(controls.scrollBy).toHaveBeenCalledWith({ top: 50, behavior: 'auto' });
-    vi.unstubAllGlobals();
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
+  });
+
+  it('lets explicit navigation cancel an in-flight continuity recovery', () => {
+    const scroller = document.createElement('div');
+    const row = document.createElement('div');
+    row.setAttribute('data-chat-search-scope', '');
+    row.setAttribute('data-message-id', 'm1');
+    scroller.appendChild(row);
+    setRect(scroller, { top: 10, bottom: 410 });
+    setRect(row, { top: 30, bottom: 100 });
+    controls.scrollerRef.current = scroller;
+    controls.followEnabledRef.current = false;
+
+    const { result } = renderHook(() => useChatScrollController({
+      messages: [msg('m1')],
+      isActive: true,
+      sessionId: 's1',
+    }));
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    row.remove();
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    expect(result.current.isViewportRecoveryFenced).toBe(true);
+
+    controls.scrollToIndex.mockClear();
+    act(() => result.current.scrollToMessage('m1', { behavior: 'auto' }));
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
+    expect(controls.scrollToIndex).toHaveBeenCalledTimes(1);
+
+    setRect(row, { top: 80, bottom: 150 });
+    scroller.appendChild(row);
+    act(() => result.current.onItemsRendered());
+    expect(controls.scrollBy).not.toHaveBeenCalled();
+  });
+
+  it('lets explicit bottom navigation cancel an in-flight continuity recovery', () => {
+    const scroller = document.createElement('div');
+    const row = document.createElement('div');
+    row.setAttribute('data-chat-search-scope', '');
+    row.setAttribute('data-message-id', 'm1');
+    scroller.appendChild(row);
+    setRect(scroller, { top: 10, bottom: 410 });
+    setRect(row, { top: 30, bottom: 100 });
+    controls.scrollerRef.current = scroller;
+    controls.followEnabledRef.current = false;
+    const { result } = renderHook(() => useChatScrollController({
+      messages: [msg('m1')],
+      isActive: true,
+      sessionId: 's1',
+    }));
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    row.remove();
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    expect(result.current.isViewportRecoveryFenced).toBe(true);
+
+    controls.scrollToIndex.mockClear();
+    act(() => result.current.scrollToBottom('auto'));
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
+    expect(controls.scrollToBottom).toHaveBeenCalledWith('auto');
+
+    setRect(row, { top: 80, bottom: 150 });
+    scroller.appendChild(row);
+    act(() => result.current.onItemsRendered());
+    expect(controls.scrollBy).not.toHaveBeenCalled();
+  });
+
+  it('lets newer direct viewport input cancel an in-flight continuity recovery', () => {
+    const scroller = document.createElement('div');
+    const row = document.createElement('div');
+    row.setAttribute('data-chat-search-scope', '');
+    row.setAttribute('data-message-id', 'm1');
+    scroller.appendChild(row);
+    setRect(scroller, { top: 10, bottom: 410 });
+    setRect(row, { top: 30, bottom: 100 });
+    controls.scrollerRef.current = scroller;
+    controls.followEnabledRef.current = false;
+    const { result } = renderHook(() => useChatScrollController({
+      messages: [msg('m1')],
+      isActive: true,
+      sessionId: 's1',
+    }));
+
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    act(() => result.current.onViewportAdmissionChanged(false, 0));
+    row.remove();
+    act(() => result.current.onViewportAdmissionChanged(true, 0));
+    expect(result.current.isViewportRecoveryFenced).toBe(true);
+
+    act(() => controls.onUserScrollIntent?.());
+    expect(result.current.isViewportRecoveryFenced).toBe(false);
+
+    setRect(row, { top: 80, bottom: 150 });
+    scroller.appendChild(row);
+    act(() => result.current.onItemsRendered());
+    expect(controls.scrollBy).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,4 @@
-// Focused behavior tests for App's content slots. Restored persisted Sessions
+// Presentation behavior tests for App's content slots. Restored persisted Sessions
 // always mount TabProvider, while the heavy Chat child may stay deferred until
 // the active shell has painted.
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -6,6 +6,7 @@ import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Tab } from '@/types/tab';
+import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
 // TabProvider is the ONLY branch that triggers sidecar/SSE side effects — a
 // spy marker lets us assert whether it was mounted.
@@ -20,8 +21,8 @@ vi.mock('@/context/TabProvider', () => ({
 // Stub the heavy page subtrees so importing App stays cheap and side-effect free.
 const chatRenderSpy = vi.hoisted(() => vi.fn());
 vi.mock('@/pages/Chat', () => ({
-  default: ({ isWindowFocused }: { isWindowFocused: boolean }) => {
-    chatRenderSpy(isWindowFocused);
+  default: ({ windowPresentation }: { windowPresentation: MainWindowPresentation }) => {
+    chatRenderSpy(windowPresentation);
     return <div data-testid="chat" />;
   },
 }));
@@ -57,8 +58,11 @@ function restoredTab(over: Partial<Tab> = {}): Tab {
   };
 }
 
+const AVAILABLE_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 0 };
+const SUSPENDED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: false, generation: 1 };
+
 const noopProps = {
-  isWindowFocused: true,
+  windowPresentation: AVAILABLE_PRESENTATION,
   isLoading: false,
   error: null,
   isDeferredMount: false,
@@ -160,7 +164,7 @@ describe('restored live chat tab', () => {
     expect(screen.getByTestId('tab-provider').parentElement).toHaveClass('invisible');
   });
 
-  it('projects desktop focus only through the active Chat slot', async () => {
+  it('projects native presentation only through the active Chat slot', async () => {
     chatRenderSpy.mockClear();
     const liveTab = restoredTab();
     const view = render(
@@ -174,7 +178,7 @@ describe('restored live chat tab', () => {
         tab={liveTab}
         isActive={false}
         {...noopProps}
-        isWindowFocused={false}
+        windowPresentation={SUSPENDED_PRESENTATION}
       />,
     );
     expect(chatRenderSpy).toHaveBeenCalledTimes(inactiveRenderCount);
@@ -184,10 +188,10 @@ describe('restored live chat tab', () => {
         tab={liveTab}
         isActive
         {...noopProps}
-        isWindowFocused={false}
+        windowPresentation={SUSPENDED_PRESENTATION}
       />,
     );
-    await waitFor(() => expect(chatRenderSpy).toHaveBeenLastCalledWith(false));
+    await waitFor(() => expect(chatRenderSpy).toHaveBeenLastCalledWith(SUSPENDED_PRESENTATION));
   });
 
   it('keeps Settings and Capabilities UI state in their own mounted Tab slots', async () => {

@@ -240,7 +240,7 @@ fn on_summon_pressed<R: Runtime>(app: &AppHandle<R>) {
 
     if visible && focused {
         ulog_info!("[global-shortcut] hide (already visible+focused)");
-        if let Err(e) = window.hide() {
+        if let Err(e) = crate::tray::hide_main_window(app) {
             ulog_error!("[global-shortcut] hide failed: {}", e);
         }
         return;

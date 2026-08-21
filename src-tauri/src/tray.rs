@@ -19,6 +19,20 @@ const MENU_OPEN: &str = "open";
 const MENU_SETTINGS: &str = "settings";
 const MENU_FORCE_WAKE_LOCK: &str = "force_wake_lock";
 const MENU_EXIT: &str = "exit";
+const MAIN_WINDOW_PRESENTATION_EVENT: &str = "main-window:presentation-changed";
+
+fn emit_main_window_presentation<R: Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    surface_available: bool,
+) {
+    if let Err(error) = window.emit(MAIN_WINDOW_PRESENTATION_EVENT, surface_available) {
+        ulog_warn!(
+            "[Tray] Failed to emit main-window presentation={} error={}",
+            surface_available,
+            error
+        );
+    }
+}
 
 /// Tray-menu items whose check state we need to mutate at runtime
 /// (PRD 0.2.35 D4: handle MUST live in app state so `apply_force_wake_lock`
@@ -241,6 +255,9 @@ pub fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) {
         let show_result = window.show();
         let unminimize_result = window.unminimize();
         let focus_result = window.set_focus();
+        let surface_available =
+            window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
+        emit_main_window_presentation(&window, surface_available);
         ulog_info!(
             "[Tray] show_main_window end show_ok={} unminimize_ok={} focus_ok={} visible={} focused={}",
             show_result.is_ok(),
@@ -254,15 +271,28 @@ pub fn show_main_window<R: Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+/// Hide the main window and synchronously publish the unavailable edge before
+/// WebView delivery can be suspended. All Rust-owned hide entry points must use
+/// this helper so a quick hide→show cannot collapse into one async JS sample.
+pub fn hide_main_window<R: Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window is missing".to_string())?;
+    emit_main_window_presentation(&window, false);
+    if let Err(error) = window.hide() {
+        let surface_available =
+            window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(false);
+        emit_main_window_presentation(&window, surface_available);
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 /// Hide the main window to tray (called when close button is clicked)
 #[allow(dead_code)]
 pub fn hide_to_tray<R: Runtime>(app: &tauri::AppHandle<R>) -> bool {
-    if let Some(window) = app.get_webview_window("main") {
-        ulog_info!("[Tray] Hiding window to tray");
-        let _ = window.hide();
-        return true;
-    }
-    false
+    ulog_info!("[Tray] Hiding window to tray");
+    hide_main_window(app).is_ok()
 }
 
 /// Partial app config for reading minimize to tray setting

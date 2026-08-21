@@ -45,6 +45,11 @@ export interface VirtuosoScrollControls {
     attachScroller: (el: HTMLElement | Window | null) => void;
 }
 
+export interface UseVirtuosoScrollOptions {
+    /** Fires only for direct viewport input, before follow-state policy is applied. */
+    onUserScrollIntent?: () => void;
+}
+
 // Suppress user-intent escape for this long after a programmatic scrollToBottom. Covers
 // inertial wheel ticks from the smooth-scroll animation that would otherwise
 // mis-trigger the force→false exit.
@@ -55,7 +60,7 @@ const PROGRAMMATIC_SCROLL_GRACE_MS = 600;
 // drag / unusual inputs) leaks force indefinitely into future content changes.
 const FORCE_AUTO_DEGRADE_MS = 1500;
 
-export function useVirtuosoScroll(): VirtuosoScrollControls {
+export function useVirtuosoScroll({ onUserScrollIntent }: UseVirtuosoScrollOptions = {}): VirtuosoScrollControls {
     const virtuosoRef = useRef<VirtuosoHandle>(null);
     const scrollerRef = useRef<HTMLElement | null>(null);
     const followEnabledRef = useRef<boolean | 'force'>(true);
@@ -70,6 +75,13 @@ export function useVirtuosoScroll(): VirtuosoScrollControls {
     const graceUntilRef = useRef(0);
     // Auto-degrade force→true fallback timer (FORCE_AUTO_DEGRADE_MS).
     const forceDegradeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const onUserScrollIntentRef = useRef(onUserScrollIntent);
+    // Ref mirror keeps native input listeners stable while observing the latest owner callback.
+    // eslint-disable-next-line react-hooks/refs
+    onUserScrollIntentRef.current = onUserScrollIntent;
+    const notifyUserScrollIntent = useCallback(() => {
+        onUserScrollIntentRef.current?.();
+    }, []);
 
     const clearForceDegradeTimer = useCallback(() => {
         if (forceDegradeTimerRef.current) {
@@ -156,11 +168,12 @@ export function useVirtuosoScroll(): VirtuosoScrollControls {
     }, [clearForceDegradeTimer]);
 
     const onWheel = useCallback((e: WheelEvent) => {
+        if (e.deltaY !== 0) notifyUserScrollIntent();
         // Only upward wheel indicates user wants to see earlier content. Downward wheel
         // or trackpad inertial decay past bottom shouldn't break follow.
         if (e.deltaY >= 0) return;
         breakForceIfUserIntent();
-    }, [breakForceIfUserIntent]);
+    }, [breakForceIfUserIntent, notifyUserScrollIntent]);
 
     const touchStartYRef = useRef(0);
     const onTouchStart = useCallback((e: TouchEvent) => {
@@ -168,12 +181,19 @@ export function useVirtuosoScroll(): VirtuosoScrollControls {
     }, []);
     const onTouchMove = useCallback((e: TouchEvent) => {
         const y = e.touches[0]?.clientY ?? 0;
+        if (Math.abs(y - touchStartYRef.current) > 4) notifyUserScrollIntent();
         // Finger moving DOWN on screen = content scrolling DOWN in viewport = user wants
         // to see content ABOVE (earlier messages). That's an upward-content intent.
         if (y > touchStartYRef.current + 4) {
             breakForceIfUserIntent();
         }
-    }, [breakForceIfUserIntent]);
+    }, [breakForceIfUserIntent, notifyUserScrollIntent]);
+
+    // Pointer down covers native scrollbar dragging, which need not emit wheel
+    // or touch events before changing the viewport.
+    const onPointerDown = useCallback(() => {
+        notifyUserScrollIntent();
+    }, [notifyUserScrollIntent]);
 
     const onKeyDown = useCallback((e: KeyboardEvent) => {
         // Skip keys originating in editable targets — ArrowUp/Home are common cursor-nav
@@ -185,13 +205,24 @@ export function useVirtuosoScroll(): VirtuosoScrollControls {
             const tag = target.tagName;
             if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
         }
+        if (
+            e.key === 'PageUp'
+            || e.key === 'PageDown'
+            || e.key === 'ArrowUp'
+            || e.key === 'ArrowDown'
+            || e.key === 'Home'
+            || e.key === 'End'
+            || e.key === ' '
+        ) {
+            notifyUserScrollIntent();
+        }
         // Keys that unambiguously move the view upward/away from the bottom.
         // PageDown/End/ArrowDown at bottom shouldn't break follow — those keep user at
         // bottom or move them toward it.
         if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'Home') {
             breakForceIfUserIntent();
         }
-    }, [breakForceIfUserIntent]);
+    }, [breakForceIfUserIntent, notifyUserScrollIntent]);
 
     // Callback-ref pattern: stores the scroller for external consumers AND manages the
     // listener lifecycle. Virtuoso passes the scroller element (or Window) via its
@@ -203,6 +234,7 @@ export function useVirtuosoScroll(): VirtuosoScrollControls {
             prev.removeEventListener('wheel', onWheel);
             prev.removeEventListener('touchstart', onTouchStart);
             prev.removeEventListener('touchmove', onTouchMove);
+            prev.removeEventListener('pointerdown', onPointerDown);
         }
         const next = el instanceof HTMLElement ? el : null;
         scrollerRef.current = next;
@@ -210,8 +242,9 @@ export function useVirtuosoScroll(): VirtuosoScrollControls {
             next.addEventListener('wheel', onWheel, { passive: true });
             next.addEventListener('touchstart', onTouchStart, { passive: true });
             next.addEventListener('touchmove', onTouchMove, { passive: true });
+            next.addEventListener('pointerdown', onPointerDown, { passive: true });
         }
-    }, [onWheel, onTouchStart, onTouchMove]);
+    }, [onWheel, onTouchStart, onTouchMove, onPointerDown]);
 
     useEffect(() => {
         window.addEventListener('keydown', onKeyDown);
@@ -224,9 +257,10 @@ export function useVirtuosoScroll(): VirtuosoScrollControls {
                 el.removeEventListener('wheel', onWheel);
                 el.removeEventListener('touchstart', onTouchStart);
                 el.removeEventListener('touchmove', onTouchMove);
+                el.removeEventListener('pointerdown', onPointerDown);
             }
         };
-    }, [onWheel, onTouchStart, onTouchMove, onKeyDown, clearForceDegradeTimer]);
+    }, [onWheel, onTouchStart, onTouchMove, onPointerDown, onKeyDown, clearForceDegradeTimer]);
 
     return {
         virtuosoRef,

@@ -100,6 +100,7 @@ vi.mock('@/context/ChatRowLayoutContext', () => ({
 }));
 
 import MessageList from './MessageList';
+import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
 function msg(id: string, content: string, role: 'user' | 'assistant' = 'assistant'): MessageType {
   return { id, role, content, timestamp: new Date() } as MessageType;
@@ -119,7 +120,6 @@ function renderList(overrides: Partial<React.ComponentProps<typeof MessageList>>
     isLoading: false,
     sessionId: 's1',
     isActive: true,
-    isWindowFocused: true,
     firstItemIndex: 1_000_000,
     virtuosoRef: { current: null },
     ...createFollowProps(),
@@ -131,6 +131,9 @@ function renderList(overrides: Partial<React.ComponentProps<typeof MessageList>>
 }
 
 const lastData = () => recorded[recorded.length - 1];
+const AVAILABLE_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 0 };
+const SUSPENDED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: false, generation: 1 };
+const RESTORED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 1 };
 const streamingText = (r: Recorded) => {
   const last = r.data[r.data.length - 1];
   return typeof last?.content === 'string' ? last.content : '';
@@ -443,7 +446,6 @@ describe('MessageList — freeze data while inactive (Virtuoso cache-poisoning r
       streamingMessage: msg('stream', 'a'),
       isLoading: true,
       isActive: true,
-      isWindowFocused: true,
       firstItemIndex: 1_000_000,
       heightEstimateSeed: [120, 240, 360],
       onLoadOlder,
@@ -460,7 +462,6 @@ describe('MessageList — freeze data while inactive (Virtuoso cache-poisoning r
         streamingMessage={null}
         isLoading={false}
         isActive
-        isWindowFocused={false}
         firstItemIndex={999_995}
         heightEstimateSeed={[150, 270, 900]}
         sessionId="s1"
@@ -479,15 +480,13 @@ describe('MessageList — freeze data while inactive (Virtuoso cache-poisoning r
     expect(unfocused.components).not.toBe(focusedComponents);
 
     unfocused.atBottomStateChange?.(false);
-    expect(handleAtBottomChange).not.toHaveBeenCalled();
-    expect(followProps.followEnabledRef.current).toBe(true);
-    expect(unfocused.followOutput?.(true)).toBe('smooth');
-    followProps.followEnabledRef.current = false;
-    unfocused.atBottomStateChange?.(true);
-    expect(handleAtBottomChange).not.toHaveBeenCalled();
+    expect(handleAtBottomChange).toHaveBeenCalledWith(false);
     expect(followProps.followEnabledRef.current).toBe(false);
     expect(unfocused.followOutput?.(true)).toBe(false);
-    followProps.followEnabledRef.current = true;
+    unfocused.atBottomStateChange?.(true);
+    expect(handleAtBottomChange).toHaveBeenCalledWith(true);
+    expect(followProps.followEnabledRef.current).toBe(true);
+    expect(unfocused.followOutput?.(true)).toBe('smooth');
     unfocused.startReached?.();
     expect(onLoadOlder).toHaveBeenCalledTimes(1);
     expect(scrollToBottom).toHaveBeenCalledTimes(1);
@@ -499,7 +498,6 @@ describe('MessageList — freeze data while inactive (Virtuoso cache-poisoning r
         streamingMessage={null}
         isLoading={false}
         isActive
-        isWindowFocused
         firstItemIndex={999_995}
         heightEstimateSeed={[150, 270, 900]}
         sessionId="s1"
@@ -566,31 +564,102 @@ describe('MessageList — freeze data while inactive (Virtuoso cache-poisoning r
     expect(followRef.current).not.toBe(false);
   });
 
-  it('restores an internal Tab as soon as it becomes active even while the window is unfocused', () => {
-    const followRef: React.MutableRefObject<boolean | 'force'> = { current: true };
-    const scrollToBottom = vi.fn();
-    const history = [msg('h1', 'x', 'user'), msg('h2', 'y')];
+  it('freezes native suspension until the restored presentation has non-zero container geometry', () => {
+    let resizeCallback: ResizeObserverCallback | null = null;
+    class TestResizeObserver implements ResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const onViewportAdmissionChanged = vi.fn();
+    const history = [msg('h1', 'x', 'user')];
     const baseProps = {
-      messages: history,
       streamingMessage: null,
       isLoading: false,
+      isActive: true,
       firstItemIndex: 1_000_000,
       sessionId: 's1',
       virtuosoRef: { current: null },
-      followEnabledRef: followRef,
-      scrollToBottom,
+      ...createFollowProps(),
+      scrollToBottom: vi.fn(),
       handleAtBottomChange: vi.fn(),
+      onViewportAdmissionChanged,
     };
-    const { rerender } = renderList({ ...baseProps, isActive: true, isWindowFocused: true });
-    scrollToBottom.mockClear();
+    const { rerender } = renderList({
+      ...baseProps,
+      messages: [...history, msg('stream', 'a')],
+      streamingMessage: msg('stream', 'a'),
+      isLoading: true,
+      windowPresentation: AVAILABLE_PRESENTATION,
+    });
+    expect(streamingText(lastData())).toBe('a');
+    expect(onViewportAdmissionChanged).toHaveBeenLastCalledWith(true, 0);
 
-    rerender(<MessageList {...baseProps} isActive={false} isWindowFocused={false} />);
-    rerender(<MessageList {...baseProps} isActive isWindowFocused={false} />);
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
-    expect(scrollToBottom).toHaveBeenCalledWith('auto');
+    rerender(
+      <MessageList
+        {...baseProps}
+        messages={[...history, msg('stream', 'abc')]}
+        streamingMessage={msg('stream', 'abc')}
+        isLoading
+        windowPresentation={SUSPENDED_PRESENTATION}
+      />,
+    );
+    expect(streamingText(lastData())).toBe('a');
+    expect(onViewportAdmissionChanged).toHaveBeenLastCalledWith(false, 1);
 
-    rerender(<MessageList {...baseProps} isActive isWindowFocused />);
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+    rerender(
+      <MessageList
+        {...baseProps}
+        messages={[...history, msg('stream', 'abcdef')]}
+        streamingMessage={msg('stream', 'abcdef')}
+        isLoading
+        windowPresentation={RESTORED_PRESENTATION}
+      />,
+    );
+    expect(streamingText(lastData())).toBe('a');
+    expect(onViewportAdmissionChanged).toHaveBeenLastCalledWith(false, 1);
+
+    act(() => resizeCallback?.([
+      { contentRect: { width: 800, height: 600 } as DOMRectReadOnly } as ResizeObserverEntry,
+    ], {} as ResizeObserver));
+
+    expect(streamingText(lastData())).toBe('abcdef');
+    expect(onViewportAdmissionChanged).toHaveBeenLastCalledWith(true, 1);
+  });
+
+  it('does not admit live data when Chat first mounts inside a restored generation', () => {
+    let resizeCallback: ResizeObserverCallback | null = null;
+    class TestResizeObserver implements ResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+
+    const onViewportAdmissionChanged = vi.fn();
+    renderList({
+      messages: [msg('m1', 'restored content')],
+      windowPresentation: { surfaceAvailable: true, generation: 3 },
+      onViewportAdmissionChanged,
+    });
+
+    expect(lastData().data).toEqual([]);
+    expect(onViewportAdmissionChanged).toHaveBeenLastCalledWith(false, 3);
+
+    act(() => resizeCallback?.([
+      { contentRect: { width: 800, height: 600 } as DOMRectReadOnly } as ResizeObserverEntry,
+    ], {} as ResizeObserver));
+
+    expect(lastData().data.map(message => message.id)).toEqual(['m1']);
+    expect(onViewportAdmissionChanged).toHaveBeenLastCalledWith(true, 3);
   });
 
   it('freezes firstItemIndex while inactive (no prepend anchor drift mid-hide)', () => {

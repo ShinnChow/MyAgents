@@ -7,6 +7,7 @@ import { isTauriEnvironment } from '@/utils/browserMock';
 import { dismissTopmost } from '@/utils/closeLayer';
 import { setWindowVisible } from '@/services/notificationService';
 import { listenWithCleanup } from '@/utils/tauriListen';
+import type { MainWindowPresentationReason } from '@/utils/mainWindowPresentation';
 
 interface TrayEventsOptions {
   /** Whether minimize to tray is enabled */
@@ -20,13 +21,19 @@ interface TrayEventsOptions {
   onCmdWCloseTab?: () => void;
   /** Callback when the main window regains focus. */
   onWindowFocused?: () => void;
-  /** Synchronous projection of the native main-window focus state. */
-  onWindowFocusChanged?: (focused: boolean) => void;
+  /** Native shown/not-minimized projection. Focus only triggers a fresh sample. */
+  onWindowPresentationChanged?: (
+    surfaceAvailable: boolean,
+    reason: MainWindowPresentationReason,
+  ) => void;
 }
 
 export function useTrayEvents(options: TrayEventsOptions) {
   const optionsRef = useRef(options);
   optionsRef.current = options;
+  // One sequence spans effect listeners and imperative hide calls. Any newer
+  // native fact invalidates an older async isVisible/isMinimized sample.
+  const presentationSampleSequenceRef = useRef(0);
 
   // Handle window hide (minimize to tray)
   const hideWindow = useCallback(async () => {
@@ -35,11 +42,26 @@ export function useTrayEvents(options: TrayEventsOptions) {
     try {
       const { getCurrentWindow } = await import('@tauri-apps/api/window');
       const window = getCurrentWindow();
+      presentationSampleSequenceRef.current += 1;
+      optionsRef.current.onWindowPresentationChanged?.(false, 'hide-request');
       await window.hide();
       setWindowVisible(false);
       console.log('[useTrayEvents] Window hidden to tray');
     } catch (error) {
       console.error('[useTrayEvents] Failed to hide window:', error);
+      try {
+        const { getCurrentWindow } = await import('@tauri-apps/api/window');
+        const window = getCurrentWindow();
+        const sequence = ++presentationSampleSequenceRef.current;
+        const [visible, minimized] = await Promise.all([
+          window.isVisible(),
+          window.isMinimized(),
+        ]);
+        if (sequence !== presentationSampleSequenceRef.current) return;
+        optionsRef.current.onWindowPresentationChanged?.(visible && !minimized, 'hide-failed');
+      } catch (sampleError) {
+        console.warn('[useTrayEvents] Failed to resample window after hide failure:', sampleError);
+      }
     }
   }, []);
 
@@ -73,12 +95,42 @@ export function useTrayEvents(options: TrayEventsOptions) {
     if (!isTauriEnvironment()) return;
 
     let unlistenFocusChanged: (() => void) | null = null;
+    let unlistenResized: (() => void) | null = null;
     const ac = new AbortController();
 
     const setupListeners = async () => {
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
         const window = getCurrentWindow();
+        const publishPresentation = (
+          surfaceAvailable: boolean,
+          reason: MainWindowPresentationReason,
+        ) => {
+          if (ac.signal.aborted) return;
+          optionsRef.current.onWindowPresentationChanged?.(surfaceAvailable, reason);
+        };
+        const samplePresentation = async (reason: MainWindowPresentationReason) => {
+          const sequence = ++presentationSampleSequenceRef.current;
+          try {
+            const [visible, minimized] = await Promise.all([
+              window.isVisible(),
+              window.isMinimized(),
+            ]);
+            if (ac.signal.aborted || sequence !== presentationSampleSequenceRef.current) return;
+            publishPresentation(visible && !minimized, reason);
+          } catch (error) {
+            console.warn('[useTrayEvents] Failed to sample window presentation:', error);
+          }
+        };
+
+        // Rust-owned hide/show paths (notably the global summon shortcut) can
+        // suspend WebView event delivery before an async renderer sample sees
+        // the hidden interval. The canonical native helper publishes both
+        // edges through the existing Tauri event channel.
+        void listenWithCleanup<boolean>('main-window:presentation-changed', ({ payload }) => {
+          presentationSampleSequenceRef.current += 1;
+          publishPresentation(payload, 'native-event');
+        }, ac.signal);
 
         // window.onFocusChanged keeps the visibility tracker in sync (used by
         // `shouldNotify()`). Toast clicks are intentionally absent here: each
@@ -90,8 +142,8 @@ export function useTrayEvents(options: TrayEventsOptions) {
         // returned unlisten in the cleanup branch.
         unlistenFocusChanged = await window.onFocusChanged(({ payload: focused }) => {
           if (ac.signal.aborted) return;
-          optionsRef.current.onWindowFocusChanged?.(focused);
           console.debug('[useTrayEvents] Window focus changed:', focused);
+          void samplePresentation('focus-sample');
           if (focused) {
             setWindowVisible(true);
             optionsRef.current.onWindowFocused?.();
@@ -104,6 +156,34 @@ export function useTrayEvents(options: TrayEventsOptions) {
           unlistenFocusChanged = null;
           return;
         }
+
+        // Tao emits WM_SIZE as a Tauri resize event on Windows. A zero-sized
+        // client area is immediately unsafe for WebView layout; non-zero events
+        // trigger a native visible/minimized sample instead of guessing from size.
+        unlistenResized = await window.onResized(({ payload: size }) => {
+          if (ac.signal.aborted) return;
+          if (size.width <= 0 || size.height <= 0) {
+            presentationSampleSequenceRef.current += 1;
+            publishPresentation(false, 'resize-zero');
+            return;
+          }
+          void samplePresentation('resize-sample');
+        });
+        if (ac.signal.aborted) {
+          unlistenResized?.();
+          unlistenResized = null;
+          return;
+        }
+
+        const handleVisibilityChange = () => {
+          void samplePresentation('visibility-sample');
+        };
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+        ac.signal.addEventListener('abort', () => {
+          document.removeEventListener('visibilitychange', handleVisibilityChange);
+        }, { once: true });
+
+        void samplePresentation('initial');
 
         // ── Cmd+W handler (macOS custom menu item → window:cmd-w) ──
         // Separated from X button (CloseRequested). Cmd+W walks the close hierarchy:
@@ -133,9 +213,30 @@ export function useTrayEvents(options: TrayEventsOptions) {
 
           if (minimizeToTray) {
             const win = getCurrentWindow();
-            await win.hide();
-            setWindowVisible(false);
-            console.log('[useTrayEvents] Window hidden to tray');
+            presentationSampleSequenceRef.current += 1;
+            optionsRef.current.onWindowPresentationChanged?.(false, 'hide-request');
+            try {
+              await win.hide();
+              setWindowVisible(false);
+              console.log('[useTrayEvents] Window hidden to tray');
+            } catch (error) {
+              try {
+                const sequence = ++presentationSampleSequenceRef.current;
+                const [visible, minimized] = await Promise.all([
+                  win.isVisible(),
+                  win.isMinimized(),
+                ]);
+                if (sequence === presentationSampleSequenceRef.current) {
+                  optionsRef.current.onWindowPresentationChanged?.(
+                    visible && !minimized,
+                    'hide-failed',
+                  );
+                }
+              } catch (sampleError) {
+                console.warn('[useTrayEvents] Failed to resample window after close-hide failure:', sampleError);
+              }
+              throw error;
+            }
           } else {
             const { onExitRequested } = optionsRef.current;
             if (onExitRequested) {
@@ -180,6 +281,7 @@ export function useTrayEvents(options: TrayEventsOptions) {
     return () => {
       ac.abort();
       if (unlistenFocusChanged) unlistenFocusChanged();
+      if (unlistenResized) unlistenResized();
     };
   }, []);
 

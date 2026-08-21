@@ -105,6 +105,7 @@ import {
 } from '../../shared/official-tools';
 import { isSupportedLocale } from '../../shared/i18n';
 import { workspacePathsEqual } from '../../shared/workspacePath';
+import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 import { supportsCodexConversationBranch } from '../../shared/codex-conversation-capability';
 import { coerceReasoningEffortForRuntime, reasoningEffortChoices } from '../../shared/reasoningEffort';
 import type { ProviderHistoryEnv } from '../../shared/providerHistory';
@@ -447,8 +448,8 @@ const SessionTitleEditor = forwardRef<
 });
 
 interface ChatProps {
-  /** Native desktop-window focus projection; independent from internal Tab activity. */
-  isWindowFocused: boolean;
+  /** Native shown/not-minimized lifecycle; focus is intentionally independent. */
+  windowPresentation: MainWindowPresentation;
   /** Called when user starts a new session. Returns true if handled externally (background completion started). */
   onNewSession?: () => Promise<boolean>;
   /** Opens a persisted Session through App's canonical new/jump/revive path. */
@@ -488,7 +489,7 @@ function isCurrentSessionGoal(goal: SessionGoal | null | undefined): goal is Ses
   return Boolean(goal);
 }
 
-export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
+export default function Chat({ windowPresentation, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
   // Get state from TabContext (required - Chat must be inside TabProvider)
   const {
     tabId,
@@ -3259,7 +3260,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
   const chatScrollController = useChatScrollController({
     messages: chatScrollModel.data,
     isActive,
-    isWindowFocused,
+    windowPresentation,
     sessionId,
     rootRef: chatContentRef,
   });
@@ -3271,6 +3272,9 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     pauseAutoScroll,
     handleAtBottomChange,
     attachScroller,
+    onViewportAdmissionChanged,
+    onItemsRendered,
+    isViewportRecoveryFenced,
     scrollToMessage,
     scrollToTool,
     captureAnchor,
@@ -5399,7 +5403,10 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
               isLoading={isLoading}
               sessionId={sessionId}
               isActive={isActive}
-              isWindowFocused={isWindowFocused}
+              windowPresentation={windowPresentation}
+              onViewportAdmissionChanged={onViewportAdmissionChanged}
+              onItemsRendered={onItemsRendered}
+              isViewportRecoveryFenced={isViewportRecoveryFenced}
               virtuosoRef={virtuosoRef}
               onScrollerRef={attachScroller}
               followEnabledRef={followEnabledRef}

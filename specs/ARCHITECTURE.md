@@ -356,7 +356,8 @@ Tab 内 MUST 用 `useTabState()` 的 `apiGet` / `apiPost`，禁止全局 `apiPos
 
 App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Thought 只提交创建/讨论意图，不各自挂第二个 modal；`task.detail` / `task.comment` route 都由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
 
-- 桌面主窗口 focus 以 Tauri `onFocusChanged` 为持续事件 authority；`App` 启动时用 renderer 当前 foreground 状态播种一次，之后只持有一个布尔投影并只让 active Chat 响应。focus 只负责保存/恢复滚动意图，不能充当窗口可见性或 geometry authority：仍在展示的 active Chat 即使失焦也持续把 live 消息交给 Virtuoso。只有 App 确实以 `content-visibility:hidden` 隐藏的 internal inactive Tab 才冻结 Virtuoso 输入；TabProvider/Sidecar 生命周期始终不受两者影响。
+- 桌面主窗口的 renderable surface 投影由 App Shell 拥有：`useTrayEvents` 在 focus、resize、document visibility 与主动 hide 边界采样 Tauri `isVisible() && !isMinimized()`，零尺寸 resize 可先行判为 unavailable；Rust-owned 的全局快捷键 hide/show 通过 `tray::hide_main_window` / `tray::show_main_window` 在现有 Tauri event channel 同步投影同一个 surface edge，避免 WebView suspend 让异步 renderer 采样吞掉完整 hidden interval。`App` 只在 available→unavailable 时推进 presentation generation，并只把该投影交给 active Chat。focus 值仅服务通知/input attention，不拥有 Chat 滚动、窗口可见性或 geometry；仍在展示的窗口即使失焦也持续把 live 消息交给 Virtuoso，失焦/重新聚焦本身不得产生 scroll command。
+- MessageList 外层 viewport 的非零 `ResizeObserver` 结果是当前 presentation generation 的 renderer readiness authority。internal inactive Tab、native minimized/hidden surface 或尚未 ready 的恢复 generation 都冻结 Virtuoso 的 data/index/height input；消息/SSE 与 TabProvider/Sidecar 生命周期继续推进。`useChatScrollController` 是唯一 continuity owner：viewport admission 从 true→false 时保存 follow 或最近可信 message anchor，从 false→true 时只执行一个受 Session/transaction identity 保护的恢复意图；未挂载 anchor 通过 Virtuoso `itemsRendered` 事件结算，禁止 focus snapshot、固定延时、RAF 猜测或把可见的 `align:start` 当最终位置。完整不变量见 [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md)。
 - 侧栏只从既有 `ConfigProvider`、任务中心 store、Session 索引与当前 Tab 派生工作区/Session 展示；active 高亮是 projection，不持久化第二份“当前页面”。该投影保持单一持久选中面：Launcher 选择工作区时高亮工作区行，Chat 已进入具体 Session 时只高亮 Session 行，父工作区仅保留层级上下文而不同时涂底或声明 `aria-current`。工作区配置和 Session mutation 分别调用现有 Config / Task Center authority，不在侧栏另存领域状态。
 - 侧栏与顶部 Title/Tab chrome 是同一 App Shell material surface：三者只读取完整 Theme 必需的 `--global-sidebar-bg`，该 Token 由每套 Theme 的 light/dark package 拥有；页面内容与卡片/弹层继续使用既有 `--paper / --paper-elevated / --paper-inset` 语义。App Shell chrome 不再依赖与内容区的分割线，常规 leading inset 为 8px，手动 rail 的 52px 预留同时容纳固定 toggle 与其后 8px 留白；Tab active/hover 复用全局 `--hover-bg`。不能为制造分区而翻转通用 Paper 层级、在组件内混色或为 Tab Chrome 复制一套局部 palette。
 - 侧栏展开/rail 切换的布局槽一次提交最终宽度，不能给 `width` / `flex-basis` 加逐帧 transition 让 Chat、Browser、Terminal 等 resize-sensitive surface 连续重排。可见边界由固定展开宽度的独立 paint-only 材质层通过 `clip-path` 横向揭示/收回；右侧 Tab 标题栏与内容用一次布局后的 compositor transform 保持旧视觉中心，再与边界同节奏归位。Chat 右侧工作区复用镜像模式：面板材质横移，对话区在最终 flex 布局上从旧中心归位；内容只做 opacity/translate/clip 编排，且必须提供 `prefers-reduced-motion` 立即切换路径。
@@ -1137,6 +1138,7 @@ Windows 无自带 git/bash，NSIS 静默安装 Git for Windows（`src-tauri/nsis
 - [设计系统](./DESIGN.md) — Token / 组件 / 页面规范
 - [Theme System](./tech_docs/theme_system.md) — Theme/Appearance 状态、注册契约、Token/adapter owner、bootstrap 与跨窗口同步
 - [React 稳定性规范](./tech_docs/react_stability_rules.md) — Context / useEffect / memo 5 条规则
+- [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md) — native surface、container readiness、Virtuoso admission 与 continuity transaction
 - [UI 国际化架构](./tech_docs/i18n_architecture.md) — `uiLanguage`、i18next resources、native tray language mirror、增加新语言流程
 
 ### CLI

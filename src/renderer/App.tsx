@@ -134,6 +134,11 @@ import {
 import { buildRuntimeBackedInitialSessionBirth } from '@/utils/providerSwitchSessionBirth';
 import { resolveGlobalSidebarWorkspace } from '@/utils/globalSidebarProjection';
 import {
+  createInitialMainWindowPresentation,
+  reduceMainWindowPresentation,
+  type MainWindowPresentation,
+} from '@/utils/mainWindowPresentation';
+import {
   nowForSpaceMetric,
   trackSpaceToolMutation,
 } from '@/pages/space/spaceMetrics';
@@ -250,7 +255,7 @@ export interface LaunchProjectAnalyticsContext {
 interface TabContentProps {
   tab: Tab;
   isActive: boolean;
-  isWindowFocused: boolean;
+  windowPresentation: MainWindowPresentation;
   isLoading: boolean;
   error: string | null;
   /**
@@ -316,7 +321,7 @@ interface TabContentProps {
 
 // Exported for focused content-mount behavior tests.
 export const MemoizedTabContent = memo(function TabContent({
-  tab, isActive, isWindowFocused, isLoading, error, isDeferredMount,
+  tab, isActive, windowPresentation, isLoading, error, isDeferredMount,
   onLaunchProject, onOpenHistorySession, onNewSession, onLaunchRuntimeBackedProviderSession,
   onUpdateGenerating, onUpdateTitle, onUpdateUnread, onRenameSession, onForkSession, onUpdateSessionId, onClearInitialMessage,
   claimSessionOpeningTransition,
@@ -432,7 +437,7 @@ export const MemoizedTabContent = memo(function TabContent({
           ) : (
             <Suspense fallback={<ChatBootOverlay />}>
               <Chat
-                isWindowFocused={isWindowFocused}
+                windowPresentation={windowPresentation}
                 onOpenSession={(sessionId, title, historyEntrySource) => onOpenHistorySession(tab.id, sessionId, title, historyEntrySource)}
                 onOpenSessionInNewTab={(sessionId, title) => onOpenHistorySession(tab.id, sessionId, title, 'chat_dropdown_new_tab')}
                 onNewSession={() => onNewSession(tab.id)}
@@ -460,9 +465,9 @@ export const MemoizedTabContent = memo(function TabContent({
   return (
     prev.tab === next.tab &&
     prev.isActive === next.isActive &&
-    // Desktop focus only affects the active Chat's geometry boundary. Keep
-    // inactive heavy Tab subtrees out of every app-switch render.
-    (next.tab.view !== 'chat' || !next.isActive || prev.isWindowFocused === next.isWindowFocused) &&
+    // Native presentation only affects the active Chat's geometry boundary.
+    // Keep inactive heavy Tab subtrees out of minimize/restore renders.
+    (next.tab.view !== 'chat' || !next.isActive || prev.windowPresentation === next.windowPresentation) &&
     prev.isLoading === next.isLoading &&
     prev.error === next.error &&
     // Drives the deferred-mount → real-content transition for new tabs.
@@ -510,7 +515,14 @@ export default function App() {
   const { config, isLoading: configLoading, providers: appProviders, apiKeys: appApiKeys, providerVerifyStatus: appProviderVerifyStatus, projects: configProjects, addProject: configAddProject, patchProject: configPatchProject } = useConfig();
   const spaceBuildCapability = useSpaceBuildCapability(config.spaceEnvironment);
   const teamSpaceAvailable = spaceBuildCapability.available && config.teamSpaceEnabled === true;
-  const [isWindowFocused, setIsWindowFocused] = useState(isRendererForegrounded);
+  const [windowPresentation, setWindowPresentation] = useState(() => (
+    createInitialMainWindowPresentation(
+      typeof document === 'undefined' || document.visibilityState === 'visible',
+    )
+  ));
+  const handleWindowPresentationChanged = useCallback((surfaceAvailable: boolean) => {
+    setWindowPresentation(current => reduceMainWindowPresentation(current, surfaceAvailable));
+  }, []);
 
   // Helper Agent's persisted model defaults — used by BugReportOverlay for
   // initial picker selection + persist on pick. The LAUNCH_BUG_REPORT handler
@@ -3599,7 +3611,7 @@ export default function App() {
       // Cmd+W bottom: overlay → split → tab → launcher → STOP.
       closeCurrentTab(); // Last tab auto-creates launcher; launcher is a no-op.
     },
-    onWindowFocusChanged: setIsWindowFocused,
+    onWindowPresentationChanged: handleWindowPresentationChanged,
     onWindowFocused: handleWindowFocused,
     onExitRequested: async () => {
       // User-owned scheduler lifecycle is authoritative here. Ordinary Cron
@@ -3731,7 +3743,7 @@ export default function App() {
             key={tab.id}
             tab={tab}
             isActive={tab.id === activeTabId}
-            isWindowFocused={isWindowFocused}
+            windowPresentation={windowPresentation}
             isLoading={loadingTabs[tab.id] ?? false}
             error={tabErrors[tab.id] ?? null}
             isDeferredMount={deferredMountTabIds.has(tab.id)}
