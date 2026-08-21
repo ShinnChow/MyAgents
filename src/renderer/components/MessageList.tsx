@@ -465,12 +465,17 @@ const MessageList = memo(function MessageList({
   const isItemMeasurementActiveRef = useRef(canLayoutVirtualList);
   isItemMeasurementActiveRef.current = canLayoutVirtualList;
   const measureVisibleItemSize = useCallback<SizeFunction>((element, field) => {
+    const knownSize = Number(element.dataset.knownSize);
     if (!isItemMeasurementActiveRef.current) {
-      const knownSize = Number(element.dataset.knownSize);
-      if (Number.isFinite(knownSize)) return knownSize;
+      if (Number.isFinite(knownSize) && knownSize > 0) return knownSize;
     }
     const rectField = field === 'offsetWidth' ? 'width' : 'height';
-    return Math.round(element.getBoundingClientRect()[rectField]);
+    const measuredSize = Math.round(element.getBoundingClientRect()[rectField]);
+    // A mounted row always has positive layout size. Some WebViews can briefly report
+    // zero while updating a long virtualized list; feeding that transient geometry into
+    // Virtuoso corrupts its size model and can move the viewport far from the anchor.
+    if (measuredSize <= 0 && Number.isFinite(knownSize) && knownSize > 0) return knownSize;
+    return measuredSize;
   }, []);
   const [isLargeRowShrinking, setIsLargeRowShrinking] = useState(false);
   const collapseMeasureFrameRef = useRef<number | null>(null);

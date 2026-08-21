@@ -8,7 +8,7 @@
  *  - `false`:   disabled (user scrolled up, or paused for rewind/retry/search).
  *
  * Transitions:
- *  scrollToBottom()                     → 'force' (+ grace window + auto-degrade timer)
+ *  scrollToBottom()                     → 'force' (+ auto-degrade timer)
  *  atBottomStateChange(true)            → true    (covers force→true success AND
  *                                                  false→true when the user manually
  *                                                  scrolls back to bottom. Skipped while
@@ -16,7 +16,7 @@
  *                                                  search / retry don't get hijacked.)
  *  atBottomStateChange(false) + true    → false   (user scrolled up during normal follow)
  *  upward wheel / PageUp / ArrowUp /    → false   (escape hatch for `'force'` — without
- *  Home (after grace window)                       this, force persists forever when
+ *  Home                                            this, force persists forever when
  *                                                  content grows faster than the
  *                                                  programmatic scroll can reach bottom,
  *                                                  trapping the user in a bounce-back
@@ -50,10 +50,6 @@ export interface UseVirtuosoScrollOptions {
     onUserScrollIntent?: () => void;
 }
 
-// Suppress user-intent escape for this long after a programmatic scrollToBottom. Covers
-// inertial wheel ticks from the smooth-scroll animation that would otherwise
-// mis-trigger the force→false exit.
-const PROGRAMMATIC_SCROLL_GRACE_MS = 600;
 // Fallback: degrade 'force' → true after this long even if atBottom(true) never fires.
 // Without this, a session where streaming content grows faster than the smooth scroll
 // can reach bottom (and no wheel/key events arrive — e.g., trackpad-only / scrollbar
@@ -71,8 +67,6 @@ export function useVirtuosoScroll({ onUserScrollIntent }: UseVirtuosoScrollOptio
     // otherwise rewind/search/retry silently lose their follow suppression when Virtuoso
     // re-fires atBottom for unrelated reasons (measurement shifts during streaming).
     const pauseActiveRef = useRef(false);
-    // Timestamp after which user-intent events are honored; see PROGRAMMATIC_SCROLL_GRACE_MS.
-    const graceUntilRef = useRef(0);
     // Auto-degrade force→true fallback timer (FORCE_AUTO_DEGRADE_MS).
     const forceDegradeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const onUserScrollIntentRef = useRef(onUserScrollIntent);
@@ -103,7 +97,6 @@ export function useVirtuosoScroll({ onUserScrollIntent }: UseVirtuosoScrollOptio
     // bundled source's `function f(y) { _(i, { align: 'end', behavior: y, index: 'LAST' }) }`.
     const scrollToBottom = useCallback((behavior: 'smooth' | 'auto' = 'smooth') => {
         followEnabledRef.current = 'force';
-        graceUntilRef.current = Date.now() + PROGRAMMATIC_SCROLL_GRACE_MS;
         virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior });
         clearForceDegradeTimer();
         forceDegradeTimerRef.current = setTimeout(() => {
@@ -161,7 +154,6 @@ export function useVirtuosoScroll({ onUserScrollIntent }: UseVirtuosoScrollOptio
     // downward wheel while already at bottom is a no-op that mustn't silently disable
     // auto-follow for subsequent streaming content.
     const breakForceIfUserIntent = useCallback(() => {
-        if (Date.now() < graceUntilRef.current) return;
         if (followEnabledRef.current === false) return;
         followEnabledRef.current = false;
         clearForceDegradeTimer();

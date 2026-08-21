@@ -28,4 +28,27 @@ describe('useVirtuosoScroll user intent projection', () => {
     scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -10 }));
     expect(onUserScrollIntent).toHaveBeenCalledTimes(4);
   });
+
+  it('lets immediate upward input escape force while downward wheel keeps following', () => {
+    const { result, unmount } = renderHook(() => useVirtuosoScroll());
+    const scroller = document.createElement('div');
+    act(() => result.current.attachScroller(scroller));
+
+    act(() => result.current.scrollToBottom());
+    expect(result.current.followEnabledRef.current).toBe('force');
+
+    scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: 10 }));
+    expect(result.current.followEnabledRef.current).toBe('force');
+
+    scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -10 }));
+    expect(result.current.followEnabledRef.current).toBe(false);
+
+    for (const key of ['PageUp', 'ArrowUp', 'Home']) {
+      act(() => result.current.scrollToBottom());
+      window.dispatchEvent(new KeyboardEvent('keydown', { key }));
+      expect(result.current.followEnabledRef.current).toBe(false);
+    }
+
+    unmount();
+  });
 });

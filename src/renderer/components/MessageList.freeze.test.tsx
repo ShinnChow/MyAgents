@@ -323,6 +323,21 @@ describe('MessageList — freeze data while inactive (Virtuoso cache-poisoning r
     expect(queuedItemMeasurement?.(hiddenItem, 'offsetHeight')).toBe(321);
   });
 
+  it('rejects transient zero geometry while active without overriding valid live measurements', () => {
+    renderList({ messages: [msg('tool-row', 'variable-height tool output')] });
+    const itemMeasurement = lastData().itemSize;
+
+    const transientlyZeroItem = document.createElement('div');
+    transientlyZeroItem.dataset.knownSize = '321';
+    vi.spyOn(transientlyZeroItem, 'getBoundingClientRect').mockReturnValue({ height: 0 } as DOMRect);
+    expect(itemMeasurement?.(transientlyZeroItem, 'offsetHeight')).toBe(321);
+
+    const measurableItem = document.createElement('div');
+    measurableItem.dataset.knownSize = '321';
+    vi.spyOn(measurableItem, 'getBoundingClientRect').mockReturnValue({ height: 456 } as DOMRect);
+    expect(itemMeasurement?.(measurableItem, 'offsetHeight')).toBe(456);
+  });
+
   it('does NOT forward streaming growth to Virtuoso while inactive, and resumes live on re-activation', () => {
     const history = [msg('h1', 'hello', 'user'), msg('h2', 'hi there')];
 
