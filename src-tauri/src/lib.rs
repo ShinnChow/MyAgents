@@ -5,6 +5,9 @@ pub mod app_dirs;
 pub mod app_route;
 pub mod attachment_protocol;
 pub mod browser;
+pub mod browser_identity_store;
+pub mod browser_profile_lease;
+pub mod browser_runtime_authority;
 pub mod cli;
 mod commands;
 pub mod config_io;
@@ -30,6 +33,7 @@ mod macos_arrow_filter;
 mod macos_traffic_light;
 pub mod managed_codex;
 pub mod management_api;
+pub mod mcp_startup_admission;
 pub mod memory_auto_update;
 pub mod memory_evolution;
 pub mod notification;
@@ -411,6 +415,8 @@ pub fn run() {
             sse_proxy::session_sidecar_http_request,
             sse_proxy::global_sidecar_http_request,
             sse_proxy::proxy_analytics_http_request,
+            browser_identity_store::cmd_browser_identity_read,
+            browser_identity_store::cmd_browser_identity_mutate,
             // Updater commands
             updater::check_and_download_update,
             updater::restart_app,

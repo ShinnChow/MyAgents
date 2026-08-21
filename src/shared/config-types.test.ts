@@ -29,6 +29,16 @@ import {
 import managedCodexRuntimeLock from './managed-codex-runtime.json';
 
 describe('MCP presets', () => {
+  it('defaults new installs to an isolated Playwright browser context', () => {
+    expect(DEFAULT_CONFIG.playwrightBrowser).toEqual({
+      schemaVersion: 1,
+      mode: 'isolated',
+      headless: false,
+      capabilities: ['storage'],
+      extraArgs: [],
+    });
+  });
+
   it('keeps Tavily credentials out of the URL and projects them through an auth header', () => {
     const tavily = PRESET_MCP_SERVERS.find(server => server.id === 'tavily-search');
 

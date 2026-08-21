@@ -65,6 +65,8 @@ src-tauri/resources/sharp-runtime
 src-tauri/resources/document-processing/*
 !src-tauri/resources/document-processing/.gitkeep
 src-tauri/resources/document-processing-cache/
+src-tauri/resources/playwright-browsers/*
+!src-tauri/resources/playwright-browsers/.gitkeep
 src-tauri/resources/tsx-runtime
 src-tauri/resources/nodejs/*
 !src-tauri/resources/nodejs/.gitkeep

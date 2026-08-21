@@ -370,13 +370,14 @@ Product Session 的当前 identity、待创建的桌面 Session 和 metadata 冻
 
 `Query.initializationResult()` 只表示 SDK control request 可用，streamed `system_init` 只表示某一 turn 的 metadata；SDK 的 MCP transport 仍可能处于 `pending`、`failed`、`needs-auth` 或 `disabled`。这不是 AI turn 的可用性前置条件：Desktop、Launcher、IM 与 injected turn 全部在公共 `messageGenerator()` dispatch seam 观察同一个 Query/map generation owner，adapter 入口不再因 MCP hard-reject 任务。soft observation 仍串行发生在 domain guard 之前；因此带 `beforeDispatch` 的 injected turn 保持 `soft observation → domain guard → admission/persistence → SDK dispatch` 顺序，`pending` 最多按该 owner 的剩余绝对预算延迟后续步骤，但任何 MCP outcome 都不能拒绝任务。
 
-`builtin-session/lifecycle.ts` 持有 Query/map generation 的一次性 soft pre-warm owner：
+`builtin-session/lifecycle.ts` 持有 Query/map generation 的 dispatch grace owner；同一 generation 的 live capability 由 `agent-session.ts` 的有界低频 observer 持续投影：
 
 - Query object identity 改变时递增 generation；成功安装新 map 时递增 revision，并创建 owner-owned absolute deadline。
 - 当前预算由 `MCP_PREWARM_GRACE_MS` 派生，现为 10 秒；用户发送只消费从 owner 创建时起的**剩余**时间，不创建 per-turn 新窗口。
-- `connected` 全部到齐即 ready；`failed`、`needs-auth`、`disabled`、missing、status read error 或 deadline 都 terminal degraded，随后照常 dispatch。
-- settled outcome 保存在 owner 上；同 generation 后续 turn 是零 control-RPC fast path。owner replacement 时 promoted item 原样 requeue，只交给 replacement Query。
-- `mcpServerStatus()` 仍按 owner single-flight，避免无 AbortSignal 的 SDK control request 被重复堆积；它的异常只降级 MCP，不重建 Query。
+- 首次观察即使发生在 deadline 之后也至少读取一次真实状态；全部 `connected` 即 ready，仍未就绪或读取异常只释放本轮 dispatch，随后照常执行 AI turn。
+- dispatch outcome 保存在 owner 上；同 generation 后续 turn 是零 control-RPC fast path。它不再充当工具可用性的永久事实；低频 observer 继续发布 queued/starting/ready/needs-auth/failed 与真实 tool catalog。
+- owner replacement 时 promoted item 原样 requeue，只交给 replacement Query。`mcpServerStatus()` 在每次观察内 single-flight，observer 绑定 exact owner 的 abort，不按每个 turn 建 timer 或重启 Query。
+- MyAgents-owned 本地 stdio MCP 先经 Rust application startup admission；queue 时间计入原 10 秒 grace，迟到 grant 继续 live recovery，但绝不自动重放已经放行的 turn。
 
 Cron / Goal / Heartbeat / Memory Update 的领域 `beforeDispatch` guard 仍在公共 soft observation 之后执行，继续负责 claim、cancel、rollback 与 dispatch acceptance；MCP 不参与领域拒绝，也不再拥有 injected-only pre-persistence/final 双 fence。
 

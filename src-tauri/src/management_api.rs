@@ -113,6 +113,52 @@ pub async fn start_management_api() -> Result<u16, String> {
             "/api/runtime/sdk-child/settle",
             post(sdk_child_settle_handler),
         )
+        .route(
+            "/api/mcp/startup/acquire",
+            post(mcp_startup_acquire_handler),
+        )
+        .route("/api/mcp/startup/cancel", post(mcp_startup_cancel_handler))
+        .route("/api/mcp/startup/settle", post(mcp_startup_settle_handler))
+        .route(
+            "/api/browser/capability/acquire",
+            post(browser_capability_acquire_handler),
+        )
+        .route(
+            "/api/browser/capability/verify",
+            post(browser_capability_verify_handler),
+        )
+        .route(
+            "/api/browser/session/adopt",
+            post(browser_session_adopt_handler),
+        )
+        .route(
+            "/api/browser/profile/acquire",
+            post(browser_profile_acquire_handler),
+        )
+        .route(
+            "/api/browser/profile/cancel",
+            post(browser_profile_cancel_handler),
+        )
+        .route(
+            "/api/browser/profile/release",
+            post(browser_profile_release_handler),
+        )
+        .route(
+            "/api/browser/profile/status",
+            post(browser_profile_status_handler),
+        )
+        .route(
+            "/api/browser/identity/read",
+            post(browser_identity_read_handler),
+        )
+        .route(
+            "/api/browser/identity/checkpoint",
+            post(browser_identity_checkpoint_handler),
+        )
+        .route(
+            "/api/browser/identity/mutate",
+            post(browser_identity_mutate_handler),
+        )
         .route("/api/cron/create", post(create_cron_handler))
         .route("/api/cron/list", get(list_cron_handler))
         .route("/api/cron/update", post(update_cron_handler))
@@ -453,6 +499,772 @@ async fn sdk_child_settle_handler(
         );
     }
     no_store_json(serde_json::json!({ "ok": true }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStartupAcquireRequest {
+    sidecar_id: String,
+    request_id: String,
+    executable_identity: String,
+    runtime_generation: u64,
+    config_generation: u64,
+    priority: String,
+}
+
+fn valid_mcp_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn sidecar_is_live(sidecar_id: &str, generation: u64) -> bool {
+    get_sidecar_state()
+        .and_then(|sidecars| sidecars.lock().ok())
+        .is_some_and(|manager| manager.is_live_process(sidecar_id, generation))
+}
+
+async fn mcp_startup_acquire_handler(
+    headers: HeaderMap,
+    Json(req): Json<McpStartupAcquireRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let request_id = req.request_id.trim();
+    let executable_identity = req.executable_identity.trim();
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if sidecar_id.is_empty()
+        || !valid_mcp_request_id(request_id)
+        || !is_executable_identity(executable_identity)
+        || req.runtime_generation == 0
+        || req.config_generation == 0
+    {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid MCP startup identity and generations are required",
+        }));
+    }
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let priority = match req.priority.as_str() {
+        "interactive" => crate::mcp_startup_admission::AdmissionPriority::Interactive,
+        "background" => crate::mcp_startup_admission::AdmissionPriority::Background,
+        _ => {
+            return no_store_json(serde_json::json!({
+                "ok": false,
+                "code": "invalid_request",
+                "error": "priority must be interactive or background",
+            }));
+        }
+    };
+    let request = crate::mcp_startup_admission::McpStartupRequest {
+        request_id: request_id.to_string(),
+        executable_identity: executable_identity.to_string(),
+        sidecar_id: sidecar_id.to_string(),
+        sidecar_generation: source_generation,
+        runtime_generation: req.runtime_generation,
+        config_generation: req.config_generation,
+    };
+    let admission =
+        crate::mcp_startup_admission::request_mcp_startup(request, priority, sidecar_is_live);
+    no_store_json(serde_json::json!({
+        "ok": true,
+        "admitted": admission.admitted,
+        "leaseEpoch": admission.lease_epoch,
+        "queuePosition": admission.queue_position,
+        "retryAfterMs": admission.retry_after_ms,
+        "errorCode": admission.error_code,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStartupSettleRequest {
+    sidecar_id: String,
+    request_id: String,
+    executable_identity: String,
+    runtime_generation: u64,
+    config_generation: u64,
+    lease_epoch: u64,
+    outcome: String,
+    error_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStartupCancelRequest {
+    sidecar_id: String,
+    request_id: String,
+    executable_identity: String,
+    runtime_generation: u64,
+    config_generation: u64,
+}
+
+async fn mcp_startup_cancel_handler(
+    headers: HeaderMap,
+    Json(req): Json<McpStartupCancelRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let request_id = req.request_id.trim();
+    let executable_identity = req.executable_identity.trim();
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if sidecar_id.is_empty()
+        || !valid_mcp_request_id(request_id)
+        || !is_executable_identity(executable_identity)
+        || req.runtime_generation == 0
+        || req.config_generation == 0
+    {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid MCP startup demand identity is required",
+        }));
+    }
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let request = crate::mcp_startup_admission::McpStartupRequest {
+        request_id: request_id.to_string(),
+        executable_identity: executable_identity.to_string(),
+        sidecar_id: sidecar_id.to_string(),
+        sidecar_generation: source_generation,
+        runtime_generation: req.runtime_generation,
+        config_generation: req.config_generation,
+    };
+    let cancelled = crate::mcp_startup_admission::cancel_mcp_startup(&request, sidecar_is_live);
+    no_store_json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
+}
+
+async fn mcp_startup_settle_handler(
+    headers: HeaderMap,
+    Json(req): Json<McpStartupSettleRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let request_id = req.request_id.trim();
+    let executable_identity = req.executable_identity.trim();
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if sidecar_id.is_empty()
+        || !valid_mcp_request_id(request_id)
+        || !is_executable_identity(executable_identity)
+        || req.runtime_generation == 0
+        || req.config_generation == 0
+        || req.lease_epoch == 0
+    {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid MCP startup lease identity is required",
+        }));
+    }
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let error_code = req.error_code.as_deref();
+    let outcome = match req.outcome.as_str() {
+        "ready" => crate::runtime_launch_guard::LaunchOutcome::Ready,
+        "spawn_denied" if error_code.is_some_and(is_launch_error_code) => {
+            crate::runtime_launch_guard::LaunchOutcome::SpawnDenied
+        }
+        "released" | "failed" => crate::runtime_launch_guard::LaunchOutcome::Released,
+        _ => {
+            return no_store_json(serde_json::json!({
+                "ok": false,
+                "code": "invalid_request",
+                "error": "outcome must be ready, failed, released, or deterministic spawn_denied",
+            }));
+        }
+    };
+    let request = crate::mcp_startup_admission::McpStartupRequest {
+        request_id: request_id.to_string(),
+        executable_identity: executable_identity.to_string(),
+        sidecar_id: sidecar_id.to_string(),
+        sidecar_generation: source_generation,
+        runtime_generation: req.runtime_generation,
+        config_generation: req.config_generation,
+    };
+    let settled = crate::mcp_startup_admission::settle_mcp_startup(
+        &request,
+        req.lease_epoch,
+        outcome,
+        error_code,
+        sidecar_is_live,
+    );
+    no_store_json(serde_json::json!({ "ok": true, "settled": settled }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserCapabilityAcquireRequest {
+    sidecar_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserSessionAdoptRequest {
+    sidecar_id: String,
+    product_session_id: String,
+}
+
+fn valid_browser_product_session_id(value: &str) -> bool {
+    (1..=99).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !value.starts_with("pending-")
+}
+
+async fn browser_session_adopt_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserSessionAdoptRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let product_session_id = req.product_session_id.trim();
+    if sidecar_id.is_empty() || !valid_browser_product_session_id(product_session_id) {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A canonical Product Session ID is required",
+        }));
+    }
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let Some(sidecars) = get_sidecar_state() else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    let current_session_id = sidecars.lock().ok().and_then(|manager| {
+        manager.validate_browser_product_session_projection(
+            sidecar_id,
+            source_generation,
+            product_session_id,
+        )
+    });
+    let Some(current_session_id) = current_session_id else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_source_invalid",
+            "error": "The Browser execution identity is not owned by this Session Sidecar",
+        }));
+    };
+    let adopted = crate::browser_runtime_authority::project_browser_product_session(
+        sidecar_id,
+        source_generation,
+        &current_session_id,
+        product_session_id,
+    );
+    no_store_json(serde_json::json!({ "ok": adopted, "adopted": adopted }))
+}
+
+async fn browser_capability_acquire_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserCapabilityAcquireRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    if sidecar_id.is_empty() {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "sidecarId is required",
+        }));
+    }
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+
+    let Some(sidecars) = get_sidecar_state() else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    let resolved = sidecars
+        .lock()
+        .map_err(|error| error.to_string())
+        .ok()
+        .and_then(|mut manager| {
+            let source =
+                manager.resolve_browser_capability_source(sidecar_id, source_generation)?;
+            let host = manager.global_process_binding()?;
+            Some((source, host))
+        });
+    let Some((source, host_binding)) = resolved else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_source_invalid",
+            "error": "The requesting Session Sidecar no longer owns a browser capability source",
+        }));
+    };
+    let (host_port, host_generation) = host_binding;
+
+    let token = crate::browser_runtime_authority::issue_browser_capability(
+        crate::browser_runtime_authority::BrowserCapabilityBinding {
+            product_session_id: source.product_session_id,
+            workspace_path: source.workspace_path.to_string_lossy().into_owned(),
+            source_sidecar_id: sidecar_id.to_string(),
+            source_generation,
+            host_generation,
+        },
+    );
+    no_store_json(serde_json::json!({
+        "ok": true,
+        "url": format!("http://127.0.0.1:{host_port}/mcp/playwright"),
+        "token": token,
+        "hostGeneration": host_generation,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserCapabilityVerifyRequest {
+    sidecar_id: String,
+    token: String,
+}
+
+fn verify_global_browser_capability(
+    headers: &HeaderMap,
+    sidecar_id: &str,
+    token: &str,
+) -> Result<crate::browser_runtime_authority::BrowserCapabilityBinding, serde_json::Value> {
+    if sidecar_id != crate::sidecar::GLOBAL_SIDECAR_ID || token.is_empty() {
+        return Err(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Current Global Sidecar identity and token are required",
+        }));
+    }
+    let host_generation = request_sidecar_generation(headers).map_err(|Json(value)| value)?;
+    validate_current_sidecar_request(headers, sidecar_id)?;
+    let Some(sidecars) = get_sidecar_state() else {
+        return Err(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    crate::browser_runtime_authority::verify_browser_capability(
+        token,
+        host_generation,
+        |source_sidecar_id, source_generation| {
+            sidecars
+                .lock()
+                .ok()
+                .and_then(|manager| {
+                    manager.resolve_browser_capability_source(source_sidecar_id, source_generation)
+                })
+                .map(|source| {
+                    (
+                        source.product_session_id,
+                        source.workspace_path.to_string_lossy().into_owned(),
+                    )
+                })
+        },
+    )
+    .ok_or_else(|| {
+        serde_json::json!({
+            "ok": false,
+            "code": "browser_capability_invalid",
+            "error": "Browser capability is expired or no longer current",
+        })
+    })
+}
+
+async fn browser_capability_verify_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserCapabilityVerifyRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let token = req.token.trim();
+    let binding = match verify_global_browser_capability(&headers, sidecar_id, token) {
+        Ok(binding) => binding,
+        Err(value) => return no_store_json(value),
+    };
+
+    no_store_json(serde_json::json!({
+        "ok": true,
+        "productSessionId": binding.product_session_id,
+        "workspacePath": binding.workspace_path,
+        "hostGeneration": binding.host_generation,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserProfileRequest {
+    sidecar_id: String,
+    token: String,
+    request_id: String,
+    lease_epoch: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserProfileStatusRequest {
+    sidecar_id: String,
+    token: String,
+    request_id: String,
+    state: String,
+    queue_position: Option<u64>,
+}
+
+async fn browser_profile_acquire_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserProfileRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if !valid_mcp_request_id(req.request_id.trim()) {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid profile requestId is required",
+        }));
+    }
+    let binding =
+        match verify_global_browser_capability(&headers, req.sidecar_id.trim(), req.token.trim()) {
+            Ok(binding) => binding,
+            Err(value) => return no_store_json(value),
+        };
+    let host_generation = binding.host_generation;
+    let priority = get_sidecar_state()
+        .and_then(|sidecars| sidecars.lock().ok())
+        .and_then(|manager| {
+            manager.resolve_browser_capability_source(
+                &binding.source_sidecar_id,
+                binding.source_generation,
+            )
+        })
+        .map(|source| {
+            if source.interactive {
+                crate::browser_profile_lease::ProfileLeasePriority::Interactive
+            } else {
+                crate::browser_profile_lease::ProfileLeasePriority::Background
+            }
+        })
+        .unwrap_or(crate::browser_profile_lease::ProfileLeasePriority::Background);
+    let admission = crate::browser_profile_lease::acquire_profile_lease(
+        req.request_id.trim(),
+        binding,
+        priority,
+        host_generation,
+        sidecar_is_live,
+    );
+    no_store_json(serde_json::json!({
+        "ok": true,
+        "admitted": admission.admitted,
+        "leaseEpoch": admission.lease_epoch,
+        "queuePosition": admission.queue_position,
+        "retryAfterMs": 100,
+    }))
+}
+
+async fn browser_profile_cancel_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserProfileRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    if !valid_mcp_request_id(req.request_id.trim()) {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid profile requestId is required",
+        }));
+    }
+    let Some(host_generation) = request_sidecar_generation(&headers).ok() else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Current Global Host generation is required",
+        }));
+    };
+    let cancelled = crate::browser_profile_lease::cancel_owned_profile_request(
+        req.request_id.trim(),
+        host_generation,
+    );
+    no_store_json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
+}
+
+async fn browser_profile_release_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserProfileRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let Some(lease_epoch) = req.lease_epoch.filter(|epoch| *epoch > 0) else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid profile leaseEpoch is required",
+        }));
+    };
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    if !valid_mcp_request_id(req.request_id.trim()) {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid profile requestId is required",
+        }));
+    }
+    let Some(host_generation) = request_sidecar_generation(&headers).ok() else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Current Global Host generation is required",
+        }));
+    };
+    let released = crate::browser_profile_lease::release_owned_profile_request(
+        req.request_id.trim(),
+        lease_epoch,
+        host_generation,
+    );
+    no_store_json(serde_json::json!({ "ok": true, "released": released }))
+}
+
+async fn browser_profile_status_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserProfileStatusRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if !valid_mcp_request_id(req.request_id.trim())
+        || !matches!(req.state.as_str(), "queued" | "granted" | "cancelled")
+    {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid profile wait status is required",
+        }));
+    }
+    let binding =
+        match verify_global_browser_capability(&headers, req.sidecar_id.trim(), req.token.trim()) {
+            Ok(binding) => binding,
+            Err(value) => return no_store_json(value),
+        };
+    let Some(app_handle) = crate::logger::get_app_handle() else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "App handle is not initialized",
+        }));
+    };
+    let payload = serde_json::json!({
+        "productSessionId": binding.product_session_id,
+        "requestId": req.request_id,
+        "state": req.state,
+        "queuePosition": req.queue_position,
+    });
+    match app_handle.emit("browser:profile-wait", payload) {
+        Ok(()) => no_store_json(serde_json::json!({ "ok": true })),
+        Err(error) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": error.to_string(),
+        })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserIdentityReadRequest {
+    sidecar_id: String,
+}
+
+fn validate_global_browser_owner(
+    headers: &HeaderMap,
+    sidecar_id: &str,
+) -> Result<(), serde_json::Value> {
+    if sidecar_id.trim() != crate::sidecar::GLOBAL_SIDECAR_ID {
+        return Err(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Current Global Sidecar identity is required",
+        }));
+    }
+    validate_current_sidecar_request(headers, sidecar_id)
+}
+
+async fn browser_identity_read_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserIdentityReadRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    match crate::browser_identity_store::read_identity() {
+        Ok(snapshot) => no_store_json(serde_json::json!({
+            "ok": true,
+            "revision": snapshot.revision,
+            "state": snapshot.state,
+            "recovery": snapshot.recovery,
+        })),
+        Err(error) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_identity_unavailable",
+            "error": error,
+        })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserIdentityCheckpointRequest {
+    sidecar_id: String,
+    product_session_id: String,
+    base_revision: u64,
+    base_state: serde_json::Value,
+    observed_base_state: serde_json::Value,
+    state: serde_json::Value,
+}
+
+async fn browser_identity_checkpoint_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserIdentityCheckpointRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    if req.product_session_id.trim().is_empty() {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "productSessionId is required",
+        }));
+    }
+    match crate::browser_identity_store::checkpoint_identity(
+        req.base_revision,
+        &req.base_state,
+        &req.observed_base_state,
+        &req.state,
+    ) {
+        Ok(checkpoint) => no_store_json(serde_json::json!({
+            "ok": true,
+            "revision": checkpoint.revision,
+            "state": checkpoint.state,
+            "conflictCount": checkpoint.conflict_count,
+        })),
+        Err(error) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_identity_checkpoint_failed",
+            "error": error,
+        })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserIdentityMutationRequest {
+    sidecar_id: String,
+    base_revision: u64,
+    operation: String,
+    cookie: Option<serde_json::Value>,
+    previous_name: Option<String>,
+    previous_domain: Option<String>,
+    previous_path: Option<String>,
+    name: Option<String>,
+    domain: Option<String>,
+    path: Option<String>,
+    origin: Option<String>,
+}
+
+async fn browser_identity_mutate_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserIdentityMutationRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    let mutation = match req.operation.as_str() {
+        "upsertCookie" => req
+            .cookie
+            .map(|cookie| crate::browser_identity_store::IdentityMutation::UpsertCookie { cookie }),
+        "replaceCookie" => match (
+            req.previous_name,
+            req.previous_domain,
+            req.previous_path,
+            req.cookie,
+        ) {
+            (Some(previous_name), Some(previous_domain), Some(previous_path), Some(cookie))
+                if !previous_name.is_empty()
+                    && !previous_domain.is_empty()
+                    && !previous_path.is_empty() =>
+            {
+                Some(
+                    crate::browser_identity_store::IdentityMutation::ReplaceCookie {
+                        previous_name,
+                        previous_domain,
+                        previous_path,
+                        cookie,
+                    },
+                )
+            }
+            _ => None,
+        },
+        "deleteCookie" => match (req.name, req.domain, req.path) {
+            (Some(name), Some(domain), Some(path))
+                if !name.is_empty() && !domain.is_empty() && !path.is_empty() =>
+            {
+                Some(
+                    crate::browser_identity_store::IdentityMutation::DeleteCookie {
+                        name,
+                        domain,
+                        path,
+                    },
+                )
+            }
+            _ => None,
+        },
+        "deleteOrigin" => req
+            .origin
+            .filter(|origin| !origin.is_empty())
+            .map(|origin| crate::browser_identity_store::IdentityMutation::DeleteOrigin { origin }),
+        _ => None,
+    };
+    let Some(mutation) = mutation else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid Browser Identity Store mutation is required",
+        }));
+    };
+    match crate::browser_identity_store::mutate_identity(req.base_revision, mutation) {
+        Ok(snapshot) => no_store_json(serde_json::json!({
+            "ok": true,
+            "revision": snapshot.revision,
+            "state": snapshot.state,
+            "recovery": snapshot.recovery,
+        })),
+        Err(error) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": if error == "BROWSER_IDENTITY_REVISION_CONFLICT" {
+                "browser_identity_revision_conflict"
+            } else {
+                "browser_identity_mutation_failed"
+            },
+            "error": error,
+        })),
+    }
 }
 
 async fn grok_bearer_handler(

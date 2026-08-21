@@ -43,6 +43,7 @@ import QueuedMessagesPanel from '../QueuedMessageBubble';
 import CronTaskStatusBar from '../cron/CronTaskStatusBar';
 import GoalStatusBar from '../goal/GoalStatusBar';
 import { useUndoStack } from '@/hooks/useUndoStack';
+import { mcpServerState, readyMcpToolCount } from '../../../shared/mcpEffectiveState';
 import { CUSTOM_EVENTS } from '../../../shared/constants';
 import { reasoningEffortChoices, REASONING_EFFORT_DESCRIPTIONS, REASONING_EFFORT_DEFAULT } from '../../../shared/reasoningEffort';
 import { retainFocusOnMouseDown } from '@/utils/focusRetention';
@@ -182,6 +183,8 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
   onWorkspacePluginToggle,
   mcpServers = [],
   runtimeMcpTools = [],
+  mcpEffectiveSnapshot = null,
+  browserProfileWait = null,
   onWorkspaceMcpToggle,
   onRefreshProviders,
   onOpenAgentSettings,
@@ -410,17 +413,24 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
     const ids = [...new Set(runtimeMcpTools.map(runtimeMcpServerId).filter((id): id is string => id !== null))];
     return ids.map(id => configuredServers.get(id) ?? { id, name: id });
   }, [mcpServers, runtimeMcpTools]);
+  const externalMcpServers = useMemo(() => {
+    if (!isExternalRuntime || !mcpEffectiveSnapshot) return runtimeMcpServers;
+    const configuredServers = new Map(mcpServers.map(server => [server.id, server]));
+    return mcpEffectiveSnapshot.servers
+      .filter(server => server.desired)
+      .map(server => configuredServers.get(server.id) ?? { id: server.id, name: server.id });
+  }, [isExternalRuntime, mcpEffectiveSnapshot, mcpServers, runtimeMcpServers]);
   const effectiveToolCount = useMemo(() => {
-    const effectiveMcpCount = isExternalRuntime
-      ? runtimeMcpServers.length
-      : workspaceMcpEnabled.filter(
-        id => globalMcpEnabled.includes(id) && mcpServers.some(s => s.id === id),
-      ).length;
+    const effectiveMcpCount = mcpEffectiveSnapshot
+      ? readyMcpToolCount(mcpEffectiveSnapshot)
+      : isExternalRuntime
+        ? runtimeMcpTools.length
+        : 0;
     const effectiveOfficialCount = workspaceOfficialToolEnabled.filter(
       id => visibleOfficialTools.some(tool => tool.id === id),
     ).length;
     return effectiveMcpCount + effectiveOfficialCount;
-  }, [globalMcpEnabled, isExternalRuntime, mcpServers, runtimeMcpServers.length, visibleOfficialTools, workspaceMcpEnabled, workspaceOfficialToolEnabled]);
+  }, [isExternalRuntime, mcpEffectiveSnapshot, runtimeMcpTools.length, visibleOfficialTools, workspaceOfficialToolEnabled]);
 
   // #324 — 推理强度 submenu (fixed bottom row of the model menu). Opens on
   // hover/click of the row; 120ms close delay + an invisible hover bridge
@@ -1394,6 +1404,25 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
       {!isLauncherMode && (
         <div className="pointer-events-none mb-2 flex w-full max-w-3xl items-end justify-end gap-2 empty:hidden">
           {agentStatusSlot}
+          {browserProfileWait && (
+            <div className="pointer-events-auto flex max-w-sm items-center gap-2 rounded-xl border border-amber-500/25 bg-[var(--paper-elevated)] px-3 py-2 text-xs text-[var(--ink-muted)] shadow-sm">
+              <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500" />
+              <span className="min-w-0 flex-1">
+                {browserProfileWait.queuePosition === null
+                  ? t('input.browserProfileWait')
+                  : t('input.browserProfileWaitPosition', { position: browserProfileWait.queuePosition })}
+              </span>
+              {onStop && (
+                <button
+                  type="button"
+                  onClick={onStop}
+                  className="shrink-0 font-medium text-[var(--accent)] hover:underline"
+                >
+                  {t('input.cancelBrowserWait')}
+                </button>
+              )}
+            </div>
+          )}
           {queuedMessages.length > 0 && (
             <QueuedMessagesPanel
               messages={queuedMessages}
@@ -1978,7 +2007,7 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                     <div className="px-3 py-2 text-xs font-medium text-[var(--ink-muted)] border-b border-[var(--line)]">
                       {t('input.toolsHeader')}
                     </div>
-                    {visibleOfficialTools.length > 0 || runtimeMcpServers.length > 0 || (!isExternalRuntime && mcpServers.some(s => globalMcpEnabled.includes(s.id))) ? (
+                    {visibleOfficialTools.length > 0 || externalMcpServers.length > 0 || (!isExternalRuntime && mcpServers.some(s => globalMcpEnabled.includes(s.id))) ? (
                       <>
                       {visibleOfficialTools.map((tool) => {
                         const isEnabled = workspaceOfficialToolEnabled.includes(tool.id);
@@ -2028,7 +2057,7 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                           </div>
                         );
                       })}
-                      {isExternalRuntime && runtimeMcpServers.map((server) => (
+                      {isExternalRuntime && externalMcpServers.map((server) => (
                         <div
                           key={server.id}
                           className="px-3 py-2"
@@ -2041,12 +2070,31 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                               {server.description}
                             </div>
                           )}
+                          {mcpEffectiveSnapshot && (() => {
+                            const effective = mcpServerState(mcpEffectiveSnapshot, server.id);
+                            if (!effective || effective.state === 'disabled') return null;
+                            return (
+                              <div className="mt-0.5 flex items-center gap-1 text-xs text-[var(--ink-muted)]">
+                                <span className={`h-1.5 w-1.5 rounded-full ${effective.state === 'ready' ? 'bg-emerald-500' : effective.state === 'failed' || effective.state === 'needs_auth' ? 'bg-amber-500' : 'bg-[var(--accent)] animate-pulse'}`} />
+                                <span>
+                                  {effective.state === 'ready'
+                                    ? t('input.mcpStatus.readyTools', { count: effective.toolCount })
+                                    : effective.state === 'needs_auth'
+                                      ? t('input.mcpStatus.needsAuth')
+                                      : effective.state === 'failed'
+                                        ? t('input.mcpStatus.unavailable')
+                                        : t('input.mcpStatus.starting')}
+                                </span>
+                              </div>
+                            );
+                          })()}
                         </div>
                       ))}
                       {mcpServers
                         .filter(s => !isExternalRuntime && globalMcpEnabled.includes(s.id))
                         .map((server) => {
                           const isEnabled = workspaceMcpEnabled.includes(server.id);
+                          const effective = mcpServerState(mcpEffectiveSnapshot, server.id);
                           return (
                             <div
                               key={server.id}
@@ -2059,6 +2107,20 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                                 {server.description && (
                                   <div className="text-xs text-[var(--ink-muted)] truncate">
                                     {server.description}
+                                  </div>
+                                )}
+                                {isEnabled && effective && effective.state !== 'disabled' && (
+                                  <div className="mt-0.5 flex items-center gap-1 text-xs text-[var(--ink-muted)]">
+                                    <span className={`h-1.5 w-1.5 rounded-full ${effective.state === 'ready' ? 'bg-emerald-500' : effective.state === 'failed' || effective.state === 'needs_auth' ? 'bg-amber-500' : 'bg-[var(--accent)] animate-pulse'}`} />
+                                    <span>
+                                      {effective.state === 'ready'
+                                        ? t('input.mcpStatus.readyTools', { count: effective.toolCount })
+                                        : effective.state === 'needs_auth'
+                                          ? t('input.mcpStatus.needsAuth')
+                                          : effective.state === 'failed'
+                                            ? t('input.mcpStatus.unavailable')
+                                            : t('input.mcpStatus.starting')}
+                                    </span>
                                   </div>
                                 )}
                               </div>

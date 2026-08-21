@@ -87,6 +87,17 @@ import {
 } from './proxy-state';
 import { buildMcpSubprocessEnv } from './session-core/mcp-env-policy';
 import { resolveManagedOAuthCredential, type ManagedOAuthPurpose } from './utils/management-api-client';
+import {
+  acquireBrowserCapability,
+  adoptBrowserProductSession,
+} from './browser-host/capability-client';
+import {
+  mcpStartupExecutableIdentity,
+  settleMcpStartupLease,
+  startMcpStartupDemand,
+  type McpStartupDemand,
+  type McpStartupLease,
+} from './session-core/mcp-startup-admission-client';
 // Phase E (PRD 0.2.7): the sidecar file watcher (`file-watcher.ts` →
 // SSE `workspace:files-changed`) is removed. The renderer subscribes to
 // the Rust workspace_files watcher (Tauri event
@@ -144,6 +155,10 @@ import {
 import { isManagedCodexProviderReady } from './utils/managed-codex-readiness';
 import { canonicalizeManagedProviderEnv, findProjectAgentByWorkspacePath, getDefaultEnabledOfficialToolIdsForWorkspace, getEffectiveMcpServers, getEffectiveOfficialToolIdsForSession, isCliToolRegistryEnabled, loadConfig as loadAdminConfig, resolveWorkspaceConfig } from './utils/admin-config';
 import type { AgentConfig } from '../shared/types/agent';
+import type {
+  McpEffectiveServerSnapshot,
+  McpEffectiveSnapshot,
+} from '../shared/mcpEffectiveState';
 import { broadcast as broadcastSse, broadcastLive, flushPendingLiveEvents } from './sse';
 import { participatesInLiveRestore } from '../shared/liveRevision';
 import {
@@ -207,7 +222,6 @@ import type { ImagePayload, ResolvedImagePayload } from './runtimes/types';
 import { messageAttachmentsFromImagePayloads, resolveImagePayloads } from './runtimes/image-payload';
 import { buildBuiltinMediaAttachments, saveExtractedToolResultAttachments } from './runtimes/builtin-media-attachments';
 import {
-  getMyAgentsUserDir,
   trySyncProjectUserConfigFiles,
   type ProjectUserConfigSyncOptions,
 } from './utils/project-user-config-sync';
@@ -380,7 +394,6 @@ import {
   removePendingOutputOwnerByQueueId as turnRemovePendingOutputOwnerByQueueId,
   resetTurnUsage as resetBuiltinTurnUsage,
   setAssistantMessagePresent,
-  setBrowserToolUsed,
   setCurrentPlanFileMinMtimeMs,
   setCurrentTurnAnalyticsOrigin,
   setCurrentTurnAnalyticsSource,
@@ -395,7 +408,6 @@ import {
   setCurrentTurnStartTime,
   setLatestMainAssistantUsage,
   setSawCompactBoundary,
-  setStorageStateSaved,
   setSubstantiveActivity,
   terminalCleanup,
   turnState,
@@ -2099,12 +2111,6 @@ function maybeSurfaceInFlightAtAssistantTurnStart(reason: string): void {
 function abortPersistentSession(options: { notifyPendingRequests?: boolean } = {}): void {
   const notifyPendingRequests = options.notifyPendingRequests ?? true;
   clearTransientProviderRetryTimer('abort');
-  // Log warning if browser was used but storage state wasn't saved
-  // (The system prompt instructs the AI to save, but this is the fallback detection)
-  if (turnState.sessionBrowserToolUsed && !turnState.sessionStorageStateSaved) {
-    console.warn('[agent] Browser tools were used but storage state was not saved. Login state from this session may be lost.');
-  }
-
   // This is the only abort-request write path. The lifecycle owner flips the
   // flag; this facade performs the cross-owner cleanup chain below.
   requestAbort();
@@ -2252,10 +2258,6 @@ const builtinToolTraceStarts = new Map<string, number>();
 // inactivity watchdog to decide whether to set pendingContinueAfterAbort
 // (replaces the previous `messageCount > 3` heuristic, which was both
 // cumulative across turns and brittle against SDK init-framing changes).
-// Browser tool tracking for storage-state auto-save
-// Tracks whether any browser_* MCP tools were used in the current session,
-// and whether browser_storage_state was called (to avoid redundant save).
-
 // PRD 0.2.18 Session Inbox — per-turn binding of inbox metadata.
 //
 // Bound when the message generator yields a queued item that carries inboxMeta
@@ -2551,6 +2553,358 @@ type SdkMcpServerConfig = {
 // transport spec (SDK spawns subprocess / hits URL) or an in-process SDK
 // server object (tool handlers run in this Node process).
 type McpServerEntry = SdkMcpServerConfig | McpSdkServerConfigWithInstance;
+let builtBrowserHostGeneration = 0;
+let builtBrowserCapabilityToken = '';
+let builtBrowserCapabilityRevision = 0;
+let builtinBrowserHostRecovery: Promise<void> | null = null;
+let builtinMcpEffectiveSnapshot: McpEffectiveSnapshot | null = null;
+let builtinMcpEffectiveRevision = 0;
+let builtinMcpCatalogGeneration = 0;
+let builtinMcpObserverAbort: AbortController | null = null;
+let builtinMcpLastStatuses: Awaited<ReturnType<Query['mcpServerStatus']>> = [];
+
+function observeBuiltinBrowserCapability(capability: {
+  hostGeneration: number;
+  token: string;
+}): boolean {
+  const changed = capability.hostGeneration !== builtBrowserHostGeneration
+    || capability.token !== builtBrowserCapabilityToken;
+  builtBrowserHostGeneration = capability.hostGeneration;
+  if (capability.token !== builtBrowserCapabilityToken) {
+    builtBrowserCapabilityToken = capability.token;
+    builtBrowserCapabilityRevision += 1;
+  }
+  return changed;
+}
+type StagedBuiltinStdio = {
+  id: string;
+  config: SdkMcpServerConfig;
+  command: string;
+  args: string[];
+};
+type BuiltinMcpAdmissionOwner = {
+  runtimeGeneration: number;
+  configGeneration: number;
+  desiredKey: string;
+  serverIds: string[];
+  startedAt: number;
+  demand: McpStartupDemand;
+  lease: McpStartupLease | null;
+  state: 'queued' | 'granted' | 'settled' | 'unmanaged';
+};
+let builtinMcpStartupRuntimeGeneration = 0;
+let builtinMcpStartupConfigGeneration = 0;
+let builtinMcpAdmissionOwner: BuiltinMcpAdmissionOwner | null = null;
+
+function releaseBuiltinMcpAdmissionOwner(): void {
+  const owner = builtinMcpAdmissionOwner;
+  builtinMcpAdmissionOwner = null;
+  owner?.demand.cancel();
+  if (owner?.lease) void settleMcpStartupLease(owner.lease, 'released');
+}
+
+function beginBuiltinMcpStartupGeneration(): void {
+  releaseBuiltinMcpAdmissionOwner();
+  builtinMcpStartupRuntimeGeneration += 1;
+  builtinMcpStartupConfigGeneration = 0;
+}
+
+function scheduleGrantedBuiltinMcpInstall(owner: BuiltinMcpAdmissionOwner): void {
+  const attempt = async () => {
+    while (true) {
+      if (
+        builtinMcpAdmissionOwner !== owner
+        || (owner.state !== 'granted' && owner.state !== 'unmanaged')
+      ) return;
+      if (lifecycleState.query && !lifecycleState.abortRequested) {
+        await ensureSdkMcpInSync();
+        return;
+      }
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, 100);
+        timer.unref?.();
+      });
+    }
+  };
+  void attempt().catch(() => {});
+}
+
+async function shouldInstallBuiltinStdioWave(staged: readonly StagedBuiltinStdio[]): Promise<boolean> {
+  if (staged.length === 0) {
+    releaseBuiltinMcpAdmissionOwner();
+    return true;
+  }
+  const executableIdentity = mcpStartupExecutableIdentity(
+    staged.map(entry => ({ command: entry.command, args: entry.args })),
+  );
+  const desiredKey = `${executableIdentity}:${staged.map(entry => entry.id).sort().join(',')}`;
+  let owner = builtinMcpAdmissionOwner;
+  if (!owner || owner.desiredKey !== desiredKey) {
+    releaseBuiltinMcpAdmissionOwner();
+    builtinMcpStartupConfigGeneration += 1;
+    const demand = startMcpStartupDemand({
+      executables: staged.map(entry => ({ command: entry.command, args: entry.args })),
+      runtimeGeneration: Math.max(1, builtinMcpStartupRuntimeGeneration),
+      configGeneration: builtinMcpStartupConfigGeneration,
+      priority: lifecycleState.preWarming ? 'background' : 'interactive',
+    });
+    const createdOwner: BuiltinMcpAdmissionOwner = {
+      runtimeGeneration: Math.max(1, builtinMcpStartupRuntimeGeneration),
+      configGeneration: builtinMcpStartupConfigGeneration,
+      desiredKey,
+      serverIds: staged.map(entry => entry.id).sort(),
+      startedAt: Date.now(),
+      demand,
+      lease: null,
+      state: 'queued',
+    };
+    owner = createdOwner;
+    builtinMcpAdmissionOwner = createdOwner;
+    void demand.ready.then(lease => {
+      if (builtinMcpAdmissionOwner !== createdOwner) {
+        if (lease) void settleMcpStartupLease(lease, 'released');
+        return;
+      }
+      if (!lease) {
+        createdOwner.state = 'unmanaged';
+        scheduleGrantedBuiltinMcpInstall(createdOwner);
+        return;
+      }
+      createdOwner.lease = lease;
+      createdOwner.state = 'granted';
+      publishBuiltinMcpEffectiveSnapshot();
+      scheduleGrantedBuiltinMcpInstall(createdOwner);
+    });
+  }
+  if (owner.state === 'granted' || owner.state === 'settled' || owner.state === 'unmanaged') {
+    return true;
+  }
+  const remainingMs = owner.startedAt + MCP_PREWARM_GRACE_MS - Date.now();
+  if (remainingMs <= 0) return false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    owner.demand.ready,
+    new Promise<void>(resolve => {
+      timeout = setTimeout(resolve, remainingMs);
+      timeout.unref?.();
+    }),
+  ]);
+  if (timeout) clearTimeout(timeout);
+  const current = builtinMcpAdmissionOwner;
+  return current === owner
+    && (current.state === 'granted' || current.state === 'settled' || current.state === 'unmanaged');
+}
+
+function maybeSettleBuiltinMcpStartup(statuses: Awaited<ReturnType<Query['mcpServerStatus']>>): void {
+  const owner = builtinMcpAdmissionOwner;
+  if (!owner?.lease || owner.state !== 'granted') return;
+  const byName = new Map(statuses.map(status => [status.name, status.status]));
+  if (!owner.serverIds.every(id => {
+    const status = byName.get(id);
+    return status === 'connected' || status === 'failed' || status === 'needs-auth' || status === 'disabled';
+  })) return;
+  const ready = owner.serverIds.every(id => byName.get(id) === 'connected');
+  const lease = owner.lease;
+  owner.lease = null;
+  owner.state = 'settled';
+  void settleMcpStartupLease(lease, ready ? 'ready' : 'failed');
+}
+
+export function getBuiltinMcpEffectiveSnapshot(): McpEffectiveSnapshot | null {
+  return builtinMcpEffectiveSnapshot
+    ? {
+        ...builtinMcpEffectiveSnapshot,
+        dispatch: { ...builtinMcpEffectiveSnapshot.dispatch },
+        servers: builtinMcpEffectiveSnapshot.servers.map(server => ({ ...server })),
+        tools: [...builtinMcpEffectiveSnapshot.tools],
+      }
+    : null;
+}
+
+function sdkMcpToolName(serverId: string, toolName: string): string {
+  return toolName.startsWith('mcp__') ? toolName : `mcp__${serverId}__${toolName}`;
+}
+
+function builtinDispatchProjection(owner: NonNullable<ReturnType<typeof getQueryMcpPrewarmOwner>>):
+McpEffectiveSnapshot['dispatch'] {
+  if (!owner.outcome) return { state: 'waiting' };
+  if (owner.outcome.state === 'ready') return { state: 'settled', releaseReason: 'ready' };
+  if (owner.outcome.state === 'degraded') {
+    return { state: 'released', releaseReason: owner.outcome.reason };
+  }
+  return { state: 'released', releaseReason: 'cancelled' };
+}
+
+function projectBuiltinMcpStatuses(
+  owner: NonNullable<ReturnType<typeof getQueryMcpPrewarmOwner>>,
+  statuses: Awaited<ReturnType<Query['mcpServerStatus']>>,
+): { servers: McpEffectiveServerSnapshot[]; tools: string[] } {
+  const byName = new Map(statuses.map(status => [status.name, status]));
+  const tools: string[] = [];
+  const now = Date.now();
+  const servers = owner.requiredServerIds.map((id): McpEffectiveServerSnapshot => {
+    const status = byName.get(id);
+    const admissionOwnsServer = builtinMcpAdmissionOwner?.serverIds.includes(id) === true;
+    const serverTools = status?.status === 'connected'
+      ? (status.tools ?? []).map(tool => sdkMcpToolName(id, tool.name))
+      : [];
+    tools.push(...serverTools);
+    const state: McpEffectiveServerSnapshot['state'] = status?.status === 'connected'
+      ? 'ready'
+      : status?.status === 'needs-auth'
+        ? 'needs_auth'
+        : status?.status === 'failed'
+          ? 'failed'
+          : status?.status === 'disabled'
+            ? 'disabled'
+            : admissionOwnsServer && builtinMcpAdmissionOwner?.state === 'queued'
+              ? 'queued'
+              : 'starting';
+    return {
+      id,
+      desired: true,
+      state,
+      toolCount: serverTools.length,
+      ...(state === 'failed' ? { errorCode: 'MCP_STARTUP_FAILED' } : {}),
+      ...(state === 'needs_auth' ? { errorCode: 'MCP_NEEDS_AUTH' } : {}),
+      attemptGeneration: owner.revision,
+      updatedAt: now,
+    };
+  });
+  return { servers, tools: [...new Set(tools)].sort() };
+}
+
+function publishBuiltinMcpEffectiveSnapshot(options: { observationStale?: boolean } = {}): void {
+  const owner = getQueryMcpPrewarmOwner();
+  if (!owner) return;
+  const projected = projectBuiltinMcpStatuses(owner, builtinMcpLastStatuses);
+  const previousTools = builtinMcpEffectiveSnapshot?.tools ?? [];
+  const ownerChanged = !builtinMcpEffectiveSnapshot
+    || builtinMcpEffectiveSnapshot.runtimeGeneration !== owner.generation
+    || builtinMcpEffectiveSnapshot.configGeneration !== owner.revision
+    || builtinMcpEffectiveSnapshot.configFingerprint !== owner.fingerprint;
+  if (
+    ownerChanged
+    || projected.tools.length !== previousTools.length
+    || projected.tools.some((tool, index) => tool !== previousTools[index])
+  ) {
+    builtinMcpCatalogGeneration += 1;
+  }
+  builtinMcpEffectiveRevision += 1;
+  const authority = getCurrentQueryAuthority();
+  const snapshot: McpEffectiveSnapshot = {
+    sessionId: authority?.productSessionId || getCurrentProductSessionId(),
+    runtime: 'builtin',
+    runtimeGeneration: owner.generation,
+    configGeneration: owner.revision,
+    configFingerprint: owner.fingerprint,
+    catalogGeneration: builtinMcpCatalogGeneration,
+    revision: builtinMcpEffectiveRevision,
+    observedAt: Date.now(),
+    ...(builtBrowserHostGeneration > 0 ? { browserHostGeneration: builtBrowserHostGeneration } : {}),
+    dispatch: builtinDispatchProjection(owner),
+    servers: projected.servers,
+    tools: projected.tools,
+    ...(options.observationStale ? { observationStale: true } : {}),
+  };
+  builtinMcpEffectiveSnapshot = snapshot;
+  broadcast('chat:mcp-effective-snapshot', snapshot);
+}
+
+function waitForBuiltinMcpObservation(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise(resolve => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    timer.unref?.();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function installQueryMcpOwner(params: Parameters<typeof setQueryMcpPrewarmOwner>[0]): boolean {
+  const installed = setQueryMcpPrewarmOwner(params);
+  if (!installed) return false;
+  builtinMcpObserverAbort?.abort();
+  const owner = getQueryMcpPrewarmOwner();
+  if (!owner) return false;
+  const controller = new AbortController();
+  builtinMcpObserverAbort = controller;
+  builtinMcpLastStatuses = [];
+  publishBuiltinMcpEffectiveSnapshot();
+
+  void (async () => {
+    while (!controller.signal.aborted) {
+      const current = getQueryMcpPrewarmOwner();
+      if (
+        !current
+        || current.query !== owner.query
+        || current.generation !== owner.generation
+        || current.revision !== owner.revision
+      ) return;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          readQueryMcpStatuses(owner.query).then(statuses => ({ kind: 'statuses' as const, statuses })),
+          new Promise<{ kind: 'timeout' }>(resolve => {
+            timeout = setTimeout(() => resolve({ kind: 'timeout' }), 2_000);
+            timeout.unref?.();
+          }),
+        ]);
+        if (result.kind === 'statuses') {
+          builtinMcpLastStatuses = [...result.statuses];
+          maybeSettleBuiltinMcpStartup(builtinMcpLastStatuses);
+          publishBuiltinMcpEffectiveSnapshot();
+          const playwrightStatus = builtinMcpLastStatuses.find(status => status.name === 'playwright');
+          const playwrightDesired = configState.currentMcpServers?.some(
+            server => server.id === 'playwright' && server.isBuiltin === true,
+          ) === true;
+          const playwrightNeedsTransport = playwrightDesired
+            && (!playwrightStatus || playwrightStatus.status === 'failed');
+          if (playwrightNeedsTransport && !builtinBrowserHostRecovery) {
+            builtinBrowserHostRecovery = (async () => {
+              const capability = await acquireBrowserCapability();
+              const previousHostGeneration = builtBrowserHostGeneration;
+              if (!observeBuiltinBrowserCapability(capability)) return;
+              console.warn(
+                `[agent] Browser Host transport refreshed generation=${previousHostGeneration}->${capability.hostGeneration}`,
+              );
+              await ensureSdkMcpInSync();
+            })().catch(error => {
+              console.warn(
+                `[agent] Browser Host recovery deferred: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }).finally(() => {
+              builtinBrowserHostRecovery = null;
+            });
+          }
+        } else {
+          publishBuiltinMcpEffectiveSnapshot({ observationStale: true });
+        }
+      } catch {
+        publishBuiltinMcpEffectiveSnapshot({ observationStale: true });
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+      const hasStarting = builtinMcpEffectiveSnapshot?.servers.some(server => server.state === 'starting') === true;
+      const delayMs = hasStarting ? 1_000 : 15_000;
+      if (!await waitForBuiltinMcpObservation(delayMs, controller.signal)) return;
+    }
+  })();
+  return true;
+}
+
+function clearBuiltinQueryMcpOwner(query?: Query): void {
+  builtinMcpObserverAbort?.abort();
+  builtinMcpObserverAbort = null;
+  builtinMcpLastStatuses = [];
+  clearQueryMcpPrewarmOwner(query);
+}
 
 /**
  * Read-only accessor for `configState.currentMcpServers`. Used by `/cron/execute-sync` to
@@ -3580,7 +3934,9 @@ function buildSettingSources(): ('user' | 'project')[] {
  * - For other commands: Uses user-specified command directly (node/python etc.)
  * - Inherits proxy env + injects NO_PROXY to protect localhost (mirrors Rust proxy_config)
  */
-async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
+async function buildSdkMcpServers(
+  browserProductSessionIdOverride?: string,
+): Promise<Record<string, McpServerEntry>> {
   // null = MCP not yet configured (e.g. Global sidecar, or Tab pre-warm before /api/mcp/set)
   // [] = explicitly no MCP (user has none enabled)
   // [...]= user's enabled MCP servers
@@ -3607,6 +3963,7 @@ async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
   if (isDebugMode) console.log(`[agent] MCP servers: ${servers.map(s => s.id).join(', ') || 'none'}`);
 
   const result: Record<string, McpServerEntry> = {};
+  const stagedStdio: StagedBuiltinStdio[] = [];
 
   // --- Pattern 1: Context-injected MCPs (always present based on sidecar context) ---
   // Add Bridge tools if we're in an IM context with a plugin bridge that has tools.
@@ -3640,6 +3997,7 @@ async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
 
   // Return early if no user MCP servers (but may have cron-tools)
   if (externalServers.length === 0) {
+    await shouldInstallBuiltinStdioWave([]);
     if (Object.keys(result).length > 0) {
       console.log(`[agent] Built SDK MCP servers: ${Object.keys(result).join(', ')}`);
     }
@@ -3651,6 +4009,29 @@ async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
     // Log server env for debugging
     if (isDebugMode && server.env && Object.keys(server.env).length > 0) {
       console.log(`[agent] MCP ${server.id}: Custom env vars: ${Object.keys(server.env).join(', ')}`);
+    }
+
+    if (server.id === 'playwright' && server.isBuiltin === true) {
+      const productSessionId = browserProductSessionIdOverride
+        || sessionId
+        || process.env.MYAGENTS_SIDECAR_ID?.trim();
+      if (!productSessionId || !agentDir) {
+        throw new Error('Browser Host requires Product Session and workspace identity');
+      }
+      if (browserProductSessionIdOverride) {
+        await adoptBrowserProductSession(browserProductSessionIdOverride);
+      }
+      const capability = await acquireBrowserCapability();
+      observeBuiltinBrowserCapability(capability);
+      result[server.id] = {
+        type: 'http',
+        url: capability.url,
+        headers: { Authorization: `Bearer ${capability.token}` },
+      };
+      console.log(
+        `[agent] MCP playwright: application Browser Host generation=${capability.hostGeneration}`,
+      );
+      continue;
     }
 
     if (server.type === 'stdio' && server.command) {
@@ -3692,25 +4073,7 @@ async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
       // can work around downstream proxy parser bugs for a specific MCP.
       const mcpEnv = buildMcpSubprocessEnv(process.env, server.env);
 
-      // Playwright MCP: two user-selectable modes (configured in Settings UI):
-      // - Isolated (--isolated): concurrent browser sessions, storage-state for login
-      // - Persistent (--user-data-dir): full profile, single-session only
-      // Backend just respects the args and injects --storage-state when applicable.
-      if (server.id === 'playwright') {
-        const hasIsolated = args.includes('--isolated');
-
-        // In isolated mode, inject --storage-state if file exists (for login state reuse)
-        if (hasIsolated) {
-          const storageStatePath = join(getMyAgentsUserDir(), 'browser-storage-state.json');
-          if (existsSync(storageStatePath) && !args.some((a: string) => a.startsWith('--storage-state'))) {
-            args.push(`--storage-state=${storageStatePath}`);
-            console.log(`[agent] MCP playwright: injecting storage-state from ${storageStatePath}`);
-          }
-        }
-      }
-
-      // Log full command for debugging (after Playwright arg rewrite so logs show actual args)
-      console.log(`[agent] MCP ${server.id}: ${command} ${args.join(' ')}`);
+      console.log(`[agent] MCP ${server.id}: transport=stdio argvCount=${args.length}`);
 
       const mcpConfig: SdkMcpServerConfig = {
         command,
@@ -3718,7 +4081,7 @@ async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
         env: mcpEnv,  // Always set: proxy inherited + NO_PROXY enforced
       };
 
-      result[server.id] = mcpConfig;
+      stagedStdio.push({ id: server.id, config: mcpConfig, command, args });
     } else if ((server.type === 'sse' || server.type === 'http') && server.url) {
       const remote = resolveRemoteMcpTransportConfig(server);
 
@@ -3751,6 +4114,16 @@ async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
     }
   }
 
+  if (await shouldInstallBuiltinStdioWave(stagedStdio)) {
+    for (const entry of stagedStdio) result[entry.id] = entry.config;
+  } else if (stagedStdio.length > 0) {
+    console.log(
+      `[agent] MCP startup admission queued generation=${builtinMcpAdmissionOwner?.runtimeGeneration ?? 0}`
+        + ` configGeneration=${builtinMcpAdmissionOwner?.configGeneration ?? 0}`
+        + ` servers=${stagedStdio.length}`,
+    );
+  }
+
   console.log(`[agent] Built SDK MCP servers: ${Object.keys(result).join(', ') || 'none'}`);
   // Always return result (even if empty) to prevent SDK from using default config
   return result;
@@ -3765,7 +4138,10 @@ async function buildSdkMcpServers(): Promise<Record<string, McpServerEntry>> {
 function sdkMcpMapFingerprint(servers: Record<string, unknown>): string {
   const keys = Object.keys(servers).sort().join(',');
   const surface = getImBridgeToolSurface();
-  return surface ? `${keys}|bridge=${imBridgeToolSurfaceIdentity(surface)}` : keys;
+  const browserHost = Object.hasOwn(servers, 'playwright')
+    ? `|browserHost=${builtBrowserHostGeneration}:${builtBrowserCapabilityRevision}`
+    : '';
+  return `${keys}${surface ? `|bridge=${imBridgeToolSurfaceIdentity(surface)}` : ''}${browserHost}`;
 }
 
 /** True only when the live Query already owns the current stable Bridge surface. */
@@ -3782,8 +4158,21 @@ export function isCurrentImBridgeToolSurfaceInstalled(): boolean {
 function getMcpPrewarmWindowForMap(
   servers: Record<string, unknown>,
 ): { startedAt: number; deadlineAt: number } | null {
+  if (builtinMcpAdmissionOwner) {
+    return {
+      startedAt: builtinMcpAdmissionOwner.startedAt,
+      deadlineAt: builtinMcpAdmissionOwner.startedAt + MCP_PREWARM_GRACE_MS,
+    };
+  }
   if (!Object.hasOwn(servers, 'im-bridge-tools')) return null;
   return getImBridgeToolPrewarmWindow();
+}
+
+function getDesiredMcpServerIdsForMap(servers: Record<string, unknown>): string[] {
+  return [...new Set([
+    ...Object.keys(servers),
+    ...(builtinMcpAdmissionOwner?.serverIds ?? []),
+  ])].sort();
 }
 
 /**
@@ -3814,7 +4203,7 @@ const SDK_MCP_MUTATION_TIMEOUT_MS = 30_000;
 function latchMcpMutationRecovery(targetQuery: Query): void {
   if (lifecycleState.query !== targetQuery) return;
   setFrozenSdkMcpFingerprint('');
-  clearQueryMcpPrewarmOwner(targetQuery);
+  clearBuiltinQueryMcpOwner(targetQuery);
   scheduleDeferredRestart('mcp');
   // A generator that promoted while the mutation was in flight owns recovery:
   // it requeues that exact item before draining the restart latch. With no
@@ -3891,7 +4280,7 @@ async function mutateSdkMcpForQuery(targetQuery: Query): Promise<QueryMcpMutatio
   // Never publish the previous connected snapshot while the SDK transport map
   // is changing. Injected turns will observe owner=null; ordinary turns fence
   // on the Query-generation mutation promise at generator promotion.
-  clearQueryMcpPrewarmOwner(targetQuery);
+  clearBuiltinQueryMcpOwner(targetQuery);
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     const outcome = await Promise.race([
@@ -3922,10 +4311,10 @@ async function mutateSdkMcpForQuery(targetQuery: Query): Promise<QueryMcpMutatio
     }
     setFrozenSdkMcpFingerprint(newFingerprint);
     const prewarmWindow = getMcpPrewarmWindowForMap(newServers);
-    setQueryMcpPrewarmOwner({
+    installQueryMcpOwner({
       query: targetQuery,
       fingerprint: newFingerprint,
-      requiredServerIds: Object.keys(newServers),
+      requiredServerIds: getDesiredMcpServerIdsForMap(newServers),
       ...(prewarmWindow ?? {}),
     });
     console.log(`[agent] SDK setMcpServers ok: added=[${outcome.result.added.join(',')}] removed=[${outcome.result.removed.join(',')}]`);
@@ -4030,10 +4419,11 @@ async function observeCurrentQueryMcpPrewarm(
       ? formatMcpPrewarmServers(outcome.servers)
       : lifecycleOwner.requiredServerIds.join(',') || '(none)';
     console.log(
-      `[agent] MCP pre-warm terminal outcome=${outcome.state}${outcome.state === 'degraded' ? ` reason=${outcome.reason}` : ''}`
+      `[agent] MCP dispatch outcome=${outcome.state}${outcome.state === 'degraded' ? ` releaseReason=${outcome.reason}` : ''}`
       + ` generation=${lifecycleOwner.generation} revision=${lifecycleOwner.revision}`
       + ` elapsedMs=${outcome.elapsedMs} budgetMs=${MCP_PREWARM_GRACE_MS} servers=[${servers}]`,
     );
+    publishBuiltinMcpEffectiveSnapshot();
   }
   return outcome;
 }
@@ -6333,14 +6723,6 @@ function handleToolUseStart(tool: {
   // Increment tool count for this turn
   incrementCurrentTurnToolCount();
 
-  // Track browser tool usage for storage-state auto-save
-  // MCP tool names follow pattern: mcp__playwright__browser_*
-  if (tool.name.startsWith('mcp__playwright__browser_')) {
-    setBrowserToolUsed(true);
-    if (tool.name === 'mcp__playwright__browser_storage_state') {
-      setStorageStateSaved(true);
-    }
-  }
 }
 
 /**
@@ -7190,9 +7572,6 @@ function clearMessageState(): void {
   isStreamingMessage = false;
   setMessageSequence(0);
   configClearDeferredRestart();
-  // Reset browser tool tracking for new session
-  setBrowserToolUsed(false);
-  setStorageStateSaved(false);
   // Pattern B/G: drain the output-owner queue — any in-flight IM bus
   // subscribers for the old session belong to closed SSE streams; new SDK
   // output for a new session should not be tagged with old trace IDs.
@@ -10743,7 +11122,15 @@ async function startStreamingSession(preWarm = false): Promise<void> {
     // Capturing here (not inline in commonQueryOptions) lets ensureSdkMcpInSync() later
     // diff the live SDK set against newly-arriving context-injected MCPs (im-media,
     // im-bridge-tools) without rebuilding fingerprint twice.
-    const sdkMcpServersInitial = await buildSdkMcpServers();
+    beginBuiltinMcpStartupGeneration();
+    // A fresh builtin query already owns its final UUID before SDK system_init.
+    // Bind Browser Host to that canonical Product Session now; otherwise the
+    // first Context is stranded under the renderer's pending-* placeholder and
+    // the next Query creates a second Context with the same logical identity.
+    const browserProductSessionId = isPendingSessionId(queryProductSessionId)
+      ? effectiveSdkSessionId
+      : queryProductSessionId;
+    const sdkMcpServersInitial = await buildSdkMcpServers(browserProductSessionId);
 
     // Build common query options (shared between normal start and "already in use" fallback)
     // #324 — user-selected reasoning effort. Anthropic protocol only: the SDK
@@ -10868,9 +11255,6 @@ async function startStreamingSession(preWarm = false): Promise<void> {
         type: 'preset' as const,
         preset: 'claude_code' as const,
         append: buildSystemPromptAppend(currentScenario, {
-          playwrightStorageEnabled: (configState.currentMcpServers ?? []).some(
-            s => s.id === 'playwright' && (s.args ?? []).some((a: string) => /^--caps=.*\bstorage\b/.test(a))
-          ),
           // agent-session.ts is the builtin Claude Agent SDK path by definition.
           runtime: 'builtin',
           // Universal CLI capability surface (cron / IM media). Was external-runtime
@@ -11473,10 +11857,10 @@ async function startStreamingSession(preWarm = false): Promise<void> {
       const initialMcpFingerprint = sdkMcpMapFingerprint(sdkMcpServersInitial);
       setFrozenSdkMcpFingerprint(initialMcpFingerprint);
       const prewarmWindow = getMcpPrewarmWindowForMap(sdkMcpServersInitial);
-      setQueryMcpPrewarmOwner({
+      installQueryMcpOwner({
         query: activeQuery,
         fingerprint: initialMcpFingerprint,
-        requiredServerIds: Object.keys(sdkMcpServersInitial),
+        requiredServerIds: getDesiredMcpServerIdsForMap(sdkMcpServersInitial),
         ...(prewarmWindow ?? {}),
       });
     }
@@ -13173,6 +13557,8 @@ async function startStreamingSession(preWarm = false): Promise<void> {
     // 安全关闭 SDK session
     const session = lifecycleState.query as Query | null;
     setQuerySession(null);
+    clearBuiltinQueryMcpOwner(session ?? undefined);
+    releaseBuiltinMcpAdmissionOwner();
     configState.currentCapabilitySnapshot = null;
     try { session?.close(); } catch { /* subprocess 可能已退出 */ }
 

@@ -92,6 +92,9 @@ jobs:
           cp "$SDK_SRC"/*.wasm "$SDK_DEST/"
           cp -R "$SDK_SRC/vendor" "$SDK_DEST/"
 
+      - name: Stage exact Playwright browser runtime
+        run: node scripts/prepare-playwright-runtime.mjs "${{ matrix.target }}"
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:

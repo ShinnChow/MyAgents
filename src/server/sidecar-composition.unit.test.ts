@@ -24,7 +24,11 @@ describe('Sidecar production composition', () => {
     ['GET', '/health', 'common'],
     ['GET', '/refs/12345678', 'common'],
     ['POST', '/api/provider/verify', 'global'],
+    ['POST', '/api/process/graceful-shutdown', 'global'],
+    ['POST', '/api/browser/session/retire', 'global'],
     ['POST', '/api/mcp/oauth/discover', 'global'],
+    ['GET', '/api/browser/identity', 'global'],
+    ['POST', '/mcp/playwright', 'global'],
     ['GET', '/api/runtime/models?type=codex', 'common'],
     ['GET', '/api/runtime/permission-modes?type=codex', 'common'],
     ['GET', '/api/runtime/type', 'session'],
@@ -88,6 +92,8 @@ describe('Sidecar production composition', () => {
     ['global', 'POST', '/api/inbox/drain'],
     ['session', 'POST', '/api/provider/verify'],
     ['session', 'POST', '/api/mcp/oauth/start'],
+    ['session', 'POST', '/mcp/playwright'],
+    ['session', 'POST', '/api/browser/session/retire'],
     ['session', 'PATCH', '/sessions/session-1'],
   ] as const)('%s rejects wrong-role %s %s before the real handler', async (role, method, path) => {
     const realHandler = vi.fn(async () => new Response('handled'));
@@ -105,6 +111,8 @@ describe('Sidecar production composition', () => {
   it.each([
     ['global', 'POST', '/api/provider/verify'],
     ['global', 'POST', '/api/mcp/oauth/start'],
+    ['global', 'POST', '/mcp/playwright'],
+    ['global', 'POST', '/api/browser/session/retire'],
     ['session', 'POST', '/chat/send'],
     ['session', 'POST', '/cron/execute-sync'],
     ['session', 'POST', '/goal/execute-sync'],

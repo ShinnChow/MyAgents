@@ -105,6 +105,8 @@ const SESSION_PREFIXES = [
 const GLOBAL_EXACT_PATHS = new Set([
   '/agent/upload',
   '/api/assets/qr-code',
+  '/api/browser/identity',
+  '/api/browser/session/retire',
   '/api/edge-tts/preview',
   '/api/global-stats',
   '/api/grok/verify',
@@ -112,6 +114,7 @@ const GLOBAL_EXACT_PATHS = new Set([
   '/api/mcp',
   '/api/mcp/enable',
   '/api/provider/verify',
+  '/api/process/graceful-shutdown',
   '/api/proxy/set',
   '/api/session/messages',
   '/api/subscription/status',
@@ -122,6 +125,7 @@ const GLOBAL_EXACT_PATHS = new Set([
   '/api/subscription/login/cancel',
   '/api/supported-models',
   '/api/unified-log',
+  '/mcp/playwright',
 ]);
 
 const GLOBAL_PREFIXES = ['/api/mcp/oauth/'] as const;

@@ -13,6 +13,7 @@ import {
   getBuiltinLiveSessionSnapshot,
   getBuiltinSessionCompletionTerminal,
   getCurrentMcpServers,
+  getBuiltinMcpEffectiveSnapshot,
   getLastBuiltinAssistantText,
   getMcpServers,
   getMessages,
@@ -289,6 +290,7 @@ export function createBuiltinSessionEngine(): SessionEngine {
           ? messageWireToReplayMessage(liveSnapshot.liveStreamingMessage)
           : null,
         systemInitPayload: systemInitInfo ? { info: systemInitInfo } : undefined,
+        mcpEffectiveSnapshot: getBuiltinMcpEffectiveSnapshot(),
         pendingInteractiveRequests: getPendingInteractiveRequests(),
       };
     },

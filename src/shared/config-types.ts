@@ -5,7 +5,6 @@ import type { RuntimeModelInfo, RuntimeSource, RuntimeType } from './types/runti
 import type { UiLanguage } from './i18n';
 import type { OfficialToolId, OfficialToolSettings } from './official-tools';
 import type { SubscriptionVerifyFailureKind } from './subscription';
-import { PLAYWRIGHT_MCP_PACKAGE_SPEC } from './mcpPackages';
 import managedCodexRuntimeLock from './managed-codex-runtime.json';
 import {
   DEFAULT_APPEARANCE_MODE,
@@ -903,6 +902,14 @@ export interface AppConfig {
   // Extra args for MCP servers (appended to preset args)
   // undefined = never customized, [] = user explicitly cleared
   mcpServerArgs?: Record<string, string[]>;
+  /**
+   * Product-owned Playwright Browser Host configuration.
+   *
+   * This is the only desired-state authority for the built-in Playwright MCP.
+   * `mcpServerArgs.playwright` is legacy migration input only and must never be
+   * projected directly into a runtime after this field has been normalized.
+   */
+  playwrightBrowser?: PlaywrightBrowserSettings;
 
   // ===== CLI Tool Registry (PRD 0.2.36) =====
   // Per-tool environment variables (API keys etc.) for registered CLI tools
@@ -1733,6 +1740,29 @@ export const PRESET_PROVIDERS: Provider[] = [
  */
 export type McpServerType = 'stdio' | 'sse' | 'http';
 
+export const PLAYWRIGHT_BROWSER_SETTINGS_SCHEMA_VERSION = 1 as const;
+
+export type PlaywrightBrowserMode = 'isolated' | 'persistent';
+
+/**
+ * Desired state for the application-owned Playwright Browser Host.
+ *
+ * Optional strings use omission instead of empty-string so config diffs remain
+ * stable. `extraArgs` contains only upstream flags that MyAgents does not own;
+ * lifecycle flags (`--isolated`, `--user-data-dir`, `--storage-state`) are
+ * compiled by the Host and are deliberately excluded.
+ */
+export interface PlaywrightBrowserSettings {
+  schemaVersion: typeof PLAYWRIGHT_BROWSER_SETTINGS_SCHEMA_VERSION;
+  mode: PlaywrightBrowserMode;
+  headless: boolean;
+  browser?: string;
+  device?: string;
+  userDataDir?: string;
+  capabilities: string[];
+  extraArgs: string[];
+}
+
 /**
  * MCP Server definition - unified configuration for all MCP server types
  */
@@ -1741,6 +1771,13 @@ export interface McpServerDefinition {
   name: string;            // Display name
   description?: string;    // Feature description
   type: McpServerType;
+
+  /**
+   * Opaque, non-secret revision of product-owned runtime settings that are not
+   * represented as MCP argv/env. It participates in Runtime generation
+   * fingerprints but is never executed or persisted as user-authored config.
+   */
+  runtimeConfigRevision?: string;
 
   // stdio configuration
   command?: string;        // Command to run (e.g., 'npx')
@@ -1798,8 +1835,10 @@ export const PRESET_MCP_SERVERS: McpServerDefinition[] = [
     name: 'Playwright 浏览器',
     description: '浏览器自动化能力，支持网页浏览、截图、表单填写等',
     type: 'stdio',
-    command: 'npx',
-    args: [PLAYWRIGHT_MCP_PACKAGE_SPEC],
+    // Product-owned sentinel. Session runtimes project this preset to the
+    // authenticated application Browser Host; it is never spawned as stdio.
+    command: '__browser_host__',
+    args: [],
     isBuiltin: true,
     isFree: true,
   },
@@ -1956,6 +1995,13 @@ export const DEFAULT_CONFIG: AppConfig = {
   globalSummonShortcut: {
     enabled: true,
     accelerator: 'CmdOrCtrl+Shift+M',
+  },
+  playwrightBrowser: {
+    schemaVersion: PLAYWRIGHT_BROWSER_SETTINGS_SCHEMA_VERSION,
+    mode: 'isolated',
+    headless: false,
+    capabilities: ['storage'],
+    extraArgs: [],
   },
 };
 

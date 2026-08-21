@@ -1304,6 +1304,41 @@ pub(crate) fn finish_session_owner_release(
         // The exact generation remains manager-authoritative with admission
         // closed while this waits. No global manager mutex is held here.
         drain.wait();
+        let browser_host = {
+            let mut manager_guard = manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            manager_guard.global_process_binding()
+        };
+        if let Some((port, generation)) = browser_host {
+            let retirement = crate::local_http::blocking_builder()
+                .timeout(std::time::Duration::from_millis(5_500))
+                .build()
+                .and_then(|client| {
+                    client
+                        .post(format!(
+                            "http://127.0.0.1:{port}/api/browser/session/retire"
+                        ))
+                        .header("x-myagents-sidecar-generation", generation.to_string())
+                        .json(&serde_json::json!({
+                            "productSessionId": &drain.session_id,
+                        }))
+                        .send()
+                });
+            match retirement {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => ulog_warn!(
+                    "[browser-profile] action=session-retire status=rejected session={} http_status={}",
+                    drain.session_id,
+                    response.status()
+                ),
+                Err(error) => ulog_warn!(
+                    "[browser-profile] action=session-retire status=unavailable session={} error={}",
+                    drain.session_id,
+                    error
+                ),
+            }
+        }
         let retired = {
             // Owner removal already committed before the drain. Recovering a
             // poisoned lock here is required to finish that same transition;

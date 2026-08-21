@@ -29,6 +29,10 @@ import { workspacePathsEqual } from '../../../shared/workspacePath';
 import { type ImBotConfig, DEFAULT_IM_BOT_CONFIG } from '../../../shared/types/im';
 import { normalizeUiLanguage } from '../../../shared/i18n';
 import { normalizeThemeConfigRecord } from '../../../shared/theme';
+import {
+    normalizePlaywrightBrowserConfig,
+    resolvePlaywrightBrowserConfig,
+} from '../../../shared/playwrightBrowser';
 // Agent migration is triggered from ConfigProvider after both config + projects are loaded
 import { isDebugMode } from '@/utils/debug';
 
@@ -130,6 +134,7 @@ export function migrateUiLanguageField(config: AppConfig): AppConfig {
 function normalizeLoadedConfig(config: AppConfig): AppConfig {
     normalizeStringifiedJsonFields(config);
     promoteAgentMcpJsonToGlobal(config);
+    normalizePlaywrightBrowserConfig(config);
     return normalizeDeveloperSettings(
         normalizeThemeConfigRecord(config as unknown as Record<string, unknown>) as unknown as AppConfig,
     );
@@ -168,6 +173,46 @@ export async function ensureManagedCodexProviderDevGateDefault(): Promise<void> 
             ...normalized,
             managedCodexProviderDevGate: true,
         });
+    });
+}
+
+/**
+ * Persist the one-time Playwright argv -> typed settings migration while the
+ * config write lock is held. Read-boundary normalization remains useful for
+ * old processes, but it must not be the durable migration authority.
+ *
+ * Invalid/conflicting legacy input is intentionally left byte-for-byte
+ * intact. The Runtime then reports BROWSER_CONFIG_MIGRATION_REQUIRED instead
+ * of silently selecting a default mode.
+ */
+export async function ensurePlaywrightBrowserConfigMigration(): Promise<{
+    changed: boolean;
+    migrationError?: string;
+}> {
+    if (isBrowserDevMode()) {
+        const latest = mockLoadConfig() as AppConfig;
+        const resolved = resolvePlaywrightBrowserConfig(latest);
+        if (resolved.migrationError) return { changed: false, migrationError: resolved.migrationError };
+        const before = JSON.stringify(latest);
+        normalizePlaywrightBrowserConfig(latest);
+        const changed = JSON.stringify(latest) !== before;
+        if (changed) mockSaveConfig(latest);
+        return { changed };
+    }
+
+    return withConfigLock(async () => {
+        await ensureConfigDir();
+        const dir = await getConfigDir();
+        const configPath = await join(dir, CONFIG_FILE);
+        const latest = await safeLoadJson<AppConfig>(configPath, isValidAppConfig) ?? {} as AppConfig;
+        const resolved = resolvePlaywrightBrowserConfig(latest);
+        if (resolved.migrationError) return { changed: false, migrationError: resolved.migrationError };
+
+        const before = JSON.stringify(latest);
+        normalizePlaywrightBrowserConfig(latest);
+        if (JSON.stringify(latest) === before) return { changed: false };
+        await safeWriteJson(configPath, latest);
+        return { changed: true };
     });
 }
 
@@ -224,6 +269,7 @@ export async function loadAppConfig(): Promise<AppConfig> {
             // and the independent Rust reader normalizes the same way at boot.
             normalizeStringifiedJsonFields(migrated);
             promoteAgentMcpJsonToGlobal(migrated);
+            normalizePlaywrightBrowserConfig(migrated);
             const merged = normalizeDeveloperSettings({ ...dynamicDefault, ...migrated });
             return migrateImBotConfig(merged);
         }

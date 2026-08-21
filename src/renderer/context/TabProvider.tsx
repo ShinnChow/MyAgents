@@ -67,6 +67,10 @@ import type { ProductSystemSkillRequirement } from '../../shared/systemSkills';
 import { stripLeadingSystemReminder } from '../../shared/systemReminder';
 import { deriveSessionTitle } from '../../shared/sessionTitle';
 import {
+    reduceMcpEffectiveSnapshot,
+    type McpEffectiveSnapshot,
+} from '../../shared/mcpEffectiveState';
+import {
     COLD_HISTORY_REPLAY_KIND,
     LIVE_USER_ECHO_REPLAY_KIND,
     type ChatMessageReplayPayload,
@@ -868,6 +872,11 @@ export default function TabProvider({
     const [logs, setLogs] = useState<string[]>([]);
     const [unifiedLogs, setUnifiedLogs] = useState<LogEntry[]>([]);
     const [systemInitInfo, setSystemInitInfo] = useState<SystemInitInfo | null>(null);
+    const [mcpEffectiveSnapshot, setMcpEffectiveSnapshot] = useState<McpEffectiveSnapshot | null>(null);
+    const [browserProfileWait, setBrowserProfileWait] = useState<{
+        requestId: string;
+        queuePosition: number | null;
+    } | null>(null);
     const [sdkSlashCommands, setSdkSlashCommands] = useState<SlashCommand[]>([]);
     // Issue #194 — runtime diagnostics snapshot for external runtimes (Codex
     // today; Claude Code / Gemini later). Replaces the previously-hardcoded
@@ -928,6 +937,7 @@ export default function TabProvider({
             setAgentPlanTodos(null);
             setSdkSlashCommands([]);
             setSystemInitInfo(null);
+            setMcpEffectiveSnapshot(null);
         }
     }, [sessionId]);
 
@@ -1171,8 +1181,41 @@ export default function TabProvider({
         setPendingExitPlanMode(null);
         setPendingEnterPlanMode(null);
         setQueuedMessages([]);
+        setBrowserProfileWait(null);
         startedQueueIdsRef.current.clear();
         clearAllBackgroundTaskStatuses(currentSessionIdRef.current);
+    }, []);
+
+    useEffect(() => {
+        if (!isTauri()) return;
+        const controller = new AbortController();
+        void listenWithCleanup<{
+            productSessionId?: string;
+            requestId?: string;
+            state?: 'queued' | 'granted' | 'cancelled';
+            queuePosition?: number | null;
+        }>('browser:profile-wait', ({ payload }) => {
+            if (
+                !payload.productSessionId
+                || payload.productSessionId !== currentSessionIdRef.current
+                || !payload.requestId
+            ) return;
+            if (payload.state === 'queued') {
+                setBrowserProfileWait({
+                    requestId: payload.requestId,
+                    queuePosition: typeof payload.queuePosition === 'number'
+                        ? payload.queuePosition
+                        : null,
+                });
+                return;
+            }
+            if (payload.state === 'granted' || payload.state === 'cancelled') {
+                setBrowserProfileWait(previous => (
+                    previous?.requestId === payload.requestId ? null : previous
+                ));
+            }
+        }, controller.signal);
+        return () => controller.abort();
     }, []);
 
     // Reset pagination state (firstItemIndex + hasMoreBefore + in-flight guard)
@@ -1260,6 +1303,7 @@ export default function TabProvider({
         setSessionMeta(null);
         setSessionRuntimeSource(null);
         setSystemInitInfo(null);
+        setMcpEffectiveSnapshot(null);
         // Issue #194 (Codex review #6) — clear runtime diagnostics on reset so
         // a stale Codex banner from the previous session doesn't leak into a
         // new one (or a Tab that just switched to builtin runtime).
@@ -3246,6 +3290,25 @@ export default function TabProvider({
                 break;
             }
 
+            case 'chat:mcp-effective-snapshot': {
+                const payload = data as McpEffectiveSnapshot | null;
+                const payloadSessionId = payload?.sessionId;
+                const currentId = currentSessionIdRef.current;
+                const connectedId = attachedSseSessionIdRef.current;
+                if (!payload || !shouldAcceptSessionScopedSseSnapshot({
+                    connectedSessionId: connectedId,
+                    currentSessionId: currentId,
+                    payloadSessionId,
+                    isConnectedSessionPending: connectedId ? isPendingSessionId(connectedId) : false,
+                    isCurrentSessionPending: currentId ? isPendingSessionId(currentId) : false,
+                })) {
+                    console.log(`[TabProvider ${tabId}] Ignoring MCP effective snapshot for stale session ${payloadSessionId}`);
+                    break;
+                }
+                setMcpEffectiveSnapshot(previous => reduceMcpEffectiveSnapshot(previous, payload));
+                break;
+            }
+
             case 'chat:logs': {
                 const payload = data as { lines: string[] } | null;
                 if (payload?.lines) {
@@ -4252,6 +4315,8 @@ export default function TabProvider({
                 // boundary until the first envelope from the replacement marks
                 // the connection live again; Tab config hydration keys off it.
                 setIsConnected(false);
+                setMcpEffectiveSnapshot(null);
+                setBrowserProfileWait(null);
                 resetTabServerUrlCache(tabId);
                 const restore = persistedRestoreLifecycleRef.current;
                 if (isPendingSessionId(restartedSid)) return;
@@ -5311,6 +5376,8 @@ export default function TabProvider({
         logs,
         unifiedLogs,
         systemInitInfo,
+        mcpEffectiveSnapshot,
+        browserProfileWait,
         sdkSlashCommands,
         runtimeDiagnostics,
         agentError,
@@ -5355,7 +5422,7 @@ export default function TabProvider({
         forceExecuteQueuedMessage,
     }), [
         tabId, agentDir, currentSessionId, messages, historyMessages, streamingMessage, firstItemIndex, hasMoreBefore, isLoading, isSessionLoading, sessionRestoreError, sessionRestoreMode, sessionState, sessionRuntime, sessionRuntimeSource, sessionMeta,
-        logs, unifiedLogs, systemInitInfo, sdkSlashCommands, runtimeDiagnostics, agentError, systemStatus, systemNotice, contextUsage, agentPlanTodos, lastTerminalReason, pendingPermission, pendingAskUserQuestion, pendingExitPlanMode, pendingEnterPlanMode, toolCompleteCount, queuedMessages, isConnected,
+        logs, unifiedLogs, systemInitInfo, mcpEffectiveSnapshot, browserProfileWait, sdkSlashCommands, runtimeDiagnostics, agentError, systemStatus, systemNotice, contextUsage, agentPlanTodos, lastTerminalReason, pendingPermission, pendingAskUserQuestion, pendingExitPlanMode, pendingEnterPlanMode, toolCompleteCount, queuedMessages, isConnected,
         setMessages, appendLog, appendUnifiedLog, clearUnifiedLogs, sendMessage, stopResponse, retryCurrentSessionRestore, loadOlderMessages, resetSession, adoptMigratedSession,
         apiGetJson, postJson, apiPutJson, apiDeleteJson, respondPermission, respondAskUserQuestion, respondExitPlanMode, cancelQueuedMessage, forceExecuteQueuedMessage
     ]);

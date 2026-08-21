@@ -168,8 +168,8 @@ fn next_sidecar_port_candidate(counter: &AtomicU16) -> u16 {
     }
 }
 pub(crate) use types::{
-    DispatchDrain, DispatchGate, DispatchLease, DispatchReplacement, SessionCompletionClaim,
-    SessionGenerationDrain, SidecarRetirement,
+    DispatchDrain, DispatchGate, DispatchLease, DispatchReplacement, GlobalShutdownTarget,
+    SessionCompletionClaim, SessionGenerationDrain, SidecarRetirement, SidecarShutdownPreparation,
 };
 pub use types::{RuntimeDriftResult, SessionSidecar, SidecarInstance, SidecarOwner, SidecarState};
 

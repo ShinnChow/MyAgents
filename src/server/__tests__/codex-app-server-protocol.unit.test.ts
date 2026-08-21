@@ -541,10 +541,10 @@ describe('Codex app-server protocol helpers', () => {
     expect(args).toContain('mcp_servers.fs_tool.command="node"');
     expect(args).toContain('mcp_servers.fs_tool.args=["server.js"]');
     expect(args).toContain('mcp_servers.fs_tool.env_vars=["FS_TOKEN","HTTPS_PROXY","NO_PROXY","no_proxy"]');
-    expect(args).toContain('mcp_servers.fs_tool.startup_timeout_sec=10');
+    expect(args).toContain('mcp_servers.fs_tool.startup_timeout_sec=60');
     expect(args).toContain('mcp_servers.remote-http.url="https://example.com/mcp"');
     expect(args).toContain('mcp_servers.remote-http.env_http_headers={Authorization="MYAGENTS_MCP_REMOTE_HTTP_AUTHORIZATION"}');
-    expect(args).toContain('mcp_servers.remote-http.startup_timeout_sec=10');
+    expect(args).toContain('mcp_servers.remote-http.startup_timeout_sec=60');
     expect(args.join('\n')).not.toContain('secret-token');
     expect(args.join('\n')).not.toContain('remote-secret');
     expect(env.FS_TOKEN).toBe('secret-token');
@@ -705,14 +705,15 @@ describe('Codex app-server protocol helpers', () => {
     await expect(startup).rejects.toThrow('Codex process exited during MCP startup with code 1');
   });
 
-  it('does not charge process initialization time to the native MCP startup window', async () => {
+  it('charges process initialization to the single absolute MCP dispatch window', async () => {
     vi.useFakeTimers();
     const barrier = createCodexMcpStartupBarrier(['playwright']);
+    const acceptedAt = Date.now();
 
     await vi.advanceTimersByTimeAsync(8_000);
-    barrier.arm();
+    barrier.arm(acceptedAt);
     const startup = barrier.wait();
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(2_000);
 
     await expect(startup).resolves.toMatchObject({
       outcome: 'degraded',

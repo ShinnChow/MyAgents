@@ -1,4 +1,4 @@
-import { appendFileSync, cpSync, existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeFileSync , rmSync, renameSync } from 'fs';
+import { appendFileSync, cpSync, existsSync, lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync , rmSync, renameSync } from 'fs';
 import { copyFile as copyFileAsync, readdir as readdirAsync, rm, stat } from 'fs/promises';
 import { spawn as subprocessSpawn } from './utils/subprocess';
 import { fileResponse, sniffMime } from './utils/file-response';
@@ -409,18 +409,56 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-process.on('SIGTERM', () => {
-  if (!stdioBroken) {
-    try { console.log('[process] SIGTERM received, shutting down...'); } catch { /* ignore */ }
+let gracefulShutdownHook: (() => Promise<void>) | null = null;
+let gracefulShutdownPromise: Promise<void> | null = null;
+let processShutdownStarted = false;
+
+async function shutdownOwnedResources(): Promise<void> {
+  if (!gracefulShutdownPromise) {
+    gracefulShutdownPromise = (async () => {
+      if (!gracefulShutdownHook) return;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          gracefulShutdownHook(),
+          new Promise<void>((_resolve, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error('Owned resource shutdown timed out')),
+              5_000,
+            );
+            timeout.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    })();
   }
-  process.exit(0);  // Trigger SDK's process.on('exit') handler → SIGTERM CLI subprocess
+  await gracefulShutdownPromise;
+}
+
+async function shutdownProcess(signal: 'SIGTERM' | 'SIGINT'): Promise<void> {
+  if (processShutdownStarted) return;
+  processShutdownStarted = true;
+  if (!stdioBroken) {
+    try { console.log(`[process] ${signal} received, shutting down...`); } catch { /* ignore */ }
+  }
+  try {
+    await shutdownOwnedResources();
+  } catch (error) {
+    if (!stdioBroken) {
+      try { console.error('[process] graceful resource shutdown failed:', error); } catch { /* ignore */ }
+    }
+  }
+  process.exit(0);  // Trigger SDK's process.on('exit') handler → terminate CLI subprocess
+}
+
+process.on('SIGTERM', () => {
+  void shutdownProcess('SIGTERM');
 });
 
 process.on('SIGINT', () => {
-  if (!stdioBroken) {
-    try { console.log('[process] SIGINT received, shutting down...'); } catch { /* ignore */ }
-  }
-  process.exit(0);
+  void shutdownProcess('SIGINT');
 });
 
 // ============= END CRASH DIAGNOSTICS =============
@@ -447,7 +485,7 @@ import {
 } from './agent-session';
 import type { ProviderEnv } from './provider-types';
 import { getHomeDirOrNull } from './utils/platform';
-import { getScriptDir } from './utils/runtime';
+import { getBundledPlaywrightBrowsersDir, getScriptDir } from './utils/runtime';
 import {
   createSession,
   deleteSession,
@@ -1113,69 +1151,6 @@ function ensurePluginsDirs(): void {
   }
 }
 
-/**
- * Clean up stale Playwright MCP profile lock files left by a crashed Chromium.
- *
- * Chromium leaves SingletonLock / SingletonSocket / SingletonCookie files in
- * the user-data-dir when the process crashes (or the OS kills it on app exit
- * without a clean shutdown). Subsequent Chromium launches with the same
- * user-data-dir refuse to start with "ProfileInUse" until the locks clear.
- *
- * Playwright's own startup mostly handles this, but the legacy
- * `~/.playwright-mcp-profile/` directory pre-dates Playwright MCP's improved
- * recovery paths and we've seen real "Chromium hangs forever" reports tied to
- * stale locks here. Cheap idempotent cleanup at sidecar boot.
- */
-function cleanupStalePlaywrightProfile(): void {
-  try {
-    const homeDir = getHomeDirOrNull();
-    if (!homeDir) return;
-
-    const profileDir = join(homeDir, '.playwright-mcp-profile');
-    const lockPath = join(profileDir, 'SingletonLock');
-
-    if (!existsSync(lockPath)) return;
-
-    // SingletonLock content: "hostname-pid" (POSIX symlink target on macOS/Linux,
-    // regular file content on Windows).
-    let linkTarget: string;
-    try {
-      linkTarget = readlinkSync(lockPath);
-    } catch {
-      try {
-        linkTarget = readFileSync(lockPath, 'utf-8').trim();
-      } catch {
-        return; // Can't read — bail
-      }
-    }
-
-    const pidMatch = linkTarget.match(/-(\d+)$/);
-    if (!pidMatch) return;
-    const pid = parseInt(pidMatch[1], 10);
-
-    // Probe pid liveness; if the process is alive, leave its locks alone.
-    try {
-      process.kill(pid, 0);
-      return;
-    } catch {
-      // Process is dead → safe to clean up
-    }
-
-    for (const file of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-      const filePath = join(profileDir, file);
-      try {
-        if (existsSync(filePath)) {
-          unlinkSync(filePath);
-        }
-      } catch { /* best effort */ }
-    }
-
-    console.log(`[startup] Cleaned up stale Playwright MCP profile lock (pid ${pid} dead)`);
-  } catch (err) {
-    console.warn('[startup] Playwright profile cleanup failed:', err);
-  }
-}
-
 // ============= END SKILLS CONFIG & SEED =============
 
 /**
@@ -1814,6 +1789,29 @@ async function main() {
   console.log(`[startup] HTTP server binding to 127.0.0.1:${port}...`);
 
   const dispatchRequest = composeSidecarRequestHandler(sidecarComposition, handleRequest);
+  let browserHostPromise: Promise<import('./browser-host').PlaywrightBrowserHost> | null = null;
+  const ensureBrowserHost = async (): Promise<import('./browser-host').PlaywrightBrowserHost> => {
+    if (!browserHostPromise) {
+      const bundledBrowsers = getBundledPlaywrightBrowsersDir();
+      if (!bundledBrowsers) {
+        if (existsSync(resolve(getScriptDir(), 'server-dist.js'))) {
+          throw new Error('BROWSER_RUNTIME_MISSING: bundled Playwright browsers are unavailable');
+        }
+        console.warn('[browser-host] development runtime is using Playwright\'s local browser cache');
+      } else {
+        process.env.PLAYWRIGHT_BROWSERS_PATH = bundledBrowsers;
+      }
+      browserHostPromise = import('./browser-host').then(({ PlaywrightBrowserHost }) => (
+        new PlaywrightBrowserHost()
+      ));
+    }
+    return browserHostPromise;
+  };
+  gracefulShutdownHook = async () => {
+    if (!browserHostPromise) return;
+    const browserHost = await browserHostPromise;
+    await browserHost.shutdown();
+  };
 
   honoServe({
     // Explicit 127.0.0.1 for Rust proxy compatibility (IPv4).
@@ -1937,6 +1935,47 @@ async function main() {
         const { status, body } = buildReadyResponseBody();
         return jsonResponse(body, status);
       }
+      // Rust owns process-tree retirement. This bounded handshake lets the
+      // Global Sidecar checkpoint Browser identity before Windows closes its
+      // Job Object; the generation header prevents a stale retirement from
+      // shutting down a replacement process that reused the same port.
+      if (pathname === '/api/process/graceful-shutdown' && request.method === 'POST') {
+        const expectedGeneration = process.env.MYAGENTS_SIDECAR_GENERATION?.trim();
+        const requestedGeneration = request.headers.get('x-myagents-sidecar-generation')?.trim();
+        if (!expectedGeneration || requestedGeneration !== expectedGeneration) {
+          return jsonResponse({ success: false, error: 'stale sidecar generation' }, 409);
+        }
+        try {
+          await shutdownOwnedResources();
+          return jsonResponse({ success: true });
+        } catch (error) {
+          return jsonResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          }, 500);
+        }
+      }
+      if (pathname === '/api/browser/session/retire' && request.method === 'POST') {
+        const expectedGeneration = process.env.MYAGENTS_SIDECAR_GENERATION?.trim();
+        const requestedGeneration = request.headers.get('x-myagents-sidecar-generation')?.trim();
+        if (!expectedGeneration || requestedGeneration !== expectedGeneration) {
+          return jsonResponse({ success: false, error: 'stale sidecar generation' }, 409);
+        }
+        const body = await request.json().catch(() => null) as { productSessionId?: unknown } | null;
+        if (typeof body?.productSessionId !== 'string' || !body.productSessionId.trim()) {
+          return jsonResponse({ success: false, error: 'productSessionId is required' }, 400);
+        }
+        try {
+          const browserHost = await ensureBrowserHost();
+          await browserHost.retireProductSession(body.productSessionId.trim());
+          return jsonResponse({ success: true });
+        } catch (error) {
+          return jsonResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          }, 500);
+        }
+      }
       // (removed) `POST /health/ready/retry` — pre-0.2.0 endpoint that reset
       // DeferredInitState to `pending` and returned 202 promising a re-run,
       // but no in-process re-runner exists (the deferred init block is a
@@ -1990,6 +2029,23 @@ async function main() {
           return jsonResponse({ error: 'ref body missing' }, 404);
         }
         return fr;
+      }
+
+      // Runtime-only Streamable HTTP MCP data plane. The role gate admits
+      // this endpoint only on the Global Sidecar, and the Host validates a
+      // Rust-issued Session capability before creating any MCP connection or
+      // BrowserContext. It must be usable while Session runtimes are warming,
+      // so it intentionally precedes the deferred agent-state gate.
+      if (pathname === '/mcp/playwright') {
+        const browserHost = await ensureBrowserHost();
+        return browserHost.handleRequest(request);
+      }
+      if (pathname === '/api/browser/identity') {
+        if (sidecarComposition.mode !== 'development-union') {
+          return jsonResponse({ success: false, error: 'Not found' }, 404);
+        }
+        const { handleBrowserIdentitySettingsRequest } = await import('./browser-host/settings-api');
+        return handleBrowserIdentitySettingsRequest(request);
       }
 
       // ── Deferred init gate ────────────────────────────────────────────────
@@ -3708,7 +3764,9 @@ async function main() {
           // user-facing error surfaces.
           const displayCommand = server.command === '__builtin__'
             ? '(builtin)'
-            : server.command === '__bundled_cuse__' ? 'cuse' : server.command;
+            : server.command === '__bundled_cuse__'
+              ? 'cuse'
+              : server.command === '__browser_host__' ? '(browser-host)' : server.command;
           console.log(`[api/mcp/enable] Enabling MCP: ${server.id}, type: ${server.type}, command: ${displayCommand}`);
 
           // Built-in MCP (in-process) — delegate validation to registry.
@@ -3726,6 +3784,11 @@ async function main() {
               }
             }
             console.log(`[api/mcp/enable] Built-in MCP: ${server.id} — enabled`);
+            return jsonResponse({ success: true });
+          }
+
+          if (server.id === 'playwright' && server.command === '__browser_host__') {
+            console.log('[api/mcp/enable] Playwright uses the application Browser Host');
             return jsonResponse({ success: true });
           }
 
@@ -8802,7 +8865,7 @@ description: >
             currentInitPhase = 'cleanup';
             setDeferredInitPhase(currentInitPhase);
             initPhaseStarted = nowMs();
-            // Retention, stale-profile cleanup and the one-time config scrub
+            // Retention and the one-time config scrub
             // are app-wide maintenance. Running them in every Session process
             // multiplied I/O and timers without adding authority.
             const collectActivePaths = (): ReadonlySet<string> => {
@@ -8815,8 +8878,6 @@ description: >
             };
             runLogRetentionSweep({ activeFilePaths: collectActivePaths() });
             startPeriodicSweep(collectActivePaths);
-            cleanupStalePlaywrightProfile();
-
             try {
               const { scrubStaleRuntimeConfig } = await import('./migrations/scrub-stale-runtime-config');
               const result = await scrubStaleRuntimeConfig();

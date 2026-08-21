@@ -158,18 +158,29 @@ pub fn stop_all_sidecars(manager: &ManagedSidecarManager, reason: &str) -> Resul
         reason
     );
 
-    // 1. Stop all managed sidecar instances (kills bun sidecars via Drop)
-    let mut manager_guard = manager.lock().map_err(|error| {
-        let error = error.to_string();
-        ulog_error!(
-            "[sidecar] stop_all action=error reason={} scope=application error={}",
-            reason,
+    // Close ordinary request admission first, but keep exact generations in
+    // manager authority while the Global Host checkpoints Browser identity.
+    let preparation = manager
+        .lock()
+        .map_err(|error| {
+            let error = error.to_string();
+            ulog_error!(
+                "[sidecar] stop_all action=error reason={} scope=application error={}",
+                reason,
+                error
+            );
             error
-        );
-        error
-    })?;
-    let retirement = manager_guard.stop_all();
-    drop(manager_guard);
+        })?
+        .prepare_stop_all();
+    preparation.wait();
+    checkpoint_global_owned_resources(&preparation.globals);
+
+    // Only after the callback has settled do we revoke generation authority
+    // and drop the retained process trees (the Windows hard-containment path).
+    let retirement = manager
+        .lock()
+        .map_err(|error| error.to_string())?
+        .stop_all();
     retirement.finish();
 
     ulog_info!(
@@ -178,6 +189,58 @@ pub fn stop_all_sidecars(manager: &ManagedSidecarManager, reason: &str) -> Resul
     );
 
     Ok(())
+}
+
+fn checkpoint_global_owned_resources(targets: &[GlobalShutdownTarget]) {
+    for target in targets {
+        let client = match crate::local_http::blocking_builder()
+            .timeout(Duration::from_millis(5_500))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                ulog_warn!(
+                    "[sidecar-global] action=graceful-shutdown status=client-error generation={} error={}",
+                    target.generation,
+                    error
+                );
+                continue;
+            }
+        };
+        let url = format!(
+            "http://127.0.0.1:{}/api/process/graceful-shutdown",
+            target.port
+        );
+        match client
+            .post(url)
+            .header(
+                "x-myagents-sidecar-generation",
+                target.generation.to_string(),
+            )
+            .send()
+        {
+            Ok(response) if response.status().is_success() => {
+                ulog_info!(
+                    "[sidecar-global] action=graceful-shutdown status=complete generation={}",
+                    target.generation
+                );
+            }
+            Ok(response) => {
+                ulog_warn!(
+                    "[sidecar-global] action=graceful-shutdown status=rejected generation={} http_status={}",
+                    target.generation,
+                    response.status()
+                );
+            }
+            Err(error) => {
+                ulog_warn!(
+                    "[sidecar-global] action=graceful-shutdown status=unavailable generation={} error={}",
+                    target.generation,
+                    error
+                );
+            }
+        }
+    }
 }
 
 /// Shutdown for update — block until all child processes are fully terminated.

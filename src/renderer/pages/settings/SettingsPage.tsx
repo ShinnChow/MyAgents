@@ -51,6 +51,7 @@ import {
     type ChatQueueResponseMode,
     type ProxyProtocol,
     type SpaceEnvironment,
+    type PlaywrightBrowserSettings,
 } from '@/config/types';
 import {
     getAllMcpServers,
@@ -58,7 +59,6 @@ import {
     toggleMcpServerEnabled,
     addCustomMcpServer,
     deleteCustomMcpServer,
-    saveMcpServerArgs,
     getMcpServerArgs,
     getMcpServerEnv,
     atomicModifyConfig,
@@ -134,6 +134,11 @@ import {
 import { AppearanceModeControl } from './components/AppearanceModeControl';
 import { ThemePresetSelect } from './components/ThemePresetSelect';
 import { useResolvedTheme } from '@/theme';
+import {
+    isSupportedPlaywrightAdvancedArg,
+    isSupportedPlaywrightCapability,
+    resolvePlaywrightBrowserConfig,
+} from '../../../shared/playwrightBrowser';
 import type {
     NetworkProbeResult,
     ProviderVerifyError,
@@ -146,14 +151,6 @@ import { SettingsSidebar } from './components/SettingsSidebar';
 import { SkillsAgentsSection } from './sections/SkillsAgentsSection';
 import { ToolboxSection } from './sections/ToolboxSection';
 import codexModelSelectorOnboarding from '@/assets/onboarding/codex-model-selector.png';
-
-// Memoized component for model tag list to avoid recreating presetModelIds on every render
-/** Default args for Playwright MCP: persistent profile mode (preserves login state, single-session) */
-async function getPlaywrightDefaultArgs(): Promise<string[]> {
-    const home = await homeDir();
-    const profilePath = await join(home, '.playwright-mcp-profile');
-    return [`--user-data-dir=${profilePath}`];
-}
 
 type ManagedCodexLoginStatus = 'idle' | 'starting' | 'waiting' | 'succeeded' | 'cancelled' | 'error';
 type SubscriptionRefreshResult = { success: true } | { success: false; error: string };
@@ -981,17 +978,21 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         device: string;
         customDevice: string;
         userDataDir: string;
+        capabilities: string[];
         extraArgs: string[];
         newArg: string;
     } | null>(null);
 
     // Storage state info for Playwright browser settings UI (isolated mode)
     const [storageStateInfo, setStorageStateInfo] = useState<{
+        revision: number;
         exists: boolean;
         cookieCount: number;
         domains: string[];
         lastModified: string | null;
-        cookies: Array<{ name: string; value: string; domain: string; path: string; secure: boolean; httpOnly: boolean }>;
+        cookies: Array<{ name: string; domain: string; path: string; secure: boolean; httpOnly: boolean; expires: number; sameSite: 'Strict' | 'Lax' | 'None' }>;
+        origins: string[];
+        recovery: 'corrupt-current' | 'corrupt-legacy' | null;
     } | null>(null);
 
     // Cookie add/edit form (null = closed, object = open)
@@ -1003,32 +1004,44 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         path: string;
     } | null>(null);
 
-    // Shared helper: reload storage state info from ~/.myagents/browser-storage-state.json
+    // Packaged Settings talks directly to the Rust persistence owner. The
+    // development-union server route remains only for the browser harness.
     const reloadStorageStateInfo = async () => {
         try {
-            const home = await homeDir();
-            const ssPath = await join(home, '.myagents', 'browser-storage-state.json');
-            const { exists: fileExists, readTextFile, stat: fsStat } = await import('@tauri-apps/plugin-fs');
-            if (await fileExists(ssPath)) {
-                const content = await readTextFile(ssPath);
-                const parsed = JSON.parse(content);
-                const rawCookies = (parsed.cookies ?? []) as Array<{ name: string; value: string; domain: string; path: string; secure?: boolean; httpOnly?: boolean }>;
-                const cookies = rawCookies.map(c => ({
-                    name: String(c.name ?? ''), value: String(c.value ?? ''), domain: String(c.domain ?? ''),
-                    path: String(c.path ?? '/'), secure: !!c.secure, httpOnly: !!c.httpOnly,
-                }));
-                const domains = [...new Set(cookies.map(c => c.domain.replace(/^\./, '')))].sort() as string[];
-                const fileStat = await fsStat(ssPath).catch(() => null);
-                setStorageStateInfo({
-                    exists: true, cookieCount: cookies.length, domains, cookies,
-                    lastModified: fileStat?.mtime ? new Date(fileStat.mtime).toLocaleString() : null,
-                });
-            } else {
-                setStorageStateInfo({ exists: false, cookieCount: 0, domains: [], cookies: [], lastModified: null });
-            }
+            type IdentitySettingsSnapshot = {
+                revision: number;
+                exists: boolean;
+                cookieCount: number;
+                domains: string[];
+                cookies: Array<{ name: string; domain: string; path: string; secure: boolean; httpOnly: boolean; expires: number; sameSite: 'Strict' | 'Lax' | 'None' }>;
+                origins: string[];
+                recovery: 'corrupt-current' | 'corrupt-legacy' | null;
+            };
+            const snapshot = isTauriEnvironment()
+                ? await invoke<IdentitySettingsSnapshot>('cmd_browser_identity_read')
+                : await apiGetJson<IdentitySettingsSnapshot & { ok: true }>('/api/browser/identity');
+            setStorageStateInfo({
+                revision: snapshot.revision,
+                exists: snapshot.exists,
+                cookieCount: snapshot.cookieCount,
+                domains: snapshot.domains,
+                cookies: snapshot.cookies,
+                origins: snapshot.origins,
+                recovery: snapshot.recovery,
+                lastModified: snapshot.revision > 0 ? `revision ${snapshot.revision}` : null,
+            });
         } catch {
-            setStorageStateInfo({ exists: false, cookieCount: 0, domains: [], cookies: [], lastModified: null });
+            setStorageStateInfo({ revision: 0, exists: false, cookieCount: 0, domains: [], cookies: [], origins: [], recovery: null, lastModified: null });
         }
+    };
+
+    const mutateBrowserIdentityFromSettings = async (mutation: Record<string, unknown>) => {
+        const baseRevision = storageStateInfo?.revision;
+        if (baseRevision === undefined) throw new Error('Browser Identity Store is not loaded');
+        if (isTauriEnvironment()) {
+            return invoke('cmd_browser_identity_mutate', { baseRevision, mutation });
+        }
+        return apiPostJson('/api/browser/identity', { baseRevision, ...mutation });
     };
 
     const [mcpFormMode, setMcpFormMode] = useState<'form' | 'json'>('form');
@@ -1200,21 +1213,6 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                 await toggleMcpServerEnabled(server.id, true);
                 setMcpEnabledIds(prev => [...prev, server.id]);
 
-                // Auto-init default args for Playwright on first enable
-                if (server.id === 'playwright') {
-                    const existingArgs = await getMcpServerArgs('playwright');
-                    if (existingArgs === undefined) {
-                        try {
-                            const defaultArgs = await getPlaywrightDefaultArgs();
-                            await saveMcpServerArgs('playwright', defaultArgs);
-                            const servers = await getAllMcpServers();
-                            setMcpServersState(servers);
-                        } catch (e) {
-                            console.warn('[Settings] Failed to init default Playwright args:', e);
-                        }
-                    }
-                }
-
                 toast.success(tSettings('toolbox.toasts.mcpEnabled'));
             } else if (result.error) {
                 // Handle different error types
@@ -1353,51 +1351,31 @@ export default function Settings({ mode = 'settings', initialSection, navigation
 
         // Playwright: open custom config dialog
         if (server.id === 'playwright') {
-            const savedArgs = await getMcpServerArgs(server.id);
-            let rawArgs: string[];
-            if (savedArgs !== undefined) {
-                rawArgs = savedArgs;
-            } else {
-                try { rawArgs = await getPlaywrightDefaultArgs(); } catch { rawArgs = []; }
-            }
-
-            let headless = false;
-            let browser = '';
-            let device = '';
+            const desired = resolvePlaywrightBrowserConfig(config).settings;
+            const headless = desired.headless;
+            const browser = desired.browser ?? '';
+            let device = desired.device ?? '';
             let customDevice = '';
-            let userDataDir = '';
-            let mode: 'persistent' | 'isolated' = 'persistent'; // default
-            const extraArgs: string[] = [];
-
-            for (const arg of rawArgs) {
-                if (arg === '--headless') {
-                    headless = true;
-                } else if (arg === '--isolated') {
-                    mode = 'isolated';
-                } else if (arg.startsWith('--browser=')) {
-                    browser = arg.slice('--browser='.length);
-                } else if (arg.startsWith('--device=')) {
-                    const val = arg.slice('--device='.length);
-                    if (PLAYWRIGHT_DEVICE_PRESETS.includes(val)) {
-                        device = val;
-                    } else {
-                        device = '__custom__';
-                        customDevice = val;
-                    }
-                } else if (arg.startsWith('--user-data-dir=')) {
-                    userDataDir = arg.slice('--user-data-dir='.length);
-                } else if (arg.startsWith('--storage-state=')) {
-                    // Skip: dynamically injected by backend
-                } else {
-                    extraArgs.push(arg);
-                }
+            if (device && !PLAYWRIGHT_DEVICE_PRESETS.includes(device)) {
+                customDevice = device;
+                device = '__custom__';
             }
 
             // Load storage state info for isolated mode display
             await reloadStorageStateInfo();
 
             setCookieForm(null); // Reset cookie form from previous session
-            setPlaywrightSettings({ mode, headless, browser, device, customDevice, userDataDir, extraArgs, newArg: '' });
+            setPlaywrightSettings({
+                mode: desired.mode,
+                headless,
+                browser,
+                device,
+                customDevice,
+                userDataDir: desired.userDataDir ?? '',
+                capabilities: desired.capabilities,
+                extraArgs: desired.extraArgs,
+                newArg: '',
+            });
             return;
         }
 
@@ -1467,7 +1445,7 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         }
     };
 
-    // Save cookie to storage-state JSON file
+    // Save cookie through the Rust-owned optimistic Identity Store.
     const handleSaveCookie = async () => {
         if (!cookieForm) return;
         const { editIndex, domain, name, value, path } = cookieForm;
@@ -1476,50 +1454,27 @@ export default function Settings({ mode = 'settings', initialSection, navigation
             return;
         }
         try {
-            const home = await homeDir();
-            const ssPath = await join(home, '.myagents', 'browser-storage-state.json');
-            const { exists: fileExists, readTextFile, writeTextFile } = await import('@tauri-apps/plugin-fs');
-
-            // Load existing or create new
-            let storageState: { cookies: Array<Record<string, unknown>>; origins: Array<Record<string, unknown>> } = { cookies: [], origins: [] };
-            if (await fileExists(ssPath)) {
-                try {
-                    storageState = JSON.parse(await readTextFile(ssPath));
-                } catch { /* corrupt file, start fresh */ }
-            }
-
             const domainVal = domain.trim().startsWith('.') ? domain.trim() : `.${domain.trim()}`;
             const pathVal = path.trim() || '/';
-
-            if (editIndex !== null && editIndex < storageState.cookies.length) {
-                // Preserve original metadata (expires, httpOnly, secure, sameSite) when editing
-                const existing = storageState.cookies[editIndex];
-                storageState.cookies[editIndex] = {
-                    ...existing,
+            const existing = editIndex !== null ? storageStateInfo?.cookies[editIndex] : undefined;
+            await mutateBrowserIdentityFromSettings({
+                operation: existing ? 'replaceCookie' : 'upsertCookie',
+                ...(existing ? {
+                    previousName: existing.name,
+                    previousDomain: existing.domain,
+                    previousPath: existing.path,
+                } : {}),
+                cookie: {
                     name: name.trim(),
                     value: value.trim(),
                     domain: domainVal,
                     path: pathVal,
-                };
-            } else {
-                // New cookie: use sensible defaults
-                storageState.cookies.push({
-                    name: name.trim(),
-                    value: value.trim(),
-                    domain: domainVal,
-                    path: pathVal,
-                    expires: -1,
-                    httpOnly: false,
-                    secure: true,
-                    sameSite: 'Lax',
-                });
-            }
-
-            // Ensure ~/.myagents/ exists (writeTextFile may fail if dir missing)
-            const myagentsDir = await join(home, '.myagents');
-            const { mkdir } = await import('@tauri-apps/plugin-fs');
-            await mkdir(myagentsDir, { recursive: true }).catch(() => {});
-            await writeTextFile(ssPath, JSON.stringify(storageState, null, 2));
+                    expires: existing?.expires ?? -1,
+                    httpOnly: existing?.httpOnly ?? false,
+                    secure: existing?.secure ?? true,
+                    sameSite: existing?.sameSite ?? 'Lax',
+                },
+            });
 
             setCookieForm(null);
             toast.success(editIndex !== null
@@ -1531,15 +1486,18 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         }
     };
 
-    // Delete a cookie from storage-state JSON
+    // Explicit Settings deletes create a tombstone revision, so a stale live
+    // Context cannot resurrect the cookie during its later checkpoint.
     const handleDeleteCookie = async (idx: number) => {
         try {
-            const home = await homeDir();
-            const ssPath = await join(home, '.myagents', 'browser-storage-state.json');
-            const { readTextFile, writeTextFile } = await import('@tauri-apps/plugin-fs');
-            const storageState = JSON.parse(await readTextFile(ssPath));
-            storageState.cookies.splice(idx, 1);
-            await writeTextFile(ssPath, JSON.stringify(storageState, null, 2));
+            const cookie = storageStateInfo?.cookies[idx];
+            if (!cookie) return;
+            await mutateBrowserIdentityFromSettings({
+                operation: 'deleteCookie',
+                name: cookie.name,
+                domain: cookie.domain,
+                path: cookie.path,
+            });
             toast.success(tSettings('toolbox.toasts.cookieDeleted'));
             await reloadStorageStateInfo();
         } catch {
@@ -1547,69 +1505,91 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         }
     };
 
+    const handleDeleteBrowserOrigin = async (origin: string) => {
+        try {
+            await mutateBrowserIdentityFromSettings({
+                operation: 'deleteOrigin',
+                origin,
+            });
+            toast.success(tSettings('toolbox.toasts.siteDataDeleted'));
+            await reloadStorageStateInfo();
+        } catch {
+            toast.error(tSettings('toolbox.toasts.deleteFailed'));
+        }
+    };
+
+    const appendPlaywrightAdvancedInput = () => {
+        setPlaywrightSettings(prev => {
+            if (!prev) return null;
+            const arg = prev.newArg.trim();
+            if (!arg) return prev;
+            if (arg.startsWith('--caps=')) {
+                const capabilities = arg.slice('--caps='.length)
+                    .split(',')
+                    .map(value => value.trim())
+                    .filter(Boolean);
+                return {
+                    ...prev,
+                    capabilities: [...new Set([...prev.capabilities, ...capabilities])],
+                    newArg: '',
+                };
+            }
+            return {
+                ...prev,
+                extraArgs: [...prev.extraArgs, arg],
+                newArg: '',
+            };
+        });
+    };
+
     const handleSavePlaywright = async () => {
         if (!playwrightSettings) return;
         try {
-            const args: string[] = [];
-
-            const home = await homeDir();
-
-            // Mode-specific args
-            if (playwrightSettings.mode === 'isolated') {
-                args.push('--isolated');
-                // Merge 'storage' capability into any existing --caps= from extra args
-                const existingCapsIdx = playwrightSettings.extraArgs.findIndex(a => a.startsWith('--caps='));
-                if (existingCapsIdx !== -1) {
-                    const existingCaps = playwrightSettings.extraArgs[existingCapsIdx].slice('--caps='.length);
-                    const capsSet = new Set(existingCaps.split(',').map(c => c.trim()).filter(Boolean));
-                    capsSet.add('storage');
-                    // Replace in extraArgs copy (don't mutate state)
-                    const extraArgsCopy = [...playwrightSettings.extraArgs];
-                    extraArgsCopy[existingCapsIdx] = `--caps=${[...capsSet].join(',')}`;
-                    args.push(...extraArgsCopy.filter(a => !a.startsWith('--caps=')));
-                    args.push(extraArgsCopy[existingCapsIdx]);
-                } else {
-                    args.push('--caps=storage');
-                }
-            } else {
-                // Persistent mode: use user-data-dir
-                let dir = playwrightSettings.userDataDir.trim();
-                // Expand ~ to home directory (tilde is a shell feature, not resolved by argv)
-                if (dir.startsWith('~/') || dir === '~') {
-                    dir = await join(home, dir.slice(2));
-                }
-                if (dir) {
-                    args.push(`--user-data-dir=${dir}`);
-                } else {
-                    const defaultProfile = await join(home, '.playwright-mcp-profile');
-                    args.push(`--user-data-dir=${defaultProfile}`);
-                }
+            const unsupportedArg = playwrightSettings.extraArgs.find(arg => !isSupportedPlaywrightAdvancedArg(arg));
+            if (unsupportedArg) {
+                toast.error(tSettings('toolbox.dialogs.playwright.unsupportedArg', { arg: unsupportedArg }));
+                return;
             }
-
-            if (playwrightSettings.headless) {
-                args.push('--headless');
+            const unsupportedCapability = playwrightSettings.capabilities.find(
+                capability => !isSupportedPlaywrightCapability(capability),
+            );
+            if (unsupportedCapability) {
+                toast.error(tSettings('toolbox.dialogs.playwright.unsupportedCapability', {
+                    capability: unsupportedCapability,
+                }));
+                return;
             }
-            if (playwrightSettings.browser) {
-                args.push(`--browser=${playwrightSettings.browser}`);
+            let userDataDir = playwrightSettings.userDataDir.trim();
+            if (userDataDir.startsWith('~/') || userDataDir === '~') {
+                const home = await homeDir();
+                userDataDir = userDataDir === '~' ? home : await join(home, userDataDir.slice(2));
             }
-            if (playwrightSettings.device) {
-                const deviceName = playwrightSettings.device === '__custom__'
-                    ? playwrightSettings.customDevice.trim()
-                    : playwrightSettings.device;
-                if (deviceName) {
-                    args.push(`--device=${deviceName}`);
-                }
-            }
-            // Add extra args (skip --caps= in isolated mode — already merged above)
-            const filteredExtraArgs = playwrightSettings.mode === 'isolated'
-                ? playwrightSettings.extraArgs.filter(a => !a.startsWith('--caps='))
-                : playwrightSettings.extraArgs;
-            args.push(...filteredExtraArgs);
+            const device = playwrightSettings.device === '__custom__'
+                ? playwrightSettings.customDevice.trim()
+                : playwrightSettings.device;
+            const capabilities = [...new Set([
+                ...(playwrightSettings.mode === 'isolated' ? ['storage'] : []),
+                ...playwrightSettings.capabilities,
+            ])];
+            const desired: PlaywrightBrowserSettings = {
+                schemaVersion: 1,
+                mode: playwrightSettings.mode,
+                headless: playwrightSettings.headless,
+                ...(playwrightSettings.browser ? { browser: playwrightSettings.browser } : {}),
+                ...(device ? { device } : {}),
+                ...(playwrightSettings.mode === 'persistent' && userDataDir ? { userDataDir } : {}),
+                capabilities,
+                extraArgs: playwrightSettings.extraArgs,
+            };
 
             await atomicModifyConfig(config => ({
                 ...config,
-                mcpServerArgs: { ...(config.mcpServerArgs ?? {}), playwright: args },
+                playwrightBrowser: desired,
+                mcpServerArgs: Object.fromEntries(
+                    Object.entries(config.mcpServerArgs ?? {}).filter(([serverId]) => serverId !== 'playwright'),
+                ),
             }));
+            await refreshConfig();
             const servers = await getAllMcpServers();
             setMcpServersState(servers);
             setPlaywrightSettings(null);
@@ -6195,21 +6175,6 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                 </label>
                                 <div className="grid grid-cols-2 gap-2">
                                     <button
-                                        onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'persistent' } : null)}
-                                        className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
-                                            playwrightSettings.mode === 'persistent'
-                                                ? 'border-[var(--accent)] bg-[var(--accent)]/5'
-                                                : 'border-[var(--line)] hover:border-[var(--line-strong)]'
-                                        }`}
-                                    >
-                                        <div className={`text-xs font-medium ${playwrightSettings.mode === 'persistent' ? 'text-[var(--accent)]' : 'text-[var(--ink)]'}`}>
-                                            {tSettings('toolbox.dialogs.playwright.persistentMode')}
-                                        </div>
-                                        <div className="text-xs text-[var(--ink-muted)] mt-0.5 leading-tight">
-                                            {tSettings('toolbox.dialogs.playwright.persistentModeDescription')}
-                                        </div>
-                                    </button>
-                                    <button
                                         onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'isolated' } : null)}
                                         className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
                                             playwrightSettings.mode === 'isolated'
@@ -6222,6 +6187,21 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                         </div>
                                         <div className="text-xs text-[var(--ink-muted)] mt-0.5 leading-tight">
                                             {tSettings('toolbox.dialogs.playwright.isolatedModeDescription')}
+                                        </div>
+                                    </button>
+                                    <button
+                                        onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'persistent' } : null)}
+                                        className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                                            playwrightSettings.mode === 'persistent'
+                                                ? 'border-[var(--accent)] bg-[var(--accent)]/5'
+                                                : 'border-[var(--line)] hover:border-[var(--line-strong)]'
+                                        }`}
+                                    >
+                                        <div className={`text-xs font-medium ${playwrightSettings.mode === 'persistent' ? 'text-[var(--accent)]' : 'text-[var(--ink)]'}`}>
+                                            {tSettings('toolbox.dialogs.playwright.persistentMode')}
+                                        </div>
+                                        <div className="text-xs text-[var(--ink-muted)] mt-0.5 leading-tight">
+                                            {tSettings('toolbox.dialogs.playwright.persistentModeDescription')}
                                         </div>
                                     </button>
                                 </div>
@@ -6265,6 +6245,11 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                         <p className="text-xs text-[var(--ink-muted)] mb-2">
                                             {tSettings('toolbox.dialogs.playwright.loginStateDescription')}
                                         </p>
+                                        {storageStateInfo?.recovery && (
+                                            <div className="mb-2 rounded-lg bg-[var(--warning-bg)] px-3 py-2 text-xs text-[var(--warning)]">
+                                                {tSettings('toolbox.dialogs.playwright.identityRecovered')}
+                                            </div>
+                                        )}
                                     </div>
 
                                     {/* Cookie List */}
@@ -6277,7 +6262,7 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                                             <span className="text-xs font-medium text-[var(--ink)] truncate">{cookie.name}</span>
                                                             <span className="text-xs text-[var(--ink-muted)]">{cookie.domain}</span>
                                                         </div>
-                                                        <div className="text-xs text-[var(--ink-muted)] truncate mt-0.5 font-mono max-w-[280px]">{cookie.value}</div>
+                                                        <div className="text-xs text-[var(--ink-muted)] truncate mt-0.5 font-mono max-w-[280px]">{cookie.path}</div>
                                                     </div>
                                                     <div className="flex items-center gap-1 shrink-0 ml-2">
                                                         <button
@@ -6285,7 +6270,7 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                                                 editIndex: idx,
                                                                 domain: cookie.domain,
                                                                 name: cookie.name,
-                                                                value: cookie.value,
+                                                                value: '',
                                                                 path: cookie.path,
                                                             })}
                                                             className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
@@ -6309,6 +6294,34 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                             </div>
                                             <div className="text-xs text-[var(--ink-muted)] mt-0.5">
                                                 {tSettings('toolbox.dialogs.playwright.emptyCookiesDescription')}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* localStorage + IndexedDB origins */}
+                                    {storageStateInfo && storageStateInfo.origins.length > 0 && (
+                                        <div>
+                                            <div className="mb-1 text-xs font-medium text-[var(--ink)]">
+                                                {tSettings('toolbox.dialogs.playwright.siteData')}
+                                            </div>
+                                            <div className="overflow-hidden rounded-lg border border-[var(--line)]">
+                                                {storageStateInfo.origins.map((origin, idx) => (
+                                                    <div
+                                                        key={origin}
+                                                        className={`flex items-center justify-between gap-2 px-3 py-2 ${idx > 0 ? 'border-t border-[var(--line)]' : ''}`}
+                                                    >
+                                                        <span className="min-w-0 truncate font-mono text-xs text-[var(--ink-muted)]">
+                                                            {origin}
+                                                        </span>
+                                                        <button
+                                                            onClick={() => handleDeleteBrowserOrigin(origin)}
+                                                            title={tSettings('toolbox.dialogs.playwright.deleteSiteData')}
+                                                            className="shrink-0 rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--error-bg)] hover:text-[var(--error)]"
+                                                        >
+                                                            <X className="h-3 w-3" />
+                                                        </button>
+                                                    </div>
+                                                ))}
                                             </div>
                                         </div>
                                     )}
@@ -6432,26 +6445,14 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                             onChange={e => setPlaywrightSettings(prev => prev ? { ...prev, newArg: e.target.value } : null)}
                                             onKeyDown={e => {
                                                 if (e.key === 'Enter' && playwrightSettings.newArg.trim()) {
-                                                    setPlaywrightSettings(prev => prev ? {
-                                                        ...prev,
-                                                        extraArgs: [...prev.extraArgs, prev.newArg.trim()],
-                                                        newArg: '',
-                                                    } : null);
+                                                    appendPlaywrightAdvancedInput();
                                                 }
                                             }}
                                             placeholder={tSettings('toolbox.dialogs.playwright.argPlaceholder')}
                                             className="flex-1 rounded-lg border border-[var(--line)] bg-[var(--paper)] px-3 py-1.5 text-sm text-[var(--ink)] placeholder-[var(--ink-muted)]/50 outline-none focus:border-[var(--accent)]"
                                         />
                                         <button
-                                            onClick={() => {
-                                                if (playwrightSettings.newArg.trim()) {
-                                                    setPlaywrightSettings(prev => prev ? {
-                                                        ...prev,
-                                                        extraArgs: [...prev.extraArgs, prev.newArg.trim()],
-                                                        newArg: '',
-                                                    } : null);
-                                                }
-                                            }}
+                                            onClick={appendPlaywrightAdvancedInput}
                                             disabled={!playwrightSettings.newArg.trim()}
                                             className="shrink-0 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-[var(--on-accent)] disabled:opacity-40"
                                         >

@@ -80,6 +80,7 @@ export const SSE_EVENT_PRIORITIES: Readonly<Record<string, SseEventPriority>> = 
   'chat:context-usage': 'coalescible',
   'chat:agent-plan-update': 'coalescible',
   'chat:runtime-tool-catalog': 'coalescible',
+  'chat:mcp-effective-snapshot': 'coalescible',
   // (Phase E PRD 0.2.7: `workspace:files-changed` SSE event removed; the
   // renderer subscribes to the Rust workspace_files watcher via Tauri
   // events instead, so this whitelist no longer needs the entry.)

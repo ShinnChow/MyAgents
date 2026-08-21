@@ -1,4 +1,5 @@
 import type { McpServerDefinition } from './config-types';
+import { playwrightBrowserSettingsRevision } from './playwrightBrowser';
 
 type AgentMcpConfig = {
   mcpEnabledServers?: unknown;
@@ -10,6 +11,7 @@ export type McpConfigContainer = {
   mcpEnabledServers?: string[];
   mcpServerEnv?: Record<string, Record<string, string>>;
   mcpServerArgs?: Record<string, string[]>;
+  playwrightBrowser?: unknown;
   agents?: unknown[];
   imBotConfig?: unknown;
   imBotConfigs?: unknown[];
@@ -30,7 +32,7 @@ function asRecord(value: unknown): Record<string, unknown> {
  */
 export function applyMcpServerConfigAdditions(
   servers: readonly McpServerDefinition[],
-  config: Pick<McpConfigContainer, 'mcpServerArgs' | 'mcpServerEnv'>,
+  config: Pick<McpConfigContainer, 'mcpServerArgs' | 'mcpServerEnv' | 'playwrightBrowser'>,
 ): McpServerDefinition[] {
   const argsByServer = asRecord(config.mcpServerArgs);
   const envByServer = asRecord(config.mcpServerEnv);
@@ -40,10 +42,14 @@ export function applyMcpServerConfigAdditions(
     const extraEnv = envByServer[server.id];
     const hasArgs = Array.isArray(extraArgs);
     const hasEnv = !!extraEnv && typeof extraEnv === 'object' && !Array.isArray(extraEnv);
-    if (!hasArgs && !hasEnv) return server;
+    const runtimeConfigRevision = server.id === 'playwright' && server.command === '__browser_host__'
+      ? playwrightBrowserSettingsRevision(config)
+      : undefined;
+    if (!hasArgs && !hasEnv && runtimeConfigRevision === undefined) return server;
 
     return {
       ...server,
+      ...(runtimeConfigRevision ? { runtimeConfigRevision } : {}),
       ...(hasArgs ? {
         args: [
           ...(Array.isArray(server.args) ? server.args : []),

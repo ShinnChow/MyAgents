@@ -280,6 +280,7 @@ export type SessionEngineStreamReplaySnapshot = {
   replayMessages: SessionEngineReplayMessage[];
   liveStreamingMessage?: SessionEngineReplayMessage | null;
   systemInitPayload?: unknown;
+  mcpEffectiveSnapshot?: import('../../shared/mcpEffectiveState').McpEffectiveSnapshot | null;
   pendingInteractiveRequests: SessionEnginePendingInteractiveRequest[];
 };
 

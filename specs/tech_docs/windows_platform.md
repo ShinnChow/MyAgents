@@ -93,6 +93,8 @@ Windows CLI mode 继续 `AttachConsole(ATTACH_PARENT_PROCESS)` 继承 cmd / Powe
 
 Task command Detector 不经过 SDK shell：bare `node` / `node.exe` 固定解析到 bundled Node.js v24，其他 bare executable 走 `system_binary::find()`；`executable + args + cwd` 分开传递，不经 `cmd /c` 或字符串重拼。Rust 进入进程边界前对绝对路径使用现有 external-path normalize，不能把 Windows verbatim/长路径前缀直接泄漏给 Node。
 
+Playwright 是另一条应用自有 Runtime：release 构建把锁定 revision 的浏览器放入 `resources/playwright-browsers`，Global Sidecar 通过 `PLAYWRIGHT_BROWSERS_PATH` 只使用该目录；缺 manifest 时生产环境 fail closed，不退回 `npx`、系统 npm cache 或临时下载。独立模式由一个 Browser generation 为每个 Product Session 建独立 BrowserContext；持久模式由 Rust Profile lease 串行化完整 user-data-dir。两种模式的 Chromium 后代都留在 Global Sidecar 的 `ChildTree` / Windows Job Object 内。正常 App/update shutdown 先由 Rust 对精确 Global generation 发起有界 loopback graceful handshake，等待 Host checkpoint 并调用受支持的 Context/Browser close；随后才关闭 Job Object 作为最终 containment。禁止按 `chrome.exe` 全机清理。
+
 ### 进程清理
 
 进程清理分成两种不能互换的 authority：

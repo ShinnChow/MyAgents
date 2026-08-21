@@ -91,6 +91,20 @@ describe('SimpleChatInput send paths', () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it('shows the exact persistent Browser queue position and cancels through Stop', async () => {
+    await i18n.changeLanguage('en-US');
+    const onStop = vi.fn();
+    const user = userEvent.setup();
+    renderInput({
+      browserProfileWait: { requestId: 'profile-wait-a', queuePosition: 2 },
+      onStop,
+    });
+
+    expect(screen.getByText(/position 2/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Cancel wait' }));
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
   it('uses stable line icons for the three builtin permission modes', async () => {
     await i18n.changeLanguage('zh-CN');
     const user = userEvent.setup();
@@ -464,8 +478,46 @@ describe('SimpleChatInput send paths', () => {
     expect(screen.getByText('Playwright')).toBeInTheDocument();
     expect(screen.getByText('Browser automation')).toBeInTheDocument();
     expect(screen.getByText('tavily-search')).toBeInTheDocument();
-    expect(toolsButton).toHaveTextContent('2');
+    expect(toolsButton).toHaveTextContent('3');
     expect(screen.queryByText('browser_click')).not.toBeInTheDocument();
+  });
+
+  it('shows Managed Runtime desired MCP status and counts only ready tools', async () => {
+    await i18n.changeLanguage('en-US');
+    const user = userEvent.setup();
+    renderInput({
+      runtime: 'codex',
+      runtimeMcpTools: ['mcp__stale__old_tool'],
+      mcpServers: [
+        { id: 'playwright', name: 'Playwright' },
+        { id: 'search', name: 'Search' },
+      ],
+      mcpEffectiveSnapshot: {
+        sessionId: 'session-a',
+        runtime: 'codex',
+        runtimeSource: 'managed-provider',
+        runtimeGeneration: 2,
+        configGeneration: 4,
+        configFingerprint: 'revision-4',
+        catalogGeneration: 3,
+        revision: 8,
+        observedAt: 1,
+        dispatch: { state: 'released', releaseReason: 'timeout' },
+        servers: [
+          { id: 'playwright', desired: true, state: 'starting', toolCount: 0, attemptGeneration: 2, updatedAt: 1 },
+          { id: 'search', desired: true, state: 'ready', toolCount: 3, attemptGeneration: 2, updatedAt: 1 },
+        ],
+        tools: ['mcp__search__one', 'mcp__search__two', 'mcp__search__three'],
+      },
+    });
+
+    const toolsButton = screen.getByTitle('Use tools');
+    expect(toolsButton).toHaveTextContent('3');
+    await user.click(toolsButton);
+    expect(screen.getByText('Playwright')).toBeInTheDocument();
+    expect(screen.getByText(/Starting/)).toBeInTheDocument();
+    expect(screen.getByText('3 tools ready')).toBeInTheDocument();
+    expect(screen.queryByText('stale')).not.toBeInTheDocument();
   });
 
   it('keeps workspace MCP configuration editable with Managed Codex builtin input chrome', async () => {
@@ -485,7 +537,7 @@ describe('SimpleChatInput send paths', () => {
     const toolsButton = screen.getByTitle('Use tools');
     await user.click(toolsButton);
 
-    expect(toolsButton).toHaveTextContent('2');
+    expect(toolsButton).toHaveTextContent(/^Tools$/);
     const playwrightRow = screen.getByText('Playwright').parentElement?.parentElement;
     expect(playwrightRow).not.toBeNull();
     expect(playwrightRow?.querySelector('button')).not.toBeNull();

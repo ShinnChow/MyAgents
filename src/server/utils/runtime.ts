@@ -181,6 +181,26 @@ export function getBundledNodePath(): string | null {
   return existsSync(nodeBin) ? nodeBin : null;
 }
 
+/** Resolve the build-staged, exact-version Playwright browser registry. */
+export function getBundledPlaywrightBrowsersDir(): string | null {
+  const scriptDir = getScriptDir();
+  const production = resolve(scriptDir, 'playwright-browsers');
+  if (existsSync(resolve(production, 'manifest.json'))) return production;
+
+  let dir = scriptDir;
+  for (let i = 0; i < 6; i++) {
+    const development = resolve(
+      dir,
+      'src-tauri',
+      'resources',
+      'playwright-browsers',
+    );
+    if (existsSync(resolve(development, 'manifest.json'))) return development;
+    dir = dirname(dir);
+  }
+  return null;
+}
+
 /**
  * Get the path to the JavaScript runtime used to execute our own scripts
  * (sidecar entrypoint, plugin bridge, etc.).

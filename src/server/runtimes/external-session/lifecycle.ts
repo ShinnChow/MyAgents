@@ -4,6 +4,7 @@ import type { RuntimeType } from '../../../shared/types/runtime';
 import type { SystemInitInfo } from '../../../shared/types/system';
 import type { SessionOrigin } from '../../../shared/session-origin';
 import type { OfficialToolId } from '../../../shared/official-tools';
+import type { McpEffectiveSnapshot } from '../../../shared/mcpEffectiveState';
 import type { AgentRuntime, RuntimeProcess } from '../types';
 import type { ExternalSessionState, ExternalSystemInitPayload } from './types';
 
@@ -25,6 +26,9 @@ let lastRuntimeSessionId = '';
 
 let externalSessionState: ExternalSessionState = 'idle';
 let externalSystemInitPayload: ExternalSystemInitPayload | null = null;
+let externalMcpEffectiveSnapshot: McpEffectiveSnapshot | null = null;
+let externalMcpEffectiveRevision = 0;
+let externalRuntimeGeneration = 0;
 let isPrewarmingSession = false;
 let liveRevision = 0;
 
@@ -41,6 +45,9 @@ export function resetExternalLifecycleState(): void {
   lastAnalyticsSource = 'desktop';
   lastAnalyticsOrigin = null;
   externalSystemInitPayload = null;
+  externalMcpEffectiveSnapshot = null;
+  externalMcpEffectiveRevision = 0;
+  externalRuntimeGeneration = 0;
   externalSessionState = 'idle';
   isPrewarmingSession = false;
   liveRevision = 0;
@@ -66,6 +73,9 @@ export function isExternalLifecycleStarting(): boolean {
 }
 
 export function beginExternalLifecycleStart(sessionId: string): () => void {
+  externalRuntimeGeneration += 1;
+  externalMcpEffectiveRevision = 0;
+  externalMcpEffectiveSnapshot = null;
   let resolveStarting!: () => void;
   startingPromise = new Promise<void>((resolve) => {
     resolveStarting = resolve;
@@ -148,6 +158,8 @@ export function bindExternalSessionContext(input: {
 }): void {
   if (lastSessionId !== input.sessionId) {
     liveRevision = 0;
+    externalMcpEffectiveRevision = 0;
+    externalMcpEffectiveSnapshot = null;
   }
   lastSessionId = input.sessionId;
   lastWorkspacePath = input.workspacePath;
@@ -218,6 +230,34 @@ export function setExternalSystemInitPayload(payload: ExternalSystemInitPayload 
 
 export function getExternalSystemInitPayloadSnapshot(): ExternalSystemInitPayload | null {
   return externalSystemInitPayload;
+}
+
+export function setExternalMcpEffectiveSnapshot(
+  snapshot: Omit<McpEffectiveSnapshot, 'sessionId' | 'runtime' | 'runtimeSource' | 'runtimeGeneration' | 'revision'>,
+  runtime: RuntimeType,
+  runtimeSource?: import('../../../shared/types/runtime').RuntimeSource,
+): McpEffectiveSnapshot {
+  externalMcpEffectiveRevision += 1;
+  externalMcpEffectiveSnapshot = {
+    ...snapshot,
+    sessionId: lastSessionId,
+    runtime,
+    ...(runtimeSource ? { runtimeSource } : {}),
+    runtimeGeneration: externalRuntimeGeneration,
+    revision: externalMcpEffectiveRevision,
+  };
+  return externalMcpEffectiveSnapshot;
+}
+
+export function getExternalMcpEffectiveSnapshot(): McpEffectiveSnapshot | null {
+  return externalMcpEffectiveSnapshot
+    ? {
+        ...externalMcpEffectiveSnapshot,
+        dispatch: { ...externalMcpEffectiveSnapshot.dispatch },
+        servers: externalMcpEffectiveSnapshot.servers.map(server => ({ ...server })),
+        tools: [...externalMcpEffectiveSnapshot.tools],
+      }
+    : null;
 }
 
 export function setExternalPrewarmingSession(value: boolean): void {

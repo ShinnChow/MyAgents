@@ -93,10 +93,6 @@ This is a lightweight, immediate, desktop-adjacent entry point. The user can eas
 Keep responses concise and directly useful for this small-window interaction.
 </myagents-floating-ball-instructions>`;
 
-const TMPL_BROWSER_STORAGE_STATE = `<myagents-browser-storage-instructions>
-当你在浏览器中执行了登录操作或用户帮你完成了登录（输入账号密码、OAuth 授权、扫码登录等），必须在登录成功后**立即**调用 browser_storage_state 工具将登录状态保存到 ~/.myagents/browser-storage-state.json，然后再继续执行后续任务。这样即使后续任务中断或会话异常终止，登录态也不会丢失，后续对话可以复用。
-</myagents-browser-storage-instructions>`;
-
 // ===== Variable replacement =====
 // Supports {{varName}} simple substitution + {{#if varName}}...{{else}}...{{/if}} conditional blocks
 
@@ -115,8 +111,6 @@ function renderTemplate(template: string, vars: Record<string, string>): string 
 // ===== Main entry =====
 
 export interface SystemPromptOptions {
-  /** Whether Playwright MCP with storage capability is enabled in this session */
-  playwrightStorageEnabled?: boolean;
   /**
    * Current runtime driving this session, used to render a runtime-accurate
    * identity line in L1. Defaults to 'builtin' (Claude Agent SDK) if omitted.
@@ -209,11 +203,6 @@ export function buildSystemPromptAppend(scenario: InteractionScenario, options?:
   // a capability the AI should notice without needing to load the skill doc.
   const sessionInboxSection = buildSessionInboxSection(scenario);
   if (sessionInboxSection) parts.push(sessionInboxSection);
-
-  // L3: Browser storage state save instruction (when Playwright with --caps=storage is active)
-  if (options?.playwrightStorageEnabled) {
-    parts.push(TMPL_BROWSER_STORAGE_STATE);
-  }
 
   // L4: CLI-backed capability hints — universal across runtimes since v0.2.11
   // (both agent-session.ts and external-session.ts pass cliToolsEnabled: true;

@@ -59,9 +59,9 @@
 
 Codex / Gemini 的 persistent runtime 预热和 Sidecar HTTP readiness 是两层不同契约。Sidecar `/health/ready` 只说明 Node owner 可接请求；external `startSession()` 返回才说明该 runtime 能接首轮 turn。
 
-Managed Codex 又多一层：`initialize` 完成后 app-server 已存活，但 MyAgents 通过进程参数注入的 MCP 仍异步启动。`CodexRuntime.startSession()` 在发起 `thread/start|resume` 的 native startup boundary 建立 10 秒 absolute soft pre-warm window，并给每个 injected MCP 写入同预算派生的 Codex 原生 `startup_timeout_sec`，避免 MyAgents barrier 之后再叠 Codex 默认隐藏等待。`ready / failed / cancelled / timeout` 都会结束本 Runtime Session 唯一一次观察；非 ready 状态记录 degraded 后继续首 turn，当前 Runtime Session 不自动 reload / retry，新 Session 才重新尝试。这个 owner 不包含 Codex 用户目录自有配置；只有 process exit、thread/RPC failure 仍是 Runtime startup failure。
+Managed Codex 又多一层：`initialize` 完成后 app-server 已存活，但 MyAgents 通过进程参数注入的 MCP 仍异步启动。`CodexRuntime.startSession()` 在发起 `thread/start|resume` 的 native startup boundary 消费从应用级 demand 接受时开始的 10 秒 absolute dispatch grace；Codex 原生 `startup_timeout_sec=60` 是单次启动尝试的上界，不重置也不延长前者。grace 到期只放行基础 turn，Runtime 状态与 tool catalog 仍持续观察；late-ready 会直接更新当前 Product Session，若启动准入时尚未把本地 MCP 放入进程，则 external-session owner 在 idle boundary replacement 并自动 pre-warm。这个 owner 不包含 Codex 用户目录自有配置；只有 process exit、thread/RPC failure 仍是 Runtime startup failure。
 
-MCP definition 在到达 runtime 前也必须保持可执行：`mcpServerArgs[id]` 是附加参数，不得替换 preset 的 package/base argv。否则该 server 会在当前 Runtime Session 的一次预热窗口后 terminal degraded，基础 turn 虽可继续，但对应工具在该 Session 内不可用。
+MCP definition 在到达 runtime 前也必须保持可执行：`mcpServerArgs[id]` 是非 Playwright MCP 的附加参数，不得替换 preset 的 package/base argv。MyAgents-owned Playwright 是例外：preset sentinel 会投影成带短期 capability 的应用 Browser Host HTTP endpoint，不再产生 per-Session `npx`。启动失败、鉴权与 late-ready 都必须进入 effective snapshot；dispatch grace 不能充当 capability terminal。
 
 ## "AI 启动中" UI 状态判据：`sdkControlReady` ≠ `system_init`
 
@@ -72,7 +72,7 @@ Claude Agent SDK 有**两个**完全不同含义的"准备好"信号，老代码
 | `Query.initializationResult()` | SDK 内部 `subtype:"initialize"` control_request 的 response | **subprocess 控制面 ready**：control request 可用、commands/agents 等初始化信息已返回；**不保证每个 MCP 已 connected** | spawn 后 ~300ms-3s |
 | streamed `system_init` (`type:"system",subtype:"init"`) | `QueryEngine.submitMessage()` 在 `fetchSystemPromptParts → processUserInput → recordTranscript → loadAllPlugins` 之后 yield（claude-code:`src/QueryEngine.ts:540`）| **per-turn metadata**：当前 turn 用到的 model / tools / mcp_servers / session_id / permissionMode | 第一条 user message 触发 turn 的中后段 |
 
-SDK 0.3 的 MCP 连接是非阻塞的：`initializationResult()` 已 resolve 或 streamed `system_init` 已列出某个 server 时，该 server 仍可能是 `pending`、`failed`、`needs-auth` 或 `disabled`。因此二者都不能作为 MCP ready 判据。Query / MCP map 创建时建立一次 10 秒 absolute deadline；所有 Desktop、IM 与 injected queue item 在公共 `messageGenerator()` dispatch seam 只消费剩余预算。`pending` 才等待；失败、鉴权、disabled、missing、status error 或 timeout 都把该 generation 标为 degraded 并继续基础 AI turn。结果在 owner 上 one-shot settle，连续会话不会每轮重读 / 重计时。
+SDK 0.3 的 MCP 连接是非阻塞的：`initializationResult()` 已 resolve 或 streamed `system_init` 已列出某个 server 时，该 server 仍可能是 `pending`、`failed`、`needs-auth` 或 `disabled`。因此二者都不能作为 MCP ready 判据。Query / MCP map generation 建立一份 10 秒 absolute dispatch grace；所有 Desktop、IM 与 injected queue item 在公共 `messageGenerator()` dispatch seam 只消费剩余预算。deadline 后首次观察仍至少读取一次真实 status，随后基础 turn 可继续；Query generation 的低频 live observer 继续投影 ready / failed / needs-auth 与真实 tool catalog。连续 turn 不重算 grace，但也不会把 timeout 缓存成永久无能力。
 
 **UI 状态机对应**：
 - `sessionState === 'starting'` → "AI 启动中（首次启动可能较慢）" hint —— **subprocess 还没 ready 才该显示这个**
@@ -135,7 +135,7 @@ setSessionState((systemInitInfo || sdkControlReady) ? 'running' : 'starting');
 4. **是否 Tab session 误开启了 MCP self-resolve？** —— 检查 `initializeAgent` 的 `includeMcp` 参数。
 5. **是否新加了 `console.log` 在 hot path 而 logger 未 buffered？** —— `UnifiedLogger` 是 in-memory bounded queue，但极高频日志仍可能拖慢。
 6. **是否第一条用户消息整段都被标成「AI 启动中」？** —— 先确认 `sdkControlReady` 是否在 pre-warm spawn 后被 `initializationResult()` 设为 true（grep `[agent] SDK control plane ready in`）。再核对所有 session 重置点同时清 `systemInitInfo` 和 `sdkControlReady`。详见上方「`sdkControlReady` ≠ `system_init`」节。
-7. **External `prewarm_done` 是否记录 MCP terminal summary？** —— Managed Codex 的 `managed MCP pre-warm terminal outcome=ready|degraded` 在 `thread/start|resume` RPC 成功返回后结算；outcome 使用 thread boundary 建立的原 10 秒 absolute deadline，因此 thread RPC 卡顿时日志可能晚于 10 秒出现。RPC 失败属于 Runtime failure，不会伪造 summary；degraded 后同一 Runtime Session 不应出现 reload / 第二次 barrier。
+7. **External 日志是否把 dispatch 与 capability 分开？** —— Managed Codex 记录 `MCP dispatch outcome=ready|released` 及 `releaseReason`，10 秒只决定当前 turn 是否继续等待；后续 native status/tool catalog 仍可在同一 Product Session 发布 late-ready，或触发一次 idle replacement。RPC 失败属于 Runtime failure，不能伪造 capability terminal。
 8. **同一 Codex pid/thread 的每轮首响仍固定慢约 30 秒？** —— 检查 MyAgents injected server 的最终 launch config 是否带 `startup_timeout_sec=10`，并确认 preset package/base argv 没被 `mcpServerArgs` 覆盖；不要先假设进程发生了重启。
 
 ## 与其他文档的关系

@@ -278,10 +278,12 @@ import {
   setExternalLifecycleScenario,
   setExternalLifecycleState,
   setExternalPrewarmingSession,
+  setExternalMcpEffectiveSnapshot,
   setExternalRuntimeSessionId,
   setExternalSystemInitPayload,
   updateExternalLifecycleStartingSessionId,
 } from './external-session/lifecycle';
+export { getExternalMcpEffectiveSnapshot } from './external-session/lifecycle';
 import { originAnalyticsFields, originFromTurnAttribution } from '../../shared/session-origin';
 import type { SessionOrigin } from '../../shared/session-origin';
 import type { OfficialToolId } from '../../shared/official-tools';
@@ -620,6 +622,29 @@ function applyPendingExternalProcessConfigInvalidation(
   return operation;
 }
 
+function scheduleManagedCodexAdmissionReplacementPrewarm(): void {
+  const sessionId = getExternalLifecycleSessionId();
+  const workspacePath = getExternalLifecycleWorkspacePath();
+  const scenario = getExternalLifecycleScenario();
+  if (!isManagedCodexProductRuntime() || !sessionId || !workspacePath) return;
+  const timer = setTimeout(() => {
+    if (
+      !isManagedCodexProductRuntime()
+      || getExternalLifecycleSessionId() !== sessionId
+      || getExternalLifecycleWorkspacePath() !== workspacePath
+      || isExternalSessionBusy()
+      || hasExternalRuntimeProcess()
+    ) return;
+    void prewarmExternalSession({ sessionId, workspacePath, scenario }).catch(error => {
+      console.warn(
+        '[external-session] MCP admission replacement prewarm failed:',
+        summarizeExternalRuntimeMessageForLog(error),
+      );
+    });
+  }, 0);
+  timer.unref?.();
+}
+
 function scheduleExternalQueueDrainAfterTurnBoundary(): void {
   if (pendingExternalProcessConfigRestartReasons().length === 0) {
     setTimeout(() => drainExternalQueueAfterTurn(), 0);
@@ -629,6 +654,7 @@ function scheduleExternalQueueDrainAfterTurnBoundary(): void {
 
   const finalization = applyPendingExternalProcessConfigInvalidation()
     .then(() => {
+      scheduleManagedCodexAdmissionReplacementPrewarm();
       setTimeout(() => drainExternalQueueAfterTurn(), 0);
     })
     .catch((error) => {
@@ -6833,6 +6859,59 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
         sessionId: getExternalLifecycleSessionId(),
         tools,
       });
+      break;
+    }
+
+    case 'mcp_effective_update': {
+      const {
+        kind: _kind,
+        ...runtimeSnapshot
+      } = event;
+      const snapshot = setExternalMcpEffectiveSnapshot(
+        {
+          ...runtimeSnapshot,
+          observedAt: Date.now(),
+        },
+        getCurrentRuntimeType(),
+        getCurrentRuntimeSource(),
+      );
+      broadcast('chat:mcp-effective-snapshot', snapshot);
+      break;
+    }
+
+    case 'mcp_startup_admission_ready': {
+      if (!isManagedCodexProductRuntime()) break;
+      setManagedCodexExtensionRestartPending(true);
+      broadcastManagedCodexExtensionDiagnostics(true);
+      if (!isExternalSessionBusy()) {
+        void applyPendingExternalProcessConfigInvalidation()
+          .then(() => scheduleManagedCodexAdmissionReplacementPrewarm())
+          .catch(error => {
+            console.warn(
+              '[external-session] MCP admission idle replacement failed:',
+              summarizeExternalRuntimeMessageForLog(error),
+            );
+          });
+      }
+      break;
+    }
+
+    case 'mcp_runtime_replacement_required': {
+      if (!isManagedCodexProductRuntime()) break;
+      pendingExternalCapabilityRestart = true;
+      console.log(
+        `[external-session] ${event.serverId} transport is ready for idle-boundary replacement`,
+      );
+      if (!isExternalSessionBusy()) {
+        void applyPendingExternalProcessConfigInvalidation()
+          .then(() => scheduleManagedCodexAdmissionReplacementPrewarm())
+          .catch(error => {
+            console.warn(
+              '[external-session] MCP transport idle replacement failed:',
+              summarizeExternalRuntimeMessageForLog(error),
+            );
+          });
+      }
       break;
     }
 

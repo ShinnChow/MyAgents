@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { McpServerDefinition } from './config-types';
 import {
+  applyMcpServerConfigAdditions,
   promoteAgentMcpJsonToGlobal,
   removeMcpServerFromAppConfig,
   type McpConfigContainer,
@@ -19,6 +20,39 @@ function remote(id: string): McpServerDefinition {
 }
 
 describe('MCP config helpers', () => {
+  it('projects Browser Host desired settings as an opaque Runtime revision', () => {
+    const playwright: McpServerDefinition = {
+      id: 'playwright',
+      name: 'Playwright',
+      type: 'stdio',
+      command: '__browser_host__',
+      args: [],
+      isBuiltin: true,
+    };
+    const isolated = applyMcpServerConfigAdditions([playwright], {
+      playwrightBrowser: {
+        schemaVersion: 1,
+        mode: 'isolated',
+        headless: false,
+        capabilities: ['storage'],
+        extraArgs: [],
+      },
+    });
+    const persistent = applyMcpServerConfigAdditions([playwright], {
+      playwrightBrowser: {
+        schemaVersion: 1,
+        mode: 'persistent',
+        headless: false,
+        capabilities: [],
+        extraArgs: [],
+      },
+    });
+
+    expect(isolated[0].runtimeConfigRevision).toMatch(/^playwright-browser-v1-[a-f0-9]{16}$/);
+    expect(persistent[0].runtimeConfigRevision).not.toBe(isolated[0].runtimeConfigRevision);
+    expect(JSON.stringify(isolated[0])).not.toContain('mode');
+  });
+
   it('promotes selected Agent-only HTTP definitions into the global catalogue', () => {
     const server = remote('remote-http');
     const config: McpConfigContainer = {

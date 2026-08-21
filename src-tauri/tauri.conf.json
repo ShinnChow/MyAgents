@@ -54,6 +54,7 @@
       "../bundled-agents": "bundled-agents",
       "../src-tauri/resources/cli": "cli",
       "../src-tauri/resources/document-processing": "document-processing",
+      "../src-tauri/resources/playwright-browsers": "playwright-browsers",
       "../bundled-workspaces": "bundled-workspaces",
       "../LICENSE": "legal/LICENSE",
       "../LICENSING.md": "legal/LICENSING.md",

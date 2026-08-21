@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   MCP_PREWARM_GRACE_MS,
+  MCP_STATUS_SNAPSHOT_TIMEOUT_MS,
   awaitMcpPrewarm,
   classifyMcpPrewarmStatuses,
   type McpPrewarmOwner,
@@ -10,6 +11,42 @@ import {
 describe('MCP soft pre-warm policy', () => {
   it('keeps the grace budget in one policy constant', () => {
     expect(MCP_PREWARM_GRACE_MS).toBe(10_000);
+    expect(MCP_STATUS_SNAPSHOT_TIMEOUT_MS).toBe(1_000);
+  });
+
+  it('performs one bounded truth read even when observation starts after the deadline', async () => {
+    const readStatuses = vi.fn(async () => [{ name: 'fs', status: 'connected' as const }]);
+    const current = owner({
+      startedAt: 0,
+      deadlineAt: 10_000,
+      statuses: readStatuses,
+    });
+
+    await expect(awaitMcpPrewarm({
+      owner: current,
+      getOwner: () => current,
+      now: () => 12_000,
+    })).resolves.toEqual({ state: 'ready', elapsedMs: 12_000 });
+    expect(readStatuses).toHaveBeenCalledOnce();
+  });
+
+  it('reports the observed pending state when the final post-deadline snapshot is not ready', async () => {
+    const current = owner({
+      startedAt: 0,
+      deadlineAt: 10_000,
+      statuses: async () => [{ name: 'fs', status: 'pending' }],
+    });
+    await expect(awaitMcpPrewarm({
+      owner: current,
+      getOwner: () => current,
+      now: () => 12_000,
+      sleep: async () => undefined,
+    })).resolves.toEqual({
+      state: 'degraded',
+      reason: 'timeout',
+      servers: [{ id: 'fs', status: 'pending' }],
+      elapsedMs: 12_000,
+    });
   });
 
   it.each([
@@ -48,7 +85,11 @@ describe('MCP soft pre-warm policy', () => {
     {
       name: 'missing',
       statuses: [],
-      expected: { state: 'degraded', servers: [{ id: 'fs' }] },
+      expected: {
+        state: 'pending',
+        pendingServers: [{ id: 'fs' }],
+        degradedServers: [],
+      },
     },
   ] satisfies Array<{
     name: string;

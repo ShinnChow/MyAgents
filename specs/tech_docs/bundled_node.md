@@ -127,6 +127,8 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 - 通过 `process_cmd::new()` spawn（Windows 自动 `CREATE_NO_WINDOW`）
 - 环境变量通过 `proxy_config::apply_to_subprocess` 注入 `NO_PROXY` 保护 localhost
 
+Playwright preset 不走这条路径。0.4.10 起它由生产依赖中锁定的 `@playwright/mcp` 包根 `createConnection()` 驱动，Session Runtime 只连接应用级 Browser Host；浏览器可执行文件由 `scripts/prepare-playwright-runtime.mjs` 按 target 精确 staging 到 `playwright-browsers` 资源目录。运行时不得访问 npm registry、调用 `npx` 或依赖用户 Node/cache。
+
 ### 内置 in-process MCP（懒加载）
 
 当前 user-toggleable `gemini-image` / `edge-tts` 通过 `src/server/tools/builtin-mcp-meta.ts` 的 META 登记 + `createXxxServer()` 工厂懒加载，**不在** Sidecar 冷启动时创建；历史 `cron-tools` / `im-cron` / `im-media` 已迁移到 `myagents` CLI。runtime-dynamic `im-bridge-tools` 由独立的 context-injected surface owner 懒初始化，不进入 META registry。见 `pit_of_success.md §Builtin MCP 懒加载架构`。
@@ -140,7 +142,8 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 3. **Plugin Bridge 打包**：esbuild bundle `src/server/plugin-bridge/index.ts` → `plugin-bridge-dist.mjs`
 4. **CLI 打包**：esbuild bundle `src/cli/myagents.ts` → `resources/cli/myagents.cjs`；扩展名固定 CommonJS 语义，不受安装目录上层 `package.json` 影响
 5. **SDK native binary**：按 target triple 拷贝 + codesign
-6. **Tauri 构建**：`npm run tauri:build -- --target <triple>`
+6. **Playwright runtime**：按 target 下载锁定 revision 的 Chromium/Firefox/WebKit，校验 manifest 与法律声明后原子投影到 Tauri resources
+7. **Tauri 构建**：`npm run tauri:build -- --target <triple>`；wrapper 强制先完成 Playwright staging
 
 `src-tauri/resources/` 是当前构建的 staging，不是跨构建缓存。构建脚本必须在
 Tauri 读取前完整替换自己负责的目录：macOS release 在每个 target loop 内分别

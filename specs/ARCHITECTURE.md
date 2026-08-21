@@ -269,6 +269,8 @@ Global control request
 | `/api/mcp/remove-references` | Task 中删除 custom MCP identity 的持久引用 | `admin-api.ts` MCP remove cascade |
 | `/api/app/config-changed` | 将 disk-first AppConfig 失效信号广播到所有 WebView（空 payload，不携带 secret） | `admin-api.ts` model / MCP mutation |
 | `/api/runtime/sdk-child/{admit,settle}` | Rust-owned Claude SDK native child launch circuit；按 executable identity 限流 deterministic exec denial | Global / Session Sidecar 的 `createGuardedSdkQuery()` |
+| `/api/mcp/startup/*` | MyAgents-owned 本地 stdio MCP 的应用级启动准入；优先级、FIFO/aging、取消、过期与 stale settlement | Session Sidecar |
+| Management `/api/browser/*` | Browser Host capability、Browser Identity checkpoint/CAS 与持久 Profile lease | Rust/Tauri；仅当前 Global/Session birth identity 可调用 |
 | `/api/thought/*`（2 条） | 想法 create / list | CLI、`admin-api.ts` |
 | `/api/im/*` + `/api/im-bridge/*` | IM Bot 唤醒 + 媒体下发 + Plugin Bridge 回调 | Node.js / 社区插件 Bridge |
 | `/api/plugin/*`（3 条） | OpenClaw 插件 CRUD | CLI |
@@ -276,7 +278,18 @@ Global control request
 
 这是项目内**唯一**的"Node → Rust"反向 HTTP 通道，规避了"Renderer / Sidecar 控制面走 Rust proxy → Node"主流向对后端间通信的不适配。所有客户端 MUST 走 `crate::local_http::builder()`（loopback，仍复用 no_proxy 保护）。
 
+应用级资源不能由某个 Session Sidecar 的内存计数代管。Rust 的 MCP startup admission 只裁决 MyAgents-owned 本地 stdio 启动突发，不接管远端 HTTP、SDK in-process 或 `system-cli` 用户自有 MCP；10 秒 dispatch grace 从 demand 被接受时起算，包含排队时间。Global Sidecar 内的 Browser Host 使用 Rust 签发、绑定 Product Session 与 Host generation 的 capability，具体持有 Playwright `Browser` / `BrowserContext`；Rust 只拥有 Host generation、Profile lease 与 Browser Identity Store revision，不复制 Node 对象状态。
+
 Rust 为 Global 与 Session 两类 Sidecar 都在 spawn 前分配 process-global 单调 generation，并注入不可变的进程管理 identity（`MYAGENTS_SIDECAR_ID`）；Session pending / reset / handover 只迁移可变的业务 `sessionId` key，Management API 仍以进程出生时的 `(sidecarId, generation)` 校验 caller，不能给 Global 伪造 Session identity。SDK native child 的 EPERM / EACCES / ENOEXEC circuit 归 Rust 应用进程持有：admission 携带 epoch，half-open lease 自动过期，旧 settlement 不能清除较新的 failure epoch。该 circuit 是 best-effort 重试保护而非 SDK 启动 authority：只有携带上述确定性系统错误的显式 circuit denial 可以阻止启动；identity 缺失、`invalid_request` / `stale_sidecar`、transport 异常或畸形响应只跳过 circuit，继续调用 SDK，生命周期清理由 Sidecar owner 收敛。
+
+### Playwright Browser Host
+
+Playwright preset 不再让每个 Session 通过 `npx` 启动一套 MCP/Browser，而是投影到 Global Sidecar 的受管 HTTP MCP Host。Host 只使用锁定版本 `@playwright/mcp` 的公共 `createConnection(config, contextGetter)`，并由应用打包匹配的 Playwright browser runtime；运行时不访问 npm registry。
+
+- `config.json.playwrightBrowser` 是 desired settings 唯一权威；历史 `mcpServerArgs.playwright` 只做一次无损迁移。未明确保存模式时默认 `isolated`，已明确的 `--isolated` / `--user-data-dir` 保持原意；未知参数 fail-visible，不建立长期双读双写。
+- 独立模式每个 Product Session 一个 `BrowserContext`，所有 Context 共用当前应用级 Browser generation，但从不共享 pages/tabs。Context 从 Rust-owned Browser Identity revision 初始化，Host 在成功工具调用后防抖保存，并在 close/teardown/shutdown 前强制保存 Cookie、localStorage 与 IndexedDB；并发 checkpoint 通过 revision + key-level CAS 合并。设置页通过 Tauri command 直达 Rust persistence owner，并携带读取到的 revision；生产 Global Sidecar 不暴露完整 Identity 数据的 loopback route。
+- 持久化模式只有一个完整 Profile Context。首次实际取 Context 时才向 Rust 获取公平、可取消、generation-fenced 的排他 lease；HTTP 建连和工具目录读取不占 lease。正常关闭、Session owner 释放、配置 replacement 或 App 退出精确释放；外部 Chrome 占用 Profile 时返回 `PROFILE_IN_USE`，禁止删除 lock 或按进程名杀 Chrome。
+- Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host/config generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
 
 ---
 
@@ -571,9 +584,11 @@ Product Session identity 与 builtin SDK execution identity 是两个 lifecycle�
 
 Session transcript 的普通写入只接受 `SessionStore.loadSessionTranscript()` 签发的进程内 `TranscriptWriteCursor` 与新 tail；cursor 封装 durable file identity 和公开的 `persistedMessageCount`，Runtime 不另存 index/cache。短 live projection、stale cursor 或未知 append 结果不能触发 full rewrite；owner 必须重载 durable transcript并拒绝当前操作。rewind、retry、SDK retraction 与 admission rollback 通过 `mutateSessionTranscript()` 的命名 intent，在既有 per-Session lock 内从 durable rows 派生 target 后 temp+rename；SDK retraction 以 durable `sdkUuid` 为选择器，仅可额外删除明确传入的 open streaming tail id。legacy JSON 首次加载先原子发布 JSONL，失败保留 legacy source 并向调用方报错。Fork 只可写入空 target transcript，已有 target 一律冲突退出。Builtin Rewind 若同时更换 SDK binding，则由 `commitBuiltinConversationRewind()` 复用同一 per-Session lock 与 metadata 中 bounded `pendingConversationMutation`，只接受 source/target 两个 message count 完成崩溃恢复；Codex 对应使用 `commitCodexConversationRewind()`。这两个显式 composite command 不扩展成通用事务层。
 
-**Builtin MCP soft pre-warm：** `Query.initializationResult()` 与 streamed `system_init` 都不代表 MCP 已连接。初始 Query 或成功安装新 MCP map 时，`lifecycle.ts` 以 Query identity + generation + 单调 installed-map revision + runtime fingerprint 建立一次性 owner，并在 owner 上记录 `startedAt + deadlineAt`；默认预算只由 `session-core/mcp-prewarm-policy.ts::MCP_PREWARM_GRACE_MS` 定义（当前 10 秒）。Desktop、IM 与 Cron / Goal / Heartbeat / Memory Update 等 injected turn 全部在 `messageGenerator()` promotion 后、live mutation fence 之后消费该 owner 的**剩余**预算。只有 `pending` 会继续等待；`failed`、`needs-auth`、`disabled`、missing、status read error 或 deadline 到期都把当前 generation 标为 degraded 并继续 AI turn。ready / degraded 都是 terminal one-shot，后续 turn 不再读 status、不开新 timer。用户取消仍立即取消 promotion；Query/map owner replacement 则 requeue 给 replacement generator，不能让旧 control response放行旧 Query。
+**Builtin MCP dispatch grace 与 live capability：** `Query.initializationResult()` 与 streamed `system_init` 都不代表 MCP 已连接。初始 Query 或成功安装新 MCP map 时，`lifecycle.ts` 以 Query identity + generation + 单调 installed-map revision + runtime fingerprint 建立 owner，并记录 `startedAt + deadlineAt`；默认 dispatch grace 仍由 `session-core/mcp-prewarm-policy.ts::MCP_PREWARM_GRACE_MS` 定义（当前 10 秒）。Desktop、IM 与 Cron / Goal / Heartbeat / Memory Update 等 injected turn 全部在 `messageGenerator()` promotion 后、live mutation fence 之后消费该 owner 的**剩余**预算；首次观察即使已过 deadline 也至少做一次有界真实 status read。grace 到期只把 dispatch 标为 released，基础 AI turn 继续，不把当前 generation 永久判为无工具。用户取消仍立即取消 exact promotion；Query/map owner replacement 则 requeue 给 replacement generator，不能让旧 control response 放行旧 Query。
 
-`runInjectedTurn()` 不再拥有 MCP precheck、第二道 fence 或 408/503 MCP 映射，只保留 Goal/Task 等 domain `beforeDispatch` 与真实 turn timeout。Live MCP 更新仍由同一个 Query-generation mutation owner 串行化：mutation claim 与 promotion 通过同一事件循环内的同步 owner 顺序互斥；先 promotion 就推迟重建，先 claim 就由 promotion 等待同一 promise。真实 `setMcpServers()` 失败/30 秒 mutation timeout 仍表示 transport map 不确定，必须 requeue + replacement Query；这是配置切换正确性 fence，不属于 soft startup readiness。`mcpServerStatus()` 控制请求在一次 pre-warm observation 内单飞；status timeout 只结算当前 generation degraded，不再触发按 turn 重启循环。
+同一 Query generation 继续由低频 observer 读取 `mcpServerStatus()` 并发布 Runtime-neutral effective snapshot；server 可从 queued/starting 迟到变为 ready/failed/needs-auth，工具目录与 UI 由 catalog generation 更新。dispatch settlement 是 one-shot fast path，live capability observation 不是。MyAgents-owned 本地 stdio server 在真正启动前还要取得 Rust application admission；排队不会重置 10 秒 grace，名额迟到可用时仍由当前 Runtime owner 继续安装或在安全 idle boundary replacement，绝不自动重放已放行 turn。
+
+`runInjectedTurn()` 不再拥有 MCP precheck、第二道 fence 或 408/503 MCP 映射，只保留 Goal/Task 等 domain `beforeDispatch` 与真实 turn timeout。Live MCP 更新仍由同一个 Query-generation mutation owner 串行化：mutation claim 与 promotion 通过同一事件循环内的同步 owner 顺序互斥；先 promotion 就推迟重建，先 claim 就由 promotion 等待同一 promise。真实 `setMcpServers()` 失败/30 秒 mutation timeout 仍表示 transport map 不确定，必须 requeue + replacement Query；这是配置切换正确性 fence，不属于 soft startup readiness。`mcpServerStatus()` 在每次 observer tick 内单飞，observer 有固定低频间隔且随 exact owner abort，不形成 per-turn 热循环。
 
 SDK `task_started` 创建的后台 Agent/Bash 仍属于产生它的同一个 Query；foreground result 不代表整个 Query 已空闲。`lifecycle.ts` 按 Query object identity 保存 active task，现有 `applyDeferredRestartIfNeeded()` 与 pre-warm timer 在 registry 非空时保留 deferred reasons、不得 close Query；最后一个既有 terminal 事件再次触发 drain。显式 Stop/Reset/Switch 与真实 teardown 仍可立即终止，finalizer 从 exact registry `take` 残留项并合成 `stopped`。该契约不引入独立 Sidecar、等待 scheduler 或后台任务的第二份产品状态。
 

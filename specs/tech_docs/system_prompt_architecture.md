@@ -64,7 +64,6 @@ assembler。调用方传入：
 
 - `InteractionScenario`：当前 Session 的交互入口和场景。
 - `runtime`：用于生成准确的 Runtime 身份描述。
-- `playwrightStorageEnabled`：是否追加浏览器登录态保存约束。
 - `cliToolsEnabled`：是否追加稳定的 MyAgents CLI 能力提示；当前 Builtin 和全部
   External Runtime 路径都传 `true`。
 - `userCliToolsEnabled`：是否读取用户 CLI 工具注册表，受实验开关控制。
@@ -72,6 +71,8 @@ assembler。调用方传入：
 
 模板直接内联在 TypeScript 中，不从运行时文件系统加载。原因是打包后的 Bun
 `__dirname` 不能稳定定位模板资源；内联内容同时让生产包与源码使用同一个事实来源。
+
+Playwright 登录态保存不属于 Prompt 契约。0.4.10 起由应用级 Browser Host 在成功工具调用和 Context teardown 边界自动 checkpoint Cookie、localStorage 与 IndexedDB；模型无需、也不应被提示主动调用存储工具来维持产品正确性。
 
 ### 场景模型
 

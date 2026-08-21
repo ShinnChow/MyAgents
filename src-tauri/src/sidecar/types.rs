@@ -161,6 +161,29 @@ impl SidecarRetirement {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlobalShutdownTarget {
+    pub(crate) port: u16,
+    pub(crate) generation: u64,
+}
+
+/// First half of application shutdown. Request admission is closed and its
+/// drains are retained, while exact process generations remain in the manager
+/// so shutdown-only callbacks can still checkpoint and settle owned resources.
+#[must_use = "drain admitted requests before checkpointing and detaching Sidecars"]
+pub(crate) struct SidecarShutdownPreparation {
+    pub(crate) drains: Vec<DispatchDrain>,
+    pub(crate) globals: Vec<GlobalShutdownTarget>,
+}
+
+impl SidecarShutdownPreparation {
+    pub(crate) fn wait(&self) {
+        for drain in &self.drains {
+            drain.wait();
+        }
+    }
+}
+
 impl SessionGenerationDrain {
     pub(crate) fn wait(&self) {
         if let Some(drain) = &self.active {
@@ -457,6 +480,25 @@ mod lifecycle_contract_tests {
             .clone();
         let global_dispatch = manager.acquire_global_dispatch().expect("Global dispatch");
         assert_dispatch_blocks_generation_close(global_dispatch, global_gate);
+    }
+
+    #[test]
+    fn shutdown_fence_keeps_global_generation_authoritative_until_detach() {
+        let mut manager = SidecarManager::new();
+        let generation = manager.next_instance_generation();
+        manager.insert_instance(
+            GLOBAL_SIDECAR_ID.to_string(),
+            test_global_instance(31419, generation, true),
+        );
+
+        let preparation = manager.prepare_stop_all();
+        preparation.wait();
+        assert!(manager.is_live_process(GLOBAL_SIDECAR_ID, generation));
+        assert!(manager.acquire_global_dispatch().is_err());
+
+        let retirement = manager.stop_all();
+        assert!(!manager.is_live_process(GLOBAL_SIDECAR_ID, generation));
+        retirement.finish();
     }
 
     #[test]

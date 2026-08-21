@@ -55,6 +55,12 @@ const TARGETS = {
     format: 'esm',
     sourcemap: true,
     banner: { js: ESM_INTEROP_BANNER },
+    // Playwright's optional macOS watcher is guarded by a runtime try/catch,
+    // and its BiDi-over-CDP bridge is loaded only by that explicit protocol.
+    // Neither belongs to the Browser Host's supported launch path. Keeping
+    // these optional native/private edges external lets the public
+    // @playwright/mcp API bundle portably without packaging host-only addons.
+    external: ['fsevents', 'chromium-bidi/*'],
     /** Post-build: catch hardcoded `__dirname = "<dev-machine path>"` leaks.
      *  esbuild treats a top-level `__dirname` as a compile-time constant; the
      *  source must use `import.meta.url` / `getScriptDir()` instead. If anyone

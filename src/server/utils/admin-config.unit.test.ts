@@ -4,7 +4,6 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { PLAYWRIGHT_MCP_PACKAGE_SPEC } from '../../shared/mcpPackages';
 import { getAllMcpServers, resolveWorkspaceConfig } from './admin-config';
 
 const scratchDirs: string[] = [];
@@ -17,7 +16,7 @@ afterEach(() => {
 });
 
 describe('server MCP catalogue merge', () => {
-  it('appends preset args instead of replacing the executable package spec', () => {
+  it('projects legacy Playwright args onto the Browser Host preset', () => {
     const servers = getAllMcpServers({
       mcpServers: [],
       mcpEnabledServers: ['playwright'],
@@ -26,10 +25,10 @@ describe('server MCP catalogue merge', () => {
       },
     });
 
-    expect(servers.find((server) => server.id === 'playwright')?.args).toEqual([
-      PLAYWRIGHT_MCP_PACKAGE_SPEC,
-      '--user-data-dir=/tmp/playwright-profile',
-    ]);
+    expect(servers.find((server) => server.id === 'playwright')).toMatchObject({
+      command: '__browser_host__',
+      args: ['--user-data-dir=/tmp/playwright-profile'],
+    });
   });
 
   it('resolves owned Session IDs against current definitions and global enablement', () => {

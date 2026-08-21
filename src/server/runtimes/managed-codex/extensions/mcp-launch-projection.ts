@@ -1,10 +1,11 @@
 import type { McpServerDefinition } from '../../../../shared/config-types';
-import { MCP_PREWARM_GRACE_MS } from '../../../session-core/mcp-prewarm-policy';
 import { resolveMcpTemplateValue } from '../../../session-core/mcp-template-resolution';
 import { NpxMcpResolutionError, resolveNpxMcpInvocation } from '../../../utils/mcp-command';
 import { getBundledCusePath } from '../../../utils/runtime';
 
 const CODEX_MCP_NO_PROXY_VAL = 'localhost,localhost.localdomain,127.0.0.1,127.0.0.0/8,::1';
+/** Native attempt bound, deliberately independent from MyAgents' 10s dispatch grace. */
+export const MANAGED_CODEX_MCP_STARTUP_TIMEOUT_SEC = 60;
 const CODEX_MCP_PROXY_ENV_KEYS = [
   'HTTP_PROXY',
   'HTTPS_PROXY',
@@ -273,7 +274,7 @@ export function projectManagedCodexMcpLaunchConfig(
         pushCodexConfigArg(
           serverArgs,
           `mcp_servers.${serverName}.startup_timeout_sec`,
-          String(MCP_PREWARM_GRACE_MS / 1_000),
+          String(MANAGED_CODEX_MCP_STARTUP_TIMEOUT_SEC),
         );
       } else if (server.type === 'http') {
         if (!server.url) reject('missing HTTP MCP URL');
@@ -313,7 +314,7 @@ export function projectManagedCodexMcpLaunchConfig(
         pushCodexConfigArg(
           serverArgs,
           `mcp_servers.${serverName}.startup_timeout_sec`,
-          String(MCP_PREWARM_GRACE_MS / 1_000),
+          String(MANAGED_CODEX_MCP_STARTUP_TIMEOUT_SEC),
         );
       } else {
         unsupported(`Codex app-server does not support MyAgents MCP type ${server.type}`);

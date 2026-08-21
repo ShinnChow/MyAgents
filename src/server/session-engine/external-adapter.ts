@@ -26,6 +26,7 @@ import {
   getExternalSessionState,
   getExternalSessionWorkspacePath,
   getExternalSystemInitPayload,
+  getExternalMcpEffectiveSnapshot,
   getExternalCurrentTurnIdentity,
   getManagedCodexExtensionConfigSnapshot,
   getLastExternalAssistantText,
@@ -307,6 +308,7 @@ export function createExternalSessionEngine(): SessionEngine {
           ? sessionMessageToReplayMessage(liveSnapshot.liveStreamingMessage)
           : null,
         systemInitPayload: systemInitPayload ?? undefined,
+        mcpEffectiveSnapshot: getExternalMcpEffectiveSnapshot(),
         pendingInteractiveRequests: liveSnapshot?.pendingInteractiveRequests
           ?? getExternalPendingInteractiveRequests(),
       };
