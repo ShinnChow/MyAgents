@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -15,7 +16,9 @@ import {
   taskListComments,
   taskRetryComment,
 } from "@/api/taskCenter";
+import Markdown from "@/components/Markdown";
 import { listenWithCleanup } from "@/utils/tauriListen";
+import { CUSTOM_EVENTS } from "@/../shared/constants";
 import type { Task } from "@/../shared/types/task";
 import type {
   TaskComment,
@@ -28,8 +31,12 @@ interface Props {
   task: Task;
   targetCommentId?: string | null;
   onTargetReady?: (found: boolean) => void;
+  agentLabel?: string | null;
+  onBeforeOpenSession?: () => void;
   children?: ReactNode;
 }
+
+const COMPOSER_MAX_HEIGHT_PX = 144;
 
 function mergeReplyParents(
   current: TaskCommentReplySummary[],
@@ -47,6 +54,8 @@ export function TaskCommentTimeline({
   task,
   targetCommentId,
   onTargetReady,
+  agentLabel,
+  onBeforeOpenSession,
   children,
 }: Props) {
   const { t, i18n } = useTranslation("task");
@@ -63,7 +72,10 @@ export function TaskCommentTimeline({
   const [replyTo, setReplyTo] = useState<TaskComment | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const timelineRef = useRef<HTMLDivElement>(null);
   const itemRefs = useRef(new Map<string, HTMLDivElement>());
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isComposingRef = useRef(false);
   const notifiedTargetRef = useRef<string | null>(null);
   const loadSequenceRef = useRef(0);
   const onTargetReadyRef = useRef(onTargetReady);
@@ -71,6 +83,38 @@ export function TaskCommentTimeline({
   useEffect(() => {
     onTargetReadyRef.current = onTargetReady;
   }, [onTargetReady]);
+
+  const resizeTextarea = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea || isComposingRef.current) return;
+    textarea.style.height = "auto";
+    const nextHeight = Math.min(
+      textarea.scrollHeight,
+      COMPOSER_MAX_HEIGHT_PX,
+    );
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY =
+      textarea.scrollHeight > COMPOSER_MAX_HEIGHT_PX ? "auto" : "hidden";
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeTextarea();
+  }, [body, resizeTextarea]);
+
+  useEffect(() => {
+    const root = timelineRef.current;
+    if (!root || typeof ResizeObserver === "undefined") return;
+    let previousWidth = root.getBoundingClientRect().width;
+    const observer = new ResizeObserver((entries) => {
+      const width =
+        entries[0]?.contentRect.width ?? root.getBoundingClientRect().width;
+      if (width === previousWidth) return;
+      previousWidth = width;
+      resizeTextarea();
+    });
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, [resizeTextarea]);
 
   useEffect(() => {
     if (loading || !targetCommentId) return;
@@ -256,8 +300,24 @@ export function TaskCommentTimeline({
       ? t("comments.latestSessionHint")
       : t("comments.pendingHint");
 
+  const openCommentSession = useCallback(
+    (sessionId: string) => {
+      onBeforeOpenSession?.();
+      window.dispatchEvent(
+        new CustomEvent(CUSTOM_EVENTS.OPEN_SESSION_IN_NEW_TAB, {
+          detail: {
+            sessionId,
+            workspacePath: task.workspacePath,
+            historyEntrySource: "task_run_history",
+          },
+        }),
+      );
+    },
+    [onBeforeOpenSession, task.workspacePath],
+  );
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div ref={timelineRef} className="flex min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-8 pt-6 max-sm:px-5">
         <div className="mx-auto max-w-[860px]">
           {children}
@@ -323,6 +383,33 @@ export function TaskCommentTimeline({
                   const retryable =
                     comment.admission?.state === "failed" ||
                     comment.admission?.state === "unknown";
+                  const resolvedAgentLabel =
+                    agentLabel || comment.author.label || null;
+                  const authorLabel =
+                    comment.author.kind === "agent"
+                      ? `Agent(${resolvedAgentLabel || "Agent"})`
+                      : comment.author.label || t("comments.you");
+                  const canOpenSession =
+                    comment.author.kind === "agent" &&
+                    !!comment.conversationSessionId;
+                  const commentIdentity = (
+                    <>
+                      <span className="font-medium text-[var(--ink-secondary)]">
+                        {authorLabel}
+                      </span>
+                      <span>·</span>
+                      <time>
+                        {new Date(comment.createdAt).toLocaleString(
+                          i18n.language,
+                        )}
+                      </time>
+                      {comment.conversationSessionId && (
+                        <span className="truncate font-mono text-xs">
+                          · {comment.conversationSessionId.slice(0, 8)}
+                        </span>
+                      )}
+                    </>
+                  );
                   return (
                     <div
                       key={comment.id}
@@ -331,7 +418,7 @@ export function TaskCommentTimeline({
                         else itemRefs.current.delete(comment.id);
                       }}
                       tabIndex={-1}
-                      className={`group rounded-xl px-3 py-3 transition-colors ${highlighted ? "bg-[var(--accent-warm)]/10 ring-1 ring-[var(--accent-warm)]/35" : "hover:bg-[var(--paper-inset)]/70"}`}
+                      className={`rounded-xl px-3 py-3 ${highlighted ? "bg-[var(--accent-warm)]/10 ring-1 ring-[var(--accent-warm)]/35" : ""}`}
                     >
                       {highlighted && (
                         <div
@@ -342,24 +429,21 @@ export function TaskCommentTimeline({
                           {t("comments.notificationTarget")}
                         </div>
                       )}
-                      <div className="flex items-center gap-2 text-xs text-[var(--ink-muted)]">
-                        <span className="font-medium text-[var(--ink-secondary)]">
-                          {comment.author.kind === "agent"
-                            ? comment.author.label || "Agent"
-                            : comment.author.label || t("comments.you")}
-                        </span>
-                        <span>·</span>
-                        <time>
-                          {new Date(comment.createdAt).toLocaleString(
-                            i18n.language,
-                          )}
-                        </time>
-                        {comment.conversationSessionId && (
-                          <span className="truncate font-mono text-xs">
-                            · {comment.conversationSessionId.slice(0, 8)}
-                          </span>
-                        )}
-                      </div>
+                      {canOpenSession ? (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            openCommentSession(comment.conversationSessionId!)
+                          }
+                          className="flex max-w-full min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-left text-xs text-[var(--ink-muted)] transition-colors hover:text-[var(--accent-warm)]"
+                        >
+                          {commentIdentity}
+                        </button>
+                      ) : (
+                        <div className="flex items-center gap-2 text-xs text-[var(--ink-muted)]">
+                          {commentIdentity}
+                        </div>
+                      )}
                       {parentQuote && (
                         <button
                           type="button"
@@ -382,9 +466,11 @@ export function TaskCommentTimeline({
                           {parentQuote}
                         </button>
                       )}
-                      <p className="mt-2 whitespace-pre-wrap text-sm leading-6 text-[var(--ink-secondary)]">
-                        {comment.body}
-                      </p>
+                      <div className="mt-2 text-sm leading-6 text-[var(--ink-secondary)] [&_.markdown-content]:text-sm">
+                        <Markdown compact raw preserveNewlines>
+                          {comment.body}
+                        </Markdown>
+                      </div>
                       <div className="mt-2 flex items-center gap-3 text-xs">
                         <button
                           type="button"
@@ -438,10 +524,10 @@ export function TaskCommentTimeline({
         </div>
       </div>
 
-      <div className="z-10 shrink-0 border-t border-[var(--line-subtle)] bg-[var(--paper-elevated)] px-8 py-4 max-sm:px-5">
+      <div className="z-10 shrink-0 border-t border-[var(--line-subtle)] bg-[var(--paper-elevated)] px-8 py-2.5 max-sm:px-5">
         <div className="mx-auto max-w-[860px]">
           {replyTo && (
-            <div className="mb-2 flex items-center gap-2 rounded-lg bg-[var(--paper-inset)] px-3 py-2 text-xs text-[var(--ink-muted)]">
+            <div className="mb-1.5 flex items-center gap-2 rounded-lg bg-[var(--paper-inset)] px-2.5 py-1.5 text-xs text-[var(--ink-muted)]">
               <CornerUpLeft className="h-3.5 w-3.5 shrink-0" />
               <span className="min-w-0 flex-1 truncate">
                 {taskCommentQuote(replyTo.body)}
@@ -455,21 +541,32 @@ export function TaskCommentTimeline({
               </button>
             </div>
           )}
-          <div className="rounded-xl border border-[var(--line)] bg-[var(--paper)] p-3 shadow-sm focus-within:border-[var(--line-strong)]">
+          <div className="rounded-xl border border-[var(--line)] bg-[var(--paper)] px-3 py-2.5 shadow-sm focus-within:border-[var(--line-strong)]">
             <textarea
+              ref={textareaRef}
               value={body}
               onChange={(event) => setBody(event.target.value)}
+              onCompositionStart={() => {
+                isComposingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                isComposingRef.current = false;
+                requestAnimationFrame(resizeTextarea);
+              }}
               onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229) {
+                  return;
+                }
                 if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                   event.preventDefault();
                   void submit();
                 }
               }}
-              rows={3}
+              rows={2}
               placeholder={t("comments.placeholder")}
-              className="w-full resize-none bg-transparent text-sm leading-6 text-[var(--ink)] outline-none placeholder:text-[var(--ink-muted)]/70"
+              className="min-h-10 max-h-36 w-full resize-none overflow-y-hidden bg-transparent text-sm leading-5 text-[var(--ink)] outline-none placeholder:text-[var(--ink-muted)]/70"
             />
-            <div className="mt-2 flex items-center gap-3">
+            <div className="mt-1 flex items-center gap-3">
               <span className="min-w-0 flex-1 text-xs text-[var(--ink-muted)]">
                 {sendHint}
               </span>

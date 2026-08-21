@@ -1,8 +1,9 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Task } from "@/../shared/types/task";
 import type { TaskComment } from "@/../shared/types/taskComment";
+import { CUSTOM_EVENTS } from "@/../shared/constants";
 import { TaskCommentTimeline } from "./TaskCommentTimeline";
 
 const mocks = vi.hoisted(() => ({
@@ -122,6 +123,126 @@ describe("TaskCommentTimeline", () => {
       }),
     );
     expect(await screen.findByText("已进入会话队列")).toBeInTheDocument();
+  });
+
+  it("renders compact Markdown and opens an Agent comment Session from its identity line", async () => {
+    const markdownComment = {
+      ...agentComment,
+      body: "**三条重点**\n\n- 第一条\n- 第二条",
+    };
+    mocks.list.mockResolvedValueOnce({
+      items: [markdownComment],
+      nextBefore: undefined,
+    });
+    const onBeforeOpenSession = vi.fn();
+    const onOpen = vi.fn();
+    window.addEventListener(CUSTOM_EVENTS.OPEN_SESSION_IN_NEW_TAB, onOpen);
+
+    render(
+      <TaskCommentTimeline
+        task={task()}
+        agentLabel="mino"
+        onBeforeOpenSession={onBeforeOpenSession}
+      />,
+    );
+
+    expect(await screen.findByText("三条重点")).toHaveProperty(
+      "tagName",
+      "STRONG",
+    );
+    const identity = screen.getByRole("button", {
+      name: /Agent\(mino\).*session-/,
+    });
+    fireEvent.click(identity);
+
+    expect(onBeforeOpenSession).toHaveBeenCalledOnce();
+    expect(onOpen).toHaveBeenCalledOnce();
+    expect((onOpen.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      sessionId: "session-exact",
+      workspacePath: "/workspace",
+      historyEntrySource: "task_run_history",
+    });
+    expect(identity.closest('[tabindex="-1"]')).not.toHaveClass(
+      "hover:bg-[var(--paper-inset)]/70",
+    );
+    expect(screen.getByPlaceholderText("补充信息或回复 Agent…")).toHaveAttribute(
+      "rows",
+      "2",
+    );
+
+    window.removeEventListener(CUSTOM_EVENTS.OPEN_SESSION_IN_NEW_TAB, onOpen);
+  });
+
+  it("keeps the exact Agent(name) identity format when the configured name is Agent", async () => {
+    mocks.list.mockResolvedValueOnce({
+      items: [agentComment],
+      nextBefore: undefined,
+    });
+
+    render(<TaskCommentTimeline task={task()} agentLabel="Agent" />);
+
+    expect(
+      await screen.findByRole("button", { name: /Agent\(Agent\).*session-/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not restyle marked IME text and remeasures after composition", async () => {
+    render(<TaskCommentTimeline task={task()} />);
+    const textarea = screen.getByPlaceholderText("补充信息或回复 Agent…");
+    let scrollHeight = 40;
+    Object.defineProperty(textarea, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight,
+    });
+    fireEvent.change(textarea, { target: { value: "初始文本" } });
+    expect(textarea.style.height).toBe("40px");
+
+    fireEvent.compositionStart(textarea);
+    scrollHeight = 100;
+    fireEvent.change(textarea, { target: { value: "输入法组合中的文本" } });
+    expect(textarea.style.height).toBe("40px");
+
+    fireEvent.compositionEnd(textarea);
+    await waitFor(() => expect(textarea.style.height).toBe("100px"));
+  });
+
+  it("remeasures a wrapped draft when the timeline width changes", () => {
+    let resizeCallback: ResizeObserverCallback | null = null;
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", TestResizeObserver);
+    try {
+      render(<TaskCommentTimeline task={task()} />);
+      const textarea = screen.getByPlaceholderText("补充信息或回复 Agent…");
+      let scrollHeight = 40;
+      Object.defineProperty(textarea, "scrollHeight", {
+        configurable: true,
+        get: () => scrollHeight,
+      });
+      fireEvent.change(textarea, { target: { value: "会随宽度换行的草稿" } });
+      expect(textarea.style.height).toBe("40px");
+
+      scrollHeight = 120;
+      act(() => {
+        resizeCallback?.(
+          [
+            {
+              contentRect: { width: 500 } as DOMRectReadOnly,
+            } as ResizeObserverEntry,
+          ],
+          {} as ResizeObserver,
+        );
+      });
+      expect(textarea.style.height).toBe("120px");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("explains that a direct comment without a Session stays pending", async () => {

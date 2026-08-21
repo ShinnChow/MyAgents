@@ -203,6 +203,6 @@ Goal 是 Session 状态，不是 Task execution mode：
 
 App Shell 只挂一个 `DispatchTaskDialog`：侧边栏和 Task Center 默认智能 Tab，Thought 派发默认手动 Tab。智能 Tab 与 Thought AI 讨论共用 Task discussion builder、runtime selection、required product Skill 和新 Chat launch；确认前不写 Task。手动验收输入通过 shared helper 合并进 `task.md`，不单写 `verify.md`。既有 Task 的标签字段、列表过滤和编辑兼容能力保持不变。
 
-Task detail 是全高、可路由的大 Drawer：主栏阅读完整 `task.md` 并承载 Comment 时间线；右栏展示状态、schedule/trigger、workspace/runtime/Session 和运行审计。编辑是 Drawer 内独立表单 sheet，dirty close 必须确认。Task list、Bell、OS toast 与 deep link 都进入这一 surface。
+Task detail 是全高、可路由的大 Drawer：主栏阅读完整 `task.md`，承载按时间正序排列的 Comment 时间线和紧凑吸底 composer；Comment 正文继续以字符串 Markdown source 持久化，由共享 compact Markdown renderer 展示，Agent 身份行复用 App 的 Session singleton 导航。宽窗使用约 360–400px 属性栏展示状态、schedule/trigger、workspace/runtime/Session 和通知，空间不足时切换为属性 sheet。完整 status history、`progress.md` 与独立 legacy `verify.md` 不在详情投影，底层事实和兼容文件不变。Header 保持单行，编辑位于更多菜单并打开 Drawer 内独立表单 sheet，dirty close 必须确认。Task list、Bell、OS toast 与 deep link 都进入这一 surface。
 
 Task Center 在创建/编辑中提供 always/command、结构化 argv、cwd、timeout 和无提交 test；command Task 显示标识与 runtime health/checkpoint/pending/error 投影，并把 test、check-now、run-now、reset 明确分成四个动作。新建 `single-session` Task 必须先 materialize 并持久化一个真实 `preselectedSessionId`，可选择当前或任意已有 Session。

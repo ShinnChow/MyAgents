@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Task } from '@/../shared/types/task';
@@ -25,7 +25,9 @@ vi.mock('@/api/taskCenter', () => ({
   taskTriggerTestTask: vi.fn(),
   taskUpdateStatus: vi.fn(),
 }));
-vi.mock('@/hooks/useConfig', () => ({ useConfig: () => ({ projects: [] }) }));
+vi.mock('@/hooks/useConfig', () => ({
+  useConfig: () => ({ config: { agents: [] }, projects: [] }),
+}));
 vi.mock('@/hooks/useAgentStatuses', () => ({ useAgentStatuses: () => ({ statuses: [] }) }));
 vi.mock('@/hooks/useCloseLayer', () => ({ useCloseLayer: vi.fn() }));
 vi.mock('@/components/Toast', () => ({
@@ -38,19 +40,26 @@ vi.mock('@/components/OverlayBackdrop', () => ({
 }));
 vi.mock('./TaskSessionsList', () => ({ TaskSessionsList: () => <div /> }));
 vi.mock('./SummaryCard', () => ({ SummaryCard: () => <div /> }));
-vi.mock('./TaskDocBlock', () => ({ TaskDocBlock: () => <div /> }));
+vi.mock('./TaskDocBlock', () => ({
+  TaskDocBlock: ({ doc }: { doc: string }) => <div>doc:{doc}</div>,
+}));
 vi.mock('./TaskEditPanel', () => ({ TaskEditPanel: () => <div /> }));
 vi.mock('./TaskCommentTimeline', () => ({
   TaskCommentTimeline: ({
     targetCommentId,
     onTargetReady,
+    children,
   }: {
     targetCommentId?: string | null;
     onTargetReady?: (found: boolean) => void;
+    children?: React.ReactNode;
   }) => (
-    <button type="button" onClick={() => onTargetReady?.(true)}>
-      comment target: {targetCommentId ?? 'none'}
-    </button>
+    <div>
+      {children}
+      <button type="button" onClick={() => onTargetReady?.(true)}>
+        comment target: {targetCommentId ?? 'none'}
+      </button>
+    </div>
   ),
 }));
 
@@ -129,7 +138,13 @@ beforeEach(() => {
 
 describe('TriggerRuntimeSection', () => {
   it('renders Task detail as one accessible Drawer and passes the exact comment target', async () => {
-    const task = commandTask();
+    const task = {
+      ...commandTask(),
+      externalSource: {
+        type: 'space-issue' as const,
+        issueId: 'ISSUE-42',
+      },
+    };
     const onTargetReady = vi.fn();
     detailApiMocks.taskGet.mockResolvedValue(task);
 
@@ -143,6 +158,18 @@ describe('TriggerRuntimeSection', () => {
     );
 
     expect(screen.getByRole('dialog', { name: '任务详情' })).toHaveAttribute('aria-modal', 'true');
+    const header = screen.getByRole('heading', { name: task.name }).closest('header');
+    expect(header).not.toBeNull();
+    expect(within(header!).getByRole('button', { name: '中止' })).toBeInTheDocument();
+    expect(within(header!).getByTitle('更多操作')).toBeInTheDocument();
+    expect(within(header!).getByRole('button', { name: /关闭/ })).toBeInTheDocument();
+    expect(within(header!).queryByText('命令感知')).not.toBeInTheDocument();
+    expect(within(header!).queryByText(/Space Issue/)).not.toBeInTheDocument();
+    expect(screen.getByText('Space Issue · ISSUE-42')).toBeInTheDocument();
+    expect(screen.getByText('doc:task')).toBeInTheDocument();
+    expect(screen.queryByText('doc:verify')).not.toBeInTheDocument();
+    expect(screen.queryByText('doc:progress')).not.toBeInTheDocument();
+    expect(screen.queryByText(/状态变更记录/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'comment target: comment-exact' }));
     expect(onTargetReady).toHaveBeenCalledWith(true);
   });

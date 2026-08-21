@@ -51,13 +51,11 @@ import type {
   TaskTriggerTestResponse,
 } from "@/../shared/types/task";
 import { TaskStatusBadge } from "./TaskStatusBadge";
-import { StatusHistoryList } from "./StatusHistoryList";
 import { TaskSessionsList } from "./TaskSessionsList";
 import { SummaryCard } from "./SummaryCard";
 import { TaskDocBlock } from "./TaskDocBlock";
 import { TaskCommentTimeline } from "./TaskCommentTimeline";
 import { TaskEditPanel, type FocusDoc } from "./TaskEditPanel";
-import { TaskTriggerBadge } from "./TaskTriggerBadge";
 import { extractErrorMessage } from "./errors";
 import { TriggerErrorDetails } from "./TriggerErrorDetails";
 
@@ -125,13 +123,24 @@ export function TaskDetailOverlay({
   const [reloadToken, setReloadToken] = useState(0);
 
   const toast = useToast();
-  const { projects } = useConfig();
-  const agentId = useMemo(() => {
-    const p = projects.find((x) =>
-      workspacePathsEqual(x.path, task.workspacePath),
+  const { config, projects } = useConfig();
+  const workspace = useMemo(
+    () =>
+      projects.find((x) =>
+        workspacePathsEqual(x.path, task.workspacePath),
+      ) ?? null,
+    [projects, task.workspacePath],
+  );
+  const agentId = workspace?.agentId ?? null;
+  const agentLabel = useMemo(() => {
+    if (!agentId) return workspace?.displayName ?? workspace?.name ?? null;
+    return (
+      config.agents?.find((agent) => agent.id === agentId)?.name ??
+      workspace?.displayName ??
+      workspace?.name ??
+      null
     );
-    return p?.agentId ?? null;
-  }, [projects, task.workspacePath]);
+  }, [agentId, config.agents, workspace?.displayName, workspace?.name]);
 
   // Guard every async setState call so a late-returning sync / refetch
   // can't hit an already-unmounted overlay. The toast / onChanged callback
@@ -534,51 +543,28 @@ export function TaskDetailOverlay({
           className="relative flex h-full w-[82vw] max-w-[1440px] flex-col overflow-hidden border-l border-[var(--line)] bg-[var(--paper-elevated)] shadow-2xl max-lg:w-[92vw] max-sm:w-full"
           aria-label={t("detail.drawerLabel")}
         >
-          <header className="flex shrink-0 items-start gap-4 border-b border-[var(--line)] px-7 py-5">
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <TaskStatusBadge
-                  status={task.status}
-                  executionState={task.executionState}
-                />
-                {task.trigger?.detector.type === "command" && (
-                  <TaskTriggerBadge />
-                )}
-                {task.externalSource?.type === "space-issue" && (
-                  <span className="rounded-full bg-[var(--paper-inset)] px-2 py-0.5 text-xs text-[var(--ink-muted)]">
-                    Space Issue · {task.externalSource.issueId}
-                  </span>
-                )}
-              </div>
-              <h2 className="mt-2 min-w-0 truncate text-xl font-semibold leading-snug text-[var(--ink)]">
+          <header className="flex shrink-0 items-center gap-2 border-b border-[var(--line)] px-6 py-3">
+            <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+              <TaskStatusBadge
+                status={task.status}
+                executionState={task.executionState}
+              />
+              <h2
+                className="min-w-0 flex-1 truncate text-lg font-semibold leading-7 text-[var(--ink)]"
+                title={task.name}
+              >
                 {task.name}
               </h2>
-              {task.description && (
-                <p className="mt-1 max-w-[80ch] text-sm leading-6 text-[var(--ink-muted)]">
-                  {task.description}
-                </p>
-              )}
             </div>
             <button
               type="button"
               onClick={() => setShowMobileProperties((value) => !value)}
-              className="shrink-0 rounded-[var(--radius-md)] p-1.5 text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] lg:hidden"
+              className="shrink-0 rounded-[var(--radius-md)] p-1.5 text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] xl:hidden"
               title={t("detail.properties")}
               aria-label={t("detail.properties")}
             >
               <SlidersHorizontal className="h-4 w-4" />
             </button>
-            <button
-              type="button"
-              onClick={onClose}
-              className="shrink-0 rounded-[var(--radius-md)] p-1.5 text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
-              title={t("detail.closeTitle")}
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </header>
-
-          <div className="flex shrink-0 items-center gap-2 border-b border-[var(--line-subtle)] px-7 py-2">
             {task.status === "todo" && (
               <ActionBtn
                 icon={<Play className="h-3.5 w-3.5" />}
@@ -619,19 +605,13 @@ export function TaskDetailOverlay({
                   title="reset → todo → run (PRD §10.2.2)"
                 />
               )}
-            <ActionBtn
-              icon={<Pencil className="h-3.5 w-3.5" />}
-              label={t("detail.edit")}
-              disabled={busy || locked}
-              onClick={() => enterEdit(null)}
-              title={locked ? t("detail.editLockedTitle") : undefined}
-            />
-            <div className="flex-1" />
             <OverflowMenu
               status={task.status}
               busy={busy}
+              locked={locked}
               syncing={syncing}
               canSyncToAgent={canSyncToAgent}
+              onEdit={() => enterEdit(null)}
               onMarkDone={() => runStatus("done")}
               onArchive={doArchive}
               onSyncToAgent={() => setShowSyncConfirm(true)}
@@ -641,7 +621,16 @@ export function TaskDetailOverlay({
                   : () => setShowDeleteConfirm(true)
               }
             />
-          </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="shrink-0 rounded-[var(--radius-md)] p-1.5 text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
+              title={t("detail.closeTitle")}
+              aria-label={t("detail.closeTitle")}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </header>
 
           {err && (
             <div className="shrink-0 border-b border-[var(--error)]/30 bg-[var(--error-bg)] px-7 py-2 text-xs text-[var(--error)]">
@@ -655,7 +644,21 @@ export function TaskDetailOverlay({
                 task={task}
                 targetCommentId={targetCommentId}
                 onTargetReady={onTargetCommentReady}
+                agentLabel={agentLabel}
+                onBeforeOpenSession={onClose}
               >
+                {task.externalSource?.type === "space-issue" && (
+                  <div className="mb-2">
+                    <span className="inline-flex rounded-full bg-[var(--paper-inset)] px-2 py-0.5 text-xs text-[var(--ink-muted)]">
+                      Space Issue · {task.externalSource.issueId}
+                    </span>
+                  </div>
+                )}
+                {task.description && (
+                  <p className="mb-4 max-w-[80ch] text-sm leading-6 text-[var(--ink-muted)]">
+                    {task.description}
+                  </p>
+                )}
                 <TaskDocBlock
                   task={task}
                   doc="task"
@@ -668,7 +671,7 @@ export function TaskDetailOverlay({
               </TaskCommentTimeline>
             </main>
 
-            <aside className="hidden w-[300px] shrink-0 overflow-y-auto border-l border-[var(--line-subtle)] bg-[var(--paper)]/60 px-5 py-6 lg:block">
+            <aside className="hidden w-[380px] shrink-0 overflow-y-auto border-l border-[var(--line-subtle)] bg-[var(--paper)]/60 px-6 py-6 xl:block">
               <SummaryCard task={task} stats={runStats} />
               <div className="mt-6">
                 <TaskSessionsList task={task} onBeforeOpen={onClose} />
@@ -685,31 +688,11 @@ export function TaskDetailOverlay({
                 />
               )}
               <hr className="my-5 border-[var(--line-subtle)]" />
-              <StatusHistoryList task={task} defaultCollapsed />
-              <hr className="my-5 border-[var(--line-subtle)]" />
               <NotificationSummary task={task} />
-              <TaskDocBlock
-                task={task}
-                doc="verify"
-                title={t("detail.legacyVerifyDocTitle")}
-                emptyHint=""
-                hideWhenEmpty
-                reloadKey={reloadToken}
-                onError={setErr}
-              />
-              <TaskDocBlock
-                task={task}
-                doc="progress"
-                title={t("detail.progressDocTitle")}
-                emptyHint=""
-                hideWhenEmpty
-                reloadKey={reloadToken}
-                onError={setErr}
-              />
             </aside>
 
             {showMobileProperties && (
-              <aside className="absolute inset-y-0 right-0 z-20 w-[min(340px,88vw)] overflow-y-auto border-l border-[var(--line)] bg-[var(--paper-elevated)] px-5 py-6 shadow-xl lg:hidden">
+              <aside className="absolute inset-y-0 right-0 z-20 w-[min(380px,88vw)] overflow-y-auto border-l border-[var(--line)] bg-[var(--paper-elevated)] px-5 py-6 shadow-xl xl:hidden">
                 <div className="mb-5 flex items-center justify-between">
                   <h3 className="text-sm font-semibold text-[var(--ink)]">
                     {t("detail.properties")}
@@ -738,27 +721,7 @@ export function TaskDetailOverlay({
                   />
                 )}
                 <hr className="my-5 border-[var(--line-subtle)]" />
-                <StatusHistoryList task={task} defaultCollapsed />
-                <hr className="my-5 border-[var(--line-subtle)]" />
                 <NotificationSummary task={task} />
-                <TaskDocBlock
-                  task={task}
-                  doc="verify"
-                  title={t("detail.legacyVerifyDocTitle")}
-                  emptyHint=""
-                  hideWhenEmpty
-                  reloadKey={reloadToken}
-                  onError={setErr}
-                />
-                <TaskDocBlock
-                  task={task}
-                  doc="progress"
-                  title={t("detail.progressDocTitle")}
-                  emptyHint=""
-                  hideWhenEmpty
-                  reloadKey={reloadToken}
-                  onError={setErr}
-                />
               </aside>
             )}
           </div>
@@ -787,15 +750,17 @@ export function TaskDetailOverlay({
   );
 }
 
-/** OverflowMenu — "⋯" button with all secondary actions (标记完成,
+/** OverflowMenu — "⋯" button with all secondary actions (编辑、标记完成,
  *  归档, 同步到 Agent, 删除). Wraps the shared `DropdownMenu` primitive
  *  with task-specific section layout: secondary actions first, delete
  *  separated in its own danger group. */
 function OverflowMenu({
   status,
   busy,
+  locked,
   syncing,
   canSyncToAgent,
+  onEdit,
   onMarkDone,
   onArchive,
   onSyncToAgent,
@@ -803,8 +768,10 @@ function OverflowMenu({
 }: {
   status: Task["status"];
   busy: boolean;
+  locked: boolean;
   syncing: boolean;
   canSyncToAgent: boolean;
+  onEdit: () => void;
   onMarkDone: () => void;
   onArchive: () => void;
   onSyncToAgent: () => void;
@@ -814,7 +781,15 @@ function OverflowMenu({
   const canMarkDone = status === "verifying";
   const canArchive = status === "done";
 
-  const secondary: DropdownMenuItem[] = [];
+  const secondary: DropdownMenuItem[] = [
+    {
+      icon: <Pencil className="h-3.5 w-3.5" />,
+      label: t("detail.edit"),
+      onClick: onEdit,
+      disabled: locked,
+      title: locked ? t("detail.editLockedTitle") : undefined,
+    },
+  ];
   if (canMarkDone) {
     secondary.push({
       icon: <CheckCircle className="h-3.5 w-3.5" />,

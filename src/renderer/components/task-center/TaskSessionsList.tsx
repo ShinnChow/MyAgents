@@ -119,10 +119,8 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
 
   return (
     <div>
-      {/* Title matches the `text-sm font-semibold text-[var(--ink)]`
-          style used by TaskDocBlock / StatusHistoryList headers, so the
-          overlay reads as a series of same-weight sections rather than
-          an eyebrow label hidden between larger doc blocks. */}
+      {/* Keep section titles at one consistent weight so the property rail
+          reads as a short hierarchy instead of a stack of unrelated cards. */}
       <div className="mb-2 flex items-baseline gap-2">
         <h3 className="text-sm font-semibold text-[var(--ink)]">{t('sessions.title')}</h3>
         <span className="text-xs tabular-nums text-[var(--ink-muted)]">

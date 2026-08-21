@@ -1432,7 +1432,7 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 智能 Tab 只包含 Agent 工作区选择器与一个大目标输入框，底栏动作为“与 AI 讨论”；启动新 Chat 失败时保留原输入。手动 Tab 保留名称、任务需求、可选验收、工作区、执行/Session/Trigger/结束/通知和高级配置；验收正文只在提交时合并进 canonical `task.md`。面板不展示手工标签输入；空白新建提交空标签，从想法派发只在数据层继承 Thought provenance。
 
-创建后的详情不是同一表单 modal，而是从右侧进入的全高大 Drawer：宽窗主栏阅读完整 `task.md` 并在下方显示线性评论/底部 composer，约 300px 右栏展示真实状态、调度、工作区、运行配置、Session 与审计；窄窗属性栏成为独立 sheet。Header 只放状态/来源、标题和少量高频动作；编辑打开 Drawer 内第二层表单 sheet，dirty 关闭必须确认。Task list、Bell、OS toast 与 typed deep link 都复用该 Drawer，`task.comment` 导航要滚动、focus、高亮 exact Comment 并向读屏器播报。
+创建后的详情不是同一表单 modal，而是从右侧进入的全高大 Drawer：宽窗主栏阅读完整 `task.md`，下方按时间正序显示线性评论，底部使用默认两行、最多约六行后内部滚动的紧凑吸底 composer；评论正文使用共享 compact Markdown 排版，只有 Agent 身份行具有 Session 导航 hover。约 360–400px 右栏展示真实状态、调度、工作区、运行配置、Session 与通知；空间不足时属性栏成为独立 sheet。完整 status history、`progress.md` 和独立 legacy `verify.md` 不在详情展示，底层审计与兼容文件仍保留。Header 为单行，只放状态、单行截断标题、一个生命周期主动作、更多菜单和关闭；Space Issue 等来源标识放在正文区而不挤占标题。编辑位于更多菜单并打开 Drawer 内第二层表单 sheet，dirty 关闭必须确认。Task list、Bell、OS toast 与 typed deep link 都复用该 Drawer，`task.comment` 导航要滚动、focus、高亮 exact Comment 并向读屏器播报。
 
 ---
 
@@ -1440,6 +1440,7 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.56 | 2026-08-21 | **Task 详情视觉收口**：Header 合并为状态/标题/主动作/更多/关闭单行；评论使用紧凑 Markdown，Agent 身份行直达所属 Session；composer 收敛为两行起步、有限增长的吸底输入；属性栏宽窗加宽、窄窗切 Sheet，并移除 status history、progress 与独立 verify 展示 |
 | 2.8.55 | 2026-08-21 | **Chat 窗口呈现与滚动连续性**：focus 与 renderable surface 解耦，可见失焦窗口保持完整滚动交互且重新聚焦零滚动命令；最小化/隐藏按 native presentation generation 冻结 Virtuoso，并在容器非零后按 follow 或 message anchor 单次恢复 |
 | 2.8.54 | 2026-08-21 | **Task 内容与协作中枢**：全局任务行增加 hover/focus 快捷创建；唯一创建面板收敛为智能/手动 Tab；创建后使用全高双栏 Drawer 阅读 canonical task.md、查看真实属性和线性评论，Bell/OS toast/deep link 精确聚焦评论；消息中心去掉 scope 副标题并收敛为 440px 高度 |
 | 2.8.53 | 2026-08-16 | **统一通知中心**：全局侧栏底部新增常驻 Bell、6px 暖色未读点与 380×620px fixed 非模态面板；定义 scope/header、通知行字号与图标槽、click-only read、外链失败保留/复制、中文/其他文本回退和 close-layer/focus 契约 |
