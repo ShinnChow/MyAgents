@@ -1070,7 +1070,7 @@ fn sync_admin_agent_blocking<R: Runtime>(app_handle: AppHandle<R>) -> Result<boo
 // matching exclusion list in src/server/index.ts::seedBundledSkills
 // MUST be kept in sync (comment there points back here).
 
-const SYSTEM_SKILLS_VERSION: &str = "52";
+const SYSTEM_SKILLS_VERSION: &str = "53";
 
 /// One process-wide transaction owner for the versioned system-skill
 /// snapshot. Startup automation and ConfigProvider may request convergence at
@@ -1104,9 +1104,10 @@ const SYSTEM_SKILLS: &[&str] = &[
     // converter. It is required because every Runtime must discover the same
     // App-owned job surface without an always-on prompt section.
     "myagents-anydoc",
-    // v44: one Agent workflow owns scheduled, future and conditional Task
-    // automation. Command Detector protocol is a progressive reference, not
-    // a competing Sensor product entry.
+    // v53: Task automation documents the stable Agent-facing receipt,
+    // idempotent run semantics, and existing result channels. Command
+    // Detector protocol remains a progressive reference, not a competing
+    // Sensor product entry.
     "myagents-task-automation",
     // v35: product-use knowledge shared by every MyAgents session. It owns
     // stable user-facing concepts, feature relationships, prerequisites and
@@ -1579,8 +1580,8 @@ mod system_skills_tests {
     }
 
     #[test]
-    fn v52_keeps_task_cli_automation_and_creator_skills_aligned() {
-        assert_eq!(SYSTEM_SKILLS_VERSION, "52");
+    fn v53_keeps_task_cli_automation_and_creator_skills_aligned() {
+        assert_eq!(SYSTEM_SKILLS_VERSION, "53");
         assert!(SYSTEM_SKILLS.contains(&"myagents-task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-implement"));
@@ -1622,6 +1623,8 @@ mod system_skills_tests {
         assert!(automation.contains("没有 30 天恢复承诺"));
         assert!(automation.contains("myagents task readme"));
         assert!(automation.contains("--maxExecutions 1"));
+        assert!(automation.contains("`data.receipt`"));
+        assert!(automation.contains("`changed: false`"));
         assert!(SYSTEM_SKILLS.contains(&"myagents-task-automation"));
 
         let memory_update = include_str!("../../bundled-skills/myagents-memory-update/SKILL.md");

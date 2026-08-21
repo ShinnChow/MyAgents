@@ -43,16 +43,17 @@ TaskStore 不保存：
 
 ### Provider/runtime 不变式
 
-`validate_task_provider_routing()` 在所有 create/update/migration 入口统一守门：
+Rust `validate_task_execution_routing()` 在所有 create/update/migration 入口统一守门；Node 只做 CLI 早期提示与 dry-run parity，不能代替 merged-state authority：
 
 | 条件 | 结果 |
 |---|---|
 | `providerId` 存在但 `model` 缺失 | 拒绝 |
 | external runtime 与 builtin `providerId` 同时存在 | 拒绝 |
 | `providerId` 存在、runtime 缺失 | pin 为 `builtin` |
+| `runtimeConfig.source=managed-provider` 且 runtime 不是 `codex` | 拒绝 |
 | legacy credential env | 不复制；迁移 Task 标为 Blocked 并要求重选 |
 
-External runtime 自己拥有 provider，Task 只可保存该 runtime 支持的 model/config。
+External runtime 自己拥有 provider，Task 只可保存该 runtime 支持的 model/config。Cron compatibility 更新在同一 Task control lock 内读取最新 Task，先对 routing patch 做无写入的 merged-state 校验，再开始 Running Task 的 stop→update→restart；因此无效或与并发最新状态冲突的 routing patch 不会先把 Task 停掉。
 
 ### MCP 三态
 

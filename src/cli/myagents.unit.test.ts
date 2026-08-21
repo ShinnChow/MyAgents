@@ -749,7 +749,7 @@ describe('myagents CLI Task Detector contracts', () => {
 });
 
 describe('myagents CLI Task dispatch output', () => {
-  it.each(['run', 'rerun'])('keeps the public %s JSON shape free of the analytics receipt', (action) => {
+  it.each(['run', 'rerun'])('hides only the internal %s attempt ordinal and preserves the semantic receipt', (action) => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
       printResult('task', action, {
@@ -757,6 +757,13 @@ describe('myagents CLI Task dispatch output', () => {
         data: {
           task: { id: 'task-1', status: 'running' },
           attemptOrdinal: 4,
+          receipt: {
+            operation: action,
+            taskId: 'task-1',
+            status: 'running',
+            statusMeaning: 'The Task scheduler is enabled.',
+            changed: true,
+          },
         },
       }, true);
 
@@ -764,6 +771,13 @@ describe('myagents CLI Task dispatch output', () => {
         success: true,
         data: {
           task: { id: 'task-1', status: 'running' },
+          receipt: {
+            operation: action,
+            taskId: 'task-1',
+            status: 'running',
+            statusMeaning: 'The Task scheduler is enabled.',
+            changed: true,
+          },
         },
       });
     } finally {
@@ -1926,6 +1940,66 @@ describe('myagents CLI IM contracts', () => {
 });
 
 describe('myagents CLI cron time handling', () => {
+  it('forwards every supported Task runtime override on cron add and update', () => {
+    const runtimeConfig = '{"source":"system-cli","model":"gpt-5.6-sol"}';
+    expect(buildRequestBody('cron', 'add', [], {
+      name: 'Codex automation',
+      prompt: 'Review the workspace',
+      workspace: '/tmp/codex-workspace',
+      every: '30',
+      runtime: 'codex',
+      runtimeConfig,
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      permissionMode: 'full-auto',
+    })).toMatchObject({
+      name: 'Codex automation',
+      message: 'Review the workspace',
+      workspacePath: '/tmp/codex-workspace',
+      intervalMinutes: 30,
+      runtime: 'codex',
+      runtimeConfig: { source: 'system-cli', model: 'gpt-5.6-sol' },
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      permissionMode: 'full-auto',
+    });
+    expect(buildRequestBody('cron', 'update', ['task-1'], {
+      runtime: 'codex',
+      runtimeConfig,
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      permissionMode: 'full-auto',
+    })).toEqual({
+      taskId: 'task-1',
+      patch: {
+        runtime: 'codex',
+        runtimeConfig: { source: 'system-cli', model: 'gpt-5.6-sol' },
+        providerId: 'provider-1',
+        model: 'gpt-5.6-sol',
+        permissionMode: 'full-auto',
+      },
+    });
+  });
+
+  it('rejects unsupported cron mutation flags instead of silently dropping them', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as typeof process.exit);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() => buildRequestBody('cron', 'add', [], {
+        prompt: 'Do work',
+        imaginaryRouting: 'silent-drop',
+      })).toThrow('process.exit(2)');
+      expect(error).toHaveBeenCalledWith(
+        'Error: myagents cron add does not support --imaginary-routing.',
+      );
+    } finally {
+      exit.mockRestore();
+      error.mockRestore();
+    }
+  });
+
   it('uses the same guarded prompt-file input for cron add and update', () => {
     const dir = mkdtempSync(join(tmpdir(), 'myagents-cron-prompt-file-'));
     try {

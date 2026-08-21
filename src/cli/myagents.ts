@@ -546,7 +546,8 @@ export function printResult(
     if (group === 'task' && (action === 'run' || action === 'rerun') && result.data) {
       const data = { ...(result.data as Record<string, unknown>) };
       // attemptOrdinal is an internal accepted-mutation receipt consumed by
-      // analytics. Keep the established CLI JSON response shape unchanged.
+      // analytics. The public AI contract is data.receipt; keep that semantic
+      // projection while hiding this implementation-only counter.
       delete data.attemptOrdinal;
       output = { ...result, data };
     }
@@ -3973,6 +3974,40 @@ function buildAnydocRequestBody(
   return { jobId: rest[0].trim() };
 }
 
+function assertSupportedCronFlags(
+  action: 'add' | 'update',
+  flags: Record<string, unknown>,
+): void {
+  const shared = [
+    'name',
+    'prompt',
+    'message',
+    'promptFile',
+    'schedule',
+    'every',
+    'runtime',
+    'runtimeConfig',
+    'providerId',
+    'model',
+    'permissionMode',
+    'json',
+    'help',
+    'port',
+  ];
+  const allowed = new Set(action === 'add'
+    ? [...shared, 'workspace', 'dryRun']
+    : [...shared, 'id']);
+  const unsupported = Object.keys(flags).find(key => !allowed.has(key));
+  if (!unsupported) return;
+  const displayFlag = unsupported.replace(/[A-Z]/g, value => `-${value.toLowerCase()}`);
+  exitAgentCliError(flags, {
+    code: 'FLAG_UNSUPPORTED',
+    error: `myagents cron ${action} does not support --${displayFlag}.`,
+    suggestion: 'Retry with only the documented Cron fields; unsupported flags are never ignored.',
+    suggestedCommand: 'myagents cron readme',
+  });
+}
+
 export function buildRequestBody(
   group: string,
   action: string,
@@ -4690,12 +4725,18 @@ export function buildRequestBody(
   // Cron commands
   if (group === 'cron') {
     if (action === 'add') {
+      assertSupportedCronFlags(action, flags);
       return {
         name: flags.name,
         message: resolveCronPromptText(flags),
         workspacePath: flags.workspace,
         schedule: normalizeScheduleFlag(flags.schedule, { fillMissingCronTimezone: true }),
         intervalMinutes: flags.every ? Number(flags.every) : undefined,
+        runtime: flags.runtime,
+        runtimeConfig: parseRuntimeConfigFlag(flags.runtimeConfig),
+        providerId: flags.providerId,
+        model: flags.model,
+        permissionMode: flags.permissionMode,
         // Forward --dry-run so the admin handler can return a preview
         // instead of writing to the cron store. Issue #149.
         dryRun: flags.dryRun,
@@ -4711,6 +4752,7 @@ export function buildRequestBody(
       return { taskId: rest[0] || flags.id };
     }
     if (action === 'update') {
+      assertSupportedCronFlags(action, flags);
       // Map CLI flags to Rust field names expected by update_task_fields
       const patch: Record<string, unknown> = {};
       if (flags.name !== undefined) patch.name = flags.name;
@@ -4718,6 +4760,9 @@ export function buildRequestBody(
       if (updatePrompt !== undefined) patch.prompt = updatePrompt;
       if (flags.schedule !== undefined) patch.schedule = normalizeScheduleFlag(flags.schedule);
       if (flags.every !== undefined) patch.intervalMinutes = Number(flags.every);
+      if (flags.runtime !== undefined) patch.runtime = flags.runtime;
+      if (flags.runtimeConfig !== undefined) patch.runtimeConfig = parseRuntimeConfigFlag(flags.runtimeConfig);
+      if (flags.providerId !== undefined) patch.providerId = flags.providerId;
       if (flags.model !== undefined) patch.model = flags.model;
       if (flags.permissionMode !== undefined) patch.permissionMode = flags.permissionMode;
       if (Object.keys(patch).length === 0) {

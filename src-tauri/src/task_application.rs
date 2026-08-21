@@ -110,8 +110,11 @@ impl std::error::Error for TaskApplicationError {}
 pub struct TaskRunResult {
     pub task: Task,
     /// One-based ordinal owned by the accepted run/rerun mutation. This is
-    /// deliberately independent from Session history cardinality.
-    pub attempt_ordinal: u32,
+    /// deliberately independent from Session history cardinality. A repeated
+    /// idempotent run has no newly accepted attempt.
+    pub attempt_ordinal: Option<u32>,
+    /// Whether this call changed Task lifecycle state and accepted a new run.
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -652,17 +655,17 @@ impl<'a> TaskApplication<'a> {
         source: Option<crate::task::TransitionSource>,
     ) -> Result<TaskRunResult, TaskApplicationError> {
         self.ordinary_task(task_id).await?;
-        let control = crate::task_scheduler::try_acquire_task_control(task_id)
-            .await
-            .ok_or_else(|| TaskApplicationError::busy(task_id))?;
+        // Serialize duplicate callers on the Task lifecycle authority. The
+        // follower observes Running after the leader commits and returns the
+        // same semantic success instead of racing into a busy/invalid-state
+        // error or dispatching twice.
+        let control = crate::task_scheduler::acquire_task_control(task_id).await;
         self.run_with_control_and_origin(task_id, &control, actor, source)
             .await
     }
 
     pub async fn run(&self, task_id: &str) -> Result<TaskRunResult, TaskApplicationError> {
-        let control = crate::task_scheduler::try_acquire_task_control(task_id)
-            .await
-            .ok_or_else(|| TaskApplicationError::busy(task_id))?;
+        let control = crate::task_scheduler::acquire_task_control(task_id).await;
         self.run_with_control(task_id, &control).await
     }
 
@@ -688,11 +691,17 @@ impl<'a> TaskApplication<'a> {
         source: Option<crate::task::TransitionSource>,
     ) -> Result<TaskRunResult, TaskApplicationError> {
         let task = self.any_task(task_id).await?;
+        if task.status == TaskStatus::Running {
+            return Ok(TaskRunResult {
+                task,
+                attempt_ordinal: None,
+                changed: false,
+            });
+        }
         if task.status != TaskStatus::Todo {
             return Err(TaskApplicationError::invalid_state(format!(
-                "task is in state '{}'; use 'myagents task rerun {}' to re-dispatch it",
-                task.status.as_str(),
-                task.id
+                "task is in state '{}'; inspect it before choosing 'myagents task start {}' or 'myagents task rerun {}'",
+                task.status.as_str(), task.id, task.id
             )));
         }
         if let Some(execution) = crate::task_scheduler::get_task_scheduler()
@@ -748,8 +757,9 @@ impl<'a> TaskApplication<'a> {
             return Err(TaskApplicationError::mutation(error));
         }
         Ok(TaskRunResult {
-            attempt_ordinal: running.execution_count.saturating_add(1),
+            attempt_ordinal: Some(running.execution_count.saturating_add(1)),
             task: running,
+            changed: true,
         })
     }
 
@@ -1027,7 +1037,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_run_is_a_typed_application_error() {
+    async fn repeated_run_of_running_task_is_an_idempotent_noop() {
         let temp = tempdir().unwrap();
         let tasks = TaskStore::new(temp.path().join("task-store"));
         let application = TaskApplication::new(&tasks, None);
@@ -1035,11 +1045,58 @@ mod tests {
             .create_direct(direct_input(temp.path()))
             .await
             .unwrap();
+        tasks
+            .update_status(crate::task::TaskUpdateStatusInput {
+                id: task.id.clone(),
+                status: TaskStatus::Running,
+                message: Some("already dispatched".to_string()),
+                actor: TransitionActor::System,
+                source: Some(TransitionSource::Scheduler),
+            })
+            .await
+            .unwrap();
+        let before = tasks.get(&task.id).await.unwrap();
+
+        let result = application.run(&task.id).await.unwrap();
+
+        assert!(!result.changed);
+        assert_eq!(result.attempt_ordinal, None);
+        assert_eq!(result.task.status, TaskStatus::Running);
+        let after = tasks.get(&task.id).await.unwrap();
+        assert_eq!(after.status_history.len(), before.status_history.len());
+    }
+
+    #[tokio::test]
+    async fn duplicate_run_waits_for_task_control_then_observes_running() {
+        let temp = tempdir().unwrap();
+        let tasks = TaskStore::new(temp.path().join("task-store"));
+        let application = TaskApplication::new(&tasks, None);
+        let task = application
+            .create_direct(direct_input(temp.path()))
+            .await
+            .unwrap();
+        tasks
+            .update_status(crate::task::TaskUpdateStatusInput {
+                id: task.id.clone(),
+                status: TaskStatus::Running,
+                message: Some("leader dispatched".to_string()),
+                actor: TransitionActor::System,
+                source: Some(TransitionSource::Scheduler),
+            })
+            .await
+            .unwrap();
         let control = crate::task_scheduler::acquire_task_control(&task.id).await;
 
-        let error = application.run(&task.id).await.unwrap_err();
-        assert_eq!(error.code(), TaskApplicationErrorCode::Busy);
-        drop(control);
+        let release_control = async move {
+            tokio::task::yield_now().await;
+            drop(control);
+        };
+        let (_, result) = tokio::join!(release_control, application.run(&task.id));
+        let result = result.unwrap();
+
+        assert!(!result.changed);
+        assert_eq!(result.attempt_ordinal, None);
+        assert_eq!(result.task.status, TaskStatus::Running);
     }
 
     #[tokio::test]

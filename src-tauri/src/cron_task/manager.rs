@@ -222,6 +222,7 @@ impl CronTaskManager {
         // status. Invalid/empty input must be a zero-side-effect rejection,
         // not a failed update that leaves the scheduler stopped.
         let input = task_update_from_cron_patch(&task, patch)?;
+        crate::task::validate_task_update_execution_routing(&task, &input)?;
         let was_running = task.status == crate::task::TaskStatus::Running;
         if was_running {
             store
@@ -880,6 +881,42 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn compatibility_routing_patch_is_rejected_before_running_state_changes() {
+        let mut running = task();
+        running.status = crate::task::TaskStatus::Running;
+        let missing_model = task_update_from_cron_patch(
+            &running,
+            serde_json::json!({ "providerId": "provider-1" }),
+        )
+        .unwrap();
+        assert!(
+            crate::task::validate_task_update_execution_routing(&running, &missing_model,)
+                .unwrap_err()
+                .contains("model")
+        );
+        assert_eq!(running.status, crate::task::TaskStatus::Running);
+
+        running.runtime = Some("gemini".to_string());
+        let stale_managed_source = task_update_from_cron_patch(
+            &running,
+            serde_json::json!({
+                "runtimeConfig": {
+                    "source": "managed-provider",
+                    "model": "gpt-5.6-sol"
+                }
+            }),
+        )
+        .unwrap();
+        assert!(crate::task::validate_task_update_execution_routing(
+            &running,
+            &stale_managed_source,
+        )
+        .unwrap_err()
+        .contains("requires runtime=codex"));
+        assert_eq!(running.status, crate::task::TaskStatus::Running);
     }
 
     #[test]

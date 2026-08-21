@@ -2342,8 +2342,14 @@ impl TaskStore {
         // explicit runtime (closes the "Agent runtime later flips to
         // external" cross-talk hole). Idempotent.
         pin_runtime_for_provider_id(&input.provider_id, &mut input.runtime);
-        // PRD 0.2.9 — Provider routing invariants (pairing + runtime-exclusion).
-        validate_task_provider_routing(&input.provider_id, &input.model, &input.runtime)?;
+        // Provider/runtime identity invariants are enforced by the Task owner
+        // for every ingress, not only by the Agent-facing Node preflight.
+        validate_task_execution_routing(
+            &input.provider_id,
+            &input.model,
+            &input.runtime,
+            &input.runtime_config,
+        )?;
         let managed_kind = normalize_managed_kind(input.managed_kind)?;
         // Cron expression validation at the boundary — same contract as
         // `update()`; ensures the scheduler never gets handed a malformed
@@ -2521,7 +2527,12 @@ impl TaskStore {
         }
         // PRD 0.2.9 — Same pin+validate sequence as create_direct.
         pin_runtime_for_provider_id(&input.provider_id, &mut input.runtime);
-        validate_task_provider_routing(&input.provider_id, &input.model, &input.runtime)?;
+        validate_task_execution_routing(
+            &input.provider_id,
+            &input.model,
+            &input.runtime,
+            &input.runtime_config,
+        )?;
         let managed_kind = normalize_managed_kind(input.managed_kind)?;
         if !matches!(
             initial_status,
@@ -3238,7 +3249,12 @@ impl TaskStore {
         // external-exclusion rule fires correctly, and after all field merges
         // (including clear_provider_override) so the rules see the actual
         // post-update shape, not the input fragments.
-        validate_task_provider_routing(&updated.provider_id, &updated.model, &updated.runtime)?;
+        validate_task_execution_routing(
+            &updated.provider_id,
+            &updated.model,
+            &updated.runtime,
+            &updated.runtime_config,
+        )?;
         updated.updated_at = now_ms();
 
         // Mode-transition hygiene: `run_mode` / `end_conditions` / the
@@ -4253,6 +4269,85 @@ fn validate_task_provider_routing(
         }
     }
     Ok(())
+}
+
+fn validate_task_execution_routing(
+    provider_id: &Option<String>,
+    model: &Option<String>,
+    runtime: &Option<String>,
+    runtime_config: &Option<serde_json::Value>,
+) -> Result<(), String> {
+    validate_task_provider_routing(provider_id, model, runtime)?;
+    let Some(config) = runtime_config.as_ref() else {
+        return Ok(());
+    };
+    let object = config
+        .as_object()
+        .ok_or_else(|| "runtimeConfig must be a JSON object".to_string())?;
+    if object
+        .get("model")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("runtimeConfig.model must be a string".to_string());
+    }
+    let Some(source_value) = object.get("source") else {
+        return Ok(());
+    };
+    let source = source_value
+        .as_str()
+        .ok_or_else(|| "runtimeConfig.source must be a string".to_string())?;
+    if !matches!(source, "system-cli" | "managed-provider") {
+        return Err(format!(
+            "invalid runtimeConfig.source '{source}'; valid values: system-cli, managed-provider"
+        ));
+    }
+    if source == "managed-provider" && runtime.as_deref() != Some("codex") {
+        return Err("runtimeConfig.source=managed-provider requires runtime=codex".to_string());
+    }
+    Ok(())
+}
+
+/// Validate the execution-routing slice of a Task update against the current
+/// row without mutating it. Cron compatibility uses this while a Running Task
+/// is still Running, before its stop→update→restart sequence begins.
+pub(crate) fn validate_task_update_execution_routing(
+    existing: &Task,
+    input: &TaskUpdateInput,
+) -> Result<(), String> {
+    if input.clear_provider_override
+        && input
+            .provider_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Err("providerId 与 clearProviderOverride=true 冲突 — 调用方必须二选一".to_string());
+    }
+    let mut provider_id = existing.provider_id.clone();
+    let mut model = existing.model.clone();
+    let mut runtime = existing.runtime.clone();
+    let mut runtime_config = existing.runtime_config.clone();
+    if let Some(value) = input.model.as_ref() {
+        model = (!value.trim().is_empty()).then(|| value.clone());
+    }
+    if let Some(value) = input.provider_id.as_ref() {
+        provider_id = (!value.trim().is_empty()).then(|| value.clone());
+    }
+    if input.clear_provider_override {
+        provider_id = None;
+        model = None;
+    }
+    if let Some(value) = input.runtime.as_ref() {
+        runtime = Some(value.clone());
+    }
+    if let Some(value) = input.runtime_config.as_ref() {
+        runtime_config = Some(value.clone());
+    }
+    if input.clear_runtime_override {
+        runtime = None;
+        runtime_config = None;
+    }
+    pin_runtime_for_provider_id(&provider_id, &mut runtime);
+    validate_task_execution_routing(&provider_id, &model, &runtime, &runtime_config)
 }
 
 fn session_metadata_exists(session_id: &str) -> bool {
@@ -7232,6 +7327,54 @@ mod tests {
         // 6. External runtime without provider override — accepted (the
         //    common case for codex/gemini/cc tasks).
         assert!(validate_task_provider_routing(&None, &None, &Some("codex".into()),).is_ok());
+    }
+
+    #[test]
+    fn validate_task_execution_routing_enforces_runtime_config_source() {
+        let managed = Some(serde_json::json!({
+            "source": "managed-provider",
+            "model": "gpt-5.6-sol",
+        }));
+        assert!(
+            validate_task_execution_routing(&None, &None, &Some("codex".into()), &managed,).is_ok()
+        );
+        assert!(
+            validate_task_execution_routing(&None, &None, &Some("gemini".into()), &managed,)
+                .unwrap_err()
+                .contains("requires runtime=codex")
+        );
+        assert!(validate_task_execution_routing(
+            &None,
+            &None,
+            &Some("codex".into()),
+            &Some(serde_json::json!({ "source": "mystery" })),
+        )
+        .unwrap_err()
+        .contains("invalid runtimeConfig.source"));
+    }
+
+    #[tokio::test]
+    async fn update_rejects_managed_provider_config_on_latest_non_codex_row() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let mut create = sample_direct_input(&ws);
+        create.runtime = Some("gemini".to_string());
+        let created = store.create_direct(create).await.unwrap();
+        let mut update = empty_update_input(&created.id);
+        update.runtime_config = Some(serde_json::json!({
+            "source": "managed-provider",
+            "model": "gpt-5.6-sol",
+        }));
+
+        let error = store.update(update).await.unwrap_err();
+
+        assert!(error.contains("requires runtime=codex"));
+        let unchanged = store.get(&created.id).await.unwrap();
+        assert_eq!(unchanged.runtime.as_deref(), Some("gemini"));
+        assert!(unchanged.runtime_config.is_none());
     }
 
     /// PRD 0.2.9 — verify `pin_runtime_for_provider_id` materialises

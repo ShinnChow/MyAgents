@@ -4000,7 +4000,7 @@ export async function handleCronCreate(payload: Record<string, unknown>): Promis
   const resolvedWorkspacePath = (payload.workspacePath as string | undefined)
     || (payload.workspace_path as string | undefined)
     || defaultCronWorkspace();
-  const finalPayload: Record<string, unknown> = (payload.workspacePath || payload.workspace_path)
+  const finalPayload: Record<string, unknown> = payload.workspacePath
     ? payload
     : { ...payload, workspacePath: resolvedWorkspacePath };
   const schedule = finalPayload.schedule as { kind?: unknown } | undefined;
@@ -4010,6 +4010,12 @@ export async function handleCronCreate(payload: Record<string, unknown>): Promis
       error: 'Loop schedules are Goal Mode tasks. Use myagents goal create --objective-file <path> after writing the objective to that file; do not use myagents cron add.',
     };
   }
+
+  // Cron is a compatibility surface over the canonical Task store. Validate
+  // the same runtime identity before both preview and mutation so --dry-run
+  // cannot report a configuration that the real command would reject.
+  const validationError = await validateTaskOverrides(finalPayload);
+  if (validationError) return validationError;
 
   // Issue #149: --dry-run was silently ignored — the previous implementation
   // forwarded payload to Rust regardless, so `cron add --dry-run` would
@@ -4072,6 +4078,26 @@ export async function handleCronDelete(payload: { taskId: string }): Promise<Adm
 export async function handleCronUpdate(payload: { taskId: string; patch: Record<string, unknown> }): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
+  let validationPayload: Record<string, unknown> = {
+    workspacePath: defaultCronWorkspace(),
+    ...payload.patch,
+  };
+  if (hasTaskRuntimeOverride(payload.patch)) {
+    const current = await handleTaskGet({ id: payload.taskId });
+    if (!current.success) return current;
+    if (!current.data || typeof current.data !== 'object' || Array.isArray(current.data)) {
+      return { success: false, error: `Task '${payload.taskId}' returned invalid persisted data.` };
+    }
+    // Runtime updates are patches. Validate against the persisted complete
+    // identity so changing runtimeConfig/model alone cannot inherit an
+    // unrelated current-Agent default.
+    validationPayload = {
+      ...(current.data as Record<string, unknown>),
+      ...payload.patch,
+    };
+  }
+  const validationError = await validateTaskOverrides(validationPayload);
+  if (validationError) return validationError;
   const resp = await managementApi('/api/cron/update', 'POST', payload);
   if (resp.ok) {
     // Issue #115 — surface the post-update task summary so CLI can echo
@@ -4322,6 +4348,105 @@ function compactTaskForAgent(task: Record<string, unknown>): Record<string, unkn
   };
 }
 
+type TaskAgentReceiptOperation = 'create' | 'get' | 'run' | 'rerun';
+
+function taskStatusMeaning(status: string | null, executionState: string | null): string {
+  switch (status) {
+    case 'todo':
+      return 'The Task is saved but its scheduler is not enabled. Run it when it should start.';
+    case 'running':
+      return executionState
+        ? `The Task scheduler is enabled; the current execution state is '${executionState}'.`
+        : 'The Task scheduler is enabled. This status does not by itself mean an AI turn is executing now.';
+    case 'verifying':
+      return 'The Task is settling or verifying an execution. Do not dispatch a duplicate run.';
+    case 'stopped':
+      return 'The Task scheduler is paused. Use task start to resume it.';
+    case 'blocked':
+      return 'The Task stopped after a failure or blocker. Inspect it, resolve the cause, then use task rerun.';
+    case 'done':
+      return 'The Task reached a completed terminal state. Use task rerun only to start another execution.';
+    case 'archived':
+      return 'The Task is archived and not scheduled. Use task rerun only when intentionally reactivating it.';
+    case 'deleted':
+      return 'The Task has been deleted from ordinary Task surfaces.';
+    default:
+      return 'The authoritative Task status is unavailable in this response; inspect the Task before acting.';
+  }
+}
+
+/**
+ * Add one stable, AI-facing semantic receipt without replacing any legacy
+ * response fields. Everything here is derived from the Task projection that
+ * Rust already returned; this helper owns no lifecycle or persisted state.
+ */
+function withTaskAgentReceipt(
+  response: AdminResponse,
+  operation: TaskAgentReceiptOperation,
+  options: { changed: boolean; taskId?: string },
+): AdminResponse {
+  if (!response.success || !response.data || typeof response.data !== 'object' || Array.isArray(response.data)) {
+    return response;
+  }
+  const data = response.data as Record<string, unknown>;
+  const task = data.task && typeof data.task === 'object' && !Array.isArray(data.task)
+    ? data.task as Record<string, unknown>
+    : data;
+  const taskId = typeof task.id === 'string'
+    ? task.id
+    : typeof data.taskId === 'string'
+      ? data.taskId
+      : typeof data.task_id === 'string'
+        ? data.task_id
+        : options.taskId;
+  if (!taskId) return response;
+
+  const rawStatus = typeof data.status === 'string'
+    ? data.status
+    : typeof task.status === 'string'
+      ? task.status
+      : null;
+  const status = rawStatus?.toLowerCase() ?? null;
+  const executionState = typeof task.executionState === 'string'
+    ? task.executionState
+    : typeof data.executionState === 'string'
+      ? data.executionState
+      : null;
+  const nextExecutionAt = typeof data.nextExecutionAt === 'number'
+    ? data.nextExecutionAt
+    : typeof task.nextExecutionAt === 'number'
+      ? task.nextExecutionAt
+      : null;
+  const changed = typeof data.changed === 'boolean' ? data.changed : options.changed;
+  const boundSession = task.runMode === 'single-session'
+    || task.dispatchOrigin === 'attached-session';
+
+  return {
+    ...response,
+    data: {
+      ...data,
+      receipt: {
+        operation,
+        taskId,
+        status,
+        statusMeaning: taskStatusMeaning(status, executionState),
+        changed,
+        nextExecutionAt,
+        executionState,
+        resultAccess: {
+          mode: boundSession ? 'bound-session' : 'execution-session',
+          summary: boundSession
+            ? 'Execution results stay in the Task bound Session and are not copied into Task comments automatically.'
+            : 'Execution results stay in Task execution Sessions and run history; they are not pushed back to the creating Session or copied into Task comments automatically.',
+          inspectTaskCommand: `myagents task get ${taskId} --json`,
+          inspectRunsCommand: `myagents task runs ${taskId} --limit 5 --full --json`,
+          inspectCommentsCommand: `myagents task comments ${taskId} --limit 50 --json`,
+        },
+      },
+    },
+  };
+}
+
 export async function handleTaskList(payload: {
   workspaceId?: string;
   workspacePath?: string;
@@ -4368,7 +4493,11 @@ export async function handleTaskList(payload: {
 export async function handleTaskGet(payload: { id: string }): Promise<AdminResponse> {
   const resp = await managementApi(`/api/task/get${qsFrom({ id: payload.id })}`);
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).task };
+    return withTaskAgentReceipt(
+      { success: true, data: (resp as Record<string, unknown>).task },
+      'get',
+      { changed: false, taskId: payload.id },
+    );
   }
   return mgmtError(resp, 'Failed to get task');
 }
@@ -4472,26 +4601,39 @@ export async function handleTaskCreateAttached(
 
 export async function handleTaskRun(payload: { id: string }): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/run', 'POST', payload);
-  const wrapped = wrapMgmtResponse(resp);
+  const wrapped = withTaskAgentReceipt(wrapMgmtResponse(resp), 'run', {
+    changed: resp.changed !== false,
+    taskId: payload.id,
+  });
   if (wrapped.success) {
-    const { attemptOrdinal } = wrapped.data as { attemptOrdinal: number };
-    trackServer('task_run', {
-      source: taskCliAnalyticsSource(payload as TaskCliCaller),
-      run_count: attemptOrdinal,
-    });
+    const { attemptOrdinal, changed } = wrapped.data as {
+      attemptOrdinal?: number;
+      changed?: boolean;
+    };
+    if (changed !== false && typeof attemptOrdinal === 'number') {
+      trackServer('task_run', {
+        source: taskCliAnalyticsSource(payload as TaskCliCaller),
+        run_count: attemptOrdinal,
+      });
+    }
   }
   return wrapped;
 }
 
 export async function handleTaskRerun(payload: { id: string }): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/rerun', 'POST', payload);
-  const wrapped = wrapMgmtResponse(resp);
+  const wrapped = withTaskAgentReceipt(wrapMgmtResponse(resp), 'rerun', {
+    changed: true,
+    taskId: payload.id,
+  });
   if (wrapped.success) {
-    const { attemptOrdinal } = wrapped.data as { attemptOrdinal: number };
-    trackServer('task_run', {
-      source: taskCliAnalyticsSource(payload as TaskCliCaller),
-      run_count: attemptOrdinal,
-    });
+    const { attemptOrdinal } = wrapped.data as { attemptOrdinal?: number };
+    if (typeof attemptOrdinal === 'number') {
+      trackServer('task_run', {
+        source: taskCliAnalyticsSource(payload as TaskCliCaller),
+        run_count: attemptOrdinal,
+      });
+    }
   }
   return wrapped;
 }
@@ -4627,7 +4769,11 @@ function enrichTaskCreateResponse(
           inspect: `myagents task get ${taskId}`,
         };
   }
-  return { ...response, data: enriched };
+  return withTaskAgentReceipt(
+    { ...response, data: enriched },
+    'create',
+    { changed: true, taskId },
+  );
 }
 
 /**
@@ -4655,13 +4801,10 @@ export async function handleTaskUpdate(
     if (!current.data || typeof current.data !== 'object' || Array.isArray(current.data)) {
       return { success: false, error: `Task '${payload.id}' returned invalid persisted data.` };
     }
-    validationPayload = {
-      ...(current.data as Record<string, unknown>),
-      ...payload,
-      ...(payload.clearRuntimeOverride === true
-        ? { runtime: undefined, runtimeConfig: undefined }
-        : {}),
-    };
+    validationPayload = mergeTaskRuntimeValidationPayload(
+      current.data as Record<string, unknown>,
+      payload,
+    );
   }
   const validationError = await validateTaskOverrides(validationPayload);
   if (validationError) return validationError;
@@ -4983,6 +5126,11 @@ LIFECYCLE
   create --json -> parse taskId -> get --json -> run --json.
   'run' is initial Todo enablement; 'start' resumes Stopped; 'rerun' handles a
   terminal Task. Running means scheduler enabled, not necessarily executing now.
+  create/get/run/rerun expose one stable data.receipt with statusMeaning,
+  changed, nextExecutionAt, executionState, and resultAccess. Repeating run for
+  an already-Running Task succeeds with changed=false and does not dispatch twice.
+  Results remain in the bound/execution Session and run history; ordinary
+  assistant output is never copied back to the creating Session or comments.
   A new fixed-interval Task without startAt gets its first tick about 2 seconds
   after run; Cron waits for the next wall-clock tick; scheduled waits for dispatchAt.
 
@@ -5090,9 +5238,19 @@ CREATE OPTIONS (myagents cron add ...)
                                   or explicit UTC.
   --workspace <path>              Workspace the task runs in. Defaults to the
                                   current session workspace.
+  --runtime <builtin|claude-code|codex|gemini>
+  --runtime-config <json-object>  Optional runtime identity/config override.
+  --provider-id / --model / --permission-mode
+                                  Optional Task execution overrides. Omit all
+                                  override flags to inherit the target Agent.
 
 UPDATE OPTIONS (myagents cron update <taskId> ...)
-  --name / --prompt / --message / --prompt-file / --schedule / --every / --model / --permissionMode
+  --name / --prompt / --message / --prompt-file / --schedule / --every
+  --runtime / --runtime-config / --provider-id / --model / --permission-mode
+
+  Runtime override fields use the same validation as canonical Task creation;
+  create dry-run validates the same payload as a real write. Unknown mutation
+  flags fail instead of being ignored.
   (Same semantics as create. --message is an alias for --prompt; file and inline
    prompt sources are mutually exclusive.)
 
@@ -6311,8 +6469,33 @@ interface TaskOverrideFields {
 }
 
 function hasTaskRuntimeOverride(payload: Record<string, unknown>): boolean {
-  return ['runtime', 'runtimeConfig', 'providerId', 'model', 'permissionMode', 'clearRuntimeOverride']
+  return [
+    'runtime',
+    'runtimeConfig',
+    'providerId',
+    'model',
+    'permissionMode',
+    'clearProviderOverride',
+    'clearRuntimeOverride',
+  ]
     .some(field => payload[field] !== undefined && payload[field] !== null && payload[field] !== '');
+}
+
+/** Project TaskUpdateInput clear semantics before validating a merged patch. */
+function mergeTaskRuntimeValidationPayload(
+  current: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...current,
+    ...patch,
+    ...(patch.clearProviderOverride === true
+      ? { providerId: undefined, model: undefined }
+      : {}),
+    ...(patch.clearRuntimeOverride === true
+      ? { runtime: undefined, runtimeConfig: undefined }
+      : {}),
+  };
 }
 
 /**
@@ -6334,8 +6517,47 @@ function hasTaskRuntimeOverride(payload: Record<string, unknown>): boolean {
 async function validateTaskOverrides(
   payload: TaskOverrideFields,
 ): Promise<AdminResponse | null> {
+  if (
+    payload.providerId !== undefined
+    && payload.providerId !== null
+    && (typeof payload.providerId !== 'string' || payload.providerId.trim() === '')
+  ) {
+    return { success: false, error: '--providerId must be a non-empty string.' };
+  }
+  if (
+    payload.model !== undefined
+    && payload.model !== null
+    && typeof payload.model !== 'string'
+  ) {
+    return { success: false, error: '--model must be a string.' };
+  }
+  if (
+    payload.runtimeConfig !== undefined
+    && payload.runtimeConfig !== null
+    && (typeof payload.runtimeConfig !== 'object' || Array.isArray(payload.runtimeConfig))
+  ) {
+    return { success: false, error: '--runtimeConfig must be a JSON object.' };
+  }
   const runtimeConfigModel = taskRuntimeConfigField(payload.runtimeConfig, 'model');
   const rawRuntimeSource = taskRuntimeConfigField(payload.runtimeConfig, 'source');
+  const hasProviderOverride = typeof payload.providerId === 'string' && payload.providerId.trim() !== '';
+  const hasModelOverride = typeof payload.model === 'string' && payload.model.trim() !== '';
+  if (hasProviderOverride && !hasModelOverride) {
+    return {
+      success: false,
+      error: '--providerId requires --model so the Task cannot cross-route a provider to an inherited model.',
+    };
+  }
+  if (
+    hasProviderOverride
+    && typeof payload.runtime === 'string'
+    && ['claude-code', 'codex', 'gemini'].includes(payload.runtime)
+  ) {
+    return {
+      success: false,
+      error: `Runtime '${payload.runtime}' manages its own provider and cannot be combined with --providerId.`,
+    };
+  }
   if (
     rawRuntimeSource !== undefined
     && rawRuntimeSource !== 'system-cli'

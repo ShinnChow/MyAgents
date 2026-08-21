@@ -849,6 +849,74 @@ describe('admin-api goal', () => {
 });
 
 describe('admin-api cron create', () => {
+  it('validates and forwards explicit Codex Task routing through cron create', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      task: { id: 'cron-codex', runtime: 'codex' },
+    });
+    const { handleCronCreate } = await import('./admin-api');
+    const payload = {
+      name: 'Codex automation',
+      message: 'Review the workspace',
+      workspacePath: '/tmp/myagents-cron-codex',
+      intervalMinutes: 30,
+      runtime: 'codex',
+      runtimeConfig: { source: 'managed-provider', model: 'gpt-5.6-sol' },
+    };
+
+    const result = await handleCronCreate(payload);
+
+    expect(result.success).toBe(true);
+    expect(runtimeModelMocks.queryRuntimeModels).toHaveBeenCalledWith('codex', {
+      runtimeSource: 'managed-provider',
+    });
+    expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+      '/api/cron/create',
+      'POST',
+      payload,
+    );
+  });
+
+  it('validates runtime overrides before returning a cron dry-run preview', async () => {
+    const { handleCronCreate } = await import('./admin-api');
+
+    const result = await handleCronCreate({
+      name: 'Invalid automation',
+      message: 'Do work',
+      runtime: 'imaginary-runtime',
+      dryRun: true,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Invalid --runtime value');
+    expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+  });
+
+  it('rejects provider/model routing mismatches before a cron dry-run preview', async () => {
+    const { handleCronCreate } = await import('./admin-api');
+
+    const missingModel = await handleCronCreate({
+      name: 'Invalid provider pair',
+      message: 'Do work',
+      providerId: 'provider-1',
+      dryRun: true,
+    });
+    const externalProvider = await handleCronCreate({
+      name: 'Invalid external provider',
+      message: 'Do work',
+      runtime: 'codex',
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      dryRun: true,
+    });
+
+    expect(missingModel.success).toBe(false);
+    expect(missingModel.error).toContain('requires --model');
+    expect(externalProvider.success).toBe(false);
+    expect(externalProvider.error).toContain('cannot be combined with --providerId');
+    expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+  });
+
   it('leaves execution routing unset when the caller did not request a Task override', async () => {
     const workspacePath = '/tmp/myagents-managed-codex-workspace';
     writeJson(join(scratch, '.myagents', 'config.json'), {
@@ -904,7 +972,130 @@ describe('admin-api cron create', () => {
   });
 });
 
+describe('admin-api cron update', () => {
+  it('validates and forwards runtime patches after the workspace ownership guard', async () => {
+    managementApiMocks.managementApi
+      .mockResolvedValueOnce({ ok: true, tasks: [{ id: 'cron-codex' }] })
+      .mockResolvedValueOnce({
+        ok: true,
+        task: {
+          id: 'cron-codex',
+          status: 'running',
+          workspacePath: '/tmp/myagents-cron-codex',
+          runtime: 'codex',
+          runtimeConfig: { source: 'managed-provider', model: 'old-model' },
+        },
+      })
+      .mockResolvedValueOnce({ ok: true, task: { id: 'cron-codex', runtime: 'codex' } });
+    const { handleCronUpdate } = await import('./admin-api');
+    const payload = {
+      taskId: 'cron-codex',
+      patch: {
+        runtimeConfig: { source: 'managed-provider', model: 'gpt-5.6-sol' },
+      },
+    };
+
+    const result = await handleCronUpdate(payload);
+
+    expect(result.success).toBe(true);
+    expect(runtimeModelMocks.queryRuntimeModels).toHaveBeenCalledWith('codex', {
+      runtimeSource: 'managed-provider',
+    });
+    expect(managementApiMocks.managementApi).toHaveBeenLastCalledWith(
+      '/api/cron/update',
+      'POST',
+      payload,
+    );
+  });
+});
+
 describe('admin-api accepted task attempt analytics', () => {
+  it('uses the same semantic receipt path for Task create and get', async () => {
+    const workspacePath = '/tmp/myagents-task-receipt';
+    writeJson(join(scratch, '.myagents', 'config.json'), {
+      agents: [{ id: 'agent-receipt', name: 'Receipt Agent', workspacePath }],
+    });
+    writeJson(join(scratch, '.myagents', 'projects.json'), [{
+      id: 'project-receipt', path: workspacePath, agentId: 'agent-receipt',
+    }]);
+    const persistedTask = {
+      id: 'task-receipt',
+      name: 'Receipt Task',
+      status: 'todo',
+      runMode: 'new-session',
+      nextExecutionAt: null,
+    };
+    managementApiMocks.managementApi
+      .mockResolvedValueOnce({ ok: true, task: persistedTask })
+      .mockResolvedValueOnce({ ok: true, task: persistedTask });
+    const { handleTaskCreateDirect, handleTaskGet } = await import('./admin-api');
+
+    const created = await handleTaskCreateDirect({
+      name: 'Receipt Task',
+      workspaceId: 'project-receipt',
+      workspacePath,
+      taskMdContent: 'Do the work',
+    });
+    const fetched = await handleTaskGet({ id: 'task-receipt' });
+
+    expect(created).toMatchObject({
+      success: true,
+      data: {
+        receipt: {
+          operation: 'create',
+          taskId: 'task-receipt',
+          status: 'todo',
+          changed: true,
+          resultAccess: { mode: 'execution-session' },
+        },
+      },
+    });
+    expect(fetched).toMatchObject({
+      success: true,
+      data: {
+        receipt: {
+          operation: 'get',
+          taskId: 'task-receipt',
+          status: 'todo',
+          changed: false,
+        },
+      },
+    });
+  });
+
+  it('describes Attached Task results as staying in the bound Session', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      task: {
+        id: 'task-attached-receipt',
+        status: 'running',
+        dispatchOrigin: 'attached-session',
+        runMode: null,
+        sessionIds: ['space-session'],
+      },
+    });
+    const { handleTaskCreateAttached } = await import('./admin-api');
+
+    const result = await handleTaskCreateAttached({
+      name: 'Attached receipt',
+      currentSessionId: 'space-session',
+      workspacePath: '/tmp/myagents-space-attached',
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        receipt: {
+          taskId: 'task-attached-receipt',
+          resultAccess: {
+            mode: 'bound-session',
+            summary: expect.stringContaining('bound Session'),
+          },
+        },
+      },
+    });
+  });
+
   it('reports the run ordinal returned by the accepted mutation without a task prefetch', async () => {
     managementApiMocks.managementApi.mockResolvedValueOnce({
       ok: true,
@@ -918,7 +1109,7 @@ describe('admin-api accepted task attempt analytics', () => {
 
     const result = await handleTaskRun({ id: 'task-run-accepted' });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       success: true,
       data: {
         taskId: 'task-run-accepted',
@@ -926,6 +1117,20 @@ describe('admin-api accepted task attempt analytics', () => {
         nextExecutionAt: 1_780_000_000_000,
         task: { id: 'task-run-accepted', sessionIds: ['shared-session'] },
         attemptOrdinal: 4,
+        receipt: {
+          operation: 'run',
+          taskId: 'task-run-accepted',
+          status: 'running',
+          changed: true,
+          nextExecutionAt: 1_780_000_000_000,
+          statusMeaning: expect.stringContaining('scheduler is enabled'),
+          resultAccess: {
+            mode: 'execution-session',
+            inspectTaskCommand: 'myagents task get task-run-accepted --json',
+            inspectRunsCommand: 'myagents task runs task-run-accepted --limit 5 --full --json',
+            inspectCommentsCommand: 'myagents task comments task-run-accepted --limit 50 --json',
+          },
+        },
       },
     });
     expect(managementApiMocks.managementApi).toHaveBeenCalledOnce();
@@ -952,6 +1157,40 @@ describe('admin-api accepted task attempt analytics', () => {
 
     expect(result).toEqual({ success: false, code: 'invalid_state', error: 'task is busy' });
     expect(managementApiMocks.managementApi).toHaveBeenCalledOnce();
+    expect(analyticsMocks.trackServer).not.toHaveBeenCalled();
+  });
+
+  it('returns a semantic no-op receipt and skips analytics when run was already enabled', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      taskId: 'task-already-running',
+      status: 'running',
+      nextExecutionAt: 1_780_000_000_000,
+      changed: false,
+      task: {
+        id: 'task-already-running',
+        status: 'running',
+        runMode: 'single-session',
+        sessionIds: ['bound-session'],
+      },
+    });
+    const { handleTaskRun } = await import('./admin-api');
+
+    const result = await handleTaskRun({ id: 'task-already-running' });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        changed: false,
+        receipt: {
+          operation: 'run',
+          taskId: 'task-already-running',
+          status: 'running',
+          changed: false,
+          resultAccess: { mode: 'bound-session' },
+        },
+      },
+    });
     expect(analyticsMocks.trackServer).not.toHaveBeenCalled();
   });
 
@@ -1444,6 +1683,37 @@ describe('admin-api task runtime model identity', () => {
         id: 'task-managed-update',
         runtimeConfig: { source: 'managed-provider', model: 'gpt-5.6-sol' },
       },
+    );
+  });
+
+  it('applies clear-provider semantics before validating a Task runtime switch', async () => {
+    managementApiMocks.managementApi
+      .mockResolvedValueOnce({
+        ok: true,
+        task: {
+          id: 'task-clear-provider-switch',
+          workspacePath: '/tmp/myagents-clear-provider-switch',
+          runtime: 'builtin',
+          providerId: 'anthropic',
+          model: 'claude-sonnet-4-6',
+        },
+      })
+      .mockResolvedValueOnce({ ok: true, taskUpdated: 1, cronUpdated: 0 });
+    const { handleTaskUpdate } = await import('./admin-api');
+    const payload = {
+      id: 'task-clear-provider-switch',
+      runtime: 'codex',
+      clearProviderOverride: true,
+    };
+
+    const result = await handleTaskUpdate(payload);
+
+    expect(result.success).toBe(true);
+    expect(managementApiMocks.managementApi).toHaveBeenNthCalledWith(
+      2,
+      '/api/task/update',
+      'POST',
+      payload,
     );
   });
 

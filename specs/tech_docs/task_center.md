@@ -49,7 +49,7 @@ any allowed state -> Deleted (product-level irreversible tombstone)
 - 一个 `taskId -> { queueId, canceled, sessionId, pendingSessionBirth?, state, error }` 的瞬时 execution map：复用 SessionEngine 普通 turn identity，原子拒绝重叠、撤销未 dispatch turn，并把 stop 与结果提交线性化；`pendingSessionBirth` 只在 metadata 尚未出生时持有该 exact generation 的 lifecycle capability，它不是持久 TaskRun。
 - 启动时从 `TaskStore` 的 Running Task 重建 timer。
 
-启动 Task 只有一个应用入口：`TaskApplication::run*` 先校验 schedule、提交 `Running`，再启动 timer；timer 启动失败则提交 `Blocked`。scheduler 接受本次执行后，同一操作返回从 1 开始计数的 `attemptOrdinal = executionCount + 1`；Renderer/CLI 只使用这个结果上报 `task_run.run_count`，不按 Session history 预测，也不为未被接受的执行计数。
+启动 Task 只有一个应用入口：`TaskApplication::run*` 在 Task control lock 内先裁决状态，再校验 schedule、提交 `Running` 并启动 timer；timer 启动失败则提交 `Blocked`。第一次接受执行返回从 1 开始计数的 `attemptOrdinal = executionCount + 1` 与 `changed=true`；同一 Running Task 的重复或并发 `run` 等待同一把锁后幂等返回 `changed=false`，既不重启 timer、也不产生新 ordinal。Renderer/CLI 只对真正接受的新执行上报 `task_run.run_count`，不按 Session history 预测，也不为幂等回执计数。
 
 同一 `taskId` 的 run/rerun、终态提交、timer 替换、软删除、stop，以及 outcome/history/UI event/delivery 副作用，共用按 taskId 串行的 Task control lifecycle。完整锁序是 `Task control → Session lifecycle → TaskStore`；已经持锁的代码必须使用显式的 held-guard 入口，不能再次取得同一把锁。这样，旧 stop 或旧 queue 的迟到结果不能影响新一轮执行。
 

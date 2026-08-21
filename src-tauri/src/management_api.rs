@@ -4361,10 +4361,14 @@ async fn task_run_handler(Json(req): Json<TaskIdApiRequest>) -> Json<serde_json:
         )
         .await
     {
-        Ok(result) => Json(task_lifecycle_success_response(
-            task::project_task(result.task).await,
-            Some(result.attempt_ordinal),
-        )),
+        Ok(result) => {
+            let mut response = task_lifecycle_success_response(
+                task::project_task(result.task).await,
+                result.attempt_ordinal,
+            );
+            response["changed"] = serde_json::json!(result.changed);
+            Json(response)
+        }
         Err(error) => task_application_error_response(error),
     }
 }
@@ -4408,10 +4412,14 @@ async fn task_rerun_handler(Json(req): Json<TaskIdApiRequest>) -> Json<serde_jso
         )
         .await
     {
-        Ok(result) => Json(task_lifecycle_success_response(
-            task::project_task(result.task).await,
-            Some(result.attempt_ordinal),
-        )),
+        Ok(result) => {
+            let mut response = task_lifecycle_success_response(
+                task::project_task(result.task).await,
+                result.attempt_ordinal,
+            );
+            response["changed"] = serde_json::json!(result.changed);
+            Json(response)
+        }
         Err(error) => task_application_error_response(error),
     }
 }

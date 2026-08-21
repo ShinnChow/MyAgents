@@ -220,7 +220,7 @@ Cron 兼容面只提供 `list`，不发布 `cron get`；单条详情统一使用
 
 - `start` 提交 Task `Running` 并 arm timer，不绕过 schedule/Detector；若保留的 interval anchor 已过期，scheduler 可能把下一次 tick clamp 到约 2 秒后，调用方必须读取权威 `nextExecutionAt`。
 - `run-now` 可执行 Stopped Task，不启用 scheduler，也不移动下一次 scheduled anchor。
-- `task start/stop/run/rerun` 的成功数据统一包含 `taskId`、`status`、epoch-ms `nextExecutionAt` 与 canonical `TaskProjection` 字段 `task`；run/rerun 额外包含 `attemptOrdinal`。Task application 失败统一在 Rust Management API 边界输出顶层 `code` + `error`，不得把 TaskStore 的 `{code,message}` 再编码进 `error` 字符串。
+- `task start/stop/run/rerun` 的成功数据继续包含 `taskId`、`status`、epoch-ms `nextExecutionAt` 与 canonical `TaskProjection` 字段 `task`。create/get/run/rerun 在 Node 边界额外派生稳定的 `data.receipt`，统一给 Agent 提供 `taskId/status/statusMeaning/changed/nextExecutionAt/executionState/resultAccess`；它不持久化、不拥有状态，也不替换旧字段。run/rerun 的内部 `attemptOrdinal` 仅用于新执行 analytics，不作为 CLI 公共语义；Running Task 的重复/并发 run 返回 `changed=false`，不产生新 attempt。Task application 失败统一在 Rust Management API 边界输出顶层 `code` + `error`，不得把 TaskStore 的 `{code,message}` 再编码进 `error` 字符串。
 - `Loop` 被拒绝；持续工作使用 current-session Goal。
 - `/api/admin/cron/*` 是兼容路由名，不代表独立 Cron domain/store。
 
@@ -243,7 +243,7 @@ myagents task run-now <taskId>         # 绕过 Detector，强制执行 AI
 myagents task reset-checkpoint <taskId>
 ```
 
-`task create-direct` 与 `task list` 在 Sidecar Admin 边界复用当前 workspace 解析：正常路径省略 workspace flags，Sidecar 以当前 path 匹配 `projects.json` 并补齐 Rust 所需的 stable `workspaceId + workspacePath`；只有显式跨 workspace 时由调用方提供。`agent current --json` 只返回当前 Agent/workspace/Session 的紧凑诊断，不是创建前置步骤。`task list` 的 Agent 投影默认只在当前 workspace 内返回紧凑字段与 `sessionCount`，完整 `sessionIds`、文档和 Trigger health 仍由 `task get` 拥有。
+`task create-direct` 与 `task list` 在 Sidecar Admin 边界复用当前 workspace 解析：正常路径省略 workspace flags，Sidecar 以当前 path 匹配 `projects.json` 并补齐 Rust 所需的 stable `workspaceId + workspacePath`；只有显式跨 workspace 时由调用方提供。`agent current --json` 只返回当前 Agent/workspace/Session 的紧凑诊断，不是创建前置步骤。`task list` 的 Agent 投影默认只在当前 workspace 内返回紧凑字段与 `sessionCount`，完整 `sessionIds`、文档和 Trigger health 仍由 `task get` 拥有。兼容 `cron add/update` 必须无损转发同一组 `runtime/runtimeConfig/providerId/model/permissionMode` override，并在 dry-run 与真实写入前复用同一 validator；mutation leaf 对未知 flag fail closed，禁止静默丢字段。未显式传 override 时仍只继承目标 Agent，不增加顶层或 project runtime fallback。
 
 CLI 从自身 `MYAGENTS_SESSION_ID` 判定 `agent/cli` 或 `user/cli`，把内部 caller metadata 传到既有 Rust transition 审计；Sidecar 不用自己的 `MYAGENTS_PORT` 猜调用者。UI 继续在 Tauri command 边界权威盖章为 `user/ui`。archive 仍由状态机执行 user-only guard，delete 记录真实 CLI actor/source。
 

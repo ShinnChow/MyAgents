@@ -138,13 +138,15 @@ myagents task get <taskId> --json
 myagents task run <taskId> --json
 ```
 
-创建、`run`、`start`、`stop`、`rerun` 的 JSON 回执都应包含权威最新状态和 `nextExecutionAt`，因此正常流程不需要为了确认 schedule 再额外 `get`；需要完整配置、文档路径、Session 历史或 Detector health 时再用 `task get`。首次从 Todo 启用用 `task run`；暂停后恢复用 `task start`；终态重新派发用 `task rerun`。不要通过目录时间或猜测名称寻找刚创建的 Task。
+创建、`get`、`run`、`rerun` 的 JSON 结果都提供固定的 `data.receipt`：从这里读取 `taskId`、`status`、`statusMeaning`、`changed`、`nextExecutionAt`、瞬时 `executionState` 和 `resultAccess`，不要猜测不同命令的旧字段层级。`Running` 只表示 scheduler enabled；重复或并发 `task run` 已经 Running 的 Task 会成功返回 `changed: false`，不会创建第二次派发，也不应重试。`start`、`stop` 的既有回执仍包含权威状态与 `nextExecutionAt`。首次从 Todo 启用用 `task run`；暂停后恢复用 `task start`；终态重新派发用 `task rerun`。不要通过目录时间或猜测名称寻找刚创建的 Task。
+
+`resultAccess` 只解释现有结果通道：`single-session` 的结果留在绑定 Session；`new-session` 的结果留在各次执行 Session 和 `task runs` 历史。系统不会把执行结果自动推回创建 Task 的 Session，也不会把普通 assistant 输出自动复制为 Task 评论；需要沉淀到本地时间线时由 Agent 显式调用 `task comment`。
 
 ## 治理
 
 ```bash
 myagents task get <taskId> --json       # 权威配置、状态、Detector health/checkpoint
-myagents task runs <taskId> --limit 5   # 最近 AI 执行历史
+myagents task runs <taskId> --limit 5 --full --json # 最近 AI 执行历史与结果正文
 myagents task check-now <taskId>        # 真实 Detector 检查；提交状态，命中会激活 AI
 myagents task run-now <taskId>          # 绕过 Detector，直接执行 AI
 myagents task stop <taskId>             # 暂停 schedule，保留 checkpoint
