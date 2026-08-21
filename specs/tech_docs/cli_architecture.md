@@ -357,7 +357,7 @@ Admin API 注册在 Sidecar 的 `/api/admin/*` 路由下，提供与 GUI 对等�
 | `/api/admin/goal/*` | 当前 session Goal Mode：`get` / `create` / `update` |
 | `/api/admin/task/*` | 任务中心：list/get/create/update/run/rerun/run-now、trigger validate/test/check-now/reset、status/session/archive/delete/doc |
 | `/api/admin/thought/*` | 任务中心想法：list/create |
-| `/api/admin/skill/*` | Skills CRUD、URL 安装、启停、sync |
+| `/api/admin/skill/*` | Skills CRUD、远程/本地来源安装、启停、sync；显式相对路径由 CLI 按调用者 cwd 归一化 |
 | `/api/admin/tool/*` | 用户注册 CLI 工具注册表（实验室门控，默认关闭） |
 | `/api/admin/vision/*` | 官方图片理解 CLI 工具：`readme` / `analyze` |
 | `/api/admin/plugin/*` | OpenClaw 插件安装/卸载/列表 |

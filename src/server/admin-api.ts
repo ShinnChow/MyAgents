@@ -3480,7 +3480,9 @@ IM bot sessions don't render widgets.`,
 Commands:
   list                       List installed skills + enabled state
   info <name>                Show one skill's manifest + description
-  add <url>                  Install from URL / file path
+  add <source>               Install from GitHub, HTTPS .zip, or a local source
+                             Local: absolute path, file://, explicit ./ or ../
+                             Formats: directory, .zip, .skill (not .tar.gz/.tgz)
                              [--scope user|project] [--plugin <id>] [--skill <id>]
                              [--force] [--dry-run]
   remove <name>              Uninstall a skill   [--scope user|project]
@@ -5529,11 +5531,13 @@ export async function handleSkillAdd(payload: {
 }): Promise<AdminResponse> {
   if (!payload.url) return { success: false, error: 'url is required' };
 
-  // Step 1: probe (no confirmedSelection) to learn the mode
+  // Step 1: a probe must be explicitly non-mutating. Without previewOnly the
+  // route intentionally auto-installs an unambiguous single Skill.
   const scope = payload.scope ?? 'user';
   const probe = await sidecarSelf('/api/skill/install-from-url', 'POST', {
     url: payload.url,
     scope,
+    previewOnly: true,
   }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
   if (!probe.json.success) {
     return { success: false, error: String(probe.json.error ?? 'Install probe failed') };
@@ -5541,13 +5545,38 @@ export async function handleSkillAdd(payload: {
 
   const mode = probe.json.mode as string | undefined;
 
-  // Already auto-installed (single, no conflict)
-  if (mode === 'installed') {
-    if (payload.dryRun) return { success: true, data: probe.json, hint: '[dry-run] would install the above' };
+  // Single, unambiguous, no conflict. Commit through the same confirmed path
+  // as every other CLI mode so probe and dry-run are guaranteed write-free.
+  if (mode === 'single') {
+    const preview = probe.json.preview as {
+      skill: { suggestedFolderName: string; name: string; description?: string };
+    };
+    if (payload.dryRun) {
+      return {
+        success: true,
+        dryRun: true,
+        preview: {
+          action: 'install',
+          scope,
+          source: payload.url,
+          skills: [preview.skill.suggestedFolderName],
+        },
+      };
+    }
+    const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
+      url: payload.url,
+      scope,
+      confirmedSelection: {
+        folderNames: [preview.skill.suggestedFolderName],
+      },
+    }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
+    if (!commit.json.success) {
+      return { success: false, error: String(commit.json.error ?? 'Install failed') };
+    }
     return {
       success: true,
-      data: probe.json,
-      hint: `Installed ${(probe.json.installed as unknown[] | undefined)?.length ?? 0} skill(s)`,
+      data: commit.json,
+      hint: `Installed ${(commit.json.installed as unknown[] | undefined)?.length ?? 0} skill(s)`,
     };
   }
 
@@ -5581,8 +5610,14 @@ export async function handleSkillAdd(payload: {
     if (payload.dryRun) {
       return {
         success: true,
-        hint: `[dry-run] would install ${plugin.skills.length} skill(s) from plugin "${plugin.name}"`,
-        data: { plugin: plugin.name, skills: plugin.skills.map(s => s.suggestedFolderName) },
+        dryRun: true,
+        preview: {
+          action: conflicts.length > 0 ? 'overwrite' : 'install',
+          scope,
+          source: payload.url,
+          plugin: plugin.name,
+          skills: plugin.skills.map(s => s.suggestedFolderName),
+        },
       };
     }
     const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
@@ -5628,8 +5663,13 @@ export async function handleSkillAdd(payload: {
     if (payload.dryRun) {
       return {
         success: true,
-        hint: `[dry-run] would install ${wanted.length} skill(s)`,
-        data: { skills: wanted.map(c => c.suggestedFolderName) },
+        dryRun: true,
+        preview: {
+          action: conflicts.length > 0 ? 'overwrite' : 'install',
+          scope,
+          source: payload.url,
+          skills: wanted.map(c => c.suggestedFolderName),
+        },
       };
     }
     const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
@@ -5662,7 +5702,13 @@ export async function handleSkillAdd(payload: {
     if (payload.dryRun) {
       return {
         success: true,
-        hint: `[dry-run] would overwrite "${preview.skill.suggestedFolderName}"`,
+        dryRun: true,
+        preview: {
+          action: 'overwrite',
+          scope,
+          source: payload.url,
+          skills: [preview.skill.suggestedFolderName],
+        },
       };
     }
     const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {

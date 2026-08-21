@@ -25,16 +25,18 @@ import {
   type RequestInit as UndiciRequestInit,
 } from 'undici';
 
-import { buildGithubZipCandidates, SkillUrlError, type ResolvedSkillSource } from './url-resolver';
+import { buildGithubZipCandidates, SkillUrlError, type RemoteSkillSource } from './url-resolver';
 import { getGeneralRequestDispatcher } from '../proxy-state';
 
 // ---------------------------------------------------------------------------
 // Limits (tuned for "pit of success" — refuse anything suspicious by default)
 // ---------------------------------------------------------------------------
 
-const MAX_TARBALL_BYTES = 50 * 1024 * 1024; // 50 MB total download
-const MAX_FILES_PER_REPO = 2000;             // plenty for 99% of skill repos
-const MAX_FILE_BYTES = 5 * 1024 * 1024;      // 5 MB per file (skill assets rarely exceed this)
+export const SKILL_PACKAGE_LIMITS = Object.freeze({
+  maxTotalBytes: 50 * 1024 * 1024,
+  maxFiles: 2000,
+  maxFileBytes: 5 * 1024 * 1024,
+});
 // 5 min — covers slow CN proxies + ~40-file subdirectory repos which can take
 // 30s+ even with `git clone`. Previous value (60s) was the hard cap users hit
 // repeatedly (#193). Caller-side budgets (sidecarSelf, Rust proxy) must be ≥ this.
@@ -70,7 +72,7 @@ export class TarballFetchError extends Error {
  * Fetch the zip for a resolved skill source and return the extracted tree.
  * Throws TarballFetchError on any HTTP/size/format failure.
  */
-export async function fetchSkillZip(src: ResolvedSkillSource): Promise<ExtractedTree> {
+export async function fetchSkillZip(src: RemoteSkillSource): Promise<ExtractedTree> {
   const candidates = src.kind === 'github'
     ? buildGithubZipCandidates(src)
     : [src.rawZipUrl!];
@@ -224,7 +226,7 @@ const MAX_REDIRECTS = 5;
 
 async function downloadZip(
   url: string,
-  src: ResolvedSkillSource,
+  src: RemoteSkillSource,
 ): Promise<{ buffer: Buffer; effectiveRef?: string }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -298,7 +300,7 @@ async function downloadZip(
 
     // Early abort if Content-Length is too big
     const contentLength = resp.headers.get('content-length');
-    if (contentLength && Number(contentLength) > MAX_TARBALL_BYTES) {
+    if (contentLength && Number(contentLength) > SKILL_PACKAGE_LIMITS.maxTotalBytes) {
       throw new TarballFetchError(
         `仓库太大 (${Math.round(Number(contentLength) / 1024 / 1024)} MB > 50 MB)`,
         413,
@@ -306,7 +308,7 @@ async function downloadZip(
     }
 
     const arrayBuffer = await resp.arrayBuffer();
-    if (arrayBuffer.byteLength > MAX_TARBALL_BYTES) {
+    if (arrayBuffer.byteLength > SKILL_PACKAGE_LIMITS.maxTotalBytes) {
       throw new TarballFetchError(
         `下载体积超限 (${Math.round(arrayBuffer.byteLength / 1024 / 1024)} MB > 50 MB)`,
         413,
@@ -337,7 +339,7 @@ async function downloadZip(
 // Zip → in-memory tree, stripping the GitHub wrapper root if present
 // ---------------------------------------------------------------------------
 
-function extractZipInMemory(buffer: Buffer): Map<string, Buffer> {
+export function extractZipInMemory(buffer: Buffer): Map<string, Buffer> {
   let zip: AdmZip;
   try {
     zip = new AdmZip(buffer);
@@ -349,11 +351,26 @@ function extractZipInMemory(buffer: Buffer): Map<string, Buffer> {
   if (entries.length === 0) {
     throw new TarballFetchError('zip 是空的', 422);
   }
-  if (entries.length > MAX_FILES_PER_REPO) {
+  if (entries.length > SKILL_PACKAGE_LIMITS.maxFiles) {
     throw new TarballFetchError(
-      `文件数过多 (${entries.length} > ${MAX_FILES_PER_REPO})`,
+      `文件数过多 (${entries.length} > ${SKILL_PACKAGE_LIMITS.maxFiles})`,
       413,
     );
+  }
+
+  // Validate the archive path before wrapper-root stripping. Otherwise a
+  // malicious single root such as `../` could be mistaken for a harmless
+  // GitHub wrapper and removed before the traversal check.
+  for (const entry of entries) {
+    const rawPath = entry.entryName.replace(/\\/g, '/');
+    const pathForSegments = entry.isDirectory ? rawPath.replace(/\/$/, '') : rawPath;
+    if (
+      rawPath.startsWith('/')
+      || /^[A-Za-z]:\//.test(rawPath)
+      || pathForSegments.split('/').some(segment => segment === '' || segment === '.' || segment === '..')
+    ) {
+      throw new TarballFetchError(`压缩包包含非法路径：${entry.entryName}`, 422);
+    }
   }
 
   // Detect single wrapper root (GitHub uses `<repo>-<ref-or-sha>/`)
@@ -366,24 +383,55 @@ function extractZipInMemory(buffer: Buffer): Map<string, Buffer> {
   const prefixToStrip = stripRoot ? `${stripRoot}/` : '';
 
   const files = new Map<string, Buffer>();
+  let totalBytes = 0;
   for (const entry of entries) {
+    // Check mode before directory/noise skips. A zip symlink whose name ends
+    // with `/` is also reported as isDirectory by adm-zip.
+    const unixMode = (entry.attr >>> 16) & 0o170000;
+    if (unixMode === 0o120000) {
+      throw new TarballFetchError(`压缩包包含 symlink：${entry.entryName}`, 422);
+    }
     if (entry.isDirectory) continue;
     if (entry.entryName.startsWith('__MACOSX')) continue;
 
-    let rel = entry.entryName;
+    // Normalize both archive separator forms before traversal checks. On
+    // Windows a backslash is a real path separator at publish time.
+    let rel = entry.entryName.replace(/\\/g, '/');
     if (prefixToStrip && rel.startsWith(prefixToStrip)) {
       rel = rel.slice(prefixToStrip.length);
     }
     if (!rel) continue;
 
-    // POSIX-normalize and reject any path traversal attempts
-    if (rel.includes('..') || rel.startsWith('/')) continue;
+    // Reject malformed/traversing entries rather than silently installing a
+    // partial package whose SKILL.md may no longer describe its payload.
+    if (
+      rel.startsWith('/')
+      || /^[A-Za-z]:\//.test(rel)
+      || rel.split('/').some(segment => segment === '..' || segment === '.' || segment === '')
+    ) {
+      throw new TarballFetchError(`压缩包包含非法路径：${entry.entryName}`, 422);
+    }
 
+    // Unix zip attributes encode the file type in the high mode bits. Never
+    // materialize archive symlinks as either links or misleading regular files.
     // Per-file size limit
+    if (entry.header.size > SKILL_PACKAGE_LIMITS.maxFileBytes) {
+      throw new TarballFetchError(
+        `文件过大：${rel} (${Math.round(entry.header.size / 1024 / 1024)} MB > 5 MB)`,
+        413,
+      );
+    }
     const data = entry.getData();
-    if (data.length > MAX_FILE_BYTES) {
+    if (data.length > SKILL_PACKAGE_LIMITS.maxFileBytes) {
       throw new TarballFetchError(
         `文件过大：${rel} (${Math.round(data.length / 1024 / 1024)} MB > 5 MB)`,
+        413,
+      );
+    }
+    totalBytes += data.length;
+    if (totalBytes > SKILL_PACKAGE_LIMITS.maxTotalBytes) {
+      throw new TarballFetchError(
+        `解压后总体积超限 (${Math.round(totalBytes / 1024 / 1024)} MB > 50 MB)`,
         413,
       );
     }
@@ -400,9 +448,9 @@ function extractZipInMemory(buffer: Buffer): Map<string, Buffer> {
 
 // Exported for testing
 export const _internals = {
-  MAX_TARBALL_BYTES,
-  MAX_FILES_PER_REPO,
-  MAX_FILE_BYTES,
+  MAX_TARBALL_BYTES: SKILL_PACKAGE_LIMITS.maxTotalBytes,
+  MAX_FILES_PER_REPO: SKILL_PACKAGE_LIMITS.maxFiles,
+  MAX_FILE_BYTES: SKILL_PACKAGE_LIMITS.maxFileBytes,
   FETCH_TIMEOUT_MS,
   extractZipInMemory,
 };

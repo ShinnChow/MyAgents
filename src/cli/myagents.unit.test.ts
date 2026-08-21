@@ -14,6 +14,7 @@ import {
   commandResultExitCode,
   TOP_HELP,
   normalizeScheduleFlag,
+  normalizeSkillSourceForRequest,
   parseArgs,
   parseDispatchAtValue,
   printModelList,
@@ -42,6 +43,44 @@ describe('myagents CLI port authority', () => {
     expect(resolveCliPort('32003', '32002')).toBe('32003');
     expect(resolveCliPort(undefined, '32002')).toBe('32002');
     expect(resolveCliPort(undefined, '')).toBe('');
+  });
+});
+
+describe('skill source normalization', () => {
+  it('resolves only explicit relative local paths against the CLI caller cwd', () => {
+    const cwd = join(tmpdir(), 'skill-caller');
+    expect(normalizeSkillSourceForRequest('./private-skill', cwd))
+      .toBe(join(cwd, 'private-skill'));
+    expect(normalizeSkillSourceForRequest('../private.skill', cwd))
+      .toBe(join(tmpdir(), 'private.skill'));
+  });
+
+  it('preserves GitHub shorthand, file URLs, and absolute paths', () => {
+    expect(normalizeSkillSourceForRequest('private/example', '/tmp/caller'))
+      .toBe('private/example');
+    expect(normalizeSkillSourceForRequest('file:///tmp/private.skill', '/tmp/caller'))
+      .toBe('file:///tmp/private.skill');
+    expect(normalizeSkillSourceForRequest('/tmp/private-skill', '/tmp/caller'))
+      .toBe('/tmp/private-skill');
+  });
+
+  it('normalizes an explicit relative source in the skill add request body', () => {
+    expect(buildRequestBody('skill', 'add', ['./private-skill'], { dryRun: true }))
+      .toMatchObject({
+        url: join(process.cwd(), 'private-skill'),
+        scope: 'user',
+        dryRun: true,
+      });
+  });
+
+  it('normalizes an explicit relative source inside a pasted npx command', () => {
+    const cwd = join(tmpdir(), 'skill-caller');
+    expect(normalizeSkillSourceForRequest(
+      'npx -y skills add ./private-skill --skill private',
+      cwd,
+    )).toBe(
+      `npx -y skills add ${join(cwd, 'private-skill')} --skill private`,
+    );
   });
 });
 

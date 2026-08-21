@@ -337,7 +337,7 @@ Commands:
   model     Manage model providers
   agent     Discover stable Workspace Agents and manage proactive channels
   runtime   Inspect Agent Runtimes (list installed + describe models/modes)
-  skill     Manage skills (install from URL, list, enable/disable, sync)
+  skill     Manage skills (install from URL/local source, list, enable/disable, sync)
   cron      Legacy-compatible scheduled Task aliases
   goal      Manage the current session Goal (get/create/update)
   task      Manage Task Center and scheduled automation tasks
@@ -375,6 +375,7 @@ Examples:
   myagents skill list
   myagents skill add vercel-labs/skills --skill react-best-practices
   myagents skill add https://github.com/anthropics/skills --plugin document-skills
+  myagents skill add ./private-skill --dry-run
   myagents skill add "npx skills add foo/bar --skill baz" --force
   myagents skill remove my-skill
   myagents skill sync
@@ -4808,8 +4809,9 @@ export function buildRequestBody(
   // Skill commands
   if (group === 'skill') {
     if (action === 'add') {
+      const source = rest[0] || flags.url;
       return {
-        url: rest[0] || flags.url,
+        url: typeof source === 'string' ? normalizeSkillSourceForRequest(source) : source,
         scope: (flags.scope as string) || 'user',
         plugin: flags.plugin,
         skill: flags.skill,
@@ -5320,6 +5322,28 @@ export function buildRequestBody(
   }
 
   return flags;
+}
+
+/**
+ * The Sidecar cannot observe the shell caller's cwd. Resolve only explicit
+ * relative path forms here; ambiguous `owner/repo` remains GitHub shorthand.
+ */
+export function normalizeSkillSourceForRequest(source: string, cwd = process.cwd()): string {
+  const trimmed = source.trim();
+  const pathMod = require('path') as typeof import('path');
+  if (/^\.\.?[\\/]/.test(trimmed)) {
+    return pathMod.resolve(cwd, trimmed);
+  }
+
+  // Preserve the established pasted-command surface while moving only its
+  // explicit local positional source across the CLI→Sidecar cwd boundary.
+  const wrapped = trimmed.match(
+    /^(npx(?:\s+-y)?\s+skills\s+(?:add|install)\s+)(\.\.?[\\/][^\s]+)([\s\S]*)$/i,
+  );
+  if (wrapped) {
+    return `${wrapped[1]}${pathMod.resolve(cwd, wrapped[2])}${wrapped[3]}`;
+  }
+  return source;
 }
 
 /** Parse KEY=VALUE pairs from --env flags */

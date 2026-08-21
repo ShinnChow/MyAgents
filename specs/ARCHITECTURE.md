@@ -709,22 +709,24 @@ Cmd+W 层级关闭：Overlay → 分屏面板 → Tab，高 z-index 优先。
 
 详见 `tech_docs/search_architecture.md`。
 
-### 15. Skill URL 安装 (`src/server/skills/`)
+### 15. Skill 来源安装 (`src/server/skills/`)
 
-支持从 GitHub 链接、`npx skills add` 命令或直连 zip 一键把社区 skill 装到 `~/.myagents/skills/`（或当前工作区 `.claude/skills/`）。
+支持从 GitHub 链接、`npx skills add` 命令、HTTPS zip、本地目录或本地 `.zip/.skill` 包，把 skill 物化安装到 `~/.myagents/skills/`（或当前工作区 `.claude/skills/`）。`owner/repo` 固定表示 GitHub；CLI 只把显式 `./` / `../` 相对路径按调用者 cwd 解析为绝对路径。
 
-**三段流水线：**
+**四段流水线：**
 ```
 url-resolver.ts      — 宽容解析 → ResolvedSkillSource
     ▼
-tarball-fetcher.ts   — codeload.github.com 下载 zip → 内存解包 + 安全限额
+source-loader.ts     — 远程下载或本地 no-follow 快照 → ExtractedTree
     ▼
-installer.ts         — 扫描 SKILL.md / marketplace.json → InstallAnalysis
+tarball-fetcher.ts / local-tree-reader.ts — 统一安全限额与无 symlink 树
+    ▼
+installer.ts         — analyseTree → staging → 文件锁内复核/rename 发布/失败回滚
 ```
 
-**安全限额：** tarball ≤ 50MB、单文件 ≤ 5MB、文件总数 ≤ 2000、超时 60s、Zip-Slip 防御。直连压缩包必须使用 HTTPS；下载前后每个 redirect hop 都拒绝 loopback/RFC1918/link-local/IPv6 ULA，并把 fetch 钉死到已校验 DNS 结果，防 SSRF / DNS rebinding。
+**安全限额：** 下载包与来源树总量 ≤ 50MB、单文件 ≤ 5MB、文件总数 ≤ 2000、下载超时 5 分钟；压缩包拒绝 Zip-Slip、绝对路径和 symlink，本地目录拒绝 source root / 内部 symlink 或 junction。直连压缩包必须使用 HTTPS；每个 redirect hop 都拒绝 loopback/RFC1918/link-local/IPv6 ULA，并把 fetch 钉死到已校验 DNS 结果，防 SSRF / DNS rebinding。安装永远复制为 managed root 下的普通物理目录，不保留对来源的链接。
 
-**MVP 明确不支持：** GitLab、私有仓库、git SSH URL、搜索集成、市场订阅持久化、`skill update`、跨 IDE symlink 同步、npm spec 形态。
+**明确不支持：** `.tar.gz/.tgz`、GitLab、私有仓库、git SSH URL、搜索集成、市场订阅持久化、`skill update`、跨 IDE symlink 同步、npm spec 形态。来源 URL / commit 不持久化。
 
 详见 `guides/skill_marketplace.md`。
 

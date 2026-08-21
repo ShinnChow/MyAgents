@@ -152,6 +152,7 @@ beforeEach(() => {
   process.env.USERPROFILE = scratch;
   vi.resetModules();
   agentSessionMocks.agentDir = undefined;
+  agentSessionMocks.getSidecarPort.mockReturnValue(0);
   agentSessionMocks.setMcpServers.mockClear();
   managementApiMocks.managementApi.mockClear();
   managementApiMocks.managementApi.mockResolvedValue({ ok: true, taskUpdated: 0, cronUpdated: 0 });
@@ -507,6 +508,89 @@ describe('admin-api help registry', () => {
     expect(listText).toContain('--include-subtree <true|false>');
     expect(viewText).toContain('issue.goalId');
     expect(viewText).toContain('issue.goalPathLabel');
+  });
+});
+
+describe('admin-api Skill add preview contract', () => {
+  it('keeps a single-Skill dry-run to one preview-only request', async () => {
+    const cancellation = await import('./utils/cancellation');
+    const requests: Array<Record<string, unknown>> = [];
+    agentSessionMocks.getSidecarPort.mockReturnValue(32123);
+    cancellation._setGeneralFetchTransportForTests(async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({
+        success: true,
+        mode: 'single',
+        preview: {
+          skill: { suggestedFolderName: 'private-skill', name: 'private-skill' },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    try {
+      const { handleSkillAdd } = await import('./admin-api');
+      const result = await handleSkillAdd({
+        url: '/tmp/private-skill',
+        dryRun: true,
+      });
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({
+        url: '/tmp/private-skill',
+        scope: 'user',
+        previewOnly: true,
+      });
+      expect(result).toMatchObject({
+        success: true,
+        dryRun: true,
+        preview: { action: 'install', skills: ['private-skill'] },
+      });
+    } finally {
+      cancellation._setGeneralFetchTransportForTests();
+    }
+  });
+
+  it('commits a single Skill only after a distinct preview request', async () => {
+    const cancellation = await import('./utils/cancellation');
+    const requests: Array<Record<string, unknown>> = [];
+    agentSessionMocks.getSidecarPort.mockReturnValue(32123);
+    cancellation._setGeneralFetchTransportForTests(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      const response = requests.length === 1
+        ? {
+            success: true,
+            mode: 'single',
+            preview: {
+              skill: { suggestedFolderName: 'private-skill', name: 'private-skill' },
+            },
+          }
+        : {
+            success: true,
+            mode: 'installed',
+            installed: [{ folderName: 'private-skill' }],
+          };
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    try {
+      const { handleSkillAdd } = await import('./admin-api');
+      const result = await handleSkillAdd({ url: '/tmp/private-skill' });
+
+      expect(requests).toHaveLength(2);
+      expect(requests[0]).toMatchObject({ previewOnly: true });
+      expect(requests[1]).toMatchObject({
+        url: '/tmp/private-skill',
+        confirmedSelection: { folderNames: ['private-skill'] },
+      });
+      expect(requests[1]).not.toHaveProperty('previewOnly');
+      expect(result.success).toBe(true);
+    } finally {
+      cancellation._setGeneralFetchTransportForTests();
+    }
   });
 });
 

@@ -208,7 +208,7 @@ myagents diagnose runtime codex                         # 同上的 sugar 写法
 ```bash
 myagents skill list                                     # 已装 skill（全局 + 项目级）
 myagents skill info <name>                              # 某 skill 的详情
-myagents skill add <url-or-spec> [--scope user|project] [--plugin X] [--skill Y] [--force] [--dry-run]
+myagents skill add <source> [--scope user|project] [--plugin X] [--skill Y] [--force] [--dry-run]
 myagents skill remove <name>                            # 删除
 myagents skill enable <name>                            # 启用
 myagents skill disable <name>                           # 禁用非 Required Skill；Required System Skill 会拒绝
@@ -224,12 +224,18 @@ myagents skill sync                                     # 把 ~/.claude/skills �
 | `https://github.com/foo/bar/tree/main/skills/baz` | 子路径，只装 baz |
 | `foo/bar@baz` | 仓库内多 skill 选其一 |
 | `"npx skills add foo/bar --skill baz"` | 用户从 README 复制的整条命令（用引号包） |
-| `https://example.com/x.zip` | 直连 zip/tar.gz |
+| `https://example.com/x.zip` | HTTPS 直连 zip |
+| `./private-skill` / `../private.skill` | 相对当前 CLI 调用目录的本地目录、`.zip` 或 `.skill`；必须显式写 `./` / `../` |
+| `/absolute/path/private-skill` | 本地绝对路径（Windows 也支持 drive-letter 路径） |
+| `file:///absolute/path/private.skill` | 本地 file URL |
 
-**不支持**：GitLab、私有仓库、git SSH。
+本地来源会物化复制到 MyAgents 管理目录，不保留 source symlink；`--dry-run` 只解析和预览，不写目标或 staging。
+
+**不支持**：`.tar.gz/.tgz`、GitLab、私有仓库、git SSH。
 
 **何时用：**
 - 用户贴 GitHub 链接或 `npx skills add ...` → 直接 `skill add "<原文>"`，resolver 自己剥前缀
+- 用户给出私有本地 Skill → 保留显式 `./` / `../` 或绝对路径，直接 `skill add <source>`；不要先复制进 `~/.claude/skills`
 - "装 React 最佳实践" → `skill add vercel-labs/skills --skill react-best-practices`
 - 报错 `该仓库是 Claude Plugins 市场` → 按提示加 `--plugin <name>`，比如 `skill add anthropics/skills --plugin document-skills` 一次装 docx/pdf/pptx/xlsx
 - 报错 `技能 X 已存在` → 跟用户确认要不要 `--force` 覆盖

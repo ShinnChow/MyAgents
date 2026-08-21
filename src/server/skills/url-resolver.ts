@@ -1,5 +1,5 @@
 /**
- * url-resolver.ts — Parse user input into a GitHub skill source descriptor.
+ * url-resolver.ts — Parse user input into a Skill source descriptor.
  *
  * Accepts any of:
  *   - owner/repo
@@ -8,34 +8,58 @@
  *   - https://github.com/owner/repo/tree/<ref>/<sub/path>
  *   - https://github.com/owner/repo.git
  *   - https://example.com/anything.zip        (raw zip passthrough)
+ *   - file:///absolute/path/to/skill          (local directory / zip / .skill)
+ *   - /absolute/path/to/skill                 (POSIX / Windows absolute path)
  *   - Any of the above prefixed with `npx skills add` / `npx -y skills add`,
  *     optionally followed by `--skill <name>` / `-g` / other CLI noise.
  *
- * Rejects: gitlab, bitbucket, git SSH URLs, private repo URLs, non-zip raw links.
+ * Rejects: gitlab, bitbucket, git SSH URLs, private repo URLs, non-zip raw links,
+ * and implicit relative paths (the CLI resolves explicit ./ and ../ paths
+ * against its own cwd before calling the Sidecar).
  *
  * The resolver is intentionally permissive about the *input form* (so users can
  * paste whatever they copied from a README or chat) but strict about the
- * *output shape* (a fully-resolved GitHub coordinate or a raw-zip URL).
+ * *output shape* (a fully-resolved remote coordinate or canonical local path).
  */
 
-export interface ResolvedSkillSource {
-  /** Discriminator */
-  kind: 'github' | 'raw-zip';
-  /** Human-readable display for error messages / UI */
+import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export interface GithubSkillSource {
+  kind: 'github';
   displayName: string;
-  /** GitHub owner (undefined for raw-zip) */
-  owner?: string;
-  /** GitHub repo (undefined for raw-zip) */
-  repo?: string;
-  /** GitHub ref (branch/tag); undefined means "try default branch" */
+  owner: string;
+  repo: string;
   ref?: string;
-  /** Subdirectory inside the repo to extract (e.g. "skills/baz") */
   subPath?: string;
-  /** Specific skill name hint (from `owner/repo@name` or `--skill name`) */
   skillName?: string;
-  /** Already-resolved download URL (only set for raw-zip) */
-  rawZipUrl?: string;
+  rawZipUrl?: undefined;
 }
+
+export interface RawZipSkillSource {
+  kind: 'raw-zip';
+  displayName: string;
+  rawZipUrl: string;
+  skillName?: string;
+  ref?: undefined;
+  subPath?: undefined;
+}
+
+export interface LocalSkillSource {
+  kind: 'local';
+  displayName: string;
+  /** Absolute lexical path. The loader performs no-follow canonical checks. */
+  absolutePath: string;
+  /** Canonical transport form returned as non-persistent command provenance. */
+  sourceUrl: string;
+  skillName?: string;
+  rawZipUrl?: undefined;
+  ref?: undefined;
+  subPath?: undefined;
+}
+
+export type RemoteSkillSource = GithubSkillSource | RawZipSkillSource;
+export type ResolvedSkillSource = RemoteSkillSource | LocalSkillSource;
 
 export class SkillUrlError extends Error {
   constructor(message: string) {
@@ -55,24 +79,56 @@ export function resolveSkillUrl(rawInput: string): ResolvedSkillSource {
 
   const cleaned = stripNpxWrapper(rawInput.trim());
   if (!cleaned.positional) {
-    throw new SkillUrlError('未识别到有效的仓库地址');
+    throw new SkillUrlError('未识别到有效的 Skill 来源');
   }
 
-  // Explicit raw zip/tar.gz passthrough
-  if (/^https:\/\//i.test(cleaned.positional) && /\.(zip|tar\.gz|tgz)(\?.*)?$/i.test(cleaned.positional)) {
+  const positional = cleaned.positional;
+
+  // Explicit local source. owner/repo remains the stable GitHub shorthand;
+  // callers must use an absolute path, file://, or let the CLI normalize an
+  // explicit ./ / ../ path against the caller's cwd.
+  if (/^file:/i.test(positional)) {
+    if (hasRawParentPathSegment(positional)) {
+      throw new SkillUrlError(`本地路径含非法 .. 段：${positional}`);
+    }
+    let absolutePath: string;
+    try {
+      absolutePath = fileURLToPath(positional);
+    } catch {
+      throw new SkillUrlError(`无法解析 file:// URL：${positional}`);
+    }
+    if (!isAbsolute(absolutePath)) {
+      throw new SkillUrlError(`file:// 必须指向绝对路径：${positional}`);
+    }
+    return buildLocalSource(absolutePath, cleaned.skillName, positional);
+  }
+  if (isAbsolute(positional) || /^[A-Za-z]:[\\/]/.test(positional)) {
+    if (hasParentPathSegment(positional)) {
+      throw new SkillUrlError(`本地路径含非法 .. 段：${positional}`);
+    }
+    return buildLocalSource(positional, cleaned.skillName);
+  }
+
+  // Explicit raw zip passthrough. tar.gz/tgz used to pass this resolver but
+  // always failed in AdmZip after download; reject that unsupported format
+  // before network IO instead of advertising a ghost capability.
+  if (/^https:\/\//i.test(positional) && /\.zip(\?.*)?$/i.test(positional)) {
     return {
       kind: 'raw-zip',
-      displayName: cleaned.positional,
-      rawZipUrl: cleaned.positional,
+      displayName: positional,
+      rawZipUrl: positional,
       skillName: cleaned.skillName,
     };
   }
-  if (/^http:\/\//i.test(cleaned.positional) && /\.(zip|tar\.gz|tgz)(\?.*)?$/i.test(cleaned.positional)) {
+  if (/^https?:\/\//i.test(positional) && /\.(tar\.gz|tgz)(\?.*)?$/i.test(positional)) {
+    throw new SkillUrlError('暂不支持 .tar.gz / .tgz，请提供 GitHub 仓库或 .zip 文件');
+  }
+  if (/^http:\/\//i.test(positional) && /\.zip(\?.*)?$/i.test(positional)) {
     throw new SkillUrlError('直连压缩包必须使用 HTTPS 链接');
   }
 
   // Full GitHub URL (with optional tree/<ref>/<path>)
-  const fullMatch = cleaned.positional.match(
+  const fullMatch = positional.match(
     /^https?:\/\/(?:www\.)?github\.com\/([^/\s#?]+)\/([^/\s#?]+?)(?:\.git)?(?:\/tree\/([^/\s#?]+)((?:\/[^\s#?]+)?))?\/?(?:[?#].*)?$/i,
   );
   if (fullMatch) {
@@ -81,24 +137,53 @@ export function resolveSkillUrl(rawInput: string): ResolvedSkillSource {
   }
 
   // Shorthand: owner/repo[@skillName]
-  const shortMatch = cleaned.positional.match(/^([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*?)(?:@([\w.\-/]+))?$/);
+  const shortMatch = positional.match(/^([A-Za-z0-9][\w.-]*)\/([A-Za-z0-9][\w.-]*?)(?:@([\w.\-/]+))?$/);
   if (shortMatch) {
     const [, owner, repo, atSkill] = shortMatch;
     return buildGithubSource(owner, repo, undefined, undefined, cleaned.skillName ?? atSkill);
   }
 
   // Rejected cases with friendlier messages
-  if (/^https?:\/\/(?:www\.)?gitlab\.com/i.test(cleaned.positional)) {
+  if (/^https?:\/\/(?:www\.)?gitlab\.com/i.test(positional)) {
     throw new SkillUrlError('暂不支持 GitLab，请粘贴 GitHub 链接或使用 owner/repo 简写');
   }
-  if (/^git@/i.test(cleaned.positional) || /\.git$/i.test(cleaned.positional)) {
+  if (/^git@/i.test(positional) || /\.git$/i.test(positional)) {
     throw new SkillUrlError('暂不支持 SSH / .git 克隆地址，请使用 https://github.com/... 形式');
   }
-  if (/^https?:\/\//i.test(cleaned.positional)) {
-    throw new SkillUrlError('只支持 github.com 链接或直连 .zip/.tar.gz 文件');
+  if (/^https?:\/\//i.test(positional)) {
+    throw new SkillUrlError('只支持 github.com 链接或直连 HTTPS .zip 文件');
   }
 
-  throw new SkillUrlError(`无法识别的输入："${cleaned.positional}"。示例：foo/bar、https://github.com/foo/bar`);
+  throw new SkillUrlError(
+    `无法识别的输入：“${positional}”。示例：foo/bar、https://github.com/foo/bar、file:///absolute/path/to/skill`,
+  );
+}
+
+function hasParentPathSegment(path: string): boolean {
+  return path.split(/[\\/]+/).some(segment => segment === '..');
+}
+
+function hasRawParentPathSegment(path: string): boolean {
+  try {
+    return hasParentPathSegment(decodeURIComponent(path));
+  } catch {
+    return hasParentPathSegment(path);
+  }
+}
+
+function buildLocalSource(
+  path: string,
+  skillName: string | undefined,
+  originalUrl?: string,
+): LocalSkillSource {
+  const absolutePath = resolvePath(path);
+  return {
+    kind: 'local',
+    displayName: absolutePath,
+    absolutePath,
+    sourceUrl: originalUrl ?? pathToFileURL(absolutePath).href,
+    skillName: skillName || undefined,
+  };
 }
 
 /**
@@ -127,6 +212,12 @@ function stripNpxWrapper(input: string): { positional?: string; skillName?: stri
   const tokens = trimmed.split(UNICODE_WS).filter(Boolean);
   // Drop leading `npx`, `-y`, `skills`, `add` noise (all optional / in any order up front)
   const WRAPPER_TOKENS = new Set(['npx', '-y', 'skills', 'add', 'install']);
+  // A quoted local path may legitimately contain spaces. Only tokenize the
+  // input as a pasted command when its first token is actual wrapper noise;
+  // otherwise the complete trimmed string is the one positional source.
+  if (!WRAPPER_TOKENS.has(tokens[0]?.toLowerCase() ?? '')) {
+    return { positional: trimmed };
+  }
   while (tokens.length > 0 && WRAPPER_TOKENS.has(tokens[0].toLowerCase())) {
     tokens.shift();
   }
@@ -180,7 +271,7 @@ function buildGithubSource(
   ref: string | undefined,
   subPathRaw: string | undefined,
   skillName: string | undefined,
-): ResolvedSkillSource {
+): GithubSkillSource {
   if (!isSafeSegment(owner) || !isSafeSegment(repo)) {
     throw new SkillUrlError(`非法的 owner/repo："${owner}/${repo}"`);
   }
@@ -231,10 +322,7 @@ function normalizeSubPath(raw: string | undefined): string | undefined {
  *
  * Returns an array — caller tries them in order, falling back on 404.
  */
-export function buildGithubZipCandidates(src: ResolvedSkillSource): string[] {
-  if (src.kind !== 'github' || !src.owner || !src.repo) {
-    throw new SkillUrlError('not a github source');
-  }
+export function buildGithubZipCandidates(src: GithubSkillSource): string[] {
   const base = `https://codeload.github.com/${src.owner}/${src.repo}/zip`;
   if (src.ref) {
     return [`${base}/${encodeURIComponent(src.ref)}`];

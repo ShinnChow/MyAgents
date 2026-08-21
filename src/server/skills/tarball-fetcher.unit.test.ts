@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import AdmZip from 'adm-zip';
 
 const networkMocks = vi.hoisted(() => ({
   fetch: vi.fn(),
@@ -13,6 +14,7 @@ vi.mock('undici', async (importOriginal) => {
 
 import {
   fetchSkillZip,
+  extractZipInMemory,
   isBlockedSkillPackageHost,
   isSkillPackageUrlLexicallySafe,
 } from './tarball-fetcher';
@@ -102,5 +104,58 @@ describe('skill tarball SSRF guard', () => {
     const init = networkMocks.fetch.mock.calls[0]?.[1] as { dispatcher?: unknown };
     expect(init.dispatcher).toBeDefined();
     expect(init.dispatcher).not.toBe(generalDispatcher);
+  });
+});
+
+describe('skill zip extraction boundaries', () => {
+  it('extracts an ordinary wrapper-root package', () => {
+    const zip = new AdmZip();
+    zip.addFile('repo-main/SKILL.md', Buffer.from('skill'));
+    zip.addFile('repo-main/scripts/run.js', Buffer.from('run'));
+
+    expect([...extractZipInMemory(zip.toBuffer()).keys()].sort()).toEqual([
+      'SKILL.md',
+      'scripts/run.js',
+    ]);
+  });
+
+  it('rejects traversal before a malicious root can be stripped', () => {
+    const zip = new AdmZip();
+    zip.addFile('aaa/evil', Buffer.from('evil'));
+    const buffer = zip.toBuffer();
+    for (let index = 0; index <= buffer.length - 8; index += 1) {
+      if (buffer.toString('ascii', index, index + 8) === 'aaa/evil') {
+        buffer.write('../evil!', index, 'ascii');
+      }
+    }
+
+    expect(() => extractZipInMemory(buffer)).toThrow(/非法路径/);
+  });
+
+  it('rejects Unix symlink entries instead of materializing their target text', () => {
+    const zip = new AdmZip();
+    const entry = zip.addFile('repo-main/link', Buffer.from('../outside'));
+    entry.attr = (0o120777 << 16) >>> 0;
+
+    expect(() => extractZipInMemory(zip.toBuffer())).toThrow(/symlink/);
+  });
+
+  it('rejects a symlink mode even when adm-zip also classifies it as a directory', () => {
+    const zip = new AdmZip();
+    zip.addFile('repo-main/SKILL.md', Buffer.from('skill'));
+    const entry = zip.addFile('repo-main/link/', Buffer.alloc(0));
+    entry.attr = (0o120777 << 16) >>> 0;
+
+    expect(() => extractZipInMemory(zip.toBuffer())).toThrow(/symlink/);
+  });
+
+  it('enforces total uncompressed bytes across individually valid files', () => {
+    const zip = new AdmZip();
+    const chunk = Buffer.alloc(5 * 1024 * 1024);
+    for (let index = 0; index < 11; index += 1) {
+      zip.addFile(`repo-main/file-${index}.bin`, chunk);
+    }
+
+    expect(() => extractZipInMemory(zip.toBuffer())).toThrow(/总体积超限/);
   });
 });

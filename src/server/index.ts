@@ -101,7 +101,17 @@ import {
 } from '../shared/systemSkills';
 import { resolveSkillUrl, type ResolvedSkillSource } from './skills/url-resolver';
 import { fetchSkillZip, TarballFetchError } from './skills/tarball-fetcher';
-import { analyseTree, buildInstallPayload, writeSkillFiles, type SkillCandidate } from './skills/installer';
+import { loadSkillTree, SkillSourceLoadError } from './skills/source-loader';
+import {
+  analyseTree,
+  buildInstallPayload,
+  buildInstallPayloadForCandidate,
+  pathEntryExistsNoFollow,
+  publishSkillInstallPlan,
+  SkillInstallError,
+  skillTargetCollisionKey,
+  type SkillCandidate,
+} from './skills/installer';
 import {
   installPlugin,
   uninstallPlugin,
@@ -172,7 +182,7 @@ function buildSkillSourceMeta(
   }
   return {
     type: src.kind === 'raw-zip' ? 'raw_zip' : 'url',
-    url: src.rawZipUrl ?? tree.sourceUrl,
+    url: src.kind === 'raw-zip' ? src.rawZipUrl : tree.sourceUrl,
     resolvedUrl: tree.sourceUrl,
     rootPath: cand.rootPath || null,
     skillName: cand.suggestedFolderName,
@@ -5714,6 +5724,12 @@ async function main() {
           }
 
           let tree;
+          if (resolved.kind === 'local') {
+            return jsonResponse(
+              { success: false, error: '本地 Skill 来源只支持安装，不能直接作为 Space 发布来源' },
+              400,
+            );
+          }
           try {
             tree = await fetchSkillZip(resolved);
           } catch (err) {
@@ -5832,7 +5848,7 @@ async function main() {
         }
       }
 
-      // POST /api/skill/install-from-url - Install skill(s) from a GitHub repo / raw zip URL
+      // POST /api/skill/install-from-url - Install from GitHub, HTTPS zip, or a local source.
       // Two-step flow: first call analyses and may return a preview for the user to confirm;
       // second call (with confirmedSelection) re-fetches and writes the chosen skills.
       if (pathname === '/api/skill/install-from-url' && request.method === 'POST') {
@@ -5840,6 +5856,8 @@ async function main() {
           const payload = await request.json() as {
             url: string;
             scope: 'user' | 'project';
+            /** Analyse only. Never publish even for an unambiguous single Skill. */
+            previewOnly?: boolean;
             confirmedSelection?: {
               pluginName?: string;
               folderNames?: string[];
@@ -5868,14 +5886,14 @@ async function main() {
             );
           }
 
-          // 2. Download + extract in memory
+          // 2. Read/download + extract into the same immutable in-memory tree
           let tree;
           try {
-            tree = await fetchSkillZip(resolved);
+            tree = await loadSkillTree(resolved);
           } catch (err) {
-            const statusCode = err instanceof TarballFetchError ? err.statusCode : 500;
+            const statusCode = err instanceof SkillSourceLoadError ? err.statusCode : 500;
             return jsonResponse(
-              { success: false, error: err instanceof Error ? err.message : '下载失败' },
+              { success: false, error: err instanceof Error ? err.message : '读取 Skill 来源失败' },
               statusCode,
             );
           }
@@ -5887,12 +5905,19 @@ async function main() {
             return jsonResponse({ success: false, error: analysis.reason }, 422);
           }
 
+          if (payload.previewOnly && payload.confirmedSelection) {
+            return jsonResponse(
+              { success: false, error: 'previewOnly 不能与 confirmedSelection 同时使用' },
+              400,
+            );
+          }
+
           // 4. Compute existing folder conflicts for a given candidate list
           const checkConflicts = (candidates: SkillCandidate[]) => {
             const conflicts: Array<{ suggestedFolderName: string; name: string }> = [];
             for (const cand of candidates) {
               const folder = sanitizeFolderName(cand.suggestedFolderName);
-              if (existsSync(join(baseDir, folder))) {
+              if (pathEntryExistsNoFollow(join(baseDir, folder))) {
                 conflicts.push({ suggestedFolderName: folder, name: cand.name });
               }
             }
@@ -5901,7 +5926,9 @@ async function main() {
 
           // ---------- Step B: confirmedSelection provided — write to disk ----------
           if (payload.confirmedSelection) {
-            const overwrite = new Set(payload.confirmedSelection.overwrite ?? []);
+            const overwrite = new Set(
+              (payload.confirmedSelection.overwrite ?? []).map(name => sanitizeFolderName(name)),
+            );
             const renames = payload.confirmedSelection.renames ?? {};
 
             // Determine which candidates were chosen
@@ -5937,18 +5964,18 @@ async function main() {
             //   (1) duplicates within the chosen set (two skills collapsing to
             //       the same folder name — usually via frontmatter.name collision)
             //   (2) existing folders that aren't in overwrite
-            //   (3) rename targets that collide with existing folders
-            // All of these MUST fail before we write anything, otherwise a
-            // partial install leaks. Pre-validation gives atomic-ish semantics
-            // without a temp-dir dance.
-            const plan: Array<{ cand: SkillCandidate; folderName: string; originalName: string }> = [];
+            //   (3) rename targets that collide with existing folders.
+            // The publisher repeats conflict checks under the cross-process
+            // lock; this pass exists for precise request-level diagnostics.
+            const plan: Array<{ cand: SkillCandidate; folderName: string; overwrite: boolean }> = [];
             const seenTargets = new Set<string>();
             for (const cand of chosen) {
               const originalName = sanitizeFolderName(cand.suggestedFolderName);
               const renameTo = renames[originalName] ?? renames[cand.suggestedFolderName];
               const folderName = renameTo ? sanitizeFolderName(renameTo) : originalName;
 
-              if (seenTargets.has(folderName)) {
+              const collisionKey = skillTargetCollisionKey(folderName);
+              if (seenTargets.has(collisionKey)) {
                 return jsonResponse(
                   {
                     success: false,
@@ -5959,12 +5986,12 @@ async function main() {
                   409,
                 );
               }
-              seenTargets.add(folderName);
+              seenTargets.add(collisionKey);
 
               // If renamed, the rename target must not already exist on disk
               // (the user's original `overwrite` set was keyed on the original
               // name, not the rename target).
-              if (renameTo && existsSync(join(baseDir, folderName))) {
+              if (renameTo && pathEntryExistsNoFollow(join(baseDir, folderName))) {
                 return jsonResponse(
                   {
                     success: false,
@@ -5977,7 +6004,11 @@ async function main() {
               }
 
               // Non-renamed conflict must be covered by `overwrite`
-              if (!renameTo && existsSync(join(baseDir, folderName)) && !overwrite.has(folderName)) {
+              if (
+                !renameTo
+                && pathEntryExistsNoFollow(join(baseDir, folderName))
+                && !overwrite.has(folderName)
+              ) {
                 return jsonResponse(
                   {
                     success: false,
@@ -5989,31 +6020,20 @@ async function main() {
                 );
               }
 
-              plan.push({ cand, folderName, originalName });
+              plan.push({ cand, folderName, overwrite: !renameTo && overwrite.has(folderName) });
             }
 
-            // ---------- Write phase (all validations have passed) ----------
-            const payloadMap = buildInstallPayload(tree, chosen);
-            const installed: Array<{ folderName: string; path: string; name: string; description: string }> = [];
-
-            for (const { cand, folderName } of plan) {
-              const files = payloadMap.get(cand.suggestedFolderName);
-              if (!files) continue;
-
-              const skillDir = join(baseDir, folderName);
-              if (existsSync(skillDir) && overwrite.has(folderName)) {
-                rmSync(skillDir, { recursive: true, force: true });
-              }
-
-              writeSkillFiles(skillDir, files);
-
-              installed.push({
+            // ---------- Publish phase: stage complete dirs, then lock + rename ----------
+            const installed = await publishSkillInstallPlan(
+              baseDir,
+              plan.map(({ cand, folderName, overwrite: shouldOverwrite }) => ({
                 folderName,
-                path: skillDir,
+                files: buildInstallPayloadForCandidate(tree, cand),
                 name: cand.name,
                 description: cand.description,
-              });
-            }
+                overwrite: shouldOverwrite,
+              })),
+            );
 
             if (installed.length === 0) {
               return jsonResponse({ success: false, error: '没有任何 skill 被安装' }, 500);
@@ -6049,7 +6069,7 @@ async function main() {
                     name: s.name,
                     description: s.description,
                     hasDangerousTools: s.hasDangerousTools,
-                    conflict: existsSync(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
+                    conflict: pathEntryExistsNoFollow(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
                   })),
                 })),
               },
@@ -6069,7 +6089,7 @@ async function main() {
                   description: s.description,
                   hasDangerousTools: s.hasDangerousTools,
                   rootPath: s.rootPath,
-                  conflict: existsSync(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
+                  conflict: pathEntryExistsNoFollow(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
                 })),
               },
               sourceUrl: tree.sourceUrl,
@@ -6100,14 +6120,32 @@ async function main() {
             });
           }
 
-          // Auto-install the single unambiguous skill
-          const skillDir = join(baseDir, folderName);
-          const files = buildInstallPayload(tree, [cand]).get(cand.suggestedFolderName);
-          if (!files || files.size === 0) {
-            return jsonResponse({ success: false, error: '未找到可安装的文件' }, 500);
+          if (payload.previewOnly) {
+            return jsonResponse({
+              success: true,
+              mode: 'single',
+              preview: {
+                skill: {
+                  suggestedFolderName: folderName,
+                  name: cand.name,
+                  description: cand.description,
+                  hasDangerousTools: cand.hasDangerousTools,
+                  conflict: false,
+                },
+              },
+              sourceUrl: tree.sourceUrl,
+              effectiveRef: tree.effectiveRef,
+            });
           }
 
-          writeSkillFiles(skillDir, files);
+          // Auto-install the single unambiguous skill
+          const installed = await publishSkillInstallPlan(baseDir, [{
+            folderName,
+            files: buildInstallPayloadForCandidate(tree, cand),
+            name: cand.name,
+            description: cand.description,
+            overwrite: false,
+          }]);
 
           if (scope === 'user') {
             bumpSkillsGeneration();
@@ -6117,12 +6155,7 @@ async function main() {
           return jsonResponse({
             success: true,
             mode: 'installed',
-            installed: [{
-              folderName,
-              path: skillDir,
-              name: cand.name,
-              description: cand.description,
-            }],
+            installed,
             sourceUrl: tree.sourceUrl,
             effectiveRef: tree.effectiveRef,
           });
@@ -6130,7 +6163,7 @@ async function main() {
           console.error('[api/skill/install-from-url] Error:', error);
           return jsonResponse(
             { success: false, error: error instanceof Error ? error.message : 'Install failed' },
-            500,
+            error instanceof SkillInstallError ? error.statusCode : 500,
           );
         }
       }

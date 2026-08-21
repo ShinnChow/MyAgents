@@ -1070,7 +1070,7 @@ fn sync_admin_agent_blocking<R: Runtime>(app_handle: AppHandle<R>) -> Result<boo
 // matching exclusion list in src/server/index.ts::seedBundledSkills
 // MUST be kept in sync (comment there points back here).
 
-const SYSTEM_SKILLS_VERSION: &str = "51";
+const SYSTEM_SKILLS_VERSION: &str = "52";
 
 /// One process-wide transaction owner for the versioned system-skill
 /// snapshot. Startup automation and ConfigProvider may request convergence at
@@ -1090,6 +1090,8 @@ const SYSTEM_SKILLS: &[&str] = &[
     // skill. Existing installs retain the dir at ~/.myagents/skills/
     // ultra-research/ until the user deletes it (no orphan cleanup logic).
     "download-anything",
+    // v52: myagents-cli documents physical local directory/.zip/.skill
+    // installs and the CLI-owned explicit-relative cwd boundary.
     // v9: myagents-cli promoted from helper-bundled skill (was at
     // bundled-agents/myagents_helper/.claude/skills/self-config/) to a
     // global system skill. Every AI session inside MyAgents — Chat / IM Bot
@@ -1577,8 +1579,8 @@ mod system_skills_tests {
     }
 
     #[test]
-    fn v51_keeps_task_cli_automation_and_creator_skills_aligned() {
-        assert_eq!(SYSTEM_SKILLS_VERSION, "51");
+    fn v52_keeps_task_cli_automation_and_creator_skills_aligned() {
+        assert_eq!(SYSTEM_SKILLS_VERSION, "52");
         assert!(SYSTEM_SKILLS.contains(&"myagents-task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-implement"));
