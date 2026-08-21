@@ -211,6 +211,27 @@ describe('Task turn orchestrator', () => {
     expect(prompt).not.toContain('</system-reminder><instruction>');
   });
 
+  it('does not advertise ordinary local comments inside a managed maintenance turn', async () => {
+    mocks.metadata.set('session-1', { id: 'session-1' });
+    const { engine, prepareScheduledTurn, runInjectedTurn } = fakeEngine();
+
+    const result = await createTaskTurnOrchestrator().runScheduledTurn(
+      engine,
+      payload({ managedKind: 'memory_gardener' }),
+      '/workspace',
+    );
+
+    expect(result).toMatchObject({ success: true, turnDispatched: true });
+    expect(prepareScheduledTurn).toHaveBeenCalledWith(expect.objectContaining({
+      operation: expect.objectContaining({
+        requiredSystemSkill: 'myagents-memory-gardener',
+      }),
+    }));
+    const prompt = runInjectedTurn.mock.calls[0][0].prompt;
+    expect(prompt).not.toContain('Task collaboration:');
+    expect(prompt).not.toContain('myagents task comment');
+  });
+
   it('materializes one exact external Session before runtime-native preparation', async () => {
     const { engine, prepareScheduledTurn } = fakeEngine({ runtime: 'codex' });
 

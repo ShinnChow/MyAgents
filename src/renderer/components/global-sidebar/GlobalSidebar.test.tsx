@@ -714,7 +714,7 @@ describe('GlobalSidebar rail flyout', () => {
     expect(screen.queryByRole('tooltip', { name: '小助理' })).not.toBeInTheDocument();
   });
 
-  it('keeps the hover Task-create tooltip trigger out of the nav document flow', () => {
+  it('keeps the hover Task-create tooltip trigger inside an absolute row overlay', () => {
     mocks.forcedRail = false;
     window.localStorage.setItem(
       GLOBAL_SIDEBAR_PREFERENCE_KEY,
@@ -730,8 +730,12 @@ describe('GlobalSidebar rail flyout', () => {
     renderSidebar();
 
     const createButton = screen.getByRole('button', { name: '创建任务' });
-    expect(createButton.parentElement).toHaveClass('absolute', 'right-1', 'top-1');
-    expect(createButton).not.toHaveClass('absolute');
+    const tooltipAnchor = createButton.parentElement;
+    const rowOverlay = tooltipAnchor?.parentElement;
+    expect(tooltipAnchor).toHaveClass('relative', 'inline-flex');
+    expect(tooltipAnchor).not.toHaveClass('absolute');
+    expect(rowOverlay).toHaveClass('absolute', 'right-1', 'top-1');
+    expect(rowOverlay?.parentElement).toHaveClass('group/task-create', 'relative');
   });
 
   it('keeps the workspace surface open when Session navigation is rejected', async () => {

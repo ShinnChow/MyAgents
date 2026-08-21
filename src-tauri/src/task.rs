@@ -791,6 +791,20 @@ fn task_comment_quote(body: &str) -> String {
     }
 }
 
+fn ordinary_task_for_comment<'a>(
+    tasks: &'a HashMap<String, Task>,
+    task_id: &str,
+) -> Result<&'a Task, String> {
+    let task = tasks
+        .get(task_id)
+        .filter(|task| !task.deleted)
+        .ok_or_else(|| String::from(TaskOpError::not_found(task_id)))?;
+    if is_managed_task(task) {
+        return Err(MANAGED_TASK_ERROR.to_string());
+    }
+    Ok(task)
+}
+
 fn reply_parent_summaries(
     all_comments: &[TaskComment],
     visible_comments: &[TaskComment],
@@ -1433,7 +1447,7 @@ impl TaskStore {
             Arc::new(StdRwLock::new(TaskCommentNotificationIndex::default()));
         let rebuild_tasks = initial
             .values()
-            .filter(|task| !task.deleted)
+            .filter(|task| !task.deleted && !is_managed_task(task))
             .cloned()
             .collect::<Vec<_>>();
         // The comment source is rebuilt away from the startup/UI thread. Until
@@ -1527,7 +1541,7 @@ impl TaskStore {
             .read()
             .await
             .values()
-            .filter(|task| !task.deleted)
+            .filter(|task| !task.deleted && !is_managed_task(task))
             .cloned()
             .collect::<Vec<_>>();
         spawn_comment_notification_rebuild(
@@ -1542,7 +1556,7 @@ impl TaskStore {
             .comment_notification_index
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let projection = (!task.deleted).then(|| task.name.clone());
+        let projection = (!task.deleted && !is_managed_task(task)).then(|| task.name.clone());
         index
             .task_projections
             .insert(task.id.clone(), projection.clone());
@@ -1746,10 +1760,7 @@ impl TaskStore {
     ) -> Result<TaskCommentPage, String> {
         let limit = limit.clamp(1, 100);
         let guard = self.inner.write().await;
-        let task = guard
-            .get(task_id)
-            .filter(|task| !task.deleted)
-            .ok_or_else(|| String::from(TaskOpError::not_found(task_id)))?;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
         let path = self.comments_path(&task.id)?;
         let comments = self.load_task_comments(task_id, &path)?;
         let end = match before {
@@ -1779,10 +1790,7 @@ impl TaskStore {
     ) -> Result<TaskCommentPage, String> {
         let limit = limit.clamp(1, 100);
         let guard = self.inner.write().await;
-        let task = guard
-            .get(task_id)
-            .filter(|task| !task.deleted)
-            .ok_or_else(|| String::from(TaskOpError::not_found(task_id)))?;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
         let path = self.comments_path(&task.id)?;
         let comments = self.load_task_comments(task_id, &path)?;
         let start = comments
@@ -1811,10 +1819,7 @@ impl TaskStore {
         radius: usize,
     ) -> Result<TaskCommentContextPage, String> {
         let guard = self.inner.write().await;
-        let task = guard
-            .get(task_id)
-            .filter(|task| !task.deleted)
-            .ok_or_else(|| String::from(TaskOpError::not_found(task_id)))?;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
         let path = self.comments_path(&task.id)?;
         let comments = self.load_task_comments(task_id, &path)?;
         let target = comments
@@ -1843,10 +1848,7 @@ impl TaskStore {
         self.ensure_writable()?;
         let body = Self::validate_comment_body(body)?;
         let guard = self.inner.write().await;
-        let task = guard
-            .get(task_id)
-            .filter(|task| !task.deleted)
-            .ok_or_else(|| String::from(TaskOpError::not_found(task_id)))?;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
         let path = self.comments_path(&task.id)?;
         let mut comments = self.load_task_comments(task_id, &path)?;
         let target_session_id = if let Some(parent_id) = reply_to_comment_id {
@@ -1914,10 +1916,7 @@ impl TaskStore {
         validate_safe_id(session_id, "sessionId")?;
         let body = Self::validate_comment_body(body)?;
         let guard = self.inner.write().await;
-        let task = guard
-            .get(task_id)
-            .filter(|task| !task.deleted)
-            .ok_or_else(|| String::from(TaskOpError::not_found(task_id)))?;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
         if !task_bound_session_ids(task)
             .iter()
             .any(|value| value == session_id)
@@ -1972,6 +1971,7 @@ impl TaskStore {
         error: Option<String>,
     ) -> Result<TaskComment, String> {
         let guard = self.inner.write().await;
+        ordinary_task_for_comment(&guard, task_id)?;
         let path = self.comments_path(task_id)?;
         let mut comments = self.load_task_comments(task_id, &path)?;
         let comment = comments
@@ -2001,6 +2001,7 @@ impl TaskStore {
         session_id: &str,
     ) -> Result<Vec<TaskComment>, String> {
         let guard = self.inner.write().await;
+        ordinary_task_for_comment(&guard, task_id)?;
         let path = self.comments_path(task_id)?;
         let mut comments = self.load_task_comments(task_id, &path)?;
         let mut claimed = Vec::new();
@@ -2039,6 +2040,7 @@ impl TaskStore {
         comment_id: &str,
     ) -> Result<TaskComment, String> {
         let guard = self.inner.write().await;
+        ordinary_task_for_comment(&guard, task_id)?;
         let path = self.comments_path(task_id)?;
         let mut comments = self.load_task_comments(task_id, &path)?;
         let comment = comments
@@ -3629,7 +3631,12 @@ impl TaskStore {
             .await?;
 
         let path = self.comments_path(id)?;
-        let original_comments = self.load_task_comments(id, &path)?;
+        let managed = inner.get(id).is_some_and(is_managed_task);
+        let original_comments = if managed {
+            Vec::new()
+        } else {
+            self.load_task_comments(id, &path)?
+        };
         let mut comments = original_comments.clone();
         let mut claimed = Vec::new();
         for comment in &mut comments {
@@ -5443,6 +5450,74 @@ mod tests {
             compose_dispatch_prompt(&store.get(&created.id).await.unwrap()).unwrap(),
             "执行任务：updated managed memory instructions"
         );
+    }
+
+    #[tokio::test]
+    async fn system_managed_tasks_reject_the_local_comment_surface() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let mut input = sample_direct_input(&ws);
+        input.managed_kind = Some(MANAGED_KIND_MEMORY_GARDENER.to_string());
+        let managed = store.create_system_managed_direct(input).await.unwrap();
+
+        assert_eq!(
+            store
+                .create_user_comment(&managed.id, "should stay internal", None)
+                .await
+                .unwrap_err(),
+            MANAGED_TASK_ERROR
+        );
+        assert_eq!(
+            store
+                .list_comments(&managed.id, None, 50)
+                .await
+                .unwrap_err(),
+            MANAGED_TASK_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_notification_index_ignores_historical_managed_comments() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let data = dir.path().join("data");
+        let store = TaskStore::new(data.clone());
+        let mut input = sample_direct_input(&ws);
+        input.managed_kind = Some(MANAGED_KIND_MEMORY_GARDENER.to_string());
+        let managed = store.create_system_managed_direct(input).await.unwrap();
+        let comments_path = data.join("tasks").join(&managed.id).join("comments.jsonl");
+        std::fs::create_dir_all(comments_path.parent().unwrap()).unwrap();
+        let historical = TaskComment {
+            id: "historical-managed-comment".to_string(),
+            task_id: managed.id.clone(),
+            body: "Internal maintenance result".to_string(),
+            author: TaskCommentAuthor::Agent {
+                label: None,
+                session_id: "managed-session".to_string(),
+            },
+            created_at: now_ms(),
+            reply_to_comment_id: None,
+            conversation_session_id: Some("managed-session".to_string()),
+            admission: None,
+        };
+        TaskStore::persist_comments_file(&comments_path, &[historical]).unwrap();
+        drop(store);
+
+        let recovered = TaskStore::new(data);
+        for _ in 0..100 {
+            if recovered.agent_comment_notification_source().ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let source = recovered.agent_comment_notification_source();
+        assert!(source.ready);
+        assert!(source.items.is_empty());
     }
 
     #[test]

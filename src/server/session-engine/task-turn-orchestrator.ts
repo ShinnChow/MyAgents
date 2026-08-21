@@ -309,6 +309,7 @@ export function createTaskTurnOrchestrator() {
               intervalMinutes: payload.intervalMinutes ?? 15,
               executionNumber: payload.executionNumber,
               activationEvent: payload.activationEvent,
+              includeTaskCollaboration: payload.managedKind === undefined,
             });
             admissionAttempted = true;
             const turnResult = await engine.runInjectedTurn({

@@ -274,7 +274,7 @@ impl<'a> TaskApplication<'a> {
         else {
             return Ok(comment);
         };
-        let task = self.any_task(&comment.task_id).await?;
+        let task = self.ordinary_task(&comment.task_id).await?;
         let task_md_path = crate::task::build_task_docs(&task.id)
             .map_err(TaskApplicationError::mutation)?
             .task_md;
@@ -345,7 +345,7 @@ impl<'a> TaskApplication<'a> {
             in_reply_to: comment.reply_to_comment_id.clone(),
             session_event: Some(event),
         };
-        let outcome = crate::inbox::deliver::deliver_with_resume(
+        let outcome = crate::inbox::deliver::deliver_existing_session_with_resume(
             app_handle,
             manager,
             message,
@@ -443,7 +443,7 @@ impl<'a> TaskApplication<'a> {
         // and flushes older pending comments, so a newly-created comment
         // cannot overtake that chronological backlog at the Session Inbox.
         let _control = crate::task_scheduler::acquire_task_control(task_id).await;
-        self.any_task(task_id).await?;
+        self.ordinary_task(task_id).await?;
         let comment = self
             .tasks
             .create_user_comment(task_id, body, reply_to_comment_id)
@@ -468,7 +468,7 @@ impl<'a> TaskApplication<'a> {
         comment_id: &str,
     ) -> Result<TaskComment, TaskApplicationError> {
         let _control = crate::task_scheduler::acquire_task_control(task_id).await;
-        self.any_task(task_id).await?;
+        self.ordinary_task(task_id).await?;
         let comment = self
             .tasks
             .retry_comment(task_id, comment_id)
@@ -492,7 +492,7 @@ impl<'a> TaskApplication<'a> {
         body: &str,
         reply_to_comment_id: Option<&str>,
     ) -> Result<TaskComment, TaskApplicationError> {
-        self.any_task(task_id).await?;
+        self.ordinary_task(task_id).await?;
         let comment = self
             .tasks
             .append_agent_comment(task_id, session_id, body, reply_to_comment_id)

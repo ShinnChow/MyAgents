@@ -85,6 +85,19 @@ describe('buildCronTaskReminder', () => {
     expect(wrapped).not.toContain('myagents task exit');
   });
 
+  it('omits ordinary Task collaboration guidance for managed maintenance jobs', () => {
+    const wrapped = buildCronTaskReminder({
+      taskId: 'managed-memory-job',
+      prompt: 'Maintain memory',
+      aiCanExit: false,
+      includeTaskCollaboration: false,
+    });
+
+    expect(wrapped).not.toContain('Task collaboration:');
+    expect(wrapped).not.toContain('myagents task comment');
+    expect(wrapped.endsWith('\nMaintain memory')).toBe(true);
+  });
+
   it('rejects an oversized activation handoff before building an unbounded prompt', () => {
     expect(() => buildCronTaskReminder({
       taskId: 'task-sensor',

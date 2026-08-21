@@ -1085,23 +1085,24 @@ export default memo(function GlobalSidebar({
               onClick={handleOpenTaskCenter}
             />
             {expanded && (
-              <Tip
-                label={t('globalSidebar.createTask')}
-                position="right"
-                className="absolute right-1 top-1"
-              >
-                <button
-                  type="button"
-                  onClick={event => {
-                    event.stopPropagation();
-                    onCreateTask();
-                  }}
-                  aria-label={t('globalSidebar.createTask')}
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--ink-muted)] opacity-0 transition-[opacity,color,background-color] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] group-hover/task-create:opacity-100 group-focus-within/task-create:opacity-100"
+              <span className="absolute right-1 top-1">
+                <Tip
+                  label={t('globalSidebar.createTask')}
+                  position="right"
                 >
-                  <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
-                </button>
-              </Tip>
+                  <button
+                    type="button"
+                    onClick={event => {
+                      event.stopPropagation();
+                      onCreateTask();
+                    }}
+                    aria-label={t('globalSidebar.createTask')}
+                    className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--ink-muted)] opacity-0 transition-[opacity,color,background-color] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] group-hover/task-create:opacity-100 group-focus-within/task-create:opacity-100"
+                  >
+                    <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
+                  </button>
+                </Tip>
+              </span>
             )}
           </div>
           {teamSpaceAvailable && (
