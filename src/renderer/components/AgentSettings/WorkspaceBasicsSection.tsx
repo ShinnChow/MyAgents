@@ -12,7 +12,7 @@ import { getAllMcpServers, getEnabledMcpServerIds } from '@/config/configService
 import { patchAgentConfig, patchAgentProjectConfig } from '@/config/services/agentConfigService';
 import { isProviderAvailable } from '@/config/services/providerService';
 import { CUSTOM_EVENTS } from '@/../shared/constants';
-import { applyBuiltinBrowserToolToggle } from '@/../shared/browserTools';
+import { applyBuiltinBrowserExecutionToolToggle } from '@/../shared/browserTools';
 import { PERMISSION_MODES, type Project, type McpServerDefinition } from '@/config/types';
 import type { AgentConfig } from '../../../shared/types/agent';
 import { reasoningEffortChoices, REASONING_EFFORT_DESCRIPTIONS } from '@/../shared/reasoningEffort';
@@ -238,7 +238,7 @@ export default function WorkspaceBasicsSection({ project, agent, agentDir }: Wor
       toast.warning(t('toolbox.browserResource.installFirst'));
       return;
     }
-    const newEnabled = applyBuiltinBrowserToolToggle(
+    const newEnabled = applyBuiltinBrowserExecutionToolToggle(
       current,
       serverId,
       enabled,

@@ -8,7 +8,7 @@ import { getAllMcpServers, getEnabledMcpServerIds, loadAppConfig } from '@/confi
 import type { McpServerDefinition } from '@/config/types';
 import McpToolsCard from '../../ImSettings/components/McpToolsCard';
 import {
-  applyBuiltinBrowserToolToggle,
+  applyBuiltinBrowserExecutionToolToggle,
   MANAGED_BROWSER_MCP_ID,
 } from '../../../../shared/browserTools';
 import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
@@ -56,7 +56,7 @@ export default function AgentToolsSection({ agent, onAgentChanged }: AgentToolsS
       toast.warning(t('toolbox.browserResource.installFirst'));
       return;
     }
-    const newEnabled = applyBuiltinBrowserToolToggle(
+    const newEnabled = applyBuiltinBrowserExecutionToolToggle(
       current,
       serverId,
       enabled,

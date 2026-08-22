@@ -24,7 +24,7 @@ import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
 import { type Project, type PermissionMode, type McpServerDefinition, isProjectActiveForUser, isProjectVisibleToUser } from '@/config/types';
 import { CUSTOM_EVENTS } from '../../shared/constants';
 import {
-    applyBuiltinBrowserToolToggle,
+    applyBuiltinBrowserExecutionToolToggle,
     MANAGED_BROWSER_MCP_ID,
 } from '../../shared/browserTools';
 import { workspacePathsEqual } from '../../shared/workspacePath';
@@ -351,7 +351,7 @@ export default function Launcher({ onLaunchProject, isStarting, startError: _sta
             return;
         }
         setLauncherWorkspaceMcpEnabled(prev => {
-            const newEnabled = applyBuiltinBrowserToolToggle(
+            const newEnabled = applyBuiltinBrowserExecutionToolToggle(
                 prev,
                 serverId,
                 enabled,

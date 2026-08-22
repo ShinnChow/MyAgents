@@ -8,8 +8,8 @@ import { apiPostJson } from '@/api/apiFetch';
 import { applyMcpServerConfigAdditions } from '../../../shared/mcpConfig';
 import {
     DEFAULT_STANDARD_PLAYWRIGHT_ARGS,
+    MANAGED_BROWSER_MCP_ID,
     STANDARD_PLAYWRIGHT_MCP_ID,
-    applyBuiltinBrowserToolToggle,
     isReservedBuiltinBrowserMcpId,
 } from '../../../shared/browserTools';
 
@@ -88,6 +88,25 @@ export async function getEnabledMcpServerIds(): Promise<string[]> {
     return Array.isArray(config.mcpEnabledServers) ? config.mcpEnabledServers : [];
 }
 
+/** Global catalogue availability: toggling one server never changes a peer. */
+export function applyMcpServerAvailabilityToggle(
+    current: readonly string[],
+    serverId: string,
+    enabled: boolean,
+    managedBrowserReady: boolean,
+): string[] {
+    const next = new Set(current);
+    if (!enabled) {
+        next.delete(serverId);
+        return [...next];
+    }
+    if (serverId === MANAGED_BROWSER_MCP_ID && !managedBrowserReady) {
+        return [...next];
+    }
+    next.add(serverId);
+    return [...next];
+}
+
 export function applyMcpServerToggleToConfig(
     config: AppConfig,
     serverId: string,
@@ -100,7 +119,7 @@ export function applyMcpServerToggleToConfig(
         && config.mcpServerArgs?.[STANDARD_PLAYWRIGHT_MCP_ID] === undefined;
     return {
         ...config,
-        mcpEnabledServers: applyBuiltinBrowserToolToggle(
+        mcpEnabledServers: applyMcpServerAvailabilityToggle(
             current,
             serverId,
             enabled,

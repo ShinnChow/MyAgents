@@ -40,7 +40,7 @@ import type { RuntimeConfig } from '@/../shared/types/runtime';
 import { getAllMcpServersFromConfig } from '@/config/services/mcpService';
 import { workspacePathsEqual } from '@/../shared/workspacePath';
 import {
-  applyBuiltinBrowserToolToggle,
+  applyBuiltinBrowserExecutionToolToggle,
   MANAGED_BROWSER_MCP_ID,
 } from '@/../shared/browserTools';
 import { apiGetJson } from '@/api/apiFetch';
@@ -461,10 +461,10 @@ export function TaskAdvancedConfigEditor(props: Props) {
       return;
     }
     if (mcpEnabledServers === undefined) {
-      setMcpEnabledServers(applyBuiltinBrowserToolToggle([], id, true, managedBrowserReady));
+      setMcpEnabledServers(applyBuiltinBrowserExecutionToolToggle([], id, true, managedBrowserReady));
       return;
     }
-    setMcpEnabledServers(applyBuiltinBrowserToolToggle(
+    setMcpEnabledServers(applyBuiltinBrowserExecutionToolToggle(
       mcpEnabledServers,
       id,
       enabled,

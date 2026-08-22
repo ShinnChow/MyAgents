@@ -99,7 +99,7 @@ import { BrowserPanelContext } from '@/context/BrowserPanelContext';
 import { BROWSER_BLANK_URL } from '@/components/browserConstants';
 import { CUSTOM_EVENTS, isPendingSessionId } from '../../shared/constants';
 import {
-  applyBuiltinBrowserToolToggle,
+  applyBuiltinBrowserExecutionToolToggle,
   MANAGED_BROWSER_MCP_ID,
 } from '../../shared/browserTools';
 import {
@@ -2797,7 +2797,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
       toastRef.current.warning(tSettings('toolbox.browserResource.installFirst'));
       return;
     }
-    const newEnabled = applyBuiltinBrowserToolToggle(
+    const newEnabled = applyBuiltinBrowserExecutionToolToggle(
       workspaceMcpEnabled,
       serverId,
       enabled,

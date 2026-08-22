@@ -55,6 +55,7 @@ import {
 import {
     getAllMcpServers,
     getEnabledMcpServerIds,
+    applyMcpServerAvailabilityToggle,
     toggleMcpServerEnabled,
     addCustomMcpServer,
     deleteCustomMcpServer,
@@ -136,7 +137,6 @@ import { ThemePresetSelect } from './components/ThemePresetSelect';
 import { useResolvedTheme } from '@/theme';
 import {
     MANAGED_BROWSER_MCP_ID,
-    applyBuiltinBrowserToolToggle,
     isBrowserResourceReady,
     selectLatestBrowserResourceStatus,
     shouldAutoMaintainBrowserResource,
@@ -1167,7 +1167,7 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         if (!enabled) {
             // Just disable
             await toggleMcpServerEnabled(server.id, false, false);
-            setMcpEnabledIds(prev => applyBuiltinBrowserToolToggle(prev, server.id, false, false));
+            setMcpEnabledIds(prev => applyMcpServerAvailabilityToggle(prev, server.id, false, false));
             toast.success(tSettings('toolbox.toasts.mcpDisabled'));
             return;
         }
@@ -1203,7 +1203,7 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                 // Enable the MCP
                 const browserReady = isBrowserResourceReady(browserResourceStatus);
                 await toggleMcpServerEnabled(server.id, true, browserReady);
-                setMcpEnabledIds(prev => applyBuiltinBrowserToolToggle(
+                setMcpEnabledIds(prev => applyMcpServerAvailabilityToggle(
                     prev,
                     server.id,
                     true,

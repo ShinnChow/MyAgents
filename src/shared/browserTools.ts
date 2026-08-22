@@ -51,11 +51,12 @@ export function isReservedBuiltinBrowserMcpId(serverId: string): boolean {
 
 /**
  * The two MyAgents-owned browser entries intentionally expose overlapping
- * browser_* tools. Keep the product rule local to these exact preset IDs:
- * enabling one disables the other in the same config mutation; disabling an
- * entry never changes its peer. Custom MCPs are deliberately unaffected.
+ * browser_* tools. Keep a single execution selection (Session, Agent default,
+ * Launcher, or Task override) mutually exclusive for these exact preset IDs:
+ * selecting one removes the other; deselecting one never changes its peer.
+ * Global MCP availability and custom MCPs are deliberately outside this rule.
  */
-export function applyBuiltinBrowserToolToggle(current: readonly string[], serverId: string, enabled: boolean, managedBrowserReady: boolean): string[] {
+export function applyBuiltinBrowserExecutionToolToggle(current: readonly string[], serverId: string, enabled: boolean, managedBrowserReady: boolean): string[] {
   const next = new Set(current);
   if (!enabled) {
     next.delete(serverId);

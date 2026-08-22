@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MANAGED_BROWSER_MCP_ID,
   STANDARD_PLAYWRIGHT_MCP_ID,
-  applyBuiltinBrowserToolToggle,
+  applyBuiltinBrowserExecutionToolToggle,
   isBrowserResourceReady,
   isReservedBuiltinBrowserMcpId,
   selectLatestBrowserResourceStatus,
@@ -63,12 +63,12 @@ describe('built-in browser tool policy', () => {
   });
 
   it('atomically replaces the peer when either built-in entry is enabled', () => {
-    expect(applyBuiltinBrowserToolToggle([STANDARD_PLAYWRIGHT_MCP_ID, 'custom-browser'], MANAGED_BROWSER_MCP_ID, true, true)).toEqual([
+    expect(applyBuiltinBrowserExecutionToolToggle([STANDARD_PLAYWRIGHT_MCP_ID, 'custom-browser'], MANAGED_BROWSER_MCP_ID, true, true)).toEqual([
       'custom-browser',
       MANAGED_BROWSER_MCP_ID,
     ]);
 
-    expect(applyBuiltinBrowserToolToggle([MANAGED_BROWSER_MCP_ID, 'custom-browser'], STANDARD_PLAYWRIGHT_MCP_ID, true, true)).toEqual([
+    expect(applyBuiltinBrowserExecutionToolToggle([MANAGED_BROWSER_MCP_ID, 'custom-browser'], STANDARD_PLAYWRIGHT_MCP_ID, true, true)).toEqual([
       'custom-browser',
       STANDARD_PLAYWRIGHT_MCP_ID,
     ]);
@@ -76,20 +76,20 @@ describe('built-in browser tool policy', () => {
 
   it('disabling one entry never enables or disables its peer', () => {
     expect(
-      applyBuiltinBrowserToolToggle([STANDARD_PLAYWRIGHT_MCP_ID, MANAGED_BROWSER_MCP_ID, 'custom-browser'], STANDARD_PLAYWRIGHT_MCP_ID, false, false),
+      applyBuiltinBrowserExecutionToolToggle([STANDARD_PLAYWRIGHT_MCP_ID, MANAGED_BROWSER_MCP_ID, 'custom-browser'], STANDARD_PLAYWRIGHT_MCP_ID, false, false),
     ).toEqual([MANAGED_BROWSER_MCP_ID, 'custom-browser']);
   });
 
   it('does not apply name-based mutual exclusion to custom servers', () => {
-    expect(applyBuiltinBrowserToolToggle(['playwright-custom'], 'another-browser', true, false)).toEqual(['playwright-custom', 'another-browser']);
+    expect(applyBuiltinBrowserExecutionToolToggle(['playwright-custom'], 'another-browser', true, false)).toEqual(['playwright-custom', 'another-browser']);
   });
 
   it('keeps both desired selections unchanged when managed Browser is not ready', () => {
-    expect(applyBuiltinBrowserToolToggle([STANDARD_PLAYWRIGHT_MCP_ID, 'custom-browser'], MANAGED_BROWSER_MCP_ID, true, false)).toEqual([
+    expect(applyBuiltinBrowserExecutionToolToggle([STANDARD_PLAYWRIGHT_MCP_ID, 'custom-browser'], MANAGED_BROWSER_MCP_ID, true, false)).toEqual([
       STANDARD_PLAYWRIGHT_MCP_ID,
       'custom-browser',
     ]);
-    expect(applyBuiltinBrowserToolToggle([MANAGED_BROWSER_MCP_ID, 'custom-browser'], MANAGED_BROWSER_MCP_ID, true, false)).toEqual([
+    expect(applyBuiltinBrowserExecutionToolToggle([MANAGED_BROWSER_MCP_ID, 'custom-browser'], MANAGED_BROWSER_MCP_ID, true, false)).toEqual([
       MANAGED_BROWSER_MCP_ID,
       'custom-browser',
     ]);

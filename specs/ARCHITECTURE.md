@@ -294,7 +294,7 @@ Rust 为 Global 与 Session 两类 Sidecar 都在 spawn 前分配 process-global
 - 一个 App Browser generation 共享一个 Chromium Browser process；每个 Product Session 一个隔离 `BrowserContext` 和原生窗口，同一 Context 的 Pages 是 Tabs。不存在 persistent/user-data-dir/Profile lease 模式。
 - Context 从 Rust-owned Browser Identity revision 初始化，Host 在成功工具调用后防抖保存，并在 close/teardown/shutdown 前强制保存 Cookie、localStorage 与 IndexedDB；并发 checkpoint 通过 revision + key-level CAS 合并。
 - Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
-- 两个固定内置 ID 只在正式前端启用入口互斥：开启一个会在同一 `config.json` mutation 中关闭另一个；关闭任一工具不改变对方，自定义 MCP 不参与该规则。
+- `config.mcpEnabledServers` 只表达全局可用性，因此两个固定内置 ID 可以同时启用。真正形成执行工具集的 Session、Agent 默认、Launcher 与 Task override 选择入口才互斥：选择一个会移除另一个，取消选择不改变对方；最终 Session 工具集仍取全局可用集与该执行选择集的交集。自定义 MCP 不参与该规则。
 
 ---
 

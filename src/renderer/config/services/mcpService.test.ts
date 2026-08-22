@@ -130,12 +130,12 @@ describe('built-in Browser toggle persistence', () => {
     })).rejects.toThrow('reserved by a built-in Browser tool');
   });
 
-  it('commits mutual exclusion and the absent-only Playwright default together', () => {
+  it('allows both Browser tools globally while persisting the absent-only Playwright default', () => {
     const next = applyMcpServerToggleToConfig(baseConfig({
       mcpEnabledServers: ['myagents-browser', 'custom'],
     }), 'playwright', true, true);
 
-    expect(next.mcpEnabledServers).toEqual(['custom', 'playwright']);
+    expect(next.mcpEnabledServers).toEqual(['myagents-browser', 'custom', 'playwright']);
     expect(next.mcpServerArgs?.playwright).toEqual(['--isolated']);
   });
 
@@ -153,5 +153,13 @@ describe('built-in Browser toggle persistence', () => {
     }), 'myagents-browser', true, false);
 
     expect(next.mcpEnabledServers).toEqual(['playwright', 'custom']);
+  });
+
+  it('disabling one globally does not disable its Browser peer', () => {
+    const next = applyMcpServerToggleToConfig(baseConfig({
+      mcpEnabledServers: ['playwright', 'myagents-browser', 'custom'],
+    }), 'playwright', false, true);
+
+    expect(next.mcpEnabledServers).toEqual(['myagents-browser', 'custom']);
   });
 });
