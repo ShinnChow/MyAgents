@@ -1,73 +1,59 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { assertNoNonChromiumBrowser, listFiles, readAndValidateBrowserRuntimeLock, stageDownloadedRuntime, targetLayout } from './package-browser-runtime.mjs';
-
 const repoRoot = new URL('..', import.meta.url).pathname;
+const lock = JSON.parse(readFileSync(join(repoRoot, 'src/shared/managed-browser-runtime.json'), 'utf8'));
+const mcpPackage = JSON.parse(readFileSync(join(repoRoot, 'node_modules/@playwright/mcp/package.json'), 'utf8'));
+const corePackage = JSON.parse(readFileSync(join(repoRoot, 'node_modules/playwright-core/package.json'), 'utf8'));
+const browsers = JSON.parse(readFileSync(join(repoRoot, 'node_modules/playwright-core/browsers.json'), 'utf8')).browsers;
+const chromium = browsers.find((browser) => browser.name === 'chromium');
 
-test('Browser runtime packaging is pinned to the installed Playwright dependency graph', () => {
-  const lock = readAndValidateBrowserRuntimeLock();
-  assert.equal(lock.playwrightMcpVersion, '0.0.68');
-  assert.equal(lock.chromiumRevision, '1212');
-  assert.match(lock.runtimeSet, /^playwright-.+-chromium-1212$/);
+test('Browser runtime lock is pinned to the installed Playwright dependency graph', () => {
+  assert.equal(lock.schemaVersion, 2);
+  assert.equal(lock.playwrightMcpVersion, mcpPackage.version);
+  assert.equal(lock.playwrightCoreVersion, corePackage.version);
+  assert.equal(mcpPackage.dependencies?.['playwright-core'], corePackage.version);
+  assert.equal(lock.chromiumRevision, chromium.revision);
+  assert.equal(lock.chromiumBrowserVersion, chromium.browserVersion);
+  assert.equal(lock.runtimeSet, `playwright-${corePackage.version}-chromium-${chromium.revision}`);
 });
 
-test('every supported target declares only the headed Chromium executable', () => {
-  const lock = readAndValidateBrowserRuntimeLock();
-  for (const platform of ['darwin-arm64', 'darwin-x64', 'win32-x64', 'linux-x64', 'linux-arm64']) {
-    const layout = targetLayout(platform, lock);
-    assert.match(layout.executableRelativePath, /^chromium-/);
-    assert.doesNotThrow(() => assertNoNonChromiumBrowser(Object.values(layout)));
+test('every supported target pins one official headed Chromium artifact', () => {
+  const expected = {
+    'darwin-arm64': ['mac-arm64/chrome-mac-arm64.zip', 'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'],
+    'darwin-x64': ['mac-x64/chrome-mac-x64.zip', 'chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'],
+    'win32-x64': ['win64/chrome-win64.zip', 'chrome-win64/chrome.exe'],
+    'linux-x64': ['linux64/chrome-linux64.zip', 'chrome-linux64/chrome'],
+    'linux-arm64': [`builds/chromium/${chromium.revision}/chromium-linux-arm64.zip`, 'chrome-linux/chrome'],
+  };
+  assert.deepEqual(Object.keys(lock.officialArtifacts).sort(), Object.keys(expected).sort());
+  for (const [platform, artifact] of Object.entries(lock.officialArtifacts)) {
+    assert.ok(artifact.sourceUrl.startsWith('https://cdn.playwright.dev/'));
+    assert.ok(artifact.sourceUrl.endsWith(expected[platform][0]));
+    assert.match(artifact.url, /^https:\/\/(storage\.googleapis\.com\/chrome-for-testing-public\/|playwright\.download\.prss\.microsoft\.com\/|cdn\.playwright\.dev\/builds\/chromium\/)/);
+    assert.ok(artifact.url.endsWith(expected[platform][0]));
+    assert.match(artifact.sha256, /^[0-9a-f]{64}$/);
+    assert.ok(artifact.archiveSizeBytes > 100 * 1024 * 1024);
+    assert.ok(artifact.archiveSizeBytes < 512 * 1024 * 1024);
+    assert.ok(artifact.unpackedSizeBytes > artifact.archiveSizeBytes);
+    assert.ok(artifact.unpackedSizeBytes < 1024 * 1024 * 1024);
+    assert.ok(artifact.entryCount > 0 && artifact.entryCount < 6000);
+    assert.equal(artifact.executableRelativePath, expected[platform][1]);
+    assert.ok(artifact.executableRelativePath.startsWith(`${artifact.archiveRoot}/`));
+    assert.doesNotMatch(`${artifact.sourceUrl}\n${artifact.url}\n${artifact.executableRelativePath}`, /firefox|webkit|headless-shell|ffmpeg|winldd/i);
   }
-  assert.throws(() => assertNoNonChromiumBrowser(['webkit-2259/pw_run.sh']), /non-Chromium/);
 });
 
-test('release staging copies each locked Chromium component exactly once', (t) => {
-  const lock = readAndValidateBrowserRuntimeLock();
-  const root = mkdtempSync(join(tmpdir(), 'myagents-browser-package-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
-  const downloadRoot = join(root, 'download');
-  const packageRoot = join(root, 'package');
-  mkdirSync(packageRoot, { recursive: true });
-  for (const [directory, file] of [[`chromium-${lock.chromiumRevision}`, 'chrome']]) {
-    mkdirSync(join(downloadRoot, directory), { recursive: true });
-    writeFileSync(join(downloadRoot, directory, file), directory);
-  }
-
-  stageDownloadedRuntime(downloadRoot, packageRoot, lock);
-  const files = listFiles(packageRoot);
-  assert.equal(files.filter((path) => path.startsWith(`chromium-${lock.chromiumRevision}/`)).length, 1);
-  assert.equal(
-    files.some((path) => path.startsWith('chromium_headless_shell-')),
-    false,
-  );
-  assert.equal(
-    files.some((path) => path.startsWith('ffmpeg-')),
-    false,
-  );
-  assert.deepEqual(
-    files.filter((path) => path.startsWith('PLAYWRIGHT_')),
-    ['PLAYWRIGHT_LICENSE.txt', 'PLAYWRIGHT_NOTICE.txt', 'PLAYWRIGHT_THIRD_PARTY_NOTICES.txt'],
-  );
-});
-
-test('normal app builds cannot invoke the release-only Browser packager', () => {
+test('Browser resources have no build-time packager or Tauri bundle entry', () => {
   const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
   const tauriConfig = JSON.parse(readFileSync(join(repoRoot, 'src-tauri/tauri.conf.json'), 'utf8'));
   const releaseWorkflow = readFileSync(join(repoRoot, '.github/workflows/release.yml'), 'utf8');
-  assert.equal(packageJson.scripts['tauri:build'], 'tauri build');
-  assert.equal(packageJson.scripts['tauri:dev'], 'npm run prepare:document-processing && tauri dev');
-  assert.equal(packageJson.scripts['package:browser-runtime'], 'node scripts/package-browser-runtime.mjs');
+  assert.equal(packageJson.scripts['package:browser-runtime'], undefined);
+  assert.equal(existsSync(join(repoRoot, 'scripts/package-browser-runtime.mjs')), false);
   assert.doesNotMatch(packageJson.scripts['tauri:build'], /browser|playwright/i);
   assert.doesNotMatch(packageJson.scripts['tauri:dev'], /browser|playwright/i);
-  assert.equal(
-    Object.keys(tauriConfig.bundle.resources).some((path) => /browser|playwright/i.test(path)),
-    false,
-  );
-  assert.doesNotMatch(releaseWorkflow, /prepare-playwright-runtime|playwright-browsers/);
-  assert.equal(existsSync(join(repoRoot, 'scripts/prepare-playwright-runtime.mjs')), false);
-  assert.equal(existsSync(join(repoRoot, 'scripts/tauri-build.mjs')), false);
+  assert.equal(Object.keys(tauriConfig.bundle.resources).some((path) => /browser|playwright/i.test(path)), false);
+  assert.doesNotMatch(releaseWorkflow, /prepare-playwright-runtime|playwright-browsers|package:browser-runtime/);
 });

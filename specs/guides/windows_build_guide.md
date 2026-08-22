@@ -211,13 +211,7 @@ src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 
 ### 「浏览器」Runtime（Windows x64）
 
-这是独立于桌面 App build 的可选资源发行步骤。`build_windows.ps1` / `publish_windows.ps1` 不会调用它，也不会把 Chrome 放进 installer：
-
-```powershell
-npm run package:browser-runtime -- --platform win32-x64
-```
-
-打包器从 `src\shared\managed-browser-runtime.json` 与已安装的 Playwright dependency graph 锁定 revision，下载 Chromium + Headless Shell + FFmpeg，拒绝 Firefox/WebKit 和 symlink，验证主 `chrome.exe` Authenticode，并使用 Tauri minisign key 签署 artifact/manifest。将 `dist\browser-runtime\sets\<runtime-set>\win32-x64\` 上传到同名不可变 R2 path 后，必须用 Windows release-like App 验证首次安装、更新进度、重启恢复和有头窗口。正式产物缺签名或远端 exact set 不可读时，不能发布锁定它的 App 版本。
+Windows 不再运行 Browser packager 或向 R2 上传 Chromium，`build_windows.ps1` / `publish_windows.ps1` 也不会下载 Chrome 或把它放进 installer。`src\shared\managed-browser-runtime.json` 的 `win32-x64` 项锁定当前 Playwright Core registry 对应的官方 Chrome for Testing URL、archive size、SHA-256、archive root 与 `chrome.exe` 路径。升级该锁后，必须用 Windows release-like App 验证首次安装、更新进度、重启恢复和真实有头窗口；官方 exact artifact 不可读、摘要不匹配或 smoke 失败时，不能发布锁定它的 App 版本。
 
 ---
 

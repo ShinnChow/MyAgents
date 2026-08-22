@@ -61,7 +61,6 @@
     "format:check": "prettier --experimental-cli --check --log-level warn .",
     "generate:sdk-shims": "node --import tsx/esm scripts/generate-sdk-shims.ts",
     "package:managed-codex": "node scripts/package-managed-codex-runtime.mjs",
-    "package:browser-runtime": "node scripts/package-browser-runtime.mjs",
     "publish:managed-codex": "./publish_managed_codex_runtime.sh",
     "publish:managed-codex:win": "powershell -ExecutionPolicy Bypass -File ./publish_managed_codex_runtime.ps1",
     "clean": "rm -rf node_modules dist .turbo .eslintcache *.tsbuildinfo src-tauri/target",

@@ -69,7 +69,7 @@ MyAgents 支持统一的应用代理配置，并按请求 owner 分成两个独�
    - 下载更新包 (`download.myagents.io/releases/`)
    - **实现**: `src-tauri/src/updater.rs` + `proxy_config.rs`
 
-   Managed Codex 的登录检查 / Runtime 子进程仍按 `codex-sub` provider scope 走代理；Runtime manifest / artifact 下载归 general。下载器先尊重 general / inherited 网络路径；manifest + signature 与 artifact 的每次完整 request/body future 都由 async deadline 包住，首选路径 90 秒硬墙钟到期即取消该次传输（持续有少量字节流入也不会续期）。网络、size、SHA-256 或 minisign 任一失败后，仅对已严格验证 host/path 的 `download.myagents.io` 直连重试。直连 client 禁止 redirect，结果仍必须通过 size + SHA-256 + minisign + 平台签名全链路校验，不是通用的 proxy bypass。
+   Managed Codex 的登录检查 / Runtime 子进程仍按 `codex-sub` provider scope 走代理；Runtime manifest / artifact 下载归 general。「浏览器」不请求远程 manifest，而是从随 App 签名的版本锁读取官方 exact artifact URL/size/SHA-256。下载先尊重 general / inherited 网络路径；约 169–186 MiB 的完整传输有 10 分钟硬墙钟，同时 30 秒无读取进展即失败，既允许正常慢网又不接受无限 trickle。只有 transport failure 才对同一个已严格锁定的官方最终 URL尝试一次直连，确定性 HTTP 错误不伪装成代理故障。直连 client 仍禁 redirect，结果必须通过 exact URL + size + SHA-256 + 安全解压校验，不是通用 proxy bypass。
 
    Runtime 安装锁用 pid + process start time 识别 owner；活 owner 不受锁龄影响，前一 App 进程在下载中退出时，死 owner 经过 5 秒宽限即可被下一次启动回收，不会留下 30 分钟的假“下载中”。取得安装锁后会先清理该 runtime root 下遗留的 `.download-*` 临时目录，再创建本次唯一 staging 目录，避免反复退出积累大文件。
 
@@ -334,7 +334,7 @@ let client = reqwest::Client::builder()
 | Provider-owned SDK/runtime/fetch | Provider selection | Rust/Node provider-aware helper |
 | OpenAI Bridge subprocess | **代理变量被剥离** | SDK→Bridge 是 loopback；Bridge→upstream 由 `getProxyForProviderUrl(providerId, url)` 按 Provider owner 选择 overlay / inherited |
 | Plugin Bridge | Rust `apply_proxy_env()` + Node `initializeProxyStateFromCurrentSettings({providerOwnedConsumers:false})` | 加载社区插件前安装 package-pinned global fetch/dispatcher；跟随 general；SOCKS5 在 Bridge 进程内建本地 HTTP bridge；变化后沿 Channel lifecycle 重启 |
-| Updater / Managed Runtime /「浏览器」资源下载 | Rust reqwest / updater builder | 跟随 general；浏览器 manifest/artifact 仍固定一方 HTTPS origin、禁 redirect 并在代理后执行同一验签 |
+| Updater / Managed Runtime /「浏览器」资源下载 | Rust reqwest / updater builder | 跟随 general；浏览器只访问 App 锁定的官方最终 HTTPS URL、禁 redirect，并在代理/受限直连路径后执行同一 size/SHA-256/解压校验 |
 
 ### SOCKS5 桥接机制
 

@@ -39,6 +39,16 @@ fn expose_managed_browser_runtime_lock() {
             lock_path.display()
         )
     });
+    if lock
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_u64)
+        != Some(2)
+    {
+        panic!(
+            "Browser runtime lock {} requires schemaVersion 2",
+            lock_path.display()
+        );
+    }
     let runtime_set = required_runtime_lock_string(&lock, "runtimeSet", &lock_path);
     let revision = required_runtime_lock_string(&lock, "chromiumRevision", &lock_path);
     let browser_version = required_runtime_lock_string(&lock, "chromiumBrowserVersion", &lock_path);
@@ -55,11 +65,207 @@ fn expose_managed_browser_runtime_lock() {
     if !revision.bytes().all(|byte| byte.is_ascii_digit()) {
         panic!("Browser chromiumRevision must be numeric: {revision:?}");
     }
+    let artifacts = lock
+        .get("officialArtifacts")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| {
+            panic!(
+                "Browser runtime lock {} requires officialArtifacts",
+                lock_path.display()
+            )
+        });
+    let supported_platforms = [
+        "darwin-arm64",
+        "darwin-x64",
+        "win32-x64",
+        "linux-x64",
+        "linux-arm64",
+    ];
+    if artifacts.len() != supported_platforms.len() {
+        panic!(
+            "Browser runtime lock {} must contain exactly the supported official artifacts",
+            lock_path.display()
+        );
+    }
+    for platform in supported_platforms {
+        let artifact = artifacts.get(platform).unwrap_or_else(|| {
+            panic!(
+                "Browser runtime lock {} is missing official artifact {platform}",
+                lock_path.display()
+            )
+        });
+        validate_browser_official_artifact(
+            artifact,
+            platform,
+            browser_version,
+            revision,
+            &lock_path,
+        );
+    }
+    let target_platform = match (
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        env::var("CARGO_CFG_TARGET_ARCH").as_deref(),
+    ) {
+        (Ok("macos"), Ok("aarch64")) => Some("darwin-arm64"),
+        (Ok("macos"), Ok("x86_64")) => Some("darwin-x64"),
+        (Ok("windows"), Ok("x86_64")) => Some("win32-x64"),
+        (Ok("linux"), Ok("x86_64")) => Some("linux-x64"),
+        (Ok("linux"), Ok("aarch64")) => Some("linux-arm64"),
+        _ => None,
+    };
+    let target_artifact = target_platform.and_then(|platform| artifacts.get(platform));
+    let artifact_string = |key: &str| {
+        target_artifact
+            .and_then(|artifact| artifact.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let archive_size = target_artifact
+        .and_then(|artifact| artifact.get("archiveSizeBytes"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let unpacked_size = target_artifact
+        .and_then(|artifact| artifact.get("unpackedSizeBytes"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let entry_count = target_artifact
+        .and_then(|artifact| artifact.get("entryCount"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     println!("cargo:rustc-env=MYAGENTS_BROWSER_RUNTIME_SET={runtime_set}");
     println!("cargo:rustc-env=MYAGENTS_BROWSER_REVISION={revision}");
     println!("cargo:rustc-env=MYAGENTS_BROWSER_VERSION={browser_version}");
     println!("cargo:rustc-env=MYAGENTS_BROWSER_PLAYWRIGHT_MCP_VERSION={playwright_mcp_version}");
     println!("cargo:rustc-env=MYAGENTS_BROWSER_PLAYWRIGHT_CORE_VERSION={playwright_core_version}");
+    println!(
+        "cargo:rustc-env=MYAGENTS_BROWSER_ARTIFACT_SOURCE_URL={}",
+        artifact_string("sourceUrl")
+    );
+    println!(
+        "cargo:rustc-env=MYAGENTS_BROWSER_ARTIFACT_URL={}",
+        artifact_string("url")
+    );
+    println!(
+        "cargo:rustc-env=MYAGENTS_BROWSER_ARTIFACT_SHA256={}",
+        artifact_string("sha256")
+    );
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_ARTIFACT_SIZE={archive_size}");
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_UNPACKED_SIZE={unpacked_size}");
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_ENTRY_COUNT={entry_count}");
+    println!(
+        "cargo:rustc-env=MYAGENTS_BROWSER_ARCHIVE_ROOT={}",
+        artifact_string("archiveRoot")
+    );
+    println!(
+        "cargo:rustc-env=MYAGENTS_BROWSER_EXECUTABLE_RELATIVE_PATH={}",
+        artifact_string("executableRelativePath")
+    );
+}
+
+fn validate_browser_official_artifact(
+    artifact: &serde_json::Value,
+    platform: &str,
+    browser_version: &str,
+    revision: &str,
+    lock_path: &Path,
+) {
+    let field = |key: &str| {
+        artifact
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "Browser runtime lock {} artifact {platform} requires {key}",
+                    lock_path.display()
+                )
+            })
+    };
+    let source_url = field("sourceUrl");
+    let url = field("url");
+    let sha256 = field("sha256");
+    let archive_root = field("archiveRoot");
+    let executable = field("executableRelativePath");
+    let archive_size = artifact
+        .get("archiveSizeBytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let unpacked_size = artifact
+        .get("unpackedSizeBytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let entry_count = artifact
+        .get("entryCount")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let (expected_suffix, expected_root, expected_executable) = match platform {
+        "darwin-arm64" => (
+            "mac-arm64/chrome-mac-arm64.zip",
+            "chrome-mac-arm64",
+            "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        ),
+        "darwin-x64" => (
+            "mac-x64/chrome-mac-x64.zip",
+            "chrome-mac-x64",
+            "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        ),
+        "win32-x64" => (
+            "win64/chrome-win64.zip",
+            "chrome-win64",
+            "chrome-win64/chrome.exe",
+        ),
+        "linux-x64" => (
+            "linux64/chrome-linux64.zip",
+            "chrome-linux64",
+            "chrome-linux64/chrome",
+        ),
+        "linux-arm64" => (
+            "chromium-linux-arm64.zip",
+            "chrome-linux",
+            "chrome-linux/chrome",
+        ),
+        _ => unreachable!("supported Browser platform"),
+    };
+    let official_source = source_url.starts_with("https://cdn.playwright.dev/")
+        && if platform == "linux-arm64" {
+            source_url.contains(&format!("/builds/chromium/{revision}/"))
+        } else {
+            source_url.contains(&format!("/builds/cft/{browser_version}/"))
+        };
+    let official_download = url
+        .starts_with("https://storage.googleapis.com/chrome-for-testing-public/")
+        || url.starts_with("https://playwright.download.prss.microsoft.com/")
+        || url.starts_with("https://cdn.playwright.dev/builds/chromium/");
+    let locked_download_version = if platform == "linux-arm64" {
+        url.contains(&format!("/builds/chromium/{revision}/"))
+    } else {
+        url.contains(&format!("/{browser_version}/"))
+    };
+    if !official_source
+        || !official_download
+        || !locked_download_version
+        || !source_url.ends_with(expected_suffix)
+        || !url.ends_with(expected_suffix)
+        || sha256.len() != 64
+        || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || archive_size == 0
+        || archive_size > 512 * 1024 * 1024
+        || unpacked_size == 0
+        || unpacked_size > 1024 * 1024 * 1024
+        || entry_count == 0
+        || entry_count > 6000
+        || archive_root.contains('/')
+        || archive_root.contains('\\')
+        || archive_root != expected_root
+        || executable != expected_executable
+        || executable.contains("..")
+        || executable.contains('\\')
+    {
+        panic!(
+            "Browser runtime lock {} has invalid official artifact {platform}",
+            lock_path.display()
+        );
+    }
 }
 
 fn expose_managed_codex_runtime_lock() {

@@ -93,9 +93,9 @@ Windows CLI mode 继续 `AttachConsole(ATTACH_PARENT_PROCESS)` 继承 cmd / Powe
 
 Task command Detector 不经过 SDK shell：bare `node` / `node.exe` 固定解析到 bundled Node.js v24，其他 bare executable 走 `system_binary::find()`；`executable + args + cwd` 分开传递，不经 `cmd /c` 或字符串重拼。Rust 进入进程边界前对绝对路径使用现有 external-path normalize，不能把 Windows verbatim/长路径前缀直接泄漏给 Node。
 
-浏览器工具分两条路径：标准 `playwright` 仍是普通上游 stdio MCP；新增 `myagents-browser` /「浏览器」才是应用自有 Runtime。桌面 release build、installer 和 updater 都不携带 Chromium。用户首次点击“安装资源”后，Rust App owner 才把锁定 revision 的 signed Chromium runtime set 安装到 MyAgents 数据目录；以后 App revision 变化自动维护。Global Sidecar 只能使用 Rust 投影的精确 executable path，缺资源时 fail closed，不回退 `npx`、系统 Chrome、npm cache 或临时下载。
+浏览器工具分两条路径：标准 `playwright` 仍是普通上游 stdio MCP；新增 `myagents-browser` /「浏览器」才是应用自有 Runtime。桌面 release build、installer 和 updater 都不携带 Chromium。用户首次点击“安装资源”后，Rust App owner 才按随 App 签名的版本锁直接下载 Playwright 官方 Chromium artifact，校验固定 size/SHA-256 并安装到 MyAgents 数据目录；以后 App revision 变化自动维护。Global Sidecar 只能使用 Rust 投影的精确 executable path，缺资源时 fail closed，不回退 `npx`、系统 Chrome、npm cache 或临时下载。
 
-受管「浏览器」由一个 Browser generation 为每个 Product Session 创建独立 BrowserContext/原生窗口，不存在 persistent user-data-dir 或 Profile lease。Chromium 后代留在 Global Sidecar 的 `ChildTree` / Windows Job Object 内。正常 App/update shutdown 先由 Rust 对精确 Global generation 发起有界 loopback graceful handshake，等待 Host checkpoint 并调用受支持的 Context/Browser close；随后才关闭 Job Object 作为最终 containment。禁止按 `chrome.exe` 全机清理。Windows 资源发行必须在 Windows 上验证 Chrome 的 Authenticode，再签署独立 runtime manifest/artifact；该发行步骤不属于 `build_windows.ps1` 或 `npm run tauri:build`。
+受管「浏览器」由一个 Browser generation 为每个 Product Session 创建独立 BrowserContext/原生窗口，不存在 persistent user-data-dir 或 Profile lease。Chromium 后代留在 Global Sidecar 的 `ChildTree` / Windows Job Object 内。正常 App/update shutdown 先由 Rust 对精确 Global generation 发起有界 loopback graceful handshake，等待 Host checkpoint 并调用受支持的 Context/Browser close；随后才关闭 Job Object 作为最终 containment。禁止按 `chrome.exe` 全机清理。Windows 使用锁定 Playwright revision 对应的官方 Chrome for Testing ZIP；资源计划更新需在 Windows release-like smoke 中验证实际 headed launch，但不生成、签署或上传 MyAgents 自有浏览器 artifact。
 
 ### 进程清理
 

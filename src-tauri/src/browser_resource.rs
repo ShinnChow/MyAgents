@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -14,32 +14,36 @@ use tauri::Emitter;
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use crate::managed_codex::ManagedCodexArtifactSigning;
 use crate::ulog_warn;
 use crate::utils::file_lock::{with_file_lock_blocking, FileLockError, FileLockOptions};
 
 pub const REQUIRED_RUNTIME_SET: &str = env!("MYAGENTS_BROWSER_RUNTIME_SET");
 pub const REQUIRED_CHROMIUM_REVISION: &str = env!("MYAGENTS_BROWSER_REVISION");
 const REQUIRED_CHROMIUM_BROWSER_VERSION: &str = env!("MYAGENTS_BROWSER_VERSION");
+#[cfg(test)]
 const REQUIRED_PLAYWRIGHT_MCP_VERSION: &str = env!("MYAGENTS_BROWSER_PLAYWRIGHT_MCP_VERSION");
+#[cfg(test)]
 const REQUIRED_PLAYWRIGHT_CORE_VERSION: &str = env!("MYAGENTS_BROWSER_PLAYWRIGHT_CORE_VERSION");
+const REQUIRED_ARTIFACT_SOURCE_URL: &str = env!("MYAGENTS_BROWSER_ARTIFACT_SOURCE_URL");
+const REQUIRED_ARTIFACT_URL: &str = env!("MYAGENTS_BROWSER_ARTIFACT_URL");
+const REQUIRED_ARTIFACT_SHA256: &str = env!("MYAGENTS_BROWSER_ARTIFACT_SHA256");
+const REQUIRED_ARTIFACT_SIZE: &str = env!("MYAGENTS_BROWSER_ARTIFACT_SIZE");
+const REQUIRED_UNPACKED_SIZE: &str = env!("MYAGENTS_BROWSER_UNPACKED_SIZE");
+const REQUIRED_ENTRY_COUNT: &str = env!("MYAGENTS_BROWSER_ENTRY_COUNT");
+const REQUIRED_ARCHIVE_ROOT: &str = env!("MYAGENTS_BROWSER_ARCHIVE_ROOT");
+const REQUIRED_EXECUTABLE_RELATIVE_PATH: &str = env!("MYAGENTS_BROWSER_EXECUTABLE_RELATIVE_PATH");
 
-const RUNTIME_SETS_BASE_URL: &str = "https://download.myagents.io/runtimes/browser/sets";
-const DOWNLOAD_HOST: &str = "download.myagents.io";
-const DOWNLOAD_PATH_PREFIX: &str = "/runtimes/browser/";
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
-const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
-const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
+const OFFICIAL_RUNTIME_SOURCE: &str = "playwright-official";
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 6000;
 const AUTOMATIC_RETRY_LIMIT: u8 = 2;
-const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+const DOWNLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const DOWNLOAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 static STATUS: OnceLock<Mutex<BrowserResourceStatus>> = OnceLock::new();
 static STATUS_REVISION: AtomicU64 = AtomicU64::new(1);
 static AUTOMATIC_RETRY_COUNT: AtomicU8 = AtomicU8::new(0);
-static MANIFEST_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static OPERATION_COORDINATOR: OnceLock<BrowserResourceOperationCoordinator> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,40 +148,25 @@ struct InstalledBrowserRuntime {
     platform: String,
     executable_relative_path: String,
     sha256: String,
-    manifest_signature: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    manifest_signature: Option<String>,
+    #[serde(default)]
     artifact_signature_verified: bool,
     installed_at: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserRuntimeManifest {
-    schema_version: u32,
-    runtime_set: String,
-    revision: String,
-    playwright_mcp_version: String,
-    playwright_core_version: String,
-    chromium_revision: String,
-    chromium_browser_version: String,
-    platform: String,
-    generated_at: String,
-    licenses: Vec<String>,
-    artifact: BrowserRuntimeArtifact,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserRuntimeArtifact {
-    url: String,
-    sha256: String,
-    signature: String,
-    #[serde(default)]
-    signing: Option<ManagedCodexArtifactSigning>,
-    executable_relative_path: String,
-    file_allowlist: Vec<String>,
+#[derive(Debug, Clone)]
+struct OfficialBrowserArtifact {
+    source_url: &'static str,
+    url: &'static str,
+    sha256: &'static str,
     archive_size_bytes: u64,
     unpacked_size_bytes: u64,
-    entry_count: u64,
+    entry_count: usize,
+    archive_root: &'static str,
+    executable_relative_path: &'static str,
 }
 
 fn now_iso() -> String {
@@ -195,6 +184,22 @@ fn platform_key() -> Option<&'static str> {
     }
 }
 
+fn required_artifact() -> Option<OfficialBrowserArtifact> {
+    platform_key()?;
+    let artifact = OfficialBrowserArtifact {
+        source_url: REQUIRED_ARTIFACT_SOURCE_URL,
+        url: REQUIRED_ARTIFACT_URL,
+        sha256: REQUIRED_ARTIFACT_SHA256,
+        archive_size_bytes: REQUIRED_ARTIFACT_SIZE.parse().ok()?,
+        unpacked_size_bytes: REQUIRED_UNPACKED_SIZE.parse().ok()?,
+        entry_count: REQUIRED_ENTRY_COUNT.parse().ok()?,
+        archive_root: REQUIRED_ARCHIVE_ROOT,
+        executable_relative_path: REQUIRED_EXECUTABLE_RELATIVE_PATH,
+    };
+    validate_official_artifact(&artifact).ok()?;
+    Some(artifact)
+}
+
 fn runtime_root() -> Result<PathBuf, String> {
     crate::app_dirs::myagents_data_dir()
         .map(|path| path.join("runtimes").join("browser"))
@@ -209,31 +214,79 @@ fn install_dir(platform: &str) -> Result<PathBuf, String> {
     Ok(runtime_root()?.join(REQUIRED_RUNTIME_SET).join(platform))
 }
 
-fn manifest_url(platform: &str) -> String {
-    format!(
-        "{}/{}/{}/manifest-v1.json",
-        RUNTIME_SETS_BASE_URL, REQUIRED_RUNTIME_SET, platform
-    )
+fn validate_official_artifact(artifact: &OfficialBrowserArtifact) -> Result<(), String> {
+    if artifact.sha256.len() != 64
+        || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || artifact.archive_size_bytes == 0
+        || artifact.archive_size_bytes > MAX_ARCHIVE_BYTES
+        || artifact.unpacked_size_bytes == 0
+        || artifact.unpacked_size_bytes > MAX_UNPACKED_BYTES
+        || artifact.entry_count == 0
+        || artifact.entry_count > MAX_ARCHIVE_ENTRIES
+        || artifact.archive_root.is_empty()
+        || artifact.archive_root.contains(['/', '\\'])
+        || !artifact
+            .executable_relative_path
+            .starts_with(&format!("{}/", artifact.archive_root))
+    {
+        return Err("[browser-resource] Invalid official Browser artifact lock".to_string());
+    }
+    validate_relative_path(artifact.executable_relative_path)?;
+    validate_official_source_url(artifact.source_url)?;
+    validate_download_url(artifact.url, artifact)
 }
 
-fn manifest_signature_url(platform: &str) -> String {
-    format!("{}.sig", manifest_url(platform))
-}
-
-fn validate_download_url(raw: &str) -> Result<(), String> {
+fn validate_official_source_url(raw: &str) -> Result<(), String> {
     let url = url::Url::parse(raw)
         .map_err(|error| format!("[browser-resource] Invalid download URL: {error}"))?;
     if url.scheme() != "https"
-        || url.host_str() != Some(DOWNLOAD_HOST)
+        || url.host_str() != Some("cdn.playwright.dev")
         || url.port().is_some()
-        || !url.path().starts_with(DOWNLOAD_PATH_PREFIX)
+        || !(url.path().starts_with("/builds/cft/")
+            || url.path().starts_with("/builds/chromium/")
+            || url
+                .path()
+                .starts_with("/dbazure/download/playwright/builds/chromium/"))
+        || url.username() != ""
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("[browser-resource] Invalid Playwright official source URL".to_string());
+    }
+    Ok(())
+}
+
+fn validate_download_url(raw: &str, artifact: &OfficialBrowserArtifact) -> Result<(), String> {
+    if raw != artifact.url {
+        return Err(
+            "[browser-resource] Download URL does not match the locked artifact".to_string(),
+        );
+    }
+    let url = url::Url::parse(raw)
+        .map_err(|error| format!("[browser-resource] Invalid download URL: {error}"))?;
+    let path_allowed = match url.host_str() {
+        Some("storage.googleapis.com") => url.path().starts_with(&format!(
+            "/chrome-for-testing-public/{REQUIRED_CHROMIUM_BROWSER_VERSION}/"
+        )),
+        Some("playwright.download.prss.microsoft.com") => url.path().starts_with(&format!(
+            "/dbazure/download/playwright/builds/chromium/{REQUIRED_CHROMIUM_REVISION}/"
+        )),
+        Some("cdn.playwright.dev") => url
+            .path()
+            .starts_with(&format!("/builds/chromium/{REQUIRED_CHROMIUM_REVISION}/")),
+        _ => false,
+    };
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !path_allowed
         || url.username() != ""
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
         return Err(
-            "[browser-resource] Download URL is outside the first-party runtime origin".to_string(),
+            "[browser-resource] Download URL is outside locked official origins".to_string(),
         );
     }
     Ok(())
@@ -263,13 +316,27 @@ fn installed_runtime(
     metadata: &InstalledBrowserRuntime,
     platform: &str,
 ) -> Option<BrowserResourceResolution> {
-    if metadata.schema_version != 1
+    let artifact = required_artifact()?;
+    let trusted_for_current_set = match metadata.schema_version {
+        1 => {
+            metadata
+                .manifest_signature
+                .as_deref()
+                .is_some_and(|signature| !signature.trim().is_empty())
+                && metadata.artifact_signature_verified
+        }
+        2 => {
+            metadata.source.as_deref() == Some(OFFICIAL_RUNTIME_SOURCE)
+                && metadata.sha256.eq_ignore_ascii_case(artifact.sha256)
+                && metadata.executable_relative_path == artifact.executable_relative_path
+        }
+        _ => false,
+    };
+    if !trusted_for_current_set
         || metadata.runtime_set != REQUIRED_RUNTIME_SET
         || metadata.chromium_revision != REQUIRED_CHROMIUM_REVISION
         || metadata.platform != platform
         || metadata.sha256.len() != 64
-        || metadata.manifest_signature.trim().is_empty()
-        || !metadata.artifact_signature_verified
     {
         return None;
     }
@@ -290,12 +357,21 @@ fn installed_runtime(
 }
 
 fn has_install_authorization(metadata: &InstalledBrowserRuntime, platform: &str) -> bool {
-    metadata.schema_version == 1
+    let trusted_source = match metadata.schema_version {
+        1 => {
+            metadata
+                .manifest_signature
+                .as_deref()
+                .is_some_and(|signature| !signature.trim().is_empty())
+                && metadata.artifact_signature_verified
+        }
+        2 => metadata.source.as_deref() == Some(OFFICIAL_RUNTIME_SOURCE),
+        _ => false,
+    };
+    trusted_source
         && metadata.platform == platform
         && metadata.sha256.len() == 64
         && metadata.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && !metadata.manifest_signature.trim().is_empty()
-        && metadata.artifact_signature_verified
         && validate_relative_path(&metadata.executable_relative_path).is_ok()
 }
 
@@ -330,7 +406,7 @@ fn initial_status() -> BrowserResourceStatus {
         state: state.to_string(),
         operation_id: None,
         downloaded_bytes: None,
-        total_bytes: None,
+        total_bytes: required_artifact().map(|artifact| artifact.archive_size_bytes),
         progress_percent: None,
         error_code: None,
         retryable: state != "unsupported" && state != "ready",
@@ -390,6 +466,7 @@ fn http_client(timeout: Duration, use_proxy: bool) -> Result<reqwest::Client, St
     let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
+        .read_timeout(DOWNLOAD_READ_TIMEOUT)
         .timeout(timeout);
     if use_proxy {
         crate::proxy_config::build_client_with_proxy(builder)
@@ -404,176 +481,28 @@ fn http_client(timeout: Duration, use_proxy: bool) -> Result<reqwest::Client, St
 
 fn should_retry_direct(error: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
-    normalized.contains("failed to build http client")
-        || normalized.contains("failed to fetch")
-        || normalized.contains("failed to read")
-        || normalized.contains("artifact download failed")
-        || normalized.contains("artifact stream failed")
-        || normalized.contains("timed out")
+    !normalized.contains(": http ")
+        && (normalized.contains("failed to build http client")
+            || normalized.contains("artifact download failed")
+            || normalized.contains("artifact stream failed")
+            || normalized.contains("timed out"))
 }
 
-async fn fetch_limited(
-    client: &reqwest::Client,
-    url: &str,
-    limit: u64,
-    label: &str,
-) -> Result<Vec<u8>, String> {
-    validate_download_url(url)?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| format!("[browser-resource] Failed to fetch {label}: {error}"))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "[browser-resource] Failed to fetch {label}: HTTP {}",
-            response.status()
-        ));
-    }
-    validate_download_url(response.url().as_str())?;
-    if response.content_length().unwrap_or(0) > limit {
-        return Err(format!("[browser-resource] {label} exceeds its size limit"));
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("[browser-resource] Failed to read {label}: {error}"))?;
-    if bytes.len() as u64 > limit {
-        return Err(format!("[browser-resource] {label} exceeds its size limit"));
-    }
-    Ok(bytes.to_vec())
-}
-
-async fn fetch_manifest(
-    client: &reqwest::Client,
-    platform: &str,
-) -> Result<(BrowserRuntimeManifest, String), String> {
-    let manifest_bytes = fetch_limited(
-        client,
-        &manifest_url(platform),
-        MAX_MANIFEST_BYTES,
-        "manifest",
-    )
-    .await?;
-    let signature_bytes = fetch_limited(
-        client,
-        &manifest_signature_url(platform),
-        MAX_SIGNATURE_BYTES,
-        "manifest signature",
-    )
-    .await?;
-    let signature = String::from_utf8(signature_bytes)
-        .map_err(|_| "[browser-resource] Manifest signature is not UTF-8".to_string())?;
-    let signature = signature.trim();
-    crate::managed_codex::verify_minisign_bytes(&manifest_bytes, signature, "Browser manifest")?;
-    let manifest: BrowserRuntimeManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| format!("[browser-resource] Invalid manifest JSON: {error}"))?;
-    validate_manifest(&manifest, platform)?;
-    Ok((manifest, signature.to_string()))
-}
-
-async fn fetch_manifest_with_fallback(
-    platform: &str,
-) -> Result<(BrowserRuntimeManifest, String), String> {
-    let proxied = async {
-        let client = http_client(DOWNLOAD_REQUEST_TIMEOUT, true)?;
-        fetch_manifest(&client, platform).await
-    }
-    .await;
-    match proxied {
-        Ok(result) => Ok(result),
-        Err(error) if should_retry_direct(&error) => {
-            ulog_warn!("[browser-resource] transport=proxy fallback=direct resource=manifest");
-            let client = http_client(DOWNLOAD_REQUEST_TIMEOUT, false)?;
-            fetch_manifest(&client, platform).await
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn validate_manifest(manifest: &BrowserRuntimeManifest, platform: &str) -> Result<(), String> {
-    if manifest.schema_version != MANIFEST_SCHEMA_VERSION
-        || manifest.runtime_set != REQUIRED_RUNTIME_SET
-        || manifest.revision != REQUIRED_RUNTIME_SET
-        || manifest.playwright_mcp_version != REQUIRED_PLAYWRIGHT_MCP_VERSION
-        || manifest.playwright_core_version != REQUIRED_PLAYWRIGHT_CORE_VERSION
-        || manifest.chromium_revision != REQUIRED_CHROMIUM_REVISION
-        || manifest.chromium_browser_version != REQUIRED_CHROMIUM_BROWSER_VERSION
-        || manifest.platform != platform
-        || manifest.generated_at.trim().is_empty()
-        || manifest.licenses.is_empty()
-        || manifest
-            .licenses
-            .iter()
-            .any(|license| license.trim().is_empty())
-    {
-        return Err(
-            "[browser-resource] Manifest does not match this app's locked Browser runtime"
-                .to_string(),
-        );
-    }
-    validate_artifact(&manifest.artifact, platform)?;
-    for license in &manifest.licenses {
-        validate_relative_path(license)?;
-        if !manifest.artifact.file_allowlist.contains(license) {
-            return Err("[browser-resource] Browser license notice is not allowlisted".to_string());
-        }
-    }
-    Ok(())
-}
-
-fn validate_artifact(artifact: &BrowserRuntimeArtifact, platform: &str) -> Result<(), String> {
-    validate_download_url(&artifact.url)?;
-    if artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err("[browser-resource] Artifact SHA-256 is invalid".to_string());
-    }
-    if artifact.signature.trim().is_empty()
-        || artifact.archive_size_bytes == 0
-        || artifact.archive_size_bytes > MAX_ARCHIVE_BYTES
-        || artifact.unpacked_size_bytes == 0
-        || artifact.unpacked_size_bytes > MAX_UNPACKED_BYTES
-        || artifact.entry_count == 0
-        || artifact.entry_count as usize > MAX_ARCHIVE_ENTRIES
-    {
-        return Err("[browser-resource] Artifact metadata is outside allowed bounds".to_string());
-    }
-    if artifact.file_allowlist.is_empty() || artifact.file_allowlist.len() > MAX_ARCHIVE_ENTRIES {
-        return Err("[browser-resource] Artifact file allowlist is invalid".to_string());
-    }
-    if artifact.file_allowlist.iter().collect::<HashSet<_>>().len() != artifact.file_allowlist.len()
-    {
-        return Err("[browser-resource] Artifact allowlist contains duplicates".to_string());
-    }
-    for path in artifact
-        .file_allowlist
-        .iter()
-        .chain([&artifact.executable_relative_path])
-    {
-        validate_relative_path(path)?;
-    }
-    if !artifact
-        .file_allowlist
-        .contains(&artifact.executable_relative_path)
-    {
-        return Err("[browser-resource] Required Browser component is not allowlisted".to_string());
-    }
-    if matches!(platform, "darwin-arm64" | "darwin-x64" | "win32-x64") && artifact.signing.is_none()
-    {
-        return Err("[browser-resource] Platform signing policy is required".to_string());
-    }
-    Ok(())
+fn advanced_download_percent(downloaded: u64, total: u64, current: u8) -> Option<u8> {
+    let percent = ((downloaded.saturating_mul(100)) / total) as u8;
+    (percent > current).then_some(percent)
 }
 
 async fn download_artifact(
     client: &reqwest::Client,
-    artifact: &BrowserRuntimeArtifact,
+    artifact: &OfficialBrowserArtifact,
     archive_path: &Path,
     operation_id: &str,
     progress_state: &str,
+    progress_floor: u8,
 ) -> Result<(), String> {
     let response = client
-        .get(&artifact.url)
+        .get(artifact.url)
         .send()
         .await
         .map_err(|error| format!("[browser-resource] Artifact download failed: {error}"))?;
@@ -583,7 +512,7 @@ async fn download_artifact(
             response.status()
         ));
     }
-    validate_download_url(response.url().as_str())?;
+    validate_download_url(response.url().as_str(), artifact)?;
     if let Some(length) = response.content_length() {
         if length != artifact.archive_size_bytes || length > MAX_ARCHIVE_BYTES {
             return Err("[browser-resource] Artifact Content-Length mismatch".to_string());
@@ -594,7 +523,7 @@ async fn download_artifact(
     })?;
     let mut stream = response.bytes_stream();
     let mut downloaded = 0u64;
-    let mut last_percent = 0u8;
+    let mut last_percent = progress_floor;
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|error| format!("[browser-resource] Artifact stream failed: {error}"))?;
@@ -606,8 +535,9 @@ async fn download_artifact(
         }
         file.write_all(&chunk)
             .map_err(|error| format!("[browser-resource] Failed to write artifact: {error}"))?;
-        let percent = ((downloaded.saturating_mul(100)) / artifact.archive_size_bytes) as u8;
-        if percent != last_percent {
+        if let Some(percent) =
+            advanced_download_percent(downloaded, artifact.archive_size_bytes, last_percent)
+        {
             last_percent = percent;
             transition(
                 progress_state,
@@ -628,7 +558,7 @@ async fn download_artifact(
 }
 
 async fn download_artifact_with_fallback(
-    artifact: &BrowserRuntimeArtifact,
+    artifact: &OfficialBrowserArtifact,
     archive_path: &Path,
     operation_id: &str,
     progress_state: &str,
@@ -641,6 +571,7 @@ async fn download_artifact_with_fallback(
             archive_path,
             operation_id,
             progress_state,
+            0,
         )
         .await
     }
@@ -650,12 +581,14 @@ async fn download_artifact_with_fallback(
         Err(error) if should_retry_direct(&error) => {
             ulog_warn!("[browser-resource] transport=proxy fallback=direct resource=artifact");
             let client = http_client(DOWNLOAD_REQUEST_TIMEOUT, false)?;
+            let progress_floor = current_status().progress_percent.unwrap_or(0);
             download_artifact(
                 &client,
                 artifact,
                 archive_path,
                 operation_id,
                 progress_state,
+                progress_floor,
             )
             .await
         }
@@ -727,7 +660,7 @@ fn declared_zip_entry_count(path: &Path) -> Result<usize, String> {
 fn extract_archive(
     archive_path: &Path,
     staging: &Path,
-    artifact: &BrowserRuntimeArtifact,
+    artifact: &OfficialBrowserArtifact,
 ) -> Result<(), String> {
     let archive_file = File::open(archive_path)
         .map_err(|error| format!("[browser-resource] Failed to open artifact zip: {error}"))?;
@@ -737,22 +670,18 @@ fn extract_archive(
     if declared_entries != archive.len() {
         return Err("[browser-resource] Artifact contains duplicate file entries".to_string());
     }
-    if declared_entries != artifact.entry_count as usize || archive.len() > MAX_ARCHIVE_ENTRIES {
+    if archive.is_empty()
+        || archive.len() != artifact.entry_count
+        || archive.len() > MAX_ARCHIVE_ENTRIES
+    {
         return Err("[browser-resource] Artifact entry count mismatch".to_string());
     }
-    let allowlist = artifact
-        .file_allowlist
-        .iter()
-        .cloned()
-        .collect::<HashSet<_>>();
-    if allowlist.len() != artifact.file_allowlist.len() {
-        return Err("[browser-resource] Artifact allowlist contains duplicates".to_string());
-    }
-    fs::create_dir_all(staging).map_err(|error| {
-        format!("[browser-resource] Failed to create staging directory: {error}")
-    })?;
     let mut unpacked = 0u64;
-    let mut seen_files = HashSet::new();
+    let mut seen_entries = HashSet::new();
+    let mut symlinks = Vec::new();
+    let expected_executable = Path::new(artifact.executable_relative_path);
+    let archive_root = Path::new(artifact.archive_root);
+    let mut executable_present = false;
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -760,31 +689,67 @@ fn extract_archive(
         let raw_name = entry.name().trim_end_matches('/');
         let relative = validate_relative_path(raw_name)?;
         let key = relative.to_string_lossy().replace('\\', "/");
-        if entry.is_dir() {
-            let prefix = format!("{key}/");
-            if !allowlist.iter().any(|allowed| allowed.starts_with(&prefix)) {
-                return Err("[browser-resource] Artifact directory is not allowlisted".to_string());
-            }
-        } else if !allowlist.contains(&key) {
-            return Err(format!(
-                "[browser-resource] Artifact file is not allowlisted: {key}"
-            ));
-        } else if !seen_files.insert(key.clone()) {
+        if !relative.starts_with(archive_root) {
+            return Err("[browser-resource] Artifact entry is outside its locked root".to_string());
+        }
+        if !seen_entries.insert(key) {
             return Err("[browser-resource] Artifact contains duplicate file entries".to_string());
         }
-        if entry
-            .unix_mode()
-            .is_some_and(|mode| (mode & 0o170000) == 0o120000)
-        {
-            return Err(
-                "[browser-resource] Symlinks are forbidden in Browser resources".to_string(),
-            );
+        let is_symlink = entry.is_symlink();
+        if !entry.is_dir() && !is_symlink {
+            if entry.unix_mode().is_some_and(|mode| {
+                let file_type = mode & 0o170000;
+                file_type != 0 && file_type != 0o100000
+            }) {
+                return Err(
+                    "[browser-resource] Special files are forbidden in Browser resources"
+                        .to_string(),
+                );
+            }
+            executable_present |= relative == expected_executable;
+        }
+        if is_symlink {
+            let mut target = String::new();
+            entry.read_to_string(&mut target).map_err(|error| {
+                format!("[browser-resource] Failed to read symlink target: {error}")
+            })?;
+            let target_path = validate_relative_path(&target)?;
+            let resolved = relative
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(&target_path);
+            if !resolved.starts_with(archive_root) {
+                return Err(
+                    "[browser-resource] Symlink target escapes the locked archive root".to_string(),
+                );
+            }
+            symlinks.push((relative.clone(), target_path));
         }
         unpacked = unpacked
             .checked_add(entry.size())
             .ok_or_else(|| "[browser-resource] Unpacked size overflow".to_string())?;
-        if unpacked > artifact.unpacked_size_bytes || unpacked > MAX_UNPACKED_BYTES {
+        if unpacked > MAX_UNPACKED_BYTES {
             return Err("[browser-resource] Artifact exceeded unpacked size".to_string());
+        }
+    }
+    if !executable_present {
+        return Err("[browser-resource] Required Browser component is missing".to_string());
+    }
+    if unpacked != artifact.unpacked_size_bytes {
+        return Err("[browser-resource] Artifact unpacked size mismatch".to_string());
+    }
+
+    fs::create_dir_all(staging).map_err(|error| {
+        format!("[browser-resource] Failed to create staging directory: {error}")
+    })?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("[browser-resource] Failed to read zip entry: {error}"))?;
+        let raw_name = entry.name().trim_end_matches('/');
+        let relative = validate_relative_path(raw_name)?;
+        if entry.is_symlink() {
+            continue;
         }
         let output = staging.join(relative);
         if entry.is_dir() {
@@ -814,11 +779,33 @@ fn extract_archive(
             )?;
         }
     }
-    if unpacked != artifact.unpacked_size_bytes {
-        return Err("[browser-resource] Artifact unpacked size mismatch".to_string());
+    #[cfg(unix)]
+    for (relative, target) in &symlinks {
+        use std::os::unix::fs::symlink;
+        let output = staging.join(relative);
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!("[browser-resource] Failed to create symlink parent: {error}")
+            })?;
+        }
+        symlink(target, &output).map_err(|error| {
+            format!("[browser-resource] Failed to create runtime symlink: {error}")
+        })?;
     }
-    if seen_files != allowlist {
-        return Err("[browser-resource] Artifact is missing allowlisted files".to_string());
+    #[cfg(windows)]
+    if !symlinks.is_empty() {
+        return Err(
+            "[browser-resource] Symlinks are forbidden in Windows Browser resources".to_string(),
+        );
+    }
+    let canonical_staging = fs::canonicalize(staging)
+        .map_err(|error| format!("[browser-resource] Failed to verify staging root: {error}"))?;
+    for (relative, _) in &symlinks {
+        let resolved = fs::canonicalize(staging.join(relative))
+            .map_err(|error| format!("[browser-resource] Invalid runtime symlink: {error}"))?;
+        if !resolved.starts_with(&canonical_staging) {
+            return Err("[browser-resource] Runtime symlink escapes staging root".to_string());
+        }
     }
     Ok(())
 }
@@ -873,6 +860,35 @@ fn ensure_free_space(path: &Path, required: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn cleanup_abandoned_operation_entries(root: &Path) -> Result<(), String> {
+    let entries = fs::read_dir(root).map_err(|error| {
+        format!("[browser-resource] Failed to inspect runtime staging: {error}")
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!("[browser-resource] Failed to inspect runtime staging entry: {error}")
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".download-") && !name.starts_with(".staging-") {
+            continue;
+        }
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            format!("[browser-resource] Failed to inspect abandoned staging: {error}")
+        })?;
+        let result = if file_type.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        result.map_err(|error| {
+            format!("[browser-resource] Failed to clean abandoned staging: {error}")
+        })?;
+    }
+    Ok(())
+}
+
 fn failure_projection(error: &str, updating: bool) -> (&'static str, bool) {
     if updating {
         return ("BROWSER_RESOURCE_UPDATE_FAILED", true);
@@ -911,8 +927,7 @@ fn failure_projection(error: &str, updating: bool) -> (&'static str, bool) {
 fn publish_install(
     staging: &Path,
     platform: &str,
-    manifest: &BrowserRuntimeManifest,
-    manifest_signature: &str,
+    artifact: &OfficialBrowserArtifact,
 ) -> Result<(), String> {
     let target = install_dir(platform)?;
     let backup = runtime_root()?.join(format!(".old-{}", Uuid::new_v4()));
@@ -936,14 +951,15 @@ fn publish_install(
         ));
     }
     let metadata = InstalledBrowserRuntime {
-        schema_version: 1,
+        schema_version: 2,
         runtime_set: REQUIRED_RUNTIME_SET.to_string(),
         chromium_revision: REQUIRED_CHROMIUM_REVISION.to_string(),
         platform: platform.to_string(),
-        executable_relative_path: manifest.artifact.executable_relative_path.clone(),
-        sha256: manifest.artifact.sha256.to_ascii_lowercase(),
-        manifest_signature: manifest_signature.to_string(),
-        artifact_signature_verified: true,
+        executable_relative_path: artifact.executable_relative_path.to_string(),
+        sha256: artifact.sha256.to_ascii_lowercase(),
+        source: Some(OFFICIAL_RUNTIME_SOURCE.to_string()),
+        manifest_signature: None,
+        artifact_signature_verified: false,
         installed_at: now_iso(),
     };
     if let Err(error) = atomic_write_installed(&metadata) {
@@ -995,6 +1011,8 @@ fn perform_install_owner(automatic: bool) -> Result<BrowserResourceStatus, Strin
         return Ok(transition("ready", None, None, None, Some(100), None));
     }
     let platform = platform_key().ok_or_else(|| "BROWSER_RESOURCE_UNSUPPORTED".to_string())?;
+    let artifact = required_artifact()
+        .ok_or_else(|| "[browser-resource] Official Browser artifact is unavailable".to_string())?;
     let root = runtime_root()?;
     fs::create_dir_all(&root)
         .map_err(|error| format!("[browser-resource] Failed to create runtime root: {error}"))?;
@@ -1021,30 +1039,28 @@ fn perform_install_owner(automatic: bool) -> Result<BrowserResourceStatus, Strin
         poll: Duration::from_millis(100),
     };
     let result = with_file_lock_blocking(&lock_path, options, || {
-        let (manifest, signature) = runtime_handle
-            .block_on(fetch_manifest_with_fallback(platform))
+        cleanup_abandoned_operation_entries(&root)
             .map_err(|error| FileLockError::Io(std::io::Error::other(error)))?;
         transition(
             operation_state,
             Some(&operation_id),
             Some(0),
-            Some(manifest.artifact.archive_size_bytes),
+            Some(artifact.archive_size_bytes),
             Some(0),
             None,
         );
         ensure_free_space(
             &root,
-            manifest
-                .artifact
+            artifact
                 .archive_size_bytes
-                .saturating_add(manifest.artifact.unpacked_size_bytes),
+                .saturating_add(artifact.unpacked_size_bytes),
         )
         .map_err(|error| FileLockError::Io(std::io::Error::other(error)))?;
         let archive_path = root.join(format!(".download-{operation_id}.zip"));
         let staging = root.join(format!(".staging-{operation_id}"));
         let install_result = (|| -> Result<(), String> {
             runtime_handle.block_on(download_artifact_with_fallback(
-                &manifest.artifact,
+                &artifact,
                 &archive_path,
                 &operation_id,
                 operation_state,
@@ -1052,19 +1068,15 @@ fn perform_install_owner(automatic: bool) -> Result<BrowserResourceStatus, Strin
             transition(
                 "verifying",
                 Some(&operation_id),
-                Some(manifest.artifact.archive_size_bytes),
-                Some(manifest.artifact.archive_size_bytes),
+                Some(artifact.archive_size_bytes),
+                Some(artifact.archive_size_bytes),
                 Some(100),
                 None,
             );
             let digest = sha256_file(&archive_path)?;
-            if !digest.eq_ignore_ascii_case(&manifest.artifact.sha256) {
+            if !digest.eq_ignore_ascii_case(artifact.sha256) {
                 return Err("[browser-resource] Artifact SHA-256 mismatch".to_string());
             }
-            crate::managed_codex::verify_minisign_file(
-                &archive_path,
-                &manifest.artifact.signature,
-            )?;
             transition(
                 "installing",
                 Some(&operation_id),
@@ -1073,22 +1085,14 @@ fn perform_install_owner(automatic: bool) -> Result<BrowserResourceStatus, Strin
                 Some(100),
                 None,
             );
-            extract_archive(&archive_path, &staging, &manifest.artifact)?;
-            let executable = staging.join(validate_relative_path(
-                &manifest.artifact.executable_relative_path,
-            )?);
-            if let Some(signing) = manifest.artifact.signing.as_ref() {
-                crate::managed_codex::verify_platform_signature(platform, &executable, signing)?;
-            }
+            extract_archive(&archive_path, &staging, &artifact)?;
             if !staging
-                .join(validate_relative_path(
-                    &manifest.artifact.executable_relative_path,
-                )?)
+                .join(validate_relative_path(artifact.executable_relative_path)?)
                 .is_file()
             {
                 return Err("[browser-resource] Required Browser component is missing".to_string());
             }
-            publish_install(&staging, platform, &manifest, &signature)
+            publish_install(&staging, platform, &artifact)
         })();
         let _ = fs::remove_file(&archive_path);
         if install_result.is_err() {
@@ -1120,9 +1124,11 @@ fn perform_install_owner(automatic: bool) -> Result<BrowserResourceStatus, Strin
             failed.install_authorized = authorized;
             failed.retryable = retryable;
             publish_status(failed);
-            if automatic {
-                ulog_warn!("[browser-resource] automatic maintenance failed: {}", error);
-            }
+            ulog_warn!(
+                "[browser-resource] operation={} failed: {}",
+                if automatic { "automatic" } else { "manual" },
+                error
+            );
             Err(error)
         }
     }
@@ -1145,39 +1151,10 @@ pub fn resolve_browser_resource() -> Result<BrowserResourceResolution, BrowserRe
     installed_runtime(&metadata, platform).ok_or(status)
 }
 
-fn start_manifest_size_probe() {
-    let status = current_status();
-    let Some(platform) = status.platform.clone() else {
-        return;
-    };
-    if status.state != "never_installed"
-        || status.total_bytes.is_some()
-        || MANIFEST_PROBE_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-    {
-        return;
-    }
-    tauri::async_runtime::spawn(async move {
-        if let Ok((manifest, _)) = fetch_manifest_with_fallback(&platform).await {
-            let mut current = current_status();
-            if current.state == "never_installed"
-                && current.operation_id.is_none()
-                && current.total_bytes.is_none()
-            {
-                current.total_bytes = Some(manifest.artifact.archive_size_bytes);
-                publish_status(current);
-            }
-        }
-        MANIFEST_PROBE_ACTIVE.store(false, Ordering::Release);
-    });
-}
-
 #[tauri::command]
 pub async fn cmd_browser_resource_status() -> Result<BrowserResourceStatus, String> {
-    // A signed manifest probe lets the Settings card show the exact target
-    // size. It never downloads Chromium or grants automatic maintenance.
-    start_manifest_size_probe();
+    // Size comes from the app-signed runtime lock. Reading status never starts
+    // a network request or grants automatic maintenance.
     Ok(current_status())
 }
 
@@ -1235,45 +1212,6 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use zip::write::SimpleFileOptions;
 
-    fn exact_manifest(platform: &str) -> BrowserRuntimeManifest {
-        serde_json::from_value(serde_json::json!({
-            "schemaVersion": MANIFEST_SCHEMA_VERSION,
-            "runtimeSet": REQUIRED_RUNTIME_SET,
-            "revision": REQUIRED_RUNTIME_SET,
-            "playwrightMcpVersion": REQUIRED_PLAYWRIGHT_MCP_VERSION,
-            "playwrightCoreVersion": REQUIRED_PLAYWRIGHT_CORE_VERSION,
-            "chromiumRevision": REQUIRED_CHROMIUM_REVISION,
-            "chromiumBrowserVersion": REQUIRED_CHROMIUM_BROWSER_VERSION,
-            "platform": platform,
-            "generatedAt": "2026-08-22T00:00:00Z",
-            "licenses": ["PLAYWRIGHT_LICENSE.txt"],
-            "artifact": {
-                "url": format!(
-                    "{}/{}/{}/artifacts/browser.zip",
-                    RUNTIME_SETS_BASE_URL, REQUIRED_RUNTIME_SET, platform
-                ),
-                "sha256": "a".repeat(64),
-                "signature": "signed-artifact",
-                "signing": {
-                    "type": if platform.starts_with("darwin-") { "codesign" } else { "authenticode" },
-                    "teamId": "TESTTEAM",
-                    "signingIdentity": "Test Publisher",
-                    "publisher": "Test Publisher",
-                    "certificateSha256": "b".repeat(64)
-                },
-                "executableRelativePath": "chromium/chrome",
-                "fileAllowlist": [
-                    "chromium/chrome",
-                    "PLAYWRIGHT_LICENSE.txt"
-                ],
-                "archiveSizeBytes": 1024,
-                "unpackedSizeBytes": 512,
-                "entryCount": 2
-            }
-        }))
-        .expect("exact Browser manifest fixture")
-    }
-
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let file = File::create(path).expect("create zip fixture");
         let mut writer = zip::ZipWriter::new(file);
@@ -1284,6 +1222,25 @@ mod tests {
             writer.write_all(contents).expect("write zip fixture entry");
         }
         writer.finish().expect("finish zip fixture");
+    }
+
+    fn write_zip_with_symlink(path: &Path, link_target: &str) {
+        let file = File::create(path).expect("create symlink zip fixture");
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file("chromium/chrome", SimpleFileOptions::default())
+            .expect("start executable fixture");
+        writer
+            .write_all(b"browser")
+            .expect("write executable fixture");
+        writer
+            .add_symlink(
+                "chromium/current",
+                link_target,
+                SimpleFileOptions::default(),
+            )
+            .expect("write symlink fixture");
+        writer.finish().expect("finish symlink fixture");
     }
 
     fn write_stored_zip_allowing_duplicates(path: &Path, entries: &[(&str, &[u8])]) {
@@ -1358,31 +1315,27 @@ mod tests {
         fs::write(path, bytes).expect("write duplicate zip fixture");
     }
 
-    fn archive_artifact(entries: &[(&str, &[u8])], allowlist: &[&str]) -> BrowserRuntimeArtifact {
-        BrowserRuntimeArtifact {
-            url: "https://download.myagents.io/runtimes/browser/artifact.zip".to_string(),
-            sha256: "a".repeat(64),
-            signature: "signed-artifact".to_string(),
-            signing: None,
-            executable_relative_path: "chromium/chrome".to_string(),
-            file_allowlist: allowlist.iter().map(|path| (*path).to_string()).collect(),
+    fn archive_artifact(entry_count: usize, unpacked_size_bytes: u64) -> OfficialBrowserArtifact {
+        OfficialBrowserArtifact {
+            source_url: "https://cdn.playwright.dev/builds/cft/146.0.7680.0/linux64/chrome-linux64.zip",
+            url: "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.0/linux64/chrome-linux64.zip",
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             archive_size_bytes: 1024,
-            unpacked_size_bytes: entries
-                .iter()
-                .map(|(_, contents)| contents.len() as u64)
-                .sum(),
-            entry_count: entries.len() as u64,
+            unpacked_size_bytes,
+            entry_count,
+            archive_root: "chromium",
+            executable_relative_path: "chromium/chrome",
         }
     }
 
     #[test]
-    fn rejects_archive_traversal_and_non_first_party_urls() {
+    fn rejects_archive_traversal_and_non_official_urls() {
+        let artifact = required_artifact().expect("official artifact for supported test platform");
         assert!(validate_relative_path("../escape").is_err());
         assert!(validate_relative_path("/absolute").is_err());
-        assert!(validate_download_url("https://example.com/runtimes/browser/file.zip").is_err());
-        assert!(
-            validate_download_url("https://download.myagents.io/runtimes/browser/file.zip").is_ok()
-        );
+        assert!(validate_download_url("https://example.com/browser.zip", &artifact).is_err());
+        assert!(validate_download_url(artifact.url, &artifact).is_ok());
+        assert!(validate_official_source_url(artifact.source_url).is_ok());
     }
 
     #[test]
@@ -1391,7 +1344,39 @@ mod tests {
         assert!(REQUIRED_CHROMIUM_REVISION
             .bytes()
             .all(|byte| byte.is_ascii_digit()));
-        assert_eq!(DOWNLOAD_REQUEST_TIMEOUT, Duration::from_secs(90));
+        assert!(!REQUIRED_PLAYWRIGHT_MCP_VERSION.is_empty());
+        assert!(!REQUIRED_PLAYWRIGHT_CORE_VERSION.is_empty());
+        assert!(required_artifact().is_some());
+        assert_eq!(DOWNLOAD_REQUEST_TIMEOUT, Duration::from_secs(10 * 60));
+        assert_eq!(DOWNLOAD_READ_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn install_authorization_accepts_legacy_signed_and_new_official_metadata() {
+        let platform = platform_key().expect("supported test platform");
+        let artifact = required_artifact().expect("official artifact for supported test platform");
+        let mut metadata = InstalledBrowserRuntime {
+            schema_version: 1,
+            runtime_set: REQUIRED_RUNTIME_SET.to_string(),
+            chromium_revision: REQUIRED_CHROMIUM_REVISION.to_string(),
+            platform: platform.to_string(),
+            executable_relative_path: artifact.executable_relative_path.to_string(),
+            sha256: artifact.sha256.to_string(),
+            source: None,
+            manifest_signature: Some("legacy-minisign".to_string()),
+            artifact_signature_verified: true,
+            installed_at: now_iso(),
+        };
+        assert!(has_install_authorization(&metadata, platform));
+
+        metadata.schema_version = 2;
+        metadata.source = Some(OFFICIAL_RUNTIME_SOURCE.to_string());
+        metadata.manifest_signature = None;
+        metadata.artifact_signature_verified = false;
+        assert!(has_install_authorization(&metadata, platform));
+
+        metadata.source = Some("untrusted".to_string());
+        assert!(!has_install_authorization(&metadata, platform));
     }
 
     #[test]
@@ -1399,8 +1384,14 @@ mod tests {
         assert!(should_retry_direct(
             "[browser-resource] Artifact stream failed: connection reset"
         ));
+        assert!(should_retry_direct(
+            "[browser-resource] Failed to build HTTP client: proxy unavailable"
+        ));
         assert!(!should_retry_direct(
             "[browser-resource] Artifact SHA-256 mismatch"
+        ));
+        assert!(!should_retry_direct(
+            "[browser-resource] Artifact download failed: HTTP 404 Not Found"
         ));
         assert_eq!(
             failure_projection("[browser-resource] Artifact Content-Length mismatch", false),
@@ -1421,6 +1412,35 @@ mod tests {
             failure_projection("any internal detail", true),
             ("BROWSER_RESOURCE_UPDATE_FAILED", true),
         );
+    }
+
+    #[test]
+    fn direct_fallback_keeps_download_progress_monotonic() {
+        assert_eq!(advanced_download_percent(50, 100, 0), Some(50));
+        assert_eq!(advanced_download_percent(1, 100, 50), None);
+        assert_eq!(advanced_download_percent(50, 100, 50), None);
+        assert_eq!(advanced_download_percent(51, 100, 50), Some(51));
+    }
+
+    #[test]
+    fn abandoned_operation_files_are_removed_before_the_next_space_check() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let download = temp.path().join(".download-dead.zip");
+        let staging = temp.path().join(".staging-dead");
+        let previous = temp.path().join(".old-preserved");
+        let installed = temp.path().join("installed.json");
+        fs::write(&download, b"partial archive").unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("partial"), b"partial extraction").unwrap();
+        fs::create_dir(&previous).unwrap();
+        fs::write(&installed, b"{}").unwrap();
+
+        cleanup_abandoned_operation_entries(temp.path()).expect("clean abandoned operation");
+
+        assert!(!download.exists());
+        assert!(!staging.exists());
+        assert!(previous.exists());
+        assert!(installed.exists());
     }
 
     #[test]
@@ -1467,35 +1487,26 @@ mod tests {
     }
 
     #[test]
-    fn manifest_must_match_every_locked_runtime_identity() {
-        let platform = platform_key().expect("supported test platform");
-        let manifest = exact_manifest(platform);
-        assert!(validate_manifest(&manifest, platform).is_ok());
+    fn official_artifact_must_match_the_app_signed_runtime_lock() {
+        let artifact = required_artifact().expect("official artifact for supported test platform");
+        assert!(validate_official_artifact(&artifact).is_ok());
 
-        let mut wrong_core = exact_manifest(platform);
-        wrong_core.playwright_core_version = "0.0.0".to_string();
-        assert!(validate_manifest(&wrong_core, platform).is_err());
+        let mut wrong_hash = artifact.clone();
+        wrong_hash.sha256 = "not-a-sha256";
+        assert!(validate_official_artifact(&wrong_hash).is_err());
 
-        let mut missing_license = exact_manifest(platform);
-        missing_license.artifact.file_allowlist.pop();
-        assert!(validate_manifest(&missing_license, platform).is_err());
-
-        let mut duplicate = exact_manifest(platform);
-        duplicate
-            .artifact
-            .file_allowlist
-            .push("chromium/chrome".to_string());
-        assert!(validate_manifest(&duplicate, platform).is_err());
+        let mut wrong_origin = artifact.clone();
+        wrong_origin.url = "https://example.com/browser.zip";
+        assert!(validate_official_artifact(&wrong_origin).is_err());
     }
 
     #[test]
-    fn archive_extraction_requires_the_exact_regular_file_allowlist() {
+    fn archive_extraction_requires_the_locked_root_and_executable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let entries = [("chromium/chrome", b"browser".as_slice())];
-        let allowlist = ["chromium/chrome"];
         let archive_path = temp.path().join("valid.zip");
         write_zip(&archive_path, &entries);
-        let artifact = archive_artifact(&entries, &allowlist);
+        let artifact = archive_artifact(1, 7);
         let staging = temp.path().join("valid");
         extract_archive(&archive_path, &staging, &artifact).expect("extract exact archive");
         assert_eq!(
@@ -1504,25 +1515,24 @@ mod tests {
         );
 
         let missing_path = temp.path().join("missing.zip");
-        write_zip(&missing_path, &entries[..0]);
-        let missing_artifact = archive_artifact(&entries[..0], &allowlist);
+        write_zip(&missing_path, &[("chromium/other", b"other".as_slice())]);
         assert!(extract_archive(
             &missing_path,
             &temp.path().join("missing"),
-            &missing_artifact,
+            &archive_artifact(1, 5),
         )
         .unwrap_err()
-        .contains("missing allowlisted files"));
+        .contains("Required Browser component is missing"));
     }
 
     #[test]
-    fn archive_extraction_rejects_traversal_duplicates_and_size_overflow() {
+    fn archive_extraction_rejects_traversal_duplicates_and_wrong_root() {
         let temp = tempfile::tempdir().expect("tempdir");
 
         let traversal_entries = [("../outside", b"escape".as_slice())];
         let traversal_path = temp.path().join("traversal.zip");
         write_zip(&traversal_path, &traversal_entries);
-        let traversal_artifact = archive_artifact(&traversal_entries, &["chromium/chrome"]);
+        let traversal_artifact = archive_artifact(1, 6);
         assert!(extract_archive(
             &traversal_path,
             &temp.path().join("traversal"),
@@ -1536,7 +1546,7 @@ mod tests {
         ];
         let duplicate_path = temp.path().join("duplicate.zip");
         write_stored_zip_allowing_duplicates(&duplicate_path, &duplicate_entries);
-        let duplicate_artifact = archive_artifact(&duplicate_entries, &["chromium/chrome"]);
+        let duplicate_artifact = archive_artifact(2, 11);
         let duplicate_error = extract_archive(
             &duplicate_path,
             &temp.path().join("duplicate"),
@@ -1548,17 +1558,68 @@ mod tests {
             "unexpected duplicate-entry error: {duplicate_error}"
         );
 
-        let overflow_entries = [("chromium/chrome", b"too-large".as_slice())];
-        let overflow_path = temp.path().join("overflow.zip");
-        write_zip(&overflow_path, &overflow_entries);
-        let mut overflow_artifact = archive_artifact(&overflow_entries, &["chromium/chrome"]);
-        overflow_artifact.unpacked_size_bytes = 1;
+        let outside_root_entries = [("other/chrome", b"browser".as_slice())];
+        let outside_root_path = temp.path().join("outside-root.zip");
+        write_zip(&outside_root_path, &outside_root_entries);
         assert!(extract_archive(
-            &overflow_path,
-            &temp.path().join("overflow"),
-            &overflow_artifact,
+            &outside_root_path,
+            &temp.path().join("outside-root"),
+            &archive_artifact(1, 7),
         )
         .unwrap_err()
-        .contains("exceeded unpacked size"));
+        .contains("outside its locked root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_extraction_allows_only_internal_relative_symlinks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let valid_path = temp.path().join("valid-symlink.zip");
+        write_zip_with_symlink(&valid_path, "chrome");
+        let valid_staging = temp.path().join("valid-symlink");
+        extract_archive(&valid_path, &valid_staging, &archive_artifact(2, 13))
+            .expect("extract internal symlink");
+        assert_eq!(
+            fs::canonicalize(valid_staging.join("chromium/current")).unwrap(),
+            fs::canonicalize(valid_staging.join("chromium/chrome")).unwrap()
+        );
+
+        let escaping_path = temp.path().join("escaping-symlink.zip");
+        write_zip_with_symlink(&escaping_path, "../../outside");
+        assert!(extract_archive(
+            &escaping_path,
+            &temp.path().join("escaping-symlink"),
+            &archive_artifact(2, 20),
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[ignore = "requires MYAGENTS_BROWSER_OFFICIAL_ARCHIVE pointing at the locked official ZIP"]
+    fn locked_official_archive_extracts_to_the_expected_executable() {
+        let archive_path = PathBuf::from(
+            std::env::var("MYAGENTS_BROWSER_OFFICIAL_ARCHIVE")
+                .expect("MYAGENTS_BROWSER_OFFICIAL_ARCHIVE"),
+        );
+        let artifact = required_artifact().expect("official artifact for supported test platform");
+        assert_eq!(
+            fs::metadata(&archive_path).unwrap().len(),
+            artifact.archive_size_bytes
+        );
+        assert!(sha256_file(&archive_path)
+            .unwrap()
+            .eq_ignore_ascii_case(artifact.sha256));
+        let temp = tempfile::tempdir().expect("tempdir");
+        extract_archive(&archive_path, temp.path(), &artifact).expect("extract official archive");
+        let executable = temp.path().join(artifact.executable_relative_path);
+        assert!(executable.is_file());
+        let version = std::process::Command::new(&executable)
+            .arg("--version")
+            .output()
+            .expect("launch locked Browser executable");
+        assert!(version.status.success());
+        assert!(
+            String::from_utf8_lossy(&version.stdout).contains(REQUIRED_CHROMIUM_BROWSER_VERSION)
+        );
     }
 }

@@ -129,7 +129,7 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 
 标准 `playwright` preset 继续走这条通用 stdio 路径：锁定 package spec，但保留上游 argv 与浏览器资源语义；仅在用户从未保存 args 时默认追加 `--isolated`。它与新增的 `myagents-browser` /「浏览器」不是同一个工具。
 
-「浏览器」使用 App 生产依赖中锁定的 `@playwright/mcp` 控制代码，并把保留 sentinel 投影为 Global Sidecar Browser Host 的认证 HTTP transport。它不调用 `npx`，也不从 bundled Node、系统 Chrome 或用户 Playwright cache 寻找浏览器。Rust resource owner 只在用户首次明确安装后，从一方 signed runtime set 解析精确 Chromium executable path；Chromium 资源不属于 bundled Node，也不进入 Tauri resources。
+「浏览器」使用 App 生产依赖中锁定的 `@playwright/mcp` 控制代码，并把保留 sentinel 投影为 Global Sidecar Browser Host 的认证 HTTP transport。它不调用 `npx`，也不从 bundled Node、系统 Chrome 或用户 Playwright cache 寻找浏览器。Rust resource owner 只在用户首次明确安装后，按 App 内锁定的官方 Playwright artifact URL、size 与 SHA-256 下载并解析精确 Chromium executable path；Chromium 资源不属于 bundled Node，也不进入 Tauri resources。
 
 ### 内置 in-process MCP（懒加载）
 
@@ -146,7 +146,7 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 5. **SDK native binary**：按 target triple 拷贝 + codesign
 6. **Tauri 构建**：`npm run tauri:build -- --target <triple>`；该命令不下载、不 staging 也不打包 Chromium/Headless Shell/FFmpeg
 
-「浏览器」资源发行是独立的 release-only 工作流：`npm run package:browser-runtime -- --platform <target>` 从锁定 Playwright dependency graph 生成 Chromium-only engine set（Chromium + Headless Shell + FFmpeg）、签名 manifest/artifact，并发布到 `runtimes/browser/sets/<runtime-set>/<platform>`。它既不是 `tauri:dev` / `tauri:build` 的前置步骤，也不写 `src-tauri/resources/`。
+「浏览器」不建立 MyAgents 自有的 Chromium 镜像或 runtime publisher。版本升级时，维护者显式核对锁定 `playwright-core` 的 Chromium descriptor，为五个平台更新 `managed-browser-runtime.json` 中的官方 source/final URL、size、SHA-256 与 executable layout；该核对不属于 `tauri:dev`、`tauri:build` 或桌面 release build，任何 App 构建入口都不下载浏览器。
 
 `src-tauri/resources/` 是当前构建的 staging，不是跨构建缓存。构建脚本必须在
 Tauri 读取前完整替换自己负责的目录：macOS release 在每个 target loop 内分别
