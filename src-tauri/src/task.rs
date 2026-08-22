@@ -783,7 +783,9 @@ fn next_task_comment_timestamp(comments: &[TaskComment]) -> i64 {
 
 fn task_comment_quote(body: &str) -> String {
     let mut points = body.trim().chars();
-    let quote: String = points.by_ref().take(30).collect();
+    // UI reply previews are deliberately more generous than the compact
+    // delivery reminder injected into a Session.
+    let quote: String = points.by_ref().take(60).collect();
     if points.next().is_some() {
         format!("{quote}…")
     } else {
@@ -7831,6 +7833,12 @@ mod tests {
         assert_eq!(latest.reply_parents.len(), 1);
         assert_eq!(latest.reply_parents[0].comment_id, parent.id);
         assert_eq!(latest.reply_parents[0].quote, "comment 0");
+    }
+
+    #[test]
+    fn task_comment_display_quote_keeps_sixty_code_points() {
+        let body = "字".repeat(61);
+        assert_eq!(task_comment_quote(&body), format!("{}…", "字".repeat(60)));
     }
 
     #[tokio::test]

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Task } from "@/../shared/types/task";
 import type { TaskComment } from "@/../shared/types/taskComment";
+import { taskCommentQuote } from "@/../shared/types/taskComment";
 import { CUSTOM_EVENTS } from "@/../shared/constants";
 import { TaskCommentTimeline } from "./TaskCommentTimeline";
 
@@ -153,6 +154,7 @@ describe("TaskCommentTimeline", () => {
     const identity = screen.getByRole("button", {
       name: /Agent\(mino\).*session-/,
     });
+    expect(screen.getByText("Agent(mino)")).toHaveClass("text-sm");
     fireEvent.click(identity);
 
     expect(onBeforeOpenSession).toHaveBeenCalledOnce();
@@ -245,15 +247,51 @@ describe("TaskCommentTimeline", () => {
     }
   });
 
-  it("explains that a direct comment without a Session stays pending", async () => {
+  it("keeps the composer concise without a routing explanation", async () => {
     render(<TaskCommentTimeline task={task({ sessionIds: [] })} />);
 
     expect(
       await screen.findByText("暂无评论。可以在这里补充信息或继续跟进任务。"),
     ).toBeInTheDocument();
+    expect(screen.queryByText("将发送到最近执行会话")).not.toBeInTheDocument();
     expect(
-      screen.getByText("将保存，并在任务下次产生执行会话后发送"),
-    ).toBeInTheDocument();
+      screen.queryByText("将保存，并在任务下次产生执行会话后发送"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows a longer reply preview with a square left edge and stronger fill", async () => {
+    const longBody = "这是用于验证回复引用展示长度的父评论内容，需要超过六十个字符，并继续补充足够多的文字来确认末尾会正确显示省略号而不是过早截断。";
+    const reply: TaskComment = {
+      ...agentComment,
+      id: "comment-reply-long",
+      body: "收到，继续处理。",
+      replyToCommentId: agentComment.id,
+    };
+    mocks.list.mockResolvedValueOnce({
+      items: [{ ...agentComment, body: longBody }, reply],
+      nextBefore: undefined,
+    });
+
+    render(<TaskCommentTimeline task={task()} />);
+
+    const quote = taskCommentQuote(longBody);
+    expect(Array.from(quote.slice(0, -1))).toHaveLength(60);
+    const quoteButton = await screen.findByRole("button", {
+      name: `回复 Agent：${quote}`,
+    });
+    expect(quoteButton).toHaveClass(
+      "rounded-r-md",
+      "bg-[var(--line-strong)]",
+    );
+    expect(quoteButton).not.toHaveClass("rounded-md");
+
+    fireEvent.click(screen.getAllByRole("button", { name: "回复" })[0]);
+    const composerQuote = screen.getAllByText(quote).at(-1)?.parentElement;
+    expect(composerQuote).toHaveClass(
+      "rounded-r-lg",
+      "bg-[var(--line-strong)]",
+    );
+    expect(composerQuote).not.toHaveClass("rounded-lg");
   });
 
   it("keeps an out-of-window reply parent as a short accessible quote", async () => {

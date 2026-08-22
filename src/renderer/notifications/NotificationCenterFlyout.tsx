@@ -202,7 +202,7 @@ export default function NotificationCenterFlyout({
                       </span>
                       {detail && (
                         <span
-                          className={`mt-0.5 line-clamp-3 block text-xs leading-[18px] ${item.isRead ? 'text-[var(--ink-muted)]/75' : 'text-[var(--ink-secondary)]'}`}
+                          className={`mt-0.5 line-clamp-3 text-xs leading-[18px] ${item.isRead ? 'text-[var(--ink-muted)]/75' : 'text-[var(--ink-secondary)]'}`}
                           data-notification-detail
                         >
                           {detail}

@@ -49,7 +49,8 @@ export interface TaskCommentContextPage extends TaskCommentPage {
 }
 
 export const TASK_COMMENT_BODY_MAX_BYTES = 64 * 1024;
-export const TASK_COMMENT_QUOTE_CODE_POINTS = 30;
+/** UI preview length; delivery reminders intentionally keep their own shorter quote. */
+export const TASK_COMMENT_QUOTE_CODE_POINTS = 60;
 
 export function taskCommentQuote(body: string): string {
   const points = Array.from(body.trim());

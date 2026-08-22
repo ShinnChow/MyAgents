@@ -1432,7 +1432,7 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 智能 Tab 只包含 Agent 工作区选择器与一个大目标输入框，底栏动作为“与 AI 讨论”；启动新 Chat 失败时保留原输入。手动 Tab 保留名称、任务需求、可选验收、工作区、执行/Session/Trigger/结束/通知和高级配置；验收正文只在提交时合并进 canonical `task.md`。面板不展示手工标签输入；空白新建提交空标签，从想法派发只在数据层继承 Thought provenance。
 
-创建后的详情不是同一表单 modal，而是从右侧进入的全高大 Drawer：宽窗主栏阅读完整 `task.md`，正文前只保留 home-relative（`~/.myagents/...`）文件路径，不重复显示“task.md · 执行 Prompt”标题；主栏所有 flex/Markdown/代码/表格层都必须收敛到可用栏宽，只有代码块和表格自身承担横向滚动。下方按时间正序显示线性评论，底部使用默认两行、最多约六行后内部滚动的紧凑吸底 composer；评论正文使用共享 compact Markdown 排版，只有 Agent 身份行具有 Session 导航 hover。约 360–400px 右栏展示真实状态、调度、工作区、运行配置、Session 与通知；摘要使用扁平信息组而非二次 Card，执行记录默认显示最近 5 条并以“展开更多”每次追加 5 条；空间不足时属性栏成为独立 sheet。完整 status history、`progress.md` 和独立 legacy `verify.md` 不在详情展示，底层审计与兼容文件仍保留。Header 为单行，只放状态、单行截断标题、一个生命周期主动作、更多菜单和关闭；Space Issue 等来源标识放在正文区而不挤占标题。编辑位于更多菜单并打开 Drawer 内第二层表单 sheet，dirty 关闭必须确认。Task list、Bell、OS toast 与 typed deep link 都复用该 Drawer，`task.comment` 导航要滚动、focus、高亮 exact Comment 并向读屏器播报。
+创建后的详情不是同一表单 modal，而是从右侧进入的全高大 Drawer：宽窗主栏阅读完整 `task.md`，正文前只保留 home-relative（`~/.myagents/...`）文件路径，不重复显示“task.md · 执行 Prompt”标题；主栏所有 flex/Markdown/代码/表格层都必须收敛到可用栏宽，只有代码块和表格自身承担横向滚动。下方按时间正序显示线性评论，底部使用默认两行、最多约六行后内部滚动的紧凑吸底 composer，composer 不重复解释 Session 路由；评论正文使用共享 compact Markdown 排版，主身份为 14px，时间与 Session ID 为 12px，只有 Agent 身份行具有 Session 导航 hover。回复引用使用左侧直角、右侧小圆角的较强底色，显示最多 60 个 code point。约 360–400px 右栏展示真实状态、调度、工作区、运行配置、Session 与通知；摘要使用扁平信息组而非二次 Card，执行记录默认显示最近 5 条并以“展开更多”每次追加 5 条；空间不足时属性栏成为独立 sheet。完整 status history、`progress.md` 和独立 legacy `verify.md` 不在详情展示，底层审计与兼容文件仍保留。Header 为单行，只放状态、单行截断标题、一个生命周期主动作、更多菜单和关闭；Space Issue 等来源标识放在正文区而不挤占标题。编辑位于更多菜单并打开 Drawer 内第二层表单 sheet，dirty 关闭必须确认。Task list、Bell、OS toast 与 typed deep link 都复用该 Drawer，`task.comment` 导航要滚动、focus、高亮 exact Comment 并向读屏器播报。
 
 ---
 
@@ -1440,6 +1440,7 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.59 | 2026-08-22 | **Task 评论层级微调**：主身份提升至 14px；回复引用改为左侧直角、强化底色并放宽到 60 code point；移除 composer 重复的 Session 路由说明 |
 | 2.8.58 | 2026-08-22 | **消息列表视觉减法**：通知项移除来源图标和列表内未读红点，以标题/正文深浅表达未读状态；正文统一最多三行省略 |
 | 2.8.57 | 2026-08-22 | **Task 详情密度与宽度收口**：移除正文冗余标题、文档路径折叠 home 为 `~`；补齐主栏到 Markdown/代码/表格的 `min-width: 0` 约束；右栏摘要去 Card 化，执行记录统一小字号并按每次 5 条渐进展开 |
 | 2.8.56 | 2026-08-21 | **Task 详情视觉收口**：Header 合并为状态/标题/主动作/更多/关闭单行；评论使用紧凑 Markdown，Agent 身份行直达所属 Session；composer 收敛为两行起步、有限增长的吸底输入；属性栏宽窗加宽、窄窗切 Sheet，并移除 status history、progress 与独立 verify 展示 |

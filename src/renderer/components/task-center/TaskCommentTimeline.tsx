@@ -292,14 +292,6 @@ export function TaskCommentTimeline({
     [task.id],
   );
 
-  const sendHint = replyTo
-    ? replyTo.conversationSessionId
-      ? t("comments.replySessionHint")
-      : t("comments.pendingHint")
-    : task.sessionIds.length > 0
-      ? t("comments.latestSessionHint")
-      : t("comments.pendingHint");
-
   const openCommentSession = useCallback(
     (sessionId: string) => {
       onBeforeOpenSession?.();
@@ -394,7 +386,7 @@ export function TaskCommentTimeline({
                     !!comment.conversationSessionId;
                   const commentIdentity = (
                     <>
-                      <span className="font-medium text-[var(--ink-secondary)]">
+                      <span className="text-sm font-medium text-[var(--ink-secondary)]">
                         {authorLabel}
                       </span>
                       <span>·</span>
@@ -461,7 +453,7 @@ export function TaskCommentTimeline({
                             author: parentAuthor,
                             quote: parentQuote,
                           })}
-                          className="mt-2 block max-w-full truncate rounded-md border-l-2 border-[var(--line-strong)] bg-[var(--paper-inset)] px-2 py-1 text-left text-xs text-[var(--ink-muted)] disabled:cursor-default"
+                          className="mt-2 block max-w-full truncate rounded-r-md border-l-2 border-[var(--line-strong)] bg-[var(--line-strong)] px-2 py-1 text-left text-xs text-[var(--ink-muted)] disabled:cursor-default"
                         >
                           {parentQuote}
                         </button>
@@ -527,7 +519,7 @@ export function TaskCommentTimeline({
       <div className="z-10 shrink-0 border-t border-[var(--line-subtle)] bg-[var(--paper-elevated)] px-8 py-2.5 max-sm:px-5">
         <div className="mx-auto max-w-[860px]">
           {replyTo && (
-            <div className="mb-1.5 flex items-center gap-2 rounded-lg bg-[var(--paper-inset)] px-2.5 py-1.5 text-xs text-[var(--ink-muted)]">
+            <div className="mb-1.5 flex items-center gap-2 rounded-r-lg bg-[var(--line-strong)] px-2.5 py-1.5 text-xs text-[var(--ink-muted)]">
               <CornerUpLeft className="h-3.5 w-3.5 shrink-0" />
               <span className="min-w-0 flex-1 truncate">
                 {taskCommentQuote(replyTo.body)}
@@ -566,10 +558,7 @@ export function TaskCommentTimeline({
               placeholder={t("comments.placeholder")}
               className="min-h-10 max-h-36 w-full resize-none overflow-y-hidden bg-transparent text-sm leading-5 text-[var(--ink)] outline-none placeholder:text-[var(--ink-muted)]/70"
             />
-            <div className="mt-1 flex items-center gap-3">
-              <span className="min-w-0 flex-1 text-xs text-[var(--ink-muted)]">
-                {sendHint}
-              </span>
+            <div className="mt-0.5 flex justify-end">
               <button
                 type="button"
                 onClick={() => void submit()}

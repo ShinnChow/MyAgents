@@ -178,14 +178,18 @@ describe('NotificationCenterFlyout', () => {
       'font-normal',
       'text-[var(--ink-muted)]',
     );
-    expect(unreadItem.querySelector('[data-notification-detail]')).toHaveClass(
+    const unreadDetail = unreadItem.querySelector('[data-notification-detail]');
+    const readDetail = readItem.querySelector('[data-notification-detail]');
+    expect(unreadDetail).toHaveClass(
       'line-clamp-3',
       'text-[var(--ink-secondary)]',
     );
-    expect(readItem.querySelector('[data-notification-detail]')).toHaveClass(
+    expect(unreadDetail).not.toHaveClass('block');
+    expect(readDetail).toHaveClass(
       'line-clamp-3',
       'text-[var(--ink-muted)]/75',
     );
+    expect(readDetail).not.toHaveClass('block');
     expect(unreadItem.querySelector('[aria-hidden="true"]')).not.toBeInTheDocument();
     expect(unreadItem.querySelector('svg')).not.toBeInTheDocument();
   });
