@@ -19,6 +19,7 @@ import type {
   RuntimeSource,
 } from '../../shared/types/runtime';
 import type { McpServerDefinition } from '../../shared/config-types';
+import { MANAGED_BROWSER_MCP_ID } from '../../shared/browserTools';
 import {
   acquireBrowserCapability,
   adoptBrowserProductSession,
@@ -3511,7 +3512,7 @@ export class CodexRuntime implements AgentRuntime {
     let runtimeMcpServers = extensionSnapshot?.mcpServers ?? options.mcpServers;
     const usesManagedBrowserHost = runtimeSource === 'managed-provider'
       && runtimeMcpServers?.some(
-        server => server.id === 'playwright' && server.isBuiltin === true,
+        server => server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__',
       ) === true;
     // One absolute dispatch budget starts when this Runtime generation accepts
     // its desired MCP set. Capability projection, admission queueing, process
@@ -3529,7 +3530,7 @@ export class CodexRuntime implements AgentRuntime {
         browserHostGeneration = capability.hostGeneration;
         browserCapabilityToken = capability.token;
         runtimeMcpServers = (runtimeMcpServers ?? []).map(server => (
-          server.id === 'playwright' && server.isBuiltin === true
+          server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__'
             ? {
                 ...server,
                 type: 'http' as const,
@@ -3541,12 +3542,12 @@ export class CodexRuntime implements AgentRuntime {
             : server
         ));
         console.log(
-          `[codex] MCP playwright: application Browser Host generation=${capability.hostGeneration}`,
+          `[codex] MCP ${MANAGED_BROWSER_MCP_ID}: application Browser Host generation=${capability.hostGeneration}`,
         );
       } catch (error) {
         browserCapabilityInitiallyUnavailable = true;
         runtimeMcpServers = (runtimeMcpServers ?? []).filter(
-          server => !(server.id === 'playwright' && server.isBuiltin === true),
+          server => !(server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__'),
         );
         console.warn(
           '[codex] Browser Host is temporarily unavailable; starting the base Runtime:',
@@ -3669,7 +3670,7 @@ export class CodexRuntime implements AgentRuntime {
     const effectiveMcpServerNames = [...new Set([
       ...launchConfig.mcpServerNames,
       ...admissionQueuedServerNames,
-      ...(usesManagedBrowserHost ? ['playwright'] : []),
+      ...(usesManagedBrowserHost ? [MANAGED_BROWSER_MCP_ID] : []),
     ])].sort();
     const readyMcpServerNames = new Set<string>();
     const liveMcpStates = new Map<string, CodexMcpStartupState>(
@@ -3715,7 +3716,7 @@ export class CodexRuntime implements AgentRuntime {
             browserCapabilityInitiallyUnavailable = false;
             wrappedOnEvent({
               kind: 'mcp_runtime_replacement_required',
-              serverId: 'playwright',
+              serverId: MANAGED_BROWSER_MCP_ID,
             });
           })
           .catch(() => scheduleInitialBrowserHostRecovery());
@@ -3837,7 +3838,7 @@ export class CodexRuntime implements AgentRuntime {
           }
           if (
             usesManagedBrowserHost
-            && status.name === 'playwright'
+            && status.name === MANAGED_BROWSER_MCP_ID
             && status.status === 'failed'
             && !browserHostRecovery
           ) {
@@ -3853,7 +3854,7 @@ export class CodexRuntime implements AgentRuntime {
                 );
                 wrappedOnEvent({
                   kind: 'mcp_runtime_replacement_required',
-                  serverId: 'playwright',
+                  serverId: MANAGED_BROWSER_MCP_ID,
                 });
               })
               .catch(error => {

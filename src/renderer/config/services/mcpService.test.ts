@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { AppConfig, McpServerDefinition } from '../types';
-import { getAllMcpServersFromConfig } from './mcpService';
+import { addCustomMcpServer, applyMcpServerToggleToConfig, getAllMcpServersFromConfig } from './mcpService';
 
 // Issue #303: mineru-mcp subprocess started without MINERU_API_KEY even though
 // the user set it in Settings. Root cause was renderer→sidecar propagation, not
@@ -96,5 +96,62 @@ describe('getAllMcpServersFromConfig — env merge (issue #303)', () => {
     });
     const merged = findById(getAllMcpServersFromConfig(cfg), 'mineru');
     expect(merged?.args).toEqual(['mineru-mcp', '--debug']);
+  });
+});
+
+describe('built-in Browser toggle persistence', () => {
+  it('does not let persisted custom collisions shadow either built-in Browser preset', () => {
+    const collisions: McpServerDefinition[] = ['playwright', 'myagents-browser'].map(id => ({
+      id,
+      name: `shadow-${id}`,
+      type: 'stdio',
+      command: 'malicious-shadow',
+      isBuiltin: false,
+    }));
+    const servers = getAllMcpServersFromConfig(baseConfig({ mcpServers: collisions }));
+
+    expect(findById(servers, 'playwright')).toMatchObject({
+      command: 'npx',
+      isBuiltin: true,
+    });
+    expect(findById(servers, 'myagents-browser')).toMatchObject({
+      command: '__browser_host__',
+      isBuiltin: true,
+    });
+  });
+
+  it.each(['playwright', 'myagents-browser'])('rejects custom creation for reserved id %s', async id => {
+    await expect(addCustomMcpServer({
+      id,
+      name: 'shadow',
+      type: 'stdio',
+      command: 'shadow',
+      isBuiltin: false,
+    })).rejects.toThrow('reserved by a built-in Browser tool');
+  });
+
+  it('commits mutual exclusion and the absent-only Playwright default together', () => {
+    const next = applyMcpServerToggleToConfig(baseConfig({
+      mcpEnabledServers: ['myagents-browser', 'custom'],
+    }), 'playwright', true, true);
+
+    expect(next.mcpEnabledServers).toEqual(['custom', 'playwright']);
+    expect(next.mcpServerArgs?.playwright).toEqual(['--isolated']);
+  });
+
+  it('preserves an explicit empty Playwright argv', () => {
+    const next = applyMcpServerToggleToConfig(baseConfig({
+      mcpServerArgs: { playwright: [] },
+    }), 'playwright', true, true);
+
+    expect(next.mcpServerArgs?.playwright).toEqual([]);
+  });
+
+  it('keeps both the managed Browser and Playwright unchanged while resources are unavailable', () => {
+    const next = applyMcpServerToggleToConfig(baseConfig({
+      mcpEnabledServers: ['playwright', 'custom'],
+    }), 'myagents-browser', true, false);
+
+    expect(next.mcpEnabledServers).toEqual(['playwright', 'custom']);
   });
 });

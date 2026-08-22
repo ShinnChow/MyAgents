@@ -206,6 +206,41 @@ Runtime set 是按平台分片补发的：macOS 主机默认发布 `darwin-arm64
 .\publish_managed_codex_runtime.ps1 -Yes
 ```
 
+### 可选「浏览器」Runtime 资源
+
+`myagents-browser` /「浏览器」使用单独下载的 signed Chromium runtime set。桌面 App 只包含 `@playwright/mcp` / Playwright 控制代码；`tauri:dev`、`tauri:build`、`build_macos.sh`、`build_windows.ps1` 和桌面发布脚本都不得下载、staging 或上传 Chromium。
+
+唯一版本锁是 `src/shared/managed-browser-runtime.json`。它必须与当前安装的 `@playwright/mcp`、`playwright-core/browsers.json` 完全一致。资源发布者在匹配 OS family 的可信构建机上显式执行：
+
+```bash
+# macOS 示例；Intel 资源同理传 darwin-x64
+npm run package:browser-runtime -- --platform darwin-arm64
+
+# Linux 示例
+npm run package:browser-runtime -- --platform linux-x64
+```
+
+```powershell
+# Windows x64
+npm run package:browser-runtime -- --platform win32-x64
+```
+
+正式打包需要 `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。macOS packager 同时验证 Chrome codesign Team/identity，Windows packager 验证 Authenticode；产物只允许 Chromium、Chromium Headless Shell、FFmpeg 和随附许可证，不得出现 Firefox/WebKit、symlink 或 special file。输出位于：
+
+```text
+dist/browser-runtime/sets/<runtime-set>/<platform>/
+├── manifest-v1.json
+├── manifest-v1.json.sig
+├── release-audit-v1.json
+└── artifacts/
+    ├── myagents-browser-<runtime-set>-<platform>.zip
+    └── myagents-browser-<runtime-set>-<platform>.zip.sig
+```
+
+将该目录按原层级上传到不可变的一方前缀 `runtimes/browser/sets/<runtime-set>/<platform>/`，不得覆盖已发布的同平台 set。发布 App 前必须从 `https://download.myagents.io/runtimes/browser/sets/<runtime-set>/<platform>/manifest-v1.json` 验证 exact set 可读，并用 release-like App 完成首次显式安装与 headed Chromium smoke。`--allow-unsigned` 只用于本地检查归档布局，生成物不能被生产客户端接受或上传。
+
+首次安装由用户在工具卡点击“安装资源”触发；只有首次完整成功后，Rust owner 才在后续 App 版本需要新 set 时自动维护。App/installer/updater artifact scan 必须确认不存在 `playwright-browsers`、Chromium、Headless Shell 或 FFmpeg 可执行资源。
+
 ---
 
 ## 清单文件格式
@@ -316,7 +351,7 @@ cargo metadata --manifest-path src-tauri/Cargo.toml --locked --no-deps --format-
 
 ### 4. 发布到 R2
 
-发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime。若本客户端版本锁定了新的 Codex runtime set，必须在发布 App 前通过 `publish_managed_codex_runtime.sh` / `publish_managed_codex_runtime.ps1` 确认对应平台资源已经上传。
+发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime，也不会处理「浏览器」Runtime。若本客户端版本锁定了新的 Codex 或 Browser runtime set，必须在发布 App 前分别确认对应平台资源已经上传且 exact manifest 可读。
 
 ```bash
 ./publish_release.sh

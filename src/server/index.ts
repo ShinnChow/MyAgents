@@ -251,6 +251,7 @@ async function schedulePluginRestartLazy(): Promise<void> {
 }
 import type { SessionSource, TurnAnalyticsSource } from './types/session';
 import { isPendingSessionId } from '../shared/constants';
+import { MANAGED_BROWSER_MCP_ID } from '../shared/browserTools';
 import { parseAgentFrontmatter, parseFullAgentContent, serializeAgentContent } from '../shared/agentCommands';
 import { scanAgents, readWorkspaceConfig, writeWorkspaceConfig, loadEnabledAgents, readAgentMeta, writeAgentMeta, findAgent } from './agents/agent-loader';
 import type { AgentFrontmatter, AgentMeta, AgentWorkspaceConfig } from '../shared/agentTypes';
@@ -485,7 +486,7 @@ import {
 } from './agent-session';
 import type { ProviderEnv } from './provider-types';
 import { getHomeDirOrNull } from './utils/platform';
-import { getBundledPlaywrightBrowsersDir, getScriptDir } from './utils/runtime';
+import { getScriptDir } from './utils/runtime';
 import {
   createSession,
   deleteSession,
@@ -1792,15 +1793,6 @@ async function main() {
   let browserHostPromise: Promise<import('./browser-host').PlaywrightBrowserHost> | null = null;
   const ensureBrowserHost = async (): Promise<import('./browser-host').PlaywrightBrowserHost> => {
     if (!browserHostPromise) {
-      const bundledBrowsers = getBundledPlaywrightBrowsersDir();
-      if (!bundledBrowsers) {
-        if (existsSync(resolve(getScriptDir(), 'server-dist.js'))) {
-          throw new Error('BROWSER_RUNTIME_MISSING: bundled Playwright browsers are unavailable');
-        }
-        console.warn('[browser-host] development runtime is using Playwright\'s local browser cache');
-      } else {
-        process.env.PLAYWRIGHT_BROWSERS_PATH = bundledBrowsers;
-      }
       browserHostPromise = import('./browser-host').then(({ PlaywrightBrowserHost }) => (
         new PlaywrightBrowserHost()
       ));
@@ -2040,14 +2032,6 @@ async function main() {
         const browserHost = await ensureBrowserHost();
         return browserHost.handleRequest(request);
       }
-      if (pathname === '/api/browser/identity') {
-        if (sidecarComposition.mode !== 'development-union') {
-          return jsonResponse({ success: false, error: 'Not found' }, 404);
-        }
-        const { handleBrowserIdentitySettingsRequest } = await import('./browser-host/settings-api');
-        return handleBrowserIdentitySettingsRequest(request);
-      }
-
       // ── Deferred init gate ────────────────────────────────────────────────
       // All other routes depend on agent state (currentAgentDir, MCP servers,
       // session metadata, bridge handler). Pattern 4: instead of awaiting
@@ -3787,8 +3771,8 @@ async function main() {
             return jsonResponse({ success: true });
           }
 
-          if (server.id === 'playwright' && server.command === '__browser_host__') {
-            console.log('[api/mcp/enable] Playwright uses the application Browser Host');
+          if (server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__') {
+            console.log('[api/mcp/enable] Browser uses the application Browser Host');
             return jsonResponse({ success: true });
           }
 

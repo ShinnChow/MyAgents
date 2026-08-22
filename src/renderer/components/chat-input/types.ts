@@ -83,8 +83,6 @@ export interface SimpleChatInputProps {
   runtimeMcpTools?: string[];
   /** Runtime-owned MCP readiness; desired selection remains controlled separately. */
   mcpEffectiveSnapshot?: McpEffectiveSnapshot | null;
-  /** Persistent Browser Profile wait owned by this Product Session. */
-  browserProfileWait?: { requestId: string; queuePosition: number | null } | null;
   onWorkspaceMcpToggle?: (serverId: string, enabled: boolean) => void;
   officialTools?: readonly OfficialToolDefinition[];
   workspaceOfficialToolEnabled?: OfficialToolId[];

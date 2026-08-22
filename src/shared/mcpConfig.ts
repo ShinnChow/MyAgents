@@ -1,5 +1,5 @@
 import type { McpServerDefinition } from './config-types';
-import { playwrightBrowserSettingsRevision } from './playwrightBrowser';
+import { DEFAULT_STANDARD_PLAYWRIGHT_ARGS, STANDARD_PLAYWRIGHT_MCP_ID } from './browserTools';
 
 type AgentMcpConfig = {
   mcpEnabledServers?: unknown;
@@ -11,7 +11,6 @@ export type McpConfigContainer = {
   mcpEnabledServers?: string[];
   mcpServerEnv?: Record<string, Record<string, string>>;
   mcpServerArgs?: Record<string, string[]>;
-  playwrightBrowser?: unknown;
   agents?: unknown[];
   imBotConfig?: unknown;
   imBotConfigs?: unknown[];
@@ -32,24 +31,23 @@ function asRecord(value: unknown): Record<string, unknown> {
  */
 export function applyMcpServerConfigAdditions(
   servers: readonly McpServerDefinition[],
-  config: Pick<McpConfigContainer, 'mcpServerArgs' | 'mcpServerEnv' | 'playwrightBrowser'>,
+  config: Pick<McpConfigContainer, 'mcpServerArgs' | 'mcpServerEnv'>,
 ): McpServerDefinition[] {
   const argsByServer = asRecord(config.mcpServerArgs);
   const envByServer = asRecord(config.mcpServerEnv);
 
   return servers.map((server) => {
-    const extraArgs = argsByServer[server.id];
+    const configuredArgs = argsByServer[server.id];
+    const extraArgs = configuredArgs === undefined && server.id === STANDARD_PLAYWRIGHT_MCP_ID
+      ? [...DEFAULT_STANDARD_PLAYWRIGHT_ARGS]
+      : configuredArgs;
     const extraEnv = envByServer[server.id];
     const hasArgs = Array.isArray(extraArgs);
     const hasEnv = !!extraEnv && typeof extraEnv === 'object' && !Array.isArray(extraEnv);
-    const runtimeConfigRevision = server.id === 'playwright' && server.command === '__browser_host__'
-      ? playwrightBrowserSettingsRevision(config)
-      : undefined;
-    if (!hasArgs && !hasEnv && runtimeConfigRevision === undefined) return server;
+    if (!hasArgs && !hasEnv) return server;
 
     return {
       ...server,
-      ...(runtimeConfigRevision ? { runtimeConfigRevision } : {}),
       ...(hasArgs ? {
         args: [
           ...(Array.isArray(server.args) ? server.args : []),

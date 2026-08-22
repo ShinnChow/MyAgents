@@ -699,9 +699,6 @@ impl SidecarManager {
             .instances
             .insert(tab_id.to_string(), candidate)
             .expect("replacement target remains present while manager is locked");
-        if tab_id == GLOBAL_SIDECAR_ID {
-            crate::browser_profile_lease::retire_profile_host_generation(retired.generation);
-        }
         Ok(retired)
     }
 
@@ -741,9 +738,6 @@ impl SidecarManager {
         if let Some(instance) = &removed {
             DispatchGate::close(&instance.dispatch_gate);
             self.sidecar_generations.remove(tab_id);
-            if tab_id == GLOBAL_SIDECAR_ID {
-                crate::browser_profile_lease::retire_profile_host_generation(instance.generation);
-            }
         }
         removed
     }
@@ -849,28 +843,6 @@ impl SidecarManager {
             // renderer's listener teardown to nothing, but `cmd_stop_all`
             // mid-session is a real path and the listener is alive there.)
             let _ = self.terminal_events.send(ev.clone());
-        }
-        for (session_id, sidecar) in &self.sidecars {
-            crate::browser_profile_lease::retire_profile_source(
-                &sidecar.management_id,
-                self.sidecar_generations
-                    .get(session_id)
-                    .copied()
-                    .unwrap_or(0),
-                false,
-            );
-        }
-        for recovery in self.recovering_sidecars.values() {
-            crate::browser_profile_lease::retire_profile_source(
-                &recovery.management_id,
-                recovery.dead_generation,
-                false,
-            );
-        }
-        for instance in self.instances.values() {
-            if instance.is_global {
-                crate::browser_profile_lease::retire_profile_host_generation(instance.generation);
-            }
         }
         self.request_global_sidecar_stopped("stop-all");
         for sidecar in self.sidecars.values() {
@@ -1249,11 +1221,6 @@ impl SidecarManager {
                 .recovering_sidecars
                 .get(session_id)
                 .is_some_and(|recovery| !recovery.owners.is_empty());
-            crate::browser_profile_lease::retire_profile_source(
-                &sidecar.management_id,
-                gen,
-                !event_policy.emit_terminal || retained_recovery_has_owners,
-            );
             // send() returns Err only when there are no subscribers — fine, we
             // don't require anyone listening for sidecar removal to be valid.
             if event_policy.emit_stop {

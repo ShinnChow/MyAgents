@@ -2679,6 +2679,21 @@ describe('admin-api config dry-run contract', () => {
 });
 
 describe('admin-api MCP add contract', () => {
+  it.each(['playwright', 'myagents-browser'])('rejects the reserved built-in Browser id %s', async id => {
+    const { handleMcpAdd } = await import('./admin-api');
+
+    const result = await handleMcpAdd({
+      server: { id, type: 'stdio', command: 'shadow' },
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining('reserved by a built-in Browser tool'),
+    });
+    expect(existsSync(join(scratch, '.myagents', 'config.json'))).toBe(false);
+    expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+  });
+
   it('creates a new server and fans out app-wide config invalidation', async () => {
     const { handleMcpAdd } = await import('./admin-api');
 

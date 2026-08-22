@@ -72,7 +72,7 @@ assembler。调用方传入：
 模板直接内联在 TypeScript 中，不从运行时文件系统加载。原因是打包后的 Bun
 `__dirname` 不能稳定定位模板资源；内联内容同时让生产包与源码使用同一个事实来源。
 
-Playwright 登录态保存不属于 Prompt 契约。0.4.10 起由应用级 Browser Host 在成功工具调用和 Context teardown 边界自动 checkpoint Cookie、localStorage 与 IndexedDB；模型无需、也不应被提示主动调用存储工具来维持产品正确性。
+受管「浏览器」的登录态保存不属于 Prompt 契约。应用级 Browser Host 会在成功工具调用和 Context teardown 边界自动 checkpoint Cookie、localStorage 与 IndexedDB；模型无需、也不应被提示主动调用存储工具来维持产品正确性。标准 `playwright` 仍遵循上游 MCP 的 argv/storage-state 语义，MyAgents 不用隐藏 Prompt 改写它。
 
 ### 场景模型
 
@@ -98,7 +98,7 @@ Playwright 登录态保存不属于 Prompt 契约。0.4.10 起由应用级 Brows
 | ----------------- | ------------------------------------------------------------------------------ | -------------------- |
 | L1 基础身份       | MyAgents 身份、当前 Runtime、全局目录、时间判断约束                            | 始终包含             |
 | L2 交互渠道       | 桌面，或具体 IM/Agent Channel 与私聊/群聊信息                                  | 互斥选一             |
-| L3 场景与产品交互 | Task、Heartbeat、Registered Agent、浮球、Widget、Session 协作、Browser Storage | 按条件叠加           |
+| L3 场景与产品交互 | Task、Heartbeat、Registered Agent、浮球、Widget、Session 协作                  | 按条件叠加           |
 | L4 CLI 能力发现   | Task、Goal、Thought、IM 媒体、Vision、用户注册工具                             | 按场景与能力开关叠加 |
 
 ### 当前预设片段矩阵
@@ -115,7 +115,6 @@ Playwright 登录态保存不属于 Prompt 契约。0.4.10 起由应用级 Brows
 | `myagents-floating-ball-instructions`    | 小窗回复应简短、桌面相邻上下文                          | `desktop.surface === floating-ball`                |
 | `myagents-generative-ui`                 | Widget 触发规则及按需读取设计契约                       | 全部 `desktop`，包括浮球                           |
 | `myagents-session-events`                | Agent/Session identity、start/send/watch 协作方式       | 全部场景                                           |
-| `myagents-browser-storage-instructions`  | 登录成功后保存 Playwright storage state                 | 当前仅 Builtin 且 Playwright 含 storage capability |
 | `myagents-cli-task-automation`           | “以后再做”统一使用 Task Skill/CLI，不用 OS cron         | 全部场景                                           |
 | `myagents-cli-goal`                      | Goal Mode 只在用户明确要求时创建                        | `desktop`，以及私聊 `im` / `agent-channel`         |
 | `myagents-cli-task-exit`                 | 目标完成时用 CLI 提前结束 Task                          | `cron && aiCanExit`                                |

@@ -1,18 +1,11 @@
-import { homedir } from 'os';
-import { join } from 'path';
-
 import {
   chromium,
-  devices,
-  firefox,
-  webkit,
   type Browser,
   type BrowserContext,
   type BrowserType,
   type Page,
 } from 'playwright';
 
-import type { PlaywrightBrowserSettings } from '../../shared/config-types';
 import type { VerifiedBrowserCapability } from './capability-client';
 import {
   checkpointBrowserIdentity,
@@ -21,11 +14,7 @@ import {
   type BrowserIdentityState,
 } from './identity-client';
 import { compileBrowserRuntimeSettings } from './runtime-settings';
-import {
-  acquireBrowserProfileLease,
-  releaseBrowserProfileLease,
-  type BrowserProfileLease,
-} from './profile-lease-client';
+import { waitForBrowserResource, type BrowserResourceResolution } from './resource-client';
 
 const CHECKPOINT_DEBOUNCE_MS = 750;
 const CONTEXT_REATTACH_GRACE_MS = 15_000;
@@ -33,7 +22,6 @@ const CONTEXT_CLOSE_TIMEOUT_MS = 4_000;
 
 interface ContextEntry {
   context: BrowserContext;
-  mode: PlaywrightBrowserSettings['mode'];
   identity: BrowserIdentitySnapshot;
   observedIdentityState: BrowserIdentityState;
   selection: { page: Page | null };
@@ -42,7 +30,6 @@ interface ContextEntry {
   checkpointTimer: ReturnType<typeof setTimeout> | null;
   closePromise: Promise<void> | null;
   finalizePromise: Promise<void> | null;
-  profileLease?: BrowserProfileLease;
 }
 
 /**
@@ -192,7 +179,6 @@ interface ConnectionOwner {
 }
 
 export interface BrowserContextRegistryDependencies {
-  loadSettings(): PlaywrightBrowserSettings;
   readIdentity(signal?: AbortSignal): Promise<BrowserIdentitySnapshot>;
   checkpointIdentity(
     productSessionId: string,
@@ -201,21 +187,16 @@ export interface BrowserContextRegistryDependencies {
     state: BrowserIdentityState,
     signal?: AbortSignal,
   ): Promise<BrowserIdentitySnapshot & { conflictCount: number }>;
-  browserTypes: Record<'chromium' | 'firefox' | 'webkit', BrowserType>;
-  acquireProfileLease(token: string, signal?: AbortSignal): Promise<BrowserProfileLease>;
-  releaseProfileLease(lease: BrowserProfileLease): Promise<boolean>;
+  browserType: BrowserType;
+  resolveResource(signal?: AbortSignal): Promise<BrowserResourceResolution>;
   onContextClosed(productSessionId: string): void;
 }
 
 const DEFAULT_DEPENDENCIES: BrowserContextRegistryDependencies = {
-  loadSettings: () => {
-    throw new Error('Browser Host settings loader is not installed');
-  },
   readIdentity: readBrowserIdentity,
   checkpointIdentity: checkpointBrowserIdentity,
-  browserTypes: { chromium, firefox, webkit },
-  acquireProfileLease: acquireBrowserProfileLease,
-  releaseProfileLease: releaseBrowserProfileLease,
+  browserType: chromium,
+  resolveResource: waitForBrowserResource,
   onContextClosed: () => {},
 };
 
@@ -227,9 +208,6 @@ export class BrowserContextRegistry {
   private readonly connectionOwners = new Map<string, ConnectionOwner>();
   private browser: Browser | null = null;
   private browserPromise: Promise<Browser> | null = null;
-  private settingsFingerprint: string | null = null;
-  private settingsGeneration = 0;
-  private settingsTransitionPromise: Promise<void> | null = null;
   private shutdownPromise: Promise<void> | null = null;
 
   constructor(dependencies: Partial<BrowserContextRegistryDependencies> = {}) {
@@ -314,11 +292,6 @@ export class BrowserContextRegistry {
     return true;
   }
 
-  /** Apply a desired-config boundary before publishing a new MCP backend. */
-  async prepareConnection(settings: PlaywrightBrowserSettings): Promise<void> {
-    await this.alignSettingsGeneration(settings);
-  }
-
   reconcileTabAction(
     productSessionId: string,
     action: unknown,
@@ -350,13 +323,9 @@ export class BrowserContextRegistry {
 
   async getContext(
     binding: VerifiedBrowserCapability,
-    token: string,
     signal?: AbortSignal,
-    settingsOverride?: PlaywrightBrowserSettings,
   ): Promise<BrowserContext> {
     if (signal?.aborted) throw new Error('BROWSER_CONTEXT_CANCELLED');
-    const settings = settingsOverride ?? this.dependencies.loadSettings();
-    const settingsGeneration = await this.alignSettingsGeneration(settings);
     const existing = this.entries.get(binding.productSessionId);
     if (existing) {
       return borrowBrowserContext(
@@ -385,9 +354,6 @@ export class BrowserContextRegistry {
     this.contextAbortControllers.set(binding.productSessionId, abortController);
     const promise = this.createContext(
       binding,
-      token,
-      settings,
-      settingsGeneration,
       combinedSignal,
     );
     this.contextPromises.set(binding.productSessionId, promise);
@@ -414,114 +380,37 @@ export class BrowserContextRegistry {
     }
   }
 
-  private async alignSettingsGeneration(settings: PlaywrightBrowserSettings): Promise<number> {
-    const fingerprint = JSON.stringify(settings);
-    if (this.settingsFingerprint === null) {
-      this.settingsFingerprint = fingerprint;
-      this.settingsGeneration += 1;
-      return this.settingsGeneration;
-    }
-    if (this.settingsFingerprint === fingerprint) {
-      if (this.settingsTransitionPromise) await this.settingsTransitionPromise;
-      return this.settingsGeneration;
-    }
-
-    if (this.settingsTransitionPromise) {
-      await this.settingsTransitionPromise;
-      return this.alignSettingsGeneration(settings);
-    }
-    const nextGeneration = this.settingsGeneration + 1;
-    this.settingsTransitionPromise = this.resetRuntime({
-        preserveConnectionOwners: true,
-        preserveSettingsGeneration: true,
-      }).then(() => {
-        this.settingsFingerprint = fingerprint;
-        this.settingsGeneration = nextGeneration;
-      }).finally(() => {
-        this.settingsTransitionPromise = null;
-      });
-    await this.settingsTransitionPromise;
-    return this.settingsGeneration;
-  }
-
   private async createContext(
     binding: VerifiedBrowserCapability,
-    token: string,
-    settings: PlaywrightBrowserSettings,
-    settingsGeneration: number,
     signal?: AbortSignal,
   ): Promise<BrowserContext> {
     if (signal?.aborted) throw new Error('BROWSER_CONTEXT_CANCELLED');
     const compiled = compileBrowserRuntimeSettings(
-      settings,
       binding.productSessionId,
       binding.workspacePath,
     );
 
-    let context: BrowserContext;
-    let profileLease: BrowserProfileLease | undefined;
-    let identity: BrowserIdentitySnapshot = { revision: 0, state: { cookies: [], origins: [] } };
-    if (settings.mode === 'isolated') {
-      identity = await this.dependencies.readIdentity(signal);
-      const browser = await this.getBrowser(compiled.browserName, compiled.launchOptions);
-      const device = settings.device ? devices[settings.device] : undefined;
-      if (settings.device && !device) {
-        throw new Error(`BROWSER_CONFIG_UNSUPPORTED: unknown device ${settings.device}`);
-      }
-      context = await browser.newContext({
-        ...(device ?? {}),
-        ...compiled.contextOptions,
-        storageState: identity.state as never,
-      });
-    } else {
-      profileLease = await this.dependencies.acquireProfileLease(token, signal);
-      try {
-        const browserType = this.dependencies.browserTypes[compiled.browserName];
-        const profilePath = settings.userDataDir?.trim() || join(homedir(), '.playwright-mcp-profile');
-        const device = settings.device ? devices[settings.device] : undefined;
-        if (settings.device && !device) {
-          throw new Error(`BROWSER_CONFIG_UNSUPPORTED: unknown device ${settings.device}`);
-        }
-        context = await browserType.launchPersistentContext(profilePath, {
-          ...(device ?? {}),
-          ...compiled.contextOptions,
-          ...compiled.launchOptions,
-        });
-      } catch (error) {
-        await this.dependencies.releaseProfileLease(profileLease).catch(() => false);
-        const message = error instanceof Error ? error.message : String(error);
-        if (/SingletonLock|user data directory is already in use|profile.*in use/i.test(message)) {
-          const profileError = new Error('The persistent browser profile is already in use');
-          profileError.name = 'PROFILE_IN_USE';
-          throw profileError;
-        }
-        throw error;
-      }
-    }
+    const identity = await this.dependencies.readIdentity(signal);
+    const resource = await this.dependencies.resolveResource(signal);
+    const browser = await this.getBrowser({
+      ...compiled.launchOptions,
+      executablePath: resource.executablePath,
+    });
+    const context = await browser.newContext({
+      ...compiled.contextOptions,
+      storageState: identity.state as never,
+    });
 
-    if (signal?.aborted || settingsGeneration !== this.settingsGeneration) {
-      try {
-        await context.close();
-      } catch (error) {
-        if (profileLease) {
-          const closeError = new Error('The persistent browser profile could not be closed');
-          closeError.name = 'PROFILE_CLOSE_FAILED';
-          throw closeError;
-        }
-        throw error;
-      }
-      if (profileLease) {
-        await this.dependencies.releaseProfileLease(profileLease);
-      }
-      const replaced = new Error('Browser settings changed while the Context was starting');
-      replaced.name = 'BROWSER_CONFIG_REPLACED';
-      throw replaced;
+    if (signal?.aborted) {
+      await context.close();
+      const cancelled = new Error('Browser Context creation was cancelled');
+      cancelled.name = 'BROWSER_CONTEXT_CANCELLED';
+      throw cancelled;
     }
 
     const selection = { page: null as Page | null };
     const entry: ContextEntry = {
       context,
-      mode: settings.mode,
       identity,
       observedIdentityState: identity.state,
       selection,
@@ -530,7 +419,6 @@ export class BrowserContextRegistry {
       checkpointTimer: null,
       closePromise: null,
       finalizePromise: null,
-      ...(profileLease ? { profileLease } : {}),
     };
     this.entries.set(binding.productSessionId, entry);
     context.once('close', () => {
@@ -543,18 +431,17 @@ export class BrowserContextRegistry {
       });
     });
     console.info(
-      `[browser-host] context=ready mode=${settings.mode} hostGeneration=${binding.hostGeneration}`,
+      `[browser-host] context=ready mode=managed-isolated hostGeneration=${binding.hostGeneration}`,
     );
     return context;
   }
 
   private async getBrowser(
-    browserName: 'chromium' | 'firefox' | 'webkit',
     launchOptions: Parameters<BrowserType['launch']>[0],
   ): Promise<Browser> {
     if (this.browser?.isConnected()) return this.browser;
     if (!this.browserPromise) {
-      this.browserPromise = this.dependencies.browserTypes[browserName]
+      this.browserPromise = this.dependencies.browserType
         .launch(launchOptions)
         .then(browser => {
           this.browser = browser;
@@ -576,7 +463,7 @@ export class BrowserContextRegistry {
 
   scheduleCheckpoint(productSessionId: string): void {
     const entry = this.entries.get(productSessionId);
-    if (!entry || entry.mode !== 'isolated') return;
+    if (!entry) return;
     if (entry.checkpointTimer) clearTimeout(entry.checkpointTimer);
     entry.checkpointTimer = setTimeout(() => {
       entry.checkpointTimer = null;
@@ -591,7 +478,7 @@ export class BrowserContextRegistry {
 
   async checkpoint(productSessionId: string): Promise<void> {
     const entry = this.entries.get(productSessionId);
-    if (!entry || entry.mode !== 'isolated') return;
+    if (!entry) return;
     if (entry.checkpointTimer) {
       clearTimeout(entry.checkpointTimer);
       entry.checkpointTimer = null;
@@ -654,11 +541,6 @@ export class BrowserContextRegistry {
         entry.checkpointTimer = null;
       }
       this.dependencies.onContextClosed(productSessionId);
-      if (entry.profileLease) {
-        const lease = entry.profileLease;
-        entry.profileLease = undefined;
-        await this.dependencies.releaseProfileLease(lease);
-      }
       await this.closeSharedBrowserIfIdle();
     })();
     return entry.finalizePromise;
@@ -683,14 +565,8 @@ export class BrowserContextRegistry {
           }),
         ]);
       } catch {
-        const error = new Error(
-          entry.mode === 'persistent'
-            ? 'The persistent browser profile could not be closed'
-            : 'The browser context could not be closed',
-        );
-        error.name = entry.mode === 'persistent'
-          ? 'PROFILE_CLOSE_FAILED'
-          : 'BROWSER_CONTEXT_CLOSE_FAILED';
+        const error = new Error('The browser context could not be closed');
+        error.name = 'BROWSER_CONTEXT_CLOSE_FAILED';
         throw error;
       } finally {
         if (closeTimeout) clearTimeout(closeTimeout);
@@ -706,7 +582,7 @@ export class BrowserContextRegistry {
     if (
       !this.browser
       || this.contextPromises.size > 0
-      || [...this.entries.values()].some(entry => entry.mode === 'isolated')
+      || this.entries.size > 0
     ) return;
     const browser = this.browser;
     this.browser = null;
@@ -716,7 +592,6 @@ export class BrowserContextRegistry {
 
   private async resetRuntime(options: {
     preserveConnectionOwners: boolean;
-    preserveSettingsGeneration: boolean;
   }): Promise<void> {
     const pendingContexts = [...this.contextPromises.values()];
     for (const controller of this.contextAbortControllers.values()) controller.abort();
@@ -737,17 +612,12 @@ export class BrowserContextRegistry {
     if (this.browser) await this.browser.close();
     this.browser = null;
     this.browserPromise = null;
-    if (!options.preserveSettingsGeneration) {
-      this.settingsFingerprint = null;
-      this.settingsGeneration = 0;
-    }
   }
 
   async shutdown(): Promise<void> {
     if (this.shutdownPromise) return this.shutdownPromise;
     this.shutdownPromise = this.resetRuntime({
       preserveConnectionOwners: false,
-      preserveSettingsGeneration: false,
     });
     return this.shutdownPromise;
   }

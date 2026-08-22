@@ -10,7 +10,6 @@ use std::sync::{Mutex, OnceLock};
 
 const IDENTITY_SCHEMA_VERSION: u32 = 1;
 const IDENTITY_FILE_NAME: &str = "browser-identity-store.json";
-const LEGACY_FILE_NAME: &str = "browser-storage-state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,32 +34,6 @@ pub struct IdentityCheckpoint {
     pub revision: u64,
     pub state: Value,
     pub conflict_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(
-    tag = "operation",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum IdentityMutation {
-    UpsertCookie {
-        cookie: Value,
-    },
-    ReplaceCookie {
-        previous_name: String,
-        previous_domain: String,
-        previous_path: String,
-        cookie: Value,
-    },
-    DeleteCookie {
-        name: String,
-        domain: String,
-        path: String,
-    },
-    DeleteOrigin {
-        origin: String,
-    },
 }
 
 fn empty_state() -> Value {
@@ -518,43 +491,11 @@ fn load_store() -> Result<(PathBuf, StoredIdentity), String> {
         current_corrupt = true;
     }
 
-    let legacy_path = root.join(LEGACY_FILE_NAME);
     let mut stored = empty_store();
     if current_corrupt {
         stored.recovery = Some("corrupt-current".to_string());
     }
-    let mut migrated_legacy_backup = None;
-    if legacy_path.exists() {
-        reject_symlink(&legacy_path)?;
-        let imported = fs::read(&legacy_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .filter(|state| flatten_state(state).is_ok());
-        if let Some(state) = imported {
-            stored.revision = 1;
-            stored.state = state;
-            stored.key_revisions = flatten_state(&stored.state)?
-                .into_keys()
-                .map(|key| (key, 1))
-                .collect();
-            let backup = root.join("browser-storage-state.migrated-0.4.10.json");
-            if !backup.exists() {
-                migrated_legacy_backup = Some(backup);
-            }
-        } else {
-            quarantine(&legacy_path);
-            if stored.recovery.is_none() {
-                stored.recovery = Some("corrupt-legacy".to_string());
-            }
-        }
-    }
     persist_store(&path, &stored)?;
-    // Publish and sync the new authority before retiring its only valid
-    // source. A crash or disk failure before this point leaves the legacy file
-    // available for the next startup to retry.
-    if let Some(backup) = migrated_legacy_backup {
-        let _ = fs::rename(&legacy_path, backup);
-    }
     Ok((path, stored))
 }
 
@@ -671,188 +612,6 @@ pub fn checkpoint_identity(
     })
 }
 
-fn apply_mutation(
-    mut stored: StoredIdentity,
-    mutation: IdentityMutation,
-) -> Result<(StoredIdentity, bool), String> {
-    let mut entities = flatten_state(&stored.state)?;
-    let next_revision = stored.revision.saturating_add(1);
-    let mut changed_keys = Vec::new();
-
-    match mutation {
-        IdentityMutation::UpsertCookie { cookie } => {
-            let cookie_object = cookie
-                .as_object()
-                .ok_or_else(|| "Browser identity cookie must be an object".to_string())?;
-            let key = encoded_key(
-                "cookie",
-                &[
-                    required_string(cookie_object, "name")?,
-                    required_string(cookie_object, "domain")?,
-                    required_string(cookie_object, "path")?,
-                ],
-            );
-            if entities.get(&key) != Some(&cookie) {
-                entities.insert(key.clone(), cookie);
-                changed_keys.push(key);
-            }
-        }
-        IdentityMutation::ReplaceCookie {
-            previous_name,
-            previous_domain,
-            previous_path,
-            cookie,
-        } => {
-            let cookie_object = cookie
-                .as_object()
-                .ok_or_else(|| "Browser identity cookie must be an object".to_string())?;
-            let next_key = encoded_key(
-                "cookie",
-                &[
-                    required_string(cookie_object, "name")?,
-                    required_string(cookie_object, "domain")?,
-                    required_string(cookie_object, "path")?,
-                ],
-            );
-            let previous_key = encoded_key(
-                "cookie",
-                &[&previous_name, &previous_domain, &previous_path],
-            );
-            if previous_key != next_key {
-                entities.remove(&previous_key);
-                changed_keys.push(previous_key);
-            }
-            if entities.get(&next_key) != Some(&cookie) {
-                entities.insert(next_key.clone(), cookie);
-                changed_keys.push(next_key);
-            }
-        }
-        IdentityMutation::DeleteCookie { name, domain, path } => {
-            let key = encoded_key("cookie", &[&name, &domain, &path]);
-            entities.remove(&key);
-            // Always write a tombstone. A Context created before a cookie
-            // existed must not resurrect it after the user explicitly deletes
-            // that exact cookie from Settings.
-            changed_keys.push(key);
-        }
-        IdentityMutation::DeleteOrigin { origin } => {
-            let keys = entities
-                .iter()
-                .filter_map(|(key, value)| {
-                    if key.starts_with("local:")
-                        || key.starts_with("idb-db:")
-                        || key.starts_with("idb-store:")
-                        || key.starts_with("idb-record:")
-                    {
-                        (wrapped_string(value, "origin").ok() == Some(origin.as_str()))
-                            .then(|| key.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            for key in keys {
-                entities.remove(&key);
-                changed_keys.push(key);
-            }
-            // Blocks stale Contexts whose base predates every key at this
-            // origin from re-introducing localStorage/IndexedDB state.
-            changed_keys.push(origin_delete_key(&origin));
-        }
-    }
-
-    if changed_keys.is_empty() {
-        return Ok((stored, false));
-    }
-    stored.revision = next_revision;
-    for key in changed_keys {
-        stored.key_revisions.insert(key, next_revision);
-    }
-    stored.state = rebuild_state(&entities)?;
-    Ok((stored, true))
-}
-
-pub fn mutate_identity(
-    base_revision: u64,
-    mutation: IdentityMutation,
-) -> Result<IdentitySnapshot, String> {
-    let _guard = store_lock()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (path, stored) = load_store()?;
-    if stored.revision != base_revision {
-        return Err("BROWSER_IDENTITY_REVISION_CONFLICT".to_string());
-    }
-    let (stored, changed) = apply_mutation(stored, mutation)?;
-    if changed {
-        persist_store(&path, &stored)?;
-    }
-    Ok(IdentitySnapshot {
-        revision: stored.revision,
-        state: stored.state,
-        recovery: stored.recovery,
-    })
-}
-
-pub fn identity_settings_projection(snapshot: &IdentitySnapshot) -> Value {
-    let cookies = snapshot
-        .state
-        .get("cookies")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_object)
-        .map(|cookie| {
-            json!({
-                "name": cookie.get("name").and_then(Value::as_str).unwrap_or_default(),
-                "domain": cookie.get("domain").and_then(Value::as_str).unwrap_or_default(),
-                "path": cookie.get("path").and_then(Value::as_str).unwrap_or("/"),
-                "secure": cookie.get("secure").and_then(Value::as_bool).unwrap_or(false),
-                "httpOnly": cookie.get("httpOnly").and_then(Value::as_bool).unwrap_or(false),
-                "expires": cookie.get("expires").and_then(Value::as_f64).unwrap_or(-1.0),
-                "sameSite": cookie.get("sameSite").and_then(Value::as_str).unwrap_or("Lax"),
-            })
-        })
-        .collect::<Vec<_>>();
-    let domains = cookies
-        .iter()
-        .filter_map(|cookie| cookie.get("domain").and_then(Value::as_str))
-        .map(|domain| domain.trim_start_matches('.').to_string())
-        .filter(|domain| !domain.is_empty())
-        .collect::<BTreeSet<_>>();
-    let origins = snapshot
-        .state
-        .get("origins")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|origin| origin.get("origin").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    json!({
-        "revision": snapshot.revision,
-        "exists": snapshot.revision > 0,
-        "cookieCount": cookies.len(),
-        "domains": domains,
-        "cookies": cookies,
-        "origins": origins,
-        "recovery": snapshot.recovery,
-    })
-}
-
-#[tauri::command]
-pub fn cmd_browser_identity_read() -> Result<Value, String> {
-    read_identity().map(|snapshot| identity_settings_projection(&snapshot))
-}
-
-#[tauri::command]
-pub fn cmd_browser_identity_mutate(
-    base_revision: u64,
-    mutation: IdentityMutation,
-) -> Result<Value, String> {
-    mutate_identity(base_revision, mutation).map(|snapshot| identity_settings_projection(&snapshot))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,24 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_projection_excludes_cookie_and_site_storage_values() {
-        let snapshot = IdentitySnapshot {
-            revision: 4,
-            state: state(
-                Some("secret-cookie-value"),
-                Some(("token", "secret-local-value")),
-            ),
-            recovery: Some("corrupt-current".to_string()),
-        };
-        let projection = identity_settings_projection(&snapshot);
-        let encoded = serde_json::to_string(&projection).unwrap();
-        assert!(!encoded.contains("secret-cookie-value"));
-        assert!(!encoded.contains("secret-local-value"));
-        assert_eq!(projection["cookieCount"], 1);
-        assert_eq!(projection["recovery"], "corrupt-current");
-    }
-
-    #[test]
     fn newer_key_revision_blocks_stale_delete() {
         let base_state = state(Some("old"), None);
         let newer_state = state(Some("new"), None);
@@ -1066,49 +807,5 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[test]
-    fn replacing_a_cookie_key_tombstones_the_previous_identity() {
-        let base_state = state(Some("old"), None);
-        let old_key = flatten_state(&base_state)
-            .unwrap()
-            .into_keys()
-            .next()
-            .unwrap();
-        let stored = StoredIdentity {
-            schema_version: 1,
-            revision: 1,
-            state: base_state.clone(),
-            key_revisions: BTreeMap::from([(old_key.clone(), 1)]),
-            recovery: None,
-        };
-        let replacement = json!({
-            "name": "renamed", "value": "new", "domain": ".example.com", "path": "/",
-            "expires": -1, "httpOnly": true, "secure": true, "sameSite": "Lax"
-        });
-        let (replaced, changed) = apply_mutation(
-            stored,
-            IdentityMutation::ReplaceCookie {
-                previous_name: "sid".to_string(),
-                previous_domain: ".example.com".to_string(),
-                previous_path: "/".to_string(),
-                cookie: replacement,
-            },
-        )
-        .unwrap();
-        assert!(changed);
-        assert_eq!(replaced.revision, 2);
-        assert_eq!(replaced.key_revisions.get(&old_key), Some(&2));
-
-        let stale_base = state(None, None);
-        let (merged, conflicts, applied) =
-            merge_checkpoint(replaced.clone(), 0, &stale_base, &stale_base, &base_state).unwrap();
-        assert_eq!(conflicts, 1);
-        assert!(!applied);
-        assert_eq!(merged.state, replaced.state);
-        let cookies = replaced.state["cookies"].as_array().unwrap();
-        assert_eq!(cookies.len(), 1);
-        assert_eq!(cookies[0]["name"], "renamed");
     }
 }

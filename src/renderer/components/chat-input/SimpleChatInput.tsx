@@ -184,7 +184,6 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
   mcpServers = [],
   runtimeMcpTools = [],
   mcpEffectiveSnapshot = null,
-  browserProfileWait = null,
   onWorkspaceMcpToggle,
   onRefreshProviders,
   onOpenAgentSettings,
@@ -1404,25 +1403,6 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
       {!isLauncherMode && (
         <div className="pointer-events-none mb-2 flex w-full max-w-3xl items-end justify-end gap-2 empty:hidden">
           {agentStatusSlot}
-          {browserProfileWait && (
-            <div className="pointer-events-auto flex max-w-sm items-center gap-2 rounded-xl border border-amber-500/25 bg-[var(--paper-elevated)] px-3 py-2 text-xs text-[var(--ink-muted)] shadow-sm">
-              <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-amber-500" />
-              <span className="min-w-0 flex-1">
-                {browserProfileWait.queuePosition === null
-                  ? t('input.browserProfileWait')
-                  : t('input.browserProfileWaitPosition', { position: browserProfileWait.queuePosition })}
-              </span>
-              {onStop && (
-                <button
-                  type="button"
-                  onClick={onStop}
-                  className="shrink-0 font-medium text-[var(--accent)] hover:underline"
-                >
-                  {t('input.cancelBrowserWait')}
-                </button>
-              )}
-            </div>
-          )}
           {queuedMessages.length > 0 && (
             <QueuedMessagesPanel
               messages={queuedMessages}

@@ -7,11 +7,6 @@ import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/
 import { createConnection } from '@playwright/mcp';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 
-import {
-  resolvePlaywrightBrowserConfig,
-  type ResolvedPlaywrightBrowserConfig,
-} from '../../shared/playwrightBrowser';
-import { loadConfig } from '../utils/admin-config';
 import { BrowserContextRegistry } from './context-registry';
 import { verifyBrowserCapability, type VerifiedBrowserCapability } from './capability-client';
 import { compileBrowserRuntimeSettings } from './runtime-settings';
@@ -35,7 +30,6 @@ interface HostConnection {
 
 export interface PlaywrightBrowserHostDependencies {
   verifyCapability(token: string, signal?: AbortSignal): Promise<VerifiedBrowserCapability>;
-  loadBrowserConfig(): ResolvedPlaywrightBrowserConfig;
   registry: BrowserContextRegistry;
 }
 
@@ -115,17 +109,14 @@ function browserConnectionError(error: unknown): { status: number; code: string;
   const message = error instanceof Error ? error.message : '';
   const messageCode = /^(BROWSER_[A-Z_]+):/.exec(message)?.[1];
   const code = error instanceof Error && error.name !== 'Error' ? error.name : (messageCode ?? '');
-  if (code === 'PROFILE_IN_USE') {
-    return { status: 409, code, message: 'The persistent browser profile is already in use' };
-  }
-  if (code === 'BROWSER_CONFIG_MIGRATION_REQUIRED' || code === 'BROWSER_CONFIG_UNSUPPORTED') {
-    return { status: 422, code, message: 'Browser settings require attention' };
-  }
-  if (code === 'PROFILE_CLOSE_FAILED' || code === 'BROWSER_CONTEXT_CLOSE_FAILED') {
+  if (code === 'BROWSER_CONTEXT_CLOSE_FAILED') {
     return { status: 500, code, message: 'The browser could not be closed safely' };
   }
   if (code === 'BROWSER_IDENTITY_CHECKPOINT_FAILED') {
     return { status: 503, code, message: 'Browser login state could not be confirmed' };
+  }
+  if (code.startsWith('BROWSER_RESOURCE_')) {
+    return { status: 503, code, message: 'Browser resources are not ready' };
   }
   return {
     status: 503,
@@ -191,23 +182,18 @@ export class PlaywrightBrowserHost {
   private readonly pendingConnections = new Set<HostConnection>();
   private capabilitySweepTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionCreationTail: Promise<void> = Promise.resolve();
-  private runtimeSettingsFingerprint: string | null = null;
   private activeHostRequests = 0;
   private readonly hostDrainWaiters = new Set<() => void>();
   private closing = false;
 
   constructor(dependencies: Partial<PlaywrightBrowserHostDependencies> = {}) {
-    const loadBrowserConfig = dependencies.loadBrowserConfig
-      ?? (() => resolvePlaywrightBrowserConfig(loadConfig()));
     const registry = dependencies.registry ?? new BrowserContextRegistry({
-      loadSettings: () => loadBrowserConfig().settings,
       onContextClosed: productSessionId => {
         void this.retireConnectionsForProductSession(productSessionId);
       },
     });
     this.dependencies = {
       verifyCapability: verifyBrowserCapability,
-      loadBrowserConfig,
       registry,
       ...dependencies,
     };
@@ -373,27 +359,7 @@ export class PlaywrightBrowserHost {
     token: string,
     binding: VerifiedBrowserCapability,
   ): Promise<HostConnection> {
-    const resolved = this.dependencies.loadBrowserConfig();
-    if (resolved.migrationError) {
-      const error = new Error(resolved.migrationError);
-      error.name = 'BROWSER_CONFIG_MIGRATION_REQUIRED';
-      throw error;
-    }
-    const settings = resolved.settings;
-    const settingsFingerprint = JSON.stringify(settings);
-    if (
-      this.runtimeSettingsFingerprint !== null
-      && this.runtimeSettingsFingerprint !== settingsFingerprint
-    ) {
-      await Promise.allSettled([
-        ...[...this.connections.values()].map(connection => this.retireConnection(connection)),
-        ...[...this.pendingConnections].map(connection => this.retireConnection(connection)),
-      ]);
-    }
-    await this.dependencies.registry.prepareConnection(settings);
-    this.runtimeSettingsFingerprint = settingsFingerprint;
     const compiled = compileBrowserRuntimeSettings(
-      settings,
       binding.productSessionId,
       binding.workspacePath,
     );
@@ -405,9 +371,7 @@ export class PlaywrightBrowserHost {
         compiled.connectionConfig,
         () => this.dependencies.registry.getContext(
           binding,
-          token,
           abortController.signal,
-          settings,
         ),
       );
     } catch (error) {
@@ -482,9 +446,9 @@ export class PlaywrightBrowserHost {
   private beginRetiringConnection(connection: HostConnection): void {
     if (connection.closed) return;
     connection.retiring = true;
-    // A Profile waiter has not entered a BrowserContext yet, so it is already
-    // at a safe replacement boundary. Cancel that exact pending acquisition;
-    // real Browser tool calls with an established Context continue to drain.
+    // A resource/Context waiter has not entered a BrowserContext yet, so it is
+    // already at a safe replacement boundary. Cancel that exact pending
+    // acquisition; real Browser tool calls with an established Context drain.
     this.dependencies.registry.cancelPendingContext(connection.binding.productSessionId);
   }
 
@@ -580,7 +544,7 @@ export class PlaywrightBrowserHost {
     this.closing = true;
     if (this.capabilitySweepTimer) clearTimeout(this.capabilitySweepTimer);
     this.capabilitySweepTimer = null;
-    // Pending Profile acquisition is itself an admitted Host request. Fence
+    // Pending resource/Context acquisition is itself an admitted Host request. Fence
     // and cancel every connection already known to the Host before waiting for
     // the request drain, otherwise shutdown would wait on a lease waiter that
     // only connection retirement can release.

@@ -7,6 +7,12 @@ import { patchAgentConfig } from '@/config/services/agentConfigService';
 import { getAllMcpServers, getEnabledMcpServerIds, loadAppConfig } from '@/config/configService';
 import type { McpServerDefinition } from '@/config/types';
 import McpToolsCard from '../../ImSettings/components/McpToolsCard';
+import {
+  applyBuiltinBrowserToolToggle,
+  MANAGED_BROWSER_MCP_ID,
+} from '../../../../shared/browserTools';
+import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
+import { useToast } from '@/components/Toast';
 
 interface AgentToolsSectionProps {
   agent: AgentConfig;
@@ -15,6 +21,8 @@ interface AgentToolsSectionProps {
 
 export default function AgentToolsSection({ agent, onAgentChanged }: AgentToolsSectionProps) {
   const { t } = useTranslation('settings');
+  const toast = useToast();
+  const managedBrowserReady = useBrowserResourceReady();
   const [allServers, setAllServers] = useState<McpServerDefinition[]>([]);
   const [globalEnabled, setGlobalEnabled] = useState<string[]>([]);
 
@@ -43,12 +51,20 @@ export default function AgentToolsSection({ agent, onAgentChanged }: AgentToolsS
 
   const handleToggle = useCallback(async (serverId: string) => {
     const current = agent.mcpEnabledServers || [];
-    const newEnabled = current.includes(serverId)
-      ? current.filter(id => id !== serverId)
-      : [...current, serverId];
+    const enabled = !current.includes(serverId);
+    if (serverId === MANAGED_BROWSER_MCP_ID && enabled && !managedBrowserReady) {
+      toast.warning(t('toolbox.browserResource.installFirst'));
+      return;
+    }
+    const newEnabled = applyBuiltinBrowserToolToggle(
+      current,
+      serverId,
+      enabled,
+      managedBrowserReady,
+    );
     await patchAgentConfig(agent.id, { mcpEnabledServers: newEnabled });
     onAgentChanged();
-  }, [agent.id, agent.mcpEnabledServers, onAgentChanged]);
+  }, [agent.id, agent.mcpEnabledServers, managedBrowserReady, onAgentChanged, t, toast]);
 
   const handlePluginToggle = useCallback(async (pluginId: string) => {
     const current = agent.enabledPluginIds || [];

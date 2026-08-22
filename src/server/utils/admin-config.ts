@@ -24,7 +24,7 @@ import { getHomeDirOrNull } from './platform';
 import { stripBom } from '../../shared/utils';
 import { workspacePathsEqual } from '../../shared/workspacePath';
 import { promoteAgentMcpJsonToGlobal } from '../../shared/mcpConfig';
-import type { AppConfig, ManagedProviderCredential, McpServerDefinition, PermissionMode, PlaywrightBrowserSettings, Provider, ProviderVerifyStatus, SubscriptionAuthPolicy } from '../../shared/config-types';
+import type { AppConfig, ManagedProviderCredential, McpServerDefinition, PermissionMode, Provider, ProviderVerifyStatus, SubscriptionAuthPolicy } from '../../shared/config-types';
 import {
   applyManagedCodexProviderReadiness,
   applyProviderEnablementAndOrder,
@@ -57,6 +57,7 @@ import {
   type OfficialToolSettings,
 } from '../../shared/official-tools';
 import { applyMcpServerConfigAdditions } from '../../shared/mcpConfig';
+import { isReservedBuiltinBrowserMcpId } from '../../shared/browserTools';
 import {
   coerceModelForRuntime,
   getDefaultRuntimePermissionMode,
@@ -76,7 +77,6 @@ import {
 } from '../../shared/providerRoute';
 import { resolveSessionConfig } from './resolve-session-config';
 import { normalizeThemeConfigRecord } from '../../shared/theme';
-import { normalizePlaywrightBrowserConfig } from '../../shared/playwrightBrowser';
 import { buildAvailableProvidersJson } from '../../shared/availableProvidersProjection';
 import { resolveAgentWorkspaceProjections } from '../../shared/agentWorkspaceIdentity';
 import { lookupModelModalitySupport } from './model-capabilities';
@@ -156,7 +156,6 @@ export interface AdminAppConfig {
   mcpEnabledServers?: string[];
   mcpServerEnv?: Record<string, Record<string, string>>;
   mcpServerArgs?: Record<string, string[]>;
-  playwrightBrowser?: PlaywrightBrowserSettings;
   // CLI tool registry (PRD 0.2.36): per-tool env (API keys etc.), same shape as
   // mcpServerEnv. Read at launch by the ~/.myagents/bin shims — env changes
   // need no shim rewrite.
@@ -255,7 +254,6 @@ export function loadConfig(): AdminAppConfig {
     // readers: legacy Agent-only HTTP/SSE definitions are part of the MCP
     // catalogue until the user explicitly removes or disables them.
     promoteAgentMcpJsonToGlobal(config);
-    normalizePlaywrightBrowserConfig(config);
     return config;
   } catch {
     // Malformed JSON — try .bak fallback
@@ -267,7 +265,6 @@ export function loadConfig(): AdminAppConfig {
           JSON.parse(stripBom(readFileSync(bakPath, 'utf-8'))) as AdminAppConfig,
         ) as AdminAppConfig;
         promoteAgentMcpJsonToGlobal(config);
-        normalizePlaywrightBrowserConfig(config);
         return config;
       } catch { /* bak also corrupt */ }
     }
@@ -493,9 +490,10 @@ function getPresetMcpServers(): McpServerDefinition[] {
 export function getAllMcpServers(config?: AdminAppConfig): McpServerDefinition[] {
   const c = config ?? loadConfig();
   const presets = getPresetMcpServers();
-  const custom = c.mcpServers ?? [];
+  const custom = (c.mcpServers ?? []).filter(server => !isReservedBuiltinBrowserMcpId(server.id));
 
-  // Custom servers can override presets with same ID
+  // Custom servers can override ordinary presets, but not the two exact
+  // product-owned Browser identities.
   const customIds = new Set(custom.map(s => s.id));
   const merged = [
     ...presets.filter(p => !customIds.has(p.id)),

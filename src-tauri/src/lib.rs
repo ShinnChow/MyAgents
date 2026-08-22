@@ -6,7 +6,7 @@ pub mod app_route;
 pub mod attachment_protocol;
 pub mod browser;
 pub mod browser_identity_store;
-pub mod browser_profile_lease;
+pub mod browser_resource;
 pub mod browser_runtime_authority;
 pub mod cli;
 mod commands;
@@ -415,8 +415,9 @@ pub fn run() {
             sse_proxy::session_sidecar_http_request,
             sse_proxy::global_sidecar_http_request,
             sse_proxy::proxy_analytics_http_request,
-            browser_identity_store::cmd_browser_identity_read,
-            browser_identity_store::cmd_browser_identity_mutate,
+            browser_resource::cmd_browser_resource_status,
+            browser_resource::cmd_browser_resource_install,
+            browser_resource::cmd_browser_resource_maintain,
             // Updater commands
             updater::check_and_download_update,
             updater::restart_app,
@@ -770,6 +771,10 @@ pub fn run() {
             // calls (extremely early startup) fall back to a synchronous
             // append protected by a mutex.
             logger::init_buffered_writer();
+            // Only users who completed the explicit first install have opted
+            // into Browser resources. Future app-locked revisions maintain
+            // themselves in the background; a never-installed app stays idle.
+            browser_resource::start_automatic_maintenance();
             #[cfg(target_os = "macos")]
             if let Err(error) =
                 notification::install_macos_notification_delegate(app.handle())

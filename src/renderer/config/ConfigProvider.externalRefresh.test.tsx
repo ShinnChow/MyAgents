@@ -44,7 +44,6 @@ vi.mock('./services/appConfigService', () => ({
     return mocks.config;
   }),
   ensureBundledWorkspace: mocks.ensureBundledWorkspace,
-  ensurePlaywrightBrowserConfigMigration: vi.fn(async () => ({ changed: false })),
   ensureManagedCodexProviderDevGateDefault: vi.fn(async () => {}),
   mergePresetCustomModels: vi.fn((providers: Provider[]) => providers),
 }));

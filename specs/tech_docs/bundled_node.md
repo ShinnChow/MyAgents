@@ -127,7 +127,9 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 - 通过 `process_cmd::new()` spawn（Windows 自动 `CREATE_NO_WINDOW`）
 - 环境变量通过 `proxy_config::apply_to_subprocess` 注入 `NO_PROXY` 保护 localhost
 
-Playwright preset 不走这条路径。0.4.10 起它由生产依赖中锁定的 `@playwright/mcp` 包根 `createConnection()` 驱动，Session Runtime 只连接应用级 Browser Host；浏览器可执行文件由 `scripts/prepare-playwright-runtime.mjs` 按 target 精确 staging 到 `playwright-browsers` 资源目录。运行时不得访问 npm registry、调用 `npx` 或依赖用户 Node/cache。
+标准 `playwright` preset 继续走这条通用 stdio 路径：锁定 package spec，但保留上游 argv 与浏览器资源语义；仅在用户从未保存 args 时默认追加 `--isolated`。它与新增的 `myagents-browser` /「浏览器」不是同一个工具。
+
+「浏览器」使用 App 生产依赖中锁定的 `@playwright/mcp` 控制代码，并把保留 sentinel 投影为 Global Sidecar Browser Host 的认证 HTTP transport。它不调用 `npx`，也不从 bundled Node、系统 Chrome 或用户 Playwright cache 寻找浏览器。Rust resource owner 只在用户首次明确安装后，从一方 signed runtime set 解析精确 Chromium executable path；Chromium 资源不属于 bundled Node，也不进入 Tauri resources。
 
 ### 内置 in-process MCP（懒加载）
 
@@ -142,8 +144,9 @@ Playwright preset 不走这条路径。0.4.10 起它由生产依赖中锁定的 
 3. **Plugin Bridge 打包**：esbuild bundle `src/server/plugin-bridge/index.ts` → `plugin-bridge-dist.mjs`
 4. **CLI 打包**：esbuild bundle `src/cli/myagents.ts` → `resources/cli/myagents.cjs`；扩展名固定 CommonJS 语义，不受安装目录上层 `package.json` 影响
 5. **SDK native binary**：按 target triple 拷贝 + codesign
-6. **Playwright runtime**：按 target 下载锁定 revision 的 Chromium/Firefox/WebKit，校验 manifest 与法律声明后原子投影到 Tauri resources
-7. **Tauri 构建**：`npm run tauri:build -- --target <triple>`；wrapper 强制先完成 Playwright staging
+6. **Tauri 构建**：`npm run tauri:build -- --target <triple>`；该命令不下载、不 staging 也不打包 Chromium/Headless Shell/FFmpeg
+
+「浏览器」资源发行是独立的 release-only 工作流：`npm run package:browser-runtime -- --platform <target>` 从锁定 Playwright dependency graph 生成 Chromium-only engine set（Chromium + Headless Shell + FFmpeg）、签名 manifest/artifact，并发布到 `runtimes/browser/sets/<runtime-set>/<platform>`。它既不是 `tauri:dev` / `tauri:build` 的前置步骤，也不写 `src-tauri/resources/`。
 
 `src-tauri/resources/` 是当前构建的 staging，不是跨构建缓存。构建脚本必须在
 Tauri 读取前完整替换自己负责的目录：macOS release 在每个 target loop 内分别

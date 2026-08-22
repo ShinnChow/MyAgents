@@ -152,7 +152,7 @@ struct ManagedCodexArtifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ManagedCodexArtifactSigning {
+pub(crate) struct ManagedCodexArtifactSigning {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
@@ -169,7 +169,7 @@ struct ManagedCodexArtifactSigning {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ManagedCodexSigningVerification {
+pub(crate) struct ManagedCodexSigningVerification {
     #[serde(rename = "type")]
     kind: String,
     verified_at: String,
@@ -908,7 +908,11 @@ fn managed_minisign_signature(signature: &str, label: &str) -> Result<Signature,
     Signature::decode(&decoded).map_err(|e| format!("[managed-codex] Invalid {}: {}", label, e))
 }
 
-fn verify_minisign_bytes(bytes: &[u8], signature: &str, label: &str) -> Result<(), String> {
+pub(crate) fn verify_minisign_bytes(
+    bytes: &[u8],
+    signature: &str,
+    label: &str,
+) -> Result<(), String> {
     let public_key = managed_minisign_public_key()?;
     let signature = managed_minisign_signature(signature, label)?;
     public_key
@@ -916,7 +920,7 @@ fn verify_minisign_bytes(bytes: &[u8], signature: &str, label: &str) -> Result<(
         .map_err(|e| format!("[managed-codex] {} signature mismatch: {}", label, e))
 }
 
-fn verify_minisign_file(path: &Path, signature: &str) -> Result<(), String> {
+pub(crate) fn verify_minisign_file(path: &Path, signature: &str) -> Result<(), String> {
     let public_key = managed_minisign_public_key()?;
     let signature = managed_minisign_signature(signature, "artifact signature")?;
     match public_key.verify_stream(&signature) {
@@ -1271,7 +1275,7 @@ fn verify_windows_platform_signature(
     Err("[managed-codex] Windows Authenticode verification can only run on Windows".to_string())
 }
 
-fn verify_platform_signature(
+pub(crate) fn verify_platform_signature(
     platform: &str,
     executable: &Path,
     signing: &ManagedCodexArtifactSigning,

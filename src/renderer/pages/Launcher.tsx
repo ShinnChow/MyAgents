@@ -20,8 +20,13 @@ import { useToast } from '@/components/Toast';
 import PathInputDialog from '@/components/PathInputDialog';
 import { BrandSection } from '@/components/launcher';
 import { useConfig } from '@/hooks/useConfig';
+import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
 import { type Project, type PermissionMode, type McpServerDefinition, isProjectActiveForUser, isProjectVisibleToUser } from '@/config/types';
 import { CUSTOM_EVENTS } from '../../shared/constants';
+import {
+    applyBuiltinBrowserToolToggle,
+    MANAGED_BROWSER_MCP_ID,
+} from '../../shared/browserTools';
 import { workspacePathsEqual } from '../../shared/workspacePath';
 import {
     getAllMcpServers,
@@ -69,7 +74,9 @@ interface LauncherProps {
 
 export default function Launcher({ onLaunchProject, isStarting, startError: _startError, isActive, attachmentSessionId, selectedWorkspacePath, onWorkspaceSelectionChange }: LauncherProps) {
     const { t } = useTranslation('launcher');
+    const { t: tSettings } = useTranslation('settings');
     const toast = useToast();
+    const managedBrowserReady = useBrowserResourceReady();
     const toastRef = useRef(toast);
     const {
         config,
@@ -339,8 +346,17 @@ export default function Launcher({ onLaunchProject, isStarting, startError: _sta
     // Handle workspace MCP toggle — delegates to the shared dual-write helper
     // (PRD 0.2.7) so launcher and chat-tab persist identical fields.
     const handleWorkspaceMcpToggle = useCallback((serverId: string, enabled: boolean) => {
+        if (serverId === MANAGED_BROWSER_MCP_ID && enabled && !managedBrowserReady) {
+            toastRef.current.warning(tSettings('toolbox.browserResource.installFirst'));
+            return;
+        }
         setLauncherWorkspaceMcpEnabled(prev => {
-            const newEnabled = enabled ? [...prev, serverId] : prev.filter(id => id !== serverId);
+            const newEnabled = applyBuiltinBrowserToolToggle(
+                prev,
+                serverId,
+                enabled,
+                managedBrowserReady,
+            );
             if (selectedWorkspace) {
                 void persistInputOptionChange({
                     workspaceId: selectedWorkspace.id,
@@ -358,7 +374,7 @@ export default function Launcher({ onLaunchProject, isStarting, startError: _sta
             return newEnabled;
         });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-create when workspace ID changes, not on every property change
-    }, [selectedWorkspace?.id, patchProject, isExternalRuntime]);
+    }, [selectedWorkspace?.id, patchProject, isExternalRuntime, managedBrowserReady, tSettings]);
 
     // Restore launcherLastUsed settings once config finishes loading from disk.
     // useState initializers run before async config load completes (config = DEFAULT_CONFIG

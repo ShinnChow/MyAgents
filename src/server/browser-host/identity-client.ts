@@ -15,18 +15,6 @@ export interface BrowserIdentityCheckpointResult extends BrowserIdentitySnapshot
   conflictCount: number;
 }
 
-export type BrowserIdentityMutation =
-  | { operation: 'upsertCookie'; cookie: Record<string, unknown> }
-  | {
-    operation: 'replaceCookie';
-    previousName: string;
-    previousDomain: string;
-    previousPath: string;
-    cookie: Record<string, unknown>;
-  }
-  | { operation: 'deleteCookie'; name: string; domain: string; path: string }
-  | { operation: 'deleteOrigin'; origin: string };
-
 function parseState(value: unknown): BrowserIdentityState {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Browser Identity Store returned malformed state');
@@ -108,30 +96,5 @@ export async function checkpointBrowserIdentity(
     revision: result.revision,
     conflictCount: result.conflictCount,
     state: parseState(result.state),
-  };
-}
-
-export async function mutateBrowserIdentity(
-  baseRevision: number,
-  mutation: BrowserIdentityMutation,
-  signal?: AbortSignal,
-): Promise<BrowserIdentitySnapshot> {
-  const sidecarId = assertGlobalSidecar();
-  const result = await managementApi(
-    '/api/browser/identity/mutate',
-    'POST',
-    { sidecarId, baseRevision, ...mutation },
-    { parentSignal: signal },
-  );
-  if (result.ok !== true) throw readError(result, 'Browser identity mutation failed');
-  if (typeof result.revision !== 'number' || result.revision < 0) {
-    throw new Error('Browser Identity Store returned malformed mutation result');
-  }
-  return {
-    revision: result.revision,
-    state: parseState(result.state),
-    ...(result.recovery === 'corrupt-current' || result.recovery === 'corrupt-legacy'
-      ? { recovery: result.recovery }
-      : {}),
   };
 }

@@ -270,7 +270,7 @@ Global control request
 | `/api/app/config-changed` | 将 disk-first AppConfig 失效信号广播到所有 WebView（空 payload，不携带 secret） | `admin-api.ts` model / MCP mutation |
 | `/api/runtime/sdk-child/{admit,settle}` | Rust-owned Claude SDK native child launch circuit；按 executable identity 限流 deterministic exec denial | Global / Session Sidecar 的 `createGuardedSdkQuery()` |
 | `/api/mcp/startup/*` | MyAgents-owned 本地 stdio MCP 的应用级启动准入；优先级、FIFO/aging、取消、过期与 stale settlement | Session Sidecar |
-| Management `/api/browser/*` | Browser Host capability、Browser Identity checkpoint/CAS 与持久 Profile lease | Rust/Tauri；仅当前 Global/Session birth identity 可调用 |
+| Management `/api/browser/*` | 「浏览器」Host capability、受管 Chromium resource resolution 与 Browser Identity checkpoint/CAS | Rust/Tauri；仅当前 Global/Session birth identity 可调用 |
 | `/api/thought/*`（2 条） | 想法 create / list | CLI、`admin-api.ts` |
 | `/api/im/*` + `/api/im-bridge/*` | IM Bot 唤醒 + 媒体下发 + Plugin Bridge 回调 | Node.js / 社区插件 Bridge |
 | `/api/plugin/*`（3 条） | OpenClaw 插件 CRUD | CLI |
@@ -278,18 +278,23 @@ Global control request
 
 这是项目内**唯一**的"Node → Rust"反向 HTTP 通道，规避了"Renderer / Sidecar 控制面走 Rust proxy → Node"主流向对后端间通信的不适配。所有客户端 MUST 走 `crate::local_http::builder()`（loopback，仍复用 no_proxy 保护）。
 
-应用级资源不能由某个 Session Sidecar 的内存计数代管。Rust 的 MCP startup admission 只裁决 MyAgents-owned 本地 stdio 启动突发，不接管远端 HTTP、SDK in-process 或 `system-cli` 用户自有 MCP；10 秒 dispatch grace 从 demand 被接受时起算，包含排队时间。Global Sidecar 内的 Browser Host 使用 Rust 签发、绑定 Product Session 与 Host generation 的 capability，具体持有 Playwright `Browser` / `BrowserContext`；Rust 只拥有 Host generation、Profile lease 与 Browser Identity Store revision，不复制 Node 对象状态。
+应用级资源不能由某个 Session Sidecar 的内存计数代管。Rust 的 MCP startup admission 只裁决 MyAgents-owned 本地 stdio 启动突发，不接管远端 HTTP、SDK in-process 或 `system-cli` 用户自有 MCP；10 秒 dispatch grace 从 demand 被接受时起算，包含排队时间。Global Sidecar 内的「浏览器」Host 使用 Rust 签发、绑定 Product Session 与 Host generation 的 capability，具体持有 Playwright `Browser` / `BrowserContext`；Rust 分别拥有 Host generation、Chromium resource install authorization/active revision 与 Browser Identity Store revision，不复制 Node 对象状态。
 
 Rust 为 Global 与 Session 两类 Sidecar 都在 spawn 前分配 process-global 单调 generation，并注入不可变的进程管理 identity（`MYAGENTS_SIDECAR_ID`）；Session pending / reset / handover 只迁移可变的业务 `sessionId` key，Management API 仍以进程出生时的 `(sidecarId, generation)` 校验 caller，不能给 Global 伪造 Session identity。SDK native child 的 EPERM / EACCES / ENOEXEC circuit 归 Rust 应用进程持有：admission 携带 epoch，half-open lease 自动过期，旧 settlement 不能清除较新的 failure epoch。该 circuit 是 best-effort 重试保护而非 SDK 启动 authority：只有携带上述确定性系统错误的显式 circuit denial 可以阻止启动；identity 缺失、`invalid_request` / `stale_sidecar`、transport 异常或畸形响应只跳过 circuit，继续调用 SDK，生命周期清理由 Sidecar owner 收敛。
 
-### Playwright Browser Host
+### 标准 Playwright 与受管「浏览器」
 
-Playwright preset 不再让每个 Session 通过 `npx` 启动一套 MCP/Browser，而是投影到 Global Sidecar 的受管 HTTP MCP Host。Host 只使用锁定版本 `@playwright/mcp` 的公共 `createConnection(config, contextGetter)`，并由应用打包匹配的 Playwright browser runtime；运行时不访问 npm registry。
+工具目录中存在两个独立身份，不能把它们解释成同一个工具的模式切换：
 
-- `config.json.playwrightBrowser` 是 desired settings 唯一权威；历史 `mcpServerArgs.playwright` 只做一次无损迁移。未明确保存模式时默认 `isolated`，已明确的 `--isolated` / `--user-data-dir` 保持原意；未知参数 fail-visible，不建立长期双读双写。
-- 独立模式每个 Product Session 一个 `BrowserContext`，所有 Context 共用当前应用级 Browser generation，但从不共享 pages/tabs。Context 从 Rust-owned Browser Identity revision 初始化，Host 在成功工具调用后防抖保存，并在 close/teardown/shutdown 前强制保存 Cookie、localStorage 与 IndexedDB；并发 checkpoint 通过 revision + key-level CAS 合并。设置页通过 Tauri command 直达 Rust persistence owner，并携带读取到的 revision；生产 Global Sidecar 不暴露完整 Identity 数据的 loopback route。
-- 持久化模式只有一个完整 Profile Context。首次实际取 Context 时才向 Rust 获取公平、可取消、generation-fenced 的排他 lease；HTTP 建连和工具目录读取不占 lease。正常关闭、Session owner 释放、配置 replacement 或 App 退出精确释放；外部 Chrome 占用 Profile 时返回 `PROFILE_IN_USE`，禁止删除 lock 或按进程名杀 Chrome。
-- Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host/config generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
+- `playwright` 是标准上游 Playwright MCP preset，继续作为普通 `npx @playwright/mcp@<locked>` stdio MCP 进入各 Runtime。仅当 `mcpServerArgs.playwright` 缺失时默认附加 `--isolated`；显式空数组和所有上游参数原样保留。MyAgents 不接管它的 Browser Host、浏览器下载、Profile 或进程语义。
+- `myagents-browser`（显示名「浏览器」）是 MyAgents 受管工具。固定使用有头 Chromium，通过保留 sentinel 投影到 Global Sidecar 的认证 HTTP MCP Host；Host 使用锁定 `@playwright/mcp` 的公共 `createConnection(config, contextGetter)`，不创建另一套 MCP 协议。
+
+受管工具只把 JS 控制代码与 App 一起发布，Chromium、Chromium Headless Shell 与 FFmpeg 不进入 App bundle、installer 或 updater。Rust App owner 从 `src/shared/managed-browser-runtime.json` 获取 required runtime set；从未安装时只有用户点击“安装资源”才从一方固定路径下载、验签并原子安装。首次成功形成 install authorization，后续 App revision 变化自动维护且最多重试两次；没有用户卸载入口。Browser Host 只能消费 Rust 投影的精确 executable path，不回退系统 Chrome、用户 Playwright cache、`npx playwright install` 或 App resources。
+
+- 一个 App Browser generation 共享一个 Chromium Browser process；每个 Product Session 一个隔离 `BrowserContext` 和原生窗口，同一 Context 的 Pages 是 Tabs。不存在 persistent/user-data-dir/Profile lease 模式。
+- Context 从 Rust-owned Browser Identity revision 初始化，Host 在成功工具调用后防抖保存，并在 close/teardown/shutdown 前强制保存 Cookie、localStorage 与 IndexedDB；并发 checkpoint 通过 revision + key-level CAS 合并。
+- Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
+- 两个固定内置 ID 只在正式前端启用入口互斥：开启一个会在同一 `config.json` mutation 中关闭另一个；关闭任一工具不改变对方，自定义 MCP 不参与该规则。
 
 ---
 
@@ -407,7 +412,7 @@ MyAgents 产品级 append 由 `buildSystemPromptAppend()` 统一组装：
 |----|------|---------|
 | **L1** 基础身份 | 告诉 AI 运行在 MyAgents 产品中 | 始终 |
 | **L2** 交互方式 | 桌面客户端 / IM Bot / Agent Channel | 互斥选一 |
-| **L3** 场景与产品交互 | Task / IM 心跳 / Registered Agent / 浮球 / Widget / Session 协作 / Browser Storage | 按需叠加 |
+| **L3** 场景与产品交互 | Task / IM 心跳 / Registered Agent / 浮球 / Widget / Session 协作                   | 按需叠加 |
 | **L4** CLI 能力发现 | Task / Goal / Thought / IM 媒体 / Vision / 用户注册工具 | 按场景与能力开关叠加 |
 
 当前 `InteractionScenario` 包含 desktop、im、agent-channel、cron 和 registeredAgent；

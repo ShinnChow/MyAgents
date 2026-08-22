@@ -170,7 +170,6 @@ impl BrowserRuntimeAuthority {
             .get(token)
             .map(|capability| capability.binding.clone())
     }
-
 }
 
 fn authority() -> &'static Mutex<BrowserRuntimeAuthority> {

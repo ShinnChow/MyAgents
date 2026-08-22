@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "playwrightMcpVersion": "0.0.68",
+  "playwrightCoreVersion": "1.59.0-alpha-1771104257000",
+  "chromiumRevision": "1212",
+  "chromiumBrowserVersion": "146.0.7680.0",
+  "runtimeSet": "playwright-1.59.0-alpha-1771104257000-chromium-1212"
+}

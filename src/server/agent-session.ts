@@ -114,6 +114,7 @@ import { parsePartialJson } from '../shared/parsePartialJson';
 import { deriveSessionTitle } from '../shared/sessionTitle';
 import { createLiveUserMessageReplay } from '../shared/chatMessageReplay';
 import { isPendingSessionId } from '../shared/constants';
+import { MANAGED_BROWSER_MCP_ID } from '../shared/browserTools';
 import { workspacePathsEqual } from '../shared/workspacePath';
 import { normalizeReasoningEffort, isSdkEffortLevel } from '../shared/reasoningEffort';
 import { BUILTIN_AUTO_COMPACT_PERCENT, computeContextUsage } from '../shared/contextUsage';
@@ -2860,9 +2861,9 @@ function installQueryMcpOwner(params: Parameters<typeof setQueryMcpPrewarmOwner>
           builtinMcpLastStatuses = [...result.statuses];
           maybeSettleBuiltinMcpStartup(builtinMcpLastStatuses);
           publishBuiltinMcpEffectiveSnapshot();
-          const playwrightStatus = builtinMcpLastStatuses.find(status => status.name === 'playwright');
+          const playwrightStatus = builtinMcpLastStatuses.find(status => status.name === MANAGED_BROWSER_MCP_ID);
           const playwrightDesired = configState.currentMcpServers?.some(
-            server => server.id === 'playwright' && server.isBuiltin === true,
+            server => server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__',
           ) === true;
           const playwrightNeedsTransport = playwrightDesired
             && (!playwrightStatus || playwrightStatus.status === 'failed');
@@ -4011,7 +4012,7 @@ async function buildSdkMcpServers(
       console.log(`[agent] MCP ${server.id}: Custom env vars: ${Object.keys(server.env).join(', ')}`);
     }
 
-    if (server.id === 'playwright' && server.isBuiltin === true) {
+    if (server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__') {
       const productSessionId = browserProductSessionIdOverride
         || sessionId
         || process.env.MYAGENTS_SIDECAR_ID?.trim();
@@ -4029,7 +4030,7 @@ async function buildSdkMcpServers(
         headers: { Authorization: `Bearer ${capability.token}` },
       };
       console.log(
-        `[agent] MCP playwright: application Browser Host generation=${capability.hostGeneration}`,
+        `[agent] MCP ${MANAGED_BROWSER_MCP_ID}: application Browser Host generation=${capability.hostGeneration}`,
       );
       continue;
     }
@@ -4138,7 +4139,7 @@ async function buildSdkMcpServers(
 function sdkMcpMapFingerprint(servers: Record<string, unknown>): string {
   const keys = Object.keys(servers).sort().join(',');
   const surface = getImBridgeToolSurface();
-  const browserHost = Object.hasOwn(servers, 'playwright')
+  const browserHost = Object.hasOwn(servers, MANAGED_BROWSER_MCP_ID)
     ? `|browserHost=${builtBrowserHostGeneration}:${builtBrowserCapabilityRevision}`
     : '';
   return `${keys}${surface ? `|bridge=${imBridgeToolSurfaceIdentity(surface)}` : ''}${browserHost}`;

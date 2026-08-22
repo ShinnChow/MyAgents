@@ -3,7 +3,7 @@
 //! and `system_binary` (system tool lookup).
 //!
 //! This module provides unified proxy configuration for:
-//! 1. Tauri updater → CDN downloads (`build_client_with_proxy`)
+//! 1. Tauri updater and app-owned signed runtime downloads (`build_client_with_proxy`)
 //! 2. Bun Sidecar / Plugin Bridge → subprocess env injection (`apply_to_subprocess`)
 //!
 //! **All** child processes that may use `fetch()` or HTTP clients MUST call

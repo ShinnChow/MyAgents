@@ -29,14 +29,17 @@ import {
 import managedCodexRuntimeLock from './managed-codex-runtime.json';
 
 describe('MCP presets', () => {
-  it('defaults new installs to an isolated Playwright browser context', () => {
-    expect(DEFAULT_CONFIG.playwrightBrowser).toEqual({
-      schemaVersion: 1,
-      mode: 'isolated',
-      headless: false,
-      capabilities: ['storage'],
-      extraArgs: [],
+  it('keeps standard Playwright generic and exposes the managed Browser separately', () => {
+    expect(PRESET_MCP_SERVERS.find(server => server.id === 'playwright')).toMatchObject({
+      type: 'stdio',
+      command: 'npx',
+      args: ['@playwright/mcp@0.0.68'],
     });
+    expect(PRESET_MCP_SERVERS.find(server => server.id === 'myagents-browser')).toMatchObject({
+      name: '浏览器',
+      command: '__browser_host__',
+    });
+    expect(DEFAULT_CONFIG.mcpEnabledServers ?? []).not.toContain('myagents-browser');
   });
 
   it('keeps Tavily credentials out of the URL and projects them through an auth header', () => {

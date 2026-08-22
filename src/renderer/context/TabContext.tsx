@@ -55,11 +55,6 @@ export interface SystemNotice {
     message: string;
 }
 
-export interface BrowserProfileWaitState {
-    requestId: string;
-    queuePosition: number | null;
-}
-
 export interface LoadOlderMessagesOptions {
     beforePrepend?: (visibleFreshCount: number) => void;
 }
@@ -112,8 +107,6 @@ export interface TabState {
     unifiedLogs: LogEntry[];
     systemInitInfo: SystemInitInfo | null;
     mcpEffectiveSnapshot: McpEffectiveSnapshot | null;
-    /** Active persistent-browser resource wait for this exact Product Session. */
-    browserProfileWait: BrowserProfileWaitState | null;
     /**
      * Slash commands reported by the active builtin SDK subprocess. This is
      * the dynamic companion to the Rust workspace scan used by SimpleChatInput:
@@ -290,7 +283,6 @@ const defaultContextValue: TabContextValue = {
     unifiedLogs: [],
     systemInitInfo: null,
     mcpEffectiveSnapshot: null,
-    browserProfileWait: null,
     sdkSlashCommands: [],
     runtimeDiagnostics: null,
     agentError: null,

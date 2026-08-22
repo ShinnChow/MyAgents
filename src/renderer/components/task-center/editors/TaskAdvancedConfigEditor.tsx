@@ -20,6 +20,8 @@ import { ChevronDown, Settings2 } from 'lucide-react';
 import CustomSelect from '@/components/CustomSelect';
 import { useConfig } from '@/hooks/useConfig';
 import { useAvailableProviders } from '@/hooks/useAvailableProviders';
+import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
+import { useToast } from '@/components/Toast';
 import { isProviderAvailable } from '@/config/services/providerService';
 import {
   CC_MODELS,
@@ -37,6 +39,10 @@ import type { McpServerDefinition } from '@/config/types';
 import type { RuntimeConfig } from '@/../shared/types/runtime';
 import { getAllMcpServersFromConfig } from '@/config/services/mcpService';
 import { workspacePathsEqual } from '@/../shared/workspacePath';
+import {
+  applyBuiltinBrowserToolToggle,
+  MANAGED_BROWSER_MCP_ID,
+} from '@/../shared/browserTools';
 import { apiGetJson } from '@/api/apiFetch';
 import {
   clearRuntimeModelOverride,
@@ -84,6 +90,9 @@ interface Props {
 
 export function TaskAdvancedConfigEditor(props: Props) {
   const { t } = useTranslation('task');
+  const { t: tSettings } = useTranslation('settings');
+  const toast = useToast();
+  const managedBrowserReady = useBrowserResourceReady();
   const {
     workspacePath,
     runtime,
@@ -446,16 +455,21 @@ export function TaskAdvancedConfigEditor(props: Props) {
   // `undefined` follows Agent; `[]` is an explicit no-MCP override. The
   // "恢复跟随 Agent" button is the only path that clears back to undefined.
   const toggleMcp = (id: string) => {
-    if (mcpEnabledServers === undefined) {
-      setMcpEnabledServers([id]);
+    const enabled = mcpEnabledServers === undefined || !mcpEnabledServers.includes(id);
+    if (id === MANAGED_BROWSER_MCP_ID && enabled && !managedBrowserReady) {
+      toast.warning(tSettings('toolbox.browserResource.installFirst'));
       return;
     }
-    if (mcpEnabledServers.includes(id)) {
-      const next = mcpEnabledServers.filter((s) => s !== id);
-      setMcpEnabledServers(next);
-    } else {
-      setMcpEnabledServers([...mcpEnabledServers, id]);
+    if (mcpEnabledServers === undefined) {
+      setMcpEnabledServers(applyBuiltinBrowserToolToggle([], id, true, managedBrowserReady));
+      return;
     }
+    setMcpEnabledServers(applyBuiltinBrowserToolToggle(
+      mcpEnabledServers,
+      id,
+      enabled,
+      managedBrowserReady,
+    ));
   };
 
   const resetMcpToFollow = () => setMcpEnabledServers(undefined);

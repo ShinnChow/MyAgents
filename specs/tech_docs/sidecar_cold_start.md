@@ -61,7 +61,7 @@ Codex / Gemini 的 persistent runtime 预热和 Sidecar HTTP readiness 是两层
 
 Managed Codex 又多一层：`initialize` 完成后 app-server 已存活，但 MyAgents 通过进程参数注入的 MCP 仍异步启动。`CodexRuntime.startSession()` 在发起 `thread/start|resume` 的 native startup boundary 消费从应用级 demand 接受时开始的 10 秒 absolute dispatch grace；Codex 原生 `startup_timeout_sec=60` 是单次启动尝试的上界，不重置也不延长前者。grace 到期只放行基础 turn，Runtime 状态与 tool catalog 仍持续观察；late-ready 会直接更新当前 Product Session，若启动准入时尚未把本地 MCP 放入进程，则 external-session owner 在 idle boundary replacement 并自动 pre-warm。这个 owner 不包含 Codex 用户目录自有配置；只有 process exit、thread/RPC failure 仍是 Runtime startup failure。
 
-MCP definition 在到达 runtime 前也必须保持可执行：`mcpServerArgs[id]` 是非 Playwright MCP 的附加参数，不得替换 preset 的 package/base argv。MyAgents-owned Playwright 是例外：preset sentinel 会投影成带短期 capability 的应用 Browser Host HTTP endpoint，不再产生 per-Session `npx`。启动失败、鉴权与 late-ready 都必须进入 effective snapshot；dispatch grace 不能充当 capability terminal。
+MCP definition 在到达 runtime 前也必须保持可执行：`mcpServerArgs[id]` 是 preset 的附加参数，不得替换 package/base argv。标准 `playwright` 继续产生普通 stdio MCP；只有固定 ID `myagents-browser` 的保留 sentinel 会投影成带短期 capability 的应用 Browser Host HTTP endpoint。启动失败、资源未 ready、鉴权与 late-ready 都必须进入 effective snapshot；dispatch grace 不能充当 capability terminal。
 
 ## "AI 启动中" UI 状态判据：`sdkControlReady` ≠ `system_init`
 

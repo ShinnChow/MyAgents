@@ -86,6 +86,7 @@ import {
   type PersistedAgentWorkspaceProjection,
 } from './utils/agent-workspace-identity';
 import { buildProactiveAgentTogglePatch } from '../shared/proactiveAgentPolicy';
+import { isReservedBuiltinBrowserMcpId } from '../shared/browserTools';
 
 // Long-running sidecar operations need their own budget. Anchored to the
 // sidecar's internal `FETCH_TIMEOUT_MS` (300s for tarball download) plus a
@@ -382,6 +383,9 @@ export async function handleMcpAdd(payload: {
   // Validate required fields
   if (!s.id) return { success: false, error: 'Missing required field: id' };
   if (!s.type) return { success: false, error: 'Missing required field: type' };
+  if (isReservedBuiltinBrowserMcpId(s.id)) {
+    return { success: false, error: `MCP ID "${s.id}" is reserved by a built-in Browser tool` };
+  }
 
   // Reject SDK reserved MCP names — these cause the Claude Agent SDK to crash (exit code 1)
   // with "Invalid MCP configuration: X is a reserved MCP name."

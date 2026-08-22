@@ -37,6 +37,7 @@ import {
 import QueryNavigator from '@/components/chat/QueryNavigator';
 import ChatSearchPanel from '@/components/ChatSearchPanel';
 import { useChatSearch, isHighlightApiSupported } from '@/hooks/useChatSearch';
+import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
 import SelectionCommentMenu from '@/components/SelectionCommentMenu';
 import TerminalReasonBanner from '@/components/TerminalReasonBanner';
 import RuntimeDiagnosticsBanner from '@/components/RuntimeDiagnosticsBanner';
@@ -97,6 +98,10 @@ import { patchAgentConfig, patchAgentProjectConfig, getAgentById } from '@/confi
 import { BrowserPanelContext } from '@/context/BrowserPanelContext';
 import { BROWSER_BLANK_URL } from '@/components/browserConstants';
 import { CUSTOM_EVENTS, isPendingSessionId } from '../../shared/constants';
+import {
+  applyBuiltinBrowserToolToggle,
+  MANAGED_BROWSER_MCP_ID,
+} from '../../shared/browserTools';
 import {
   IMAGE_UNDERSTANDING_TOOL_ID,
   OFFICIAL_TOOLS,
@@ -512,7 +517,6 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     unifiedLogs,
     systemInitInfo,
     mcpEffectiveSnapshot,
-    browserProfileWait,
     sdkSlashCommands,
     runtimeDiagnostics,
     agentError,
@@ -549,7 +553,9 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   const isActive = useTabActive();
   const toast = useToast();
   const { t } = useTranslation('chat');
+  const { t: tSettings } = useTranslation('settings');
   const { t: tTask, i18n } = useTranslation('task');
+  const managedBrowserReady = useBrowserResourceReady();
   const taskLocale = isSupportedLocale(i18n.language) ? i18n.language : 'zh-CN';
   const tRef = useRef(t);
   tRef.current = t;
@@ -2486,7 +2492,6 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     config?.mcpServerEnv,
     config?.mcpServerArgs,
     config?.mcpServers,
-    config?.playwrightBrowser,
     launcherMcpFallbackRevision,
     pushSessionConfig,
   ]);
@@ -2788,9 +2793,16 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   //     the live-follow source, so the single write covers both roles.
   const handleWorkspaceMcpToggle = useCallback(async (serverId: string, enabled: boolean) => {
     if (guardCronConfigMutation()) return;
-    const newEnabled = enabled
-      ? [...workspaceMcpEnabled, serverId]
-      : workspaceMcpEnabled.filter(id => id !== serverId);
+    if (serverId === MANAGED_BROWSER_MCP_ID && enabled && !managedBrowserReady) {
+      toastRef.current.warning(tSettings('toolbox.browserResource.installFirst'));
+      return;
+    }
+    const newEnabled = applyBuiltinBrowserToolToggle(
+      workspaceMcpEnabled,
+      serverId,
+      enabled,
+      managedBrowserReady,
+    );
 
     setWorkspaceMcpEnabled(newEnabled);
 
@@ -2803,7 +2815,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     if (!persisted) {
       setWorkspaceMcpEnabled(workspaceMcpEnabled);
     }
-  }, [workspaceMcpEnabled, persistTabConfigChange, guardCronConfigMutation]);
+  }, [workspaceMcpEnabled, persistTabConfigChange, guardCronConfigMutation, managedBrowserReady, tSettings]);
 
   // PRD 0.2.17 — Claude plugin per-workspace toggle. Mirrors MCP exactly:
   // optimistic local update + dual-write via persistTabConfigChange (which
@@ -5533,7 +5545,6 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
             mcpServers={mcpServers}
             runtimeMcpTools={runtimeMcpTools}
             mcpEffectiveSnapshot={mcpEffectiveSnapshot}
-            browserProfileWait={browserProfileWait}
             onWorkspaceMcpToggle={handleWorkspaceMcpToggle}
             officialTools={OFFICIAL_TOOLS}
             workspaceOfficialToolEnabled={workspaceOfficialToolEnabled}

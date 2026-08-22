@@ -20,37 +20,32 @@ function remote(id: string): McpServerDefinition {
 }
 
 describe('MCP config helpers', () => {
-  it('projects Browser Host desired settings as an opaque Runtime revision', () => {
+  it('defaults only absent standard Playwright args to isolated mode', () => {
     const playwright: McpServerDefinition = {
       id: 'playwright',
       name: 'Playwright',
       type: 'stdio',
-      command: '__browser_host__',
-      args: [],
+      command: 'npx',
+      args: ['@playwright/mcp@0.0.68'],
       isBuiltin: true,
     };
-    const isolated = applyMcpServerConfigAdditions([playwright], {
-      playwrightBrowser: {
-        schemaVersion: 1,
-        mode: 'isolated',
-        headless: false,
-        capabilities: ['storage'],
-        extraArgs: [],
-      },
-    });
-    const persistent = applyMcpServerConfigAdditions([playwright], {
-      playwrightBrowser: {
-        schemaVersion: 1,
-        mode: 'persistent',
-        headless: false,
-        capabilities: [],
-        extraArgs: [],
-      },
-    });
 
-    expect(isolated[0].runtimeConfigRevision).toMatch(/^playwright-browser-v1-[a-f0-9]{16}$/);
-    expect(persistent[0].runtimeConfigRevision).not.toBe(isolated[0].runtimeConfigRevision);
-    expect(JSON.stringify(isolated[0])).not.toContain('mode');
+    expect(applyMcpServerConfigAdditions([playwright], {})[0].args).toEqual([
+      '@playwright/mcp@0.0.68',
+      '--isolated',
+    ]);
+    expect(applyMcpServerConfigAdditions([playwright], {
+      mcpServerArgs: { playwright: [] },
+    })[0].args).toEqual(['@playwright/mcp@0.0.68']);
+    expect(applyMcpServerConfigAdditions([playwright], {
+      mcpServerArgs: {
+        playwright: ['--browser=firefox', '--user-data-dir=/tmp/profile'],
+      },
+    })[0].args).toEqual([
+      '@playwright/mcp@0.0.68',
+      '--browser=firefox',
+      '--user-data-dir=/tmp/profile',
+    ]);
   });
 
   it('promotes selected Agent-only HTTP definitions into the global catalogue', () => {

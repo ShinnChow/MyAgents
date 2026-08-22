@@ -91,20 +91,6 @@ describe('SimpleChatInput send paths', () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
-  it('shows the exact persistent Browser queue position and cancels through Stop', async () => {
-    await i18n.changeLanguage('en-US');
-    const onStop = vi.fn();
-    const user = userEvent.setup();
-    renderInput({
-      browserProfileWait: { requestId: 'profile-wait-a', queuePosition: 2 },
-      onStop,
-    });
-
-    expect(screen.getByText(/position 2/)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Cancel wait' }));
-    expect(onStop).toHaveBeenCalledOnce();
-  });
-
   it('uses stable line icons for the three builtin permission modes', async () => {
     await i18n.changeLanguage('zh-CN');
     const user = userEvent.setup();

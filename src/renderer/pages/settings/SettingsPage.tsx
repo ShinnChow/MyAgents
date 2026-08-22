@@ -51,7 +51,6 @@ import {
     type ChatQueueResponseMode,
     type ProxyProtocol,
     type SpaceEnvironment,
-    type PlaywrightBrowserSettings,
 } from '@/config/types';
 import {
     getAllMcpServers,
@@ -59,6 +58,7 @@ import {
     toggleMcpServerEnabled,
     addCustomMcpServer,
     deleteCustomMcpServer,
+    saveMcpServerArgs,
     getMcpServerArgs,
     getMcpServerEnv,
     atomicModifyConfig,
@@ -135,10 +135,14 @@ import { AppearanceModeControl } from './components/AppearanceModeControl';
 import { ThemePresetSelect } from './components/ThemePresetSelect';
 import { useResolvedTheme } from '@/theme';
 import {
-    isSupportedPlaywrightAdvancedArg,
-    isSupportedPlaywrightCapability,
-    resolvePlaywrightBrowserConfig,
-} from '../../../shared/playwrightBrowser';
+    DEFAULT_STANDARD_PLAYWRIGHT_ARGS,
+    MANAGED_BROWSER_MCP_ID,
+    applyBuiltinBrowserToolToggle,
+    isBrowserResourceReady,
+    selectLatestBrowserResourceStatus,
+    shouldAutoMaintainBrowserResource,
+    type BrowserResourceStatus,
+} from '../../../shared/browserTools';
 import type {
     NetworkProbeResult,
     ProviderVerifyError,
@@ -151,6 +155,11 @@ import { SettingsSidebar } from './components/SettingsSidebar';
 import { SkillsAgentsSection } from './sections/SkillsAgentsSection';
 import { ToolboxSection } from './sections/ToolboxSection';
 import codexModelSelectorOnboarding from '@/assets/onboarding/codex-model-selector.png';
+
+/** Standard Playwright MCP keeps upstream argv semantics; only the absent default is isolated. */
+function getPlaywrightDefaultArgs(): string[] {
+    return [...DEFAULT_STANDARD_PLAYWRIGHT_ARGS];
+}
 
 type ManagedCodexLoginStatus = 'idle' | 'starting' | 'waiting' | 'succeeded' | 'cancelled' | 'error';
 type SubscriptionRefreshResult = { success: true } | { success: false; error: string };
@@ -801,6 +810,8 @@ export default function Settings({ mode = 'settings', initialSection, navigation
     const [mcpServers, setMcpServersState] = useState<McpServerDefinition[]>([]);
     const [mcpEnabledIds, setMcpEnabledIds] = useState<string[]>([]);
     const [mcpEnabling, setMcpEnabling] = useState<Record<string, boolean>>({}); // Loading state for enable toggle
+    const [browserResourceStatus, setBrowserResourceStatus] = useState<BrowserResourceStatus | null>(null);
+    const browserResourceOperationRef = useRef(false);
     const [showMcpForm, setShowMcpForm] = useState(false);
     const [editingMcpId, setEditingMcpId] = useState<string | null>(null);
     // Dialog state for runtime not found
@@ -810,6 +821,46 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         downloadUrl?: string;
         command?: string;
     }>({ show: false });
+
+    const acceptBrowserResourceStatus = useCallback((incoming: BrowserResourceStatus) => {
+        setBrowserResourceStatus(current => selectLatestBrowserResourceStatus(current, incoming));
+    }, []);
+
+    const refreshBrowserResourceStatus = useCallback(async () => {
+        if (!isTauriEnvironment()) return;
+        try {
+            acceptBrowserResourceStatus(await invoke<BrowserResourceStatus>('cmd_browser_resource_status'));
+        } catch (error) {
+            console.warn('[Settings] Failed to read Browser resource status:', error);
+        }
+    }, [acceptBrowserResourceStatus]);
+
+    useEffect(() => {
+        if (mode !== 'capabilities' || !isTauriEnvironment()) return;
+        const abortController = new AbortController();
+        void listenWithCleanup<BrowserResourceStatus>('browser-resource-status', (event) => {
+            acceptBrowserResourceStatus(event.payload);
+        }, abortController.signal);
+        void refreshBrowserResourceStatus();
+        return () => abortController.abort();
+    }, [acceptBrowserResourceStatus, mode, refreshBrowserResourceStatus]);
+
+    const runBrowserResourceInstall = useCallback(async () => {
+        if (!isTauriEnvironment() || browserResourceOperationRef.current) return;
+        browserResourceOperationRef.current = true;
+        try {
+            const command = shouldAutoMaintainBrowserResource(browserResourceStatus)
+                ? 'cmd_browser_resource_maintain'
+                : 'cmd_browser_resource_install';
+            acceptBrowserResourceStatus(await invoke<BrowserResourceStatus>(command));
+        } catch (error) {
+            console.warn('[Settings] Browser resource operation failed:', error);
+            toast.error(tSettings('toolbox.browserResource.operationFailed'));
+            await refreshBrowserResourceStatus();
+        } finally {
+            browserResourceOperationRef.current = false;
+        }
+    }, [acceptBrowserResourceStatus, browserResourceStatus, refreshBrowserResourceStatus, tSettings, toast]);
 
     // Whether any provider is available (for "AI 小助理安装" button)
     const showAiInstallButton = useMemo(
@@ -972,77 +1023,15 @@ export default function Settings({ mode = 'settings', initialSection, navigation
 
     // Playwright MCP custom settings dialog
     const [playwrightSettings, setPlaywrightSettings] = useState<{
-        mode: 'persistent' | 'isolated';
+        mode: 'upstream' | 'persistent' | 'isolated';
         headless: boolean;
         browser: string;
         device: string;
         customDevice: string;
         userDataDir: string;
-        capabilities: string[];
         extraArgs: string[];
         newArg: string;
     } | null>(null);
-
-    // Storage state info for Playwright browser settings UI (isolated mode)
-    const [storageStateInfo, setStorageStateInfo] = useState<{
-        revision: number;
-        exists: boolean;
-        cookieCount: number;
-        domains: string[];
-        lastModified: string | null;
-        cookies: Array<{ name: string; domain: string; path: string; secure: boolean; httpOnly: boolean; expires: number; sameSite: 'Strict' | 'Lax' | 'None' }>;
-        origins: string[];
-        recovery: 'corrupt-current' | 'corrupt-legacy' | null;
-    } | null>(null);
-
-    // Cookie add/edit form (null = closed, object = open)
-    const [cookieForm, setCookieForm] = useState<{
-        editIndex: number | null; // null = adding new, number = editing existing
-        domain: string;
-        name: string;
-        value: string;
-        path: string;
-    } | null>(null);
-
-    // Packaged Settings talks directly to the Rust persistence owner. The
-    // development-union server route remains only for the browser harness.
-    const reloadStorageStateInfo = async () => {
-        try {
-            type IdentitySettingsSnapshot = {
-                revision: number;
-                exists: boolean;
-                cookieCount: number;
-                domains: string[];
-                cookies: Array<{ name: string; domain: string; path: string; secure: boolean; httpOnly: boolean; expires: number; sameSite: 'Strict' | 'Lax' | 'None' }>;
-                origins: string[];
-                recovery: 'corrupt-current' | 'corrupt-legacy' | null;
-            };
-            const snapshot = isTauriEnvironment()
-                ? await invoke<IdentitySettingsSnapshot>('cmd_browser_identity_read')
-                : await apiGetJson<IdentitySettingsSnapshot & { ok: true }>('/api/browser/identity');
-            setStorageStateInfo({
-                revision: snapshot.revision,
-                exists: snapshot.exists,
-                cookieCount: snapshot.cookieCount,
-                domains: snapshot.domains,
-                cookies: snapshot.cookies,
-                origins: snapshot.origins,
-                recovery: snapshot.recovery,
-                lastModified: snapshot.revision > 0 ? `revision ${snapshot.revision}` : null,
-            });
-        } catch {
-            setStorageStateInfo({ revision: 0, exists: false, cookieCount: 0, domains: [], cookies: [], origins: [], recovery: null, lastModified: null });
-        }
-    };
-
-    const mutateBrowserIdentityFromSettings = async (mutation: Record<string, unknown>) => {
-        const baseRevision = storageStateInfo?.revision;
-        if (baseRevision === undefined) throw new Error('Browser Identity Store is not loaded');
-        if (isTauriEnvironment()) {
-            return invoke('cmd_browser_identity_mutate', { baseRevision, mutation });
-        }
-        return apiPostJson('/api/browser/identity', { baseRevision, ...mutation });
-    };
 
     const [mcpFormMode, setMcpFormMode] = useState<'form' | 'json'>('form');
     const [mcpJsonInput, setMcpJsonInput] = useState('');
@@ -1180,9 +1169,14 @@ export default function Settings({ mode = 'settings', initialSection, navigation
     const handleMcpToggle = async (server: McpServerDefinition, enabled: boolean) => {
         if (!enabled) {
             // Just disable
-            await toggleMcpServerEnabled(server.id, false);
-            setMcpEnabledIds(prev => prev.filter(id => id !== server.id));
+            await toggleMcpServerEnabled(server.id, false, false);
+            setMcpEnabledIds(prev => applyBuiltinBrowserToolToggle(prev, server.id, false, false));
             toast.success(tSettings('toolbox.toasts.mcpDisabled'));
+            return;
+        }
+
+        if (server.id === MANAGED_BROWSER_MCP_ID && !isBrowserResourceReady(browserResourceStatus)) {
+            toast.error(tSettings('toolbox.browserResource.installFirst'));
             return;
         }
 
@@ -1210,8 +1204,14 @@ export default function Settings({ mode = 'settings', initialSection, navigation
 
             if (result.success) {
                 // Enable the MCP
-                await toggleMcpServerEnabled(server.id, true);
-                setMcpEnabledIds(prev => [...prev, server.id]);
+                const browserReady = isBrowserResourceReady(browserResourceStatus);
+                await toggleMcpServerEnabled(server.id, true, browserReady);
+                setMcpEnabledIds(prev => applyBuiltinBrowserToolToggle(
+                    prev,
+                    server.id,
+                    true,
+                    browserReady,
+                ));
 
                 toast.success(tSettings('toolbox.toasts.mcpEnabled'));
             } else if (result.error) {
@@ -1351,29 +1351,49 @@ export default function Settings({ mode = 'settings', initialSection, navigation
 
         // Playwright: open custom config dialog
         if (server.id === 'playwright') {
-            const desired = resolvePlaywrightBrowserConfig(config).settings;
-            const headless = desired.headless;
-            const browser = desired.browser ?? '';
-            let device = desired.device ?? '';
+            const savedArgs = await getMcpServerArgs(server.id);
+            const rawArgs = savedArgs ?? getPlaywrightDefaultArgs();
+            let headless = false;
+            let browser = '';
+            let device = '';
             let customDevice = '';
-            if (device && !PLAYWRIGHT_DEVICE_PRESETS.includes(device)) {
-                customDevice = device;
-                device = '__custom__';
+            let userDataDir = '';
+            let mode: 'upstream' | 'persistent' | 'isolated' = savedArgs === undefined
+                ? 'isolated'
+                : 'upstream';
+            const extraArgs: string[] = [];
+
+            for (const arg of rawArgs) {
+                if (arg === '--headless') {
+                    headless = true;
+                } else if (arg === '--isolated') {
+                    mode = 'isolated';
+                } else if (arg.startsWith('--browser=')) {
+                    browser = arg.slice('--browser='.length);
+                } else if (arg.startsWith('--device=')) {
+                    const value = arg.slice('--device='.length);
+                    if (PLAYWRIGHT_DEVICE_PRESETS.includes(value)) {
+                        device = value;
+                    } else {
+                        device = '__custom__';
+                        customDevice = value;
+                    }
+                } else if (arg.startsWith('--user-data-dir=')) {
+                    mode = 'persistent';
+                    userDataDir = arg.slice('--user-data-dir='.length);
+                } else {
+                    extraArgs.push(arg);
+                }
             }
 
-            // Load storage state info for isolated mode display
-            await reloadStorageStateInfo();
-
-            setCookieForm(null); // Reset cookie form from previous session
             setPlaywrightSettings({
-                mode: desired.mode,
+                mode,
                 headless,
                 browser,
                 device,
                 customDevice,
-                userDataDir: desired.userDataDir ?? '',
-                capabilities: desired.capabilities,
-                extraArgs: desired.extraArgs,
+                userDataDir,
+                extraArgs,
                 newArg: '',
             });
             return;
@@ -1445,95 +1465,11 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         }
     };
 
-    // Save cookie through the Rust-owned optimistic Identity Store.
-    const handleSaveCookie = async () => {
-        if (!cookieForm) return;
-        const { editIndex, domain, name, value, path } = cookieForm;
-        if (!domain.trim() || !name.trim() || !value.trim()) {
-            toast.error(tSettings('toolbox.toasts.cookieRequired'));
-            return;
-        }
-        try {
-            const domainVal = domain.trim().startsWith('.') ? domain.trim() : `.${domain.trim()}`;
-            const pathVal = path.trim() || '/';
-            const existing = editIndex !== null ? storageStateInfo?.cookies[editIndex] : undefined;
-            await mutateBrowserIdentityFromSettings({
-                operation: existing ? 'replaceCookie' : 'upsertCookie',
-                ...(existing ? {
-                    previousName: existing.name,
-                    previousDomain: existing.domain,
-                    previousPath: existing.path,
-                } : {}),
-                cookie: {
-                    name: name.trim(),
-                    value: value.trim(),
-                    domain: domainVal,
-                    path: pathVal,
-                    expires: existing?.expires ?? -1,
-                    httpOnly: existing?.httpOnly ?? false,
-                    secure: existing?.secure ?? true,
-                    sameSite: existing?.sameSite ?? 'Lax',
-                },
-            });
-
-            setCookieForm(null);
-            toast.success(editIndex !== null
-                ? tSettings('toolbox.toasts.cookieUpdated')
-                : tSettings('toolbox.toasts.cookieAdded'));
-            await reloadStorageStateInfo();
-        } catch {
-            toast.error(tSettings('toolbox.toasts.saveFailed'));
-        }
-    };
-
-    // Explicit Settings deletes create a tombstone revision, so a stale live
-    // Context cannot resurrect the cookie during its later checkpoint.
-    const handleDeleteCookie = async (idx: number) => {
-        try {
-            const cookie = storageStateInfo?.cookies[idx];
-            if (!cookie) return;
-            await mutateBrowserIdentityFromSettings({
-                operation: 'deleteCookie',
-                name: cookie.name,
-                domain: cookie.domain,
-                path: cookie.path,
-            });
-            toast.success(tSettings('toolbox.toasts.cookieDeleted'));
-            await reloadStorageStateInfo();
-        } catch {
-            toast.error(tSettings('toolbox.toasts.deleteFailed'));
-        }
-    };
-
-    const handleDeleteBrowserOrigin = async (origin: string) => {
-        try {
-            await mutateBrowserIdentityFromSettings({
-                operation: 'deleteOrigin',
-                origin,
-            });
-            toast.success(tSettings('toolbox.toasts.siteDataDeleted'));
-            await reloadStorageStateInfo();
-        } catch {
-            toast.error(tSettings('toolbox.toasts.deleteFailed'));
-        }
-    };
-
     const appendPlaywrightAdvancedInput = () => {
         setPlaywrightSettings(prev => {
             if (!prev) return null;
             const arg = prev.newArg.trim();
             if (!arg) return prev;
-            if (arg.startsWith('--caps=')) {
-                const capabilities = arg.slice('--caps='.length)
-                    .split(',')
-                    .map(value => value.trim())
-                    .filter(Boolean);
-                return {
-                    ...prev,
-                    capabilities: [...new Set([...prev.capabilities, ...capabilities])],
-                    newArg: '',
-                };
-            }
             return {
                 ...prev,
                 extraArgs: [...prev.extraArgs, arg],
@@ -1545,51 +1481,26 @@ export default function Settings({ mode = 'settings', initialSection, navigation
     const handleSavePlaywright = async () => {
         if (!playwrightSettings) return;
         try {
-            const unsupportedArg = playwrightSettings.extraArgs.find(arg => !isSupportedPlaywrightAdvancedArg(arg));
-            if (unsupportedArg) {
-                toast.error(tSettings('toolbox.dialogs.playwright.unsupportedArg', { arg: unsupportedArg }));
-                return;
+            const args: string[] = [];
+            if (playwrightSettings.mode === 'isolated') {
+                args.push('--isolated');
+            } else if (playwrightSettings.mode === 'persistent') {
+                let userDataDir = playwrightSettings.userDataDir.trim();
+                if (userDataDir.startsWith('~/') || userDataDir === '~') {
+                    const home = await homeDir();
+                    userDataDir = userDataDir === '~' ? home : await join(home, userDataDir.slice(2));
+                }
+                if (userDataDir) args.push(`--user-data-dir=${userDataDir}`);
             }
-            const unsupportedCapability = playwrightSettings.capabilities.find(
-                capability => !isSupportedPlaywrightCapability(capability),
-            );
-            if (unsupportedCapability) {
-                toast.error(tSettings('toolbox.dialogs.playwright.unsupportedCapability', {
-                    capability: unsupportedCapability,
-                }));
-                return;
-            }
-            let userDataDir = playwrightSettings.userDataDir.trim();
-            if (userDataDir.startsWith('~/') || userDataDir === '~') {
-                const home = await homeDir();
-                userDataDir = userDataDir === '~' ? home : await join(home, userDataDir.slice(2));
-            }
+            if (playwrightSettings.headless) args.push('--headless');
+            if (playwrightSettings.browser) args.push(`--browser=${playwrightSettings.browser}`);
             const device = playwrightSettings.device === '__custom__'
                 ? playwrightSettings.customDevice.trim()
                 : playwrightSettings.device;
-            const capabilities = [...new Set([
-                ...(playwrightSettings.mode === 'isolated' ? ['storage'] : []),
-                ...playwrightSettings.capabilities,
-            ])];
-            const desired: PlaywrightBrowserSettings = {
-                schemaVersion: 1,
-                mode: playwrightSettings.mode,
-                headless: playwrightSettings.headless,
-                ...(playwrightSettings.browser ? { browser: playwrightSettings.browser } : {}),
-                ...(device ? { device } : {}),
-                ...(playwrightSettings.mode === 'persistent' && userDataDir ? { userDataDir } : {}),
-                capabilities,
-                extraArgs: playwrightSettings.extraArgs,
-            };
+            if (device) args.push(`--device=${device}`);
+            args.push(...playwrightSettings.extraArgs);
 
-            await atomicModifyConfig(config => ({
-                ...config,
-                playwrightBrowser: desired,
-                mcpServerArgs: Object.fromEntries(
-                    Object.entries(config.mcpServerArgs ?? {}).filter(([serverId]) => serverId !== 'playwright'),
-                ),
-            }));
-            await refreshConfig();
+            await saveMcpServerArgs('playwright', args);
             const servers = await getAllMcpServers();
             setMcpServersState(servers);
             setPlaywrightSettings(null);
@@ -4212,12 +4123,14 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                         officialEnabledIds={officialEnabledIds}
                         officialToolEnabling={officialToolEnabling}
                         officialToolNeedsConfig={{ [IMAGE_UNDERSTANDING_TOOL_ID]: visionToolNeedsConfig }}
+                        browserResourceStatus={browserResourceStatus}
                         onAddMcp={() => { resetMcpForm(); setShowMcpForm(true); }}
                         onEditMcp={handleEditMcp}
                         onEditBuiltinMcp={handleEditBuiltinMcp}
                         onToggleMcp={handleMcpToggle}
                         onEditOfficialTool={openOfficialToolSettings}
                         onToggleOfficialTool={handleOfficialToolToggle}
+                        onInstallBrowserResource={() => { void runBrowserResourceInstall(); }}
                     />
                 )}
 
@@ -6173,7 +6086,22 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                 <label className="block text-sm font-medium text-[var(--ink)] mb-2">
                                     {tSettings('toolbox.dialogs.playwright.browserMode')}
                                 </label>
-                                <div className="grid grid-cols-2 gap-2">
+                                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                                    <button
+                                        onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'upstream' } : null)}
+                                        className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                                            playwrightSettings.mode === 'upstream'
+                                                ? 'border-[var(--accent)] bg-[var(--accent)]/5'
+                                                : 'border-[var(--line)] hover:border-[var(--line-strong)]'
+                                        }`}
+                                    >
+                                        <div className={`text-xs font-medium ${playwrightSettings.mode === 'upstream' ? 'text-[var(--accent)]' : 'text-[var(--ink)]'}`}>
+                                            {tSettings('toolbox.dialogs.playwright.upstreamMode')}
+                                        </div>
+                                        <div className="text-xs text-[var(--ink-muted)] mt-0.5 leading-tight">
+                                            {tSettings('toolbox.dialogs.playwright.upstreamModeDescription')}
+                                        </div>
+                                    </button>
                                     <button
                                         onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'isolated' } : null)}
                                         className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
@@ -6223,186 +6151,6 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                     <div className="mt-2 rounded-lg bg-[var(--warning-bg)] px-3 py-2 text-xs text-[var(--warning)]">
                                         {tSettings('toolbox.dialogs.playwright.persistentWarning')}
                                     </div>
-                                </div>
-                            )}
-
-                            {/* Isolated Mode: storage state + cookie management */}
-                            {playwrightSettings.mode === 'isolated' && (
-                                <div className="space-y-3">
-                                    <div>
-                                        <div className="flex items-center justify-between mb-1.5">
-                                            <label className="text-sm font-medium text-[var(--ink)]">
-                                                {tSettings('toolbox.dialogs.playwright.loginState')}
-                                            </label>
-                                            <button
-                                                onClick={() => setCookieForm({ editIndex: null, domain: '', name: '', value: '', path: '/' })}
-                                                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-[var(--accent)] hover:bg-[var(--accent)]/10 transition-colors"
-                                            >
-                                                <Plus className="h-3 w-3" />
-                                                {tSettings('toolbox.dialogs.playwright.addCookie')}
-                                            </button>
-                                        </div>
-                                        <p className="text-xs text-[var(--ink-muted)] mb-2">
-                                            {tSettings('toolbox.dialogs.playwright.loginStateDescription')}
-                                        </p>
-                                        {storageStateInfo?.recovery && (
-                                            <div className="mb-2 rounded-lg bg-[var(--warning-bg)] px-3 py-2 text-xs text-[var(--warning)]">
-                                                {tSettings('toolbox.dialogs.playwright.identityRecovered')}
-                                            </div>
-                                        )}
-                                    </div>
-
-                                    {/* Cookie List */}
-                                    {storageStateInfo && storageStateInfo.cookies.length > 0 ? (
-                                        <div className="rounded-lg border border-[var(--line)] overflow-hidden">
-                                            {storageStateInfo.cookies.map((cookie, idx) => (
-                                                <div key={idx} className={`flex items-center justify-between px-3 py-2 ${idx > 0 ? 'border-t border-[var(--line)]' : ''}`}>
-                                                    <div className="min-w-0 flex-1">
-                                                        <div className="flex items-center gap-1.5">
-                                                            <span className="text-xs font-medium text-[var(--ink)] truncate">{cookie.name}</span>
-                                                            <span className="text-xs text-[var(--ink-muted)]">{cookie.domain}</span>
-                                                        </div>
-                                                        <div className="text-xs text-[var(--ink-muted)] truncate mt-0.5 font-mono max-w-[280px]">{cookie.path}</div>
-                                                    </div>
-                                                    <div className="flex items-center gap-1 shrink-0 ml-2">
-                                                        <button
-                                                            onClick={() => setCookieForm({
-                                                                editIndex: idx,
-                                                                domain: cookie.domain,
-                                                                name: cookie.name,
-                                                                value: '',
-                                                                path: cookie.path,
-                                                            })}
-                                                            className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
-                                                        >
-                                                            <svg className="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-                                                        </button>
-                                                        <button
-                                                            onClick={() => handleDeleteCookie(idx)}
-                                                            className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--error-bg)] hover:text-[var(--error)]"
-                                                        >
-                                                            <X className="h-3 w-3" />
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    ) : (
-                                        <div className="rounded-lg border border-dashed border-[var(--line)] bg-[var(--paper-inset)] px-3 py-4 text-center">
-                                            <div className="text-xs text-[var(--ink-muted)]">
-                                                {tSettings('toolbox.dialogs.playwright.emptyCookies')}
-                                            </div>
-                                            <div className="text-xs text-[var(--ink-muted)] mt-0.5">
-                                                {tSettings('toolbox.dialogs.playwright.emptyCookiesDescription')}
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {/* localStorage + IndexedDB origins */}
-                                    {storageStateInfo && storageStateInfo.origins.length > 0 && (
-                                        <div>
-                                            <div className="mb-1 text-xs font-medium text-[var(--ink)]">
-                                                {tSettings('toolbox.dialogs.playwright.siteData')}
-                                            </div>
-                                            <div className="overflow-hidden rounded-lg border border-[var(--line)]">
-                                                {storageStateInfo.origins.map((origin, idx) => (
-                                                    <div
-                                                        key={origin}
-                                                        className={`flex items-center justify-between gap-2 px-3 py-2 ${idx > 0 ? 'border-t border-[var(--line)]' : ''}`}
-                                                    >
-                                                        <span className="min-w-0 truncate font-mono text-xs text-[var(--ink-muted)]">
-                                                            {origin}
-                                                        </span>
-                                                        <button
-                                                            onClick={() => handleDeleteBrowserOrigin(origin)}
-                                                            title={tSettings('toolbox.dialogs.playwright.deleteSiteData')}
-                                                            className="shrink-0 rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--error-bg)] hover:text-[var(--error)]"
-                                                        >
-                                                            <X className="h-3 w-3" />
-                                                        </button>
-                                                    </div>
-                                                ))}
-                                            </div>
-                                        </div>
-                                    )}
-
-                                    {/* Cookie Add/Edit Form (inline) */}
-                                    {cookieForm && (
-                                        <div className="rounded-lg border border-[var(--accent)]/30 bg-[var(--paper)] p-3 space-y-2.5">
-                                            <div className="text-xs font-medium text-[var(--ink)]">
-                                                {cookieForm.editIndex !== null
-                                                    ? tSettings('toolbox.dialogs.playwright.editCookie')
-                                                    : tSettings('toolbox.dialogs.playwright.addCookie')}
-                                            </div>
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <div>
-                                                    <label className="block text-xs text-[var(--ink-muted)] mb-0.5">
-                                                        {tSettings('toolbox.dialogs.playwright.domain')}
-                                                    </label>
-                                                    <input
-                                                        type="text"
-                                                        value={cookieForm.domain}
-                                                        onChange={e => setCookieForm(prev => prev ? { ...prev, domain: e.target.value } : null)}
-                                                        placeholder="example.com"
-                                                        className="w-full rounded-md border border-[var(--line)] bg-[var(--paper)] px-2.5 py-1.5 text-xs text-[var(--ink)] placeholder-[var(--ink-muted)]/50 outline-none focus:border-[var(--accent)] font-mono"
-                                                    />
-                                                </div>
-                                                <div>
-                                                    <label className="block text-xs text-[var(--ink-muted)] mb-0.5">
-                                                        {tSettings('toolbox.dialogs.playwright.path')}
-                                                    </label>
-                                                    <input
-                                                        type="text"
-                                                        value={cookieForm.path}
-                                                        onChange={e => setCookieForm(prev => prev ? { ...prev, path: e.target.value } : null)}
-                                                        placeholder="/"
-                                                        className="w-full rounded-md border border-[var(--line)] bg-[var(--paper)] px-2.5 py-1.5 text-xs text-[var(--ink)] placeholder-[var(--ink-muted)]/50 outline-none focus:border-[var(--accent)] font-mono"
-                                                    />
-                                                </div>
-                                            </div>
-                                            <div>
-                                                <label className="block text-xs text-[var(--ink-muted)] mb-0.5">
-                                                    {tSettings('toolbox.dialogs.playwright.name')}
-                                                </label>
-                                                <input
-                                                    type="text"
-                                                    value={cookieForm.name}
-                                                    onChange={e => setCookieForm(prev => prev ? { ...prev, name: e.target.value } : null)}
-                                                    placeholder="session_id"
-                                                    className="w-full rounded-md border border-[var(--line)] bg-[var(--paper)] px-2.5 py-1.5 text-xs text-[var(--ink)] placeholder-[var(--ink-muted)]/50 outline-none focus:border-[var(--accent)] font-mono"
-                                                />
-                                            </div>
-                                            <div>
-                                                <label className="block text-xs text-[var(--ink-muted)] mb-0.5">
-                                                    {tSettings('toolbox.dialogs.playwright.value')}
-                                                </label>
-                                                <input
-                                                    type="text"
-                                                    value={cookieForm.value}
-                                                    onChange={e => setCookieForm(prev => prev ? { ...prev, value: e.target.value } : null)}
-                                                    placeholder="abc123..."
-                                                    className="w-full rounded-md border border-[var(--line)] bg-[var(--paper)] px-2.5 py-1.5 text-xs text-[var(--ink)] placeholder-[var(--ink-muted)]/50 outline-none focus:border-[var(--accent)] font-mono"
-                                                />
-                                            </div>
-                                            <div className="flex justify-end gap-2 pt-1">
-                                                <button
-                                                    onClick={() => setCookieForm(null)}
-                                                    className="rounded-md px-3 py-1.5 text-xs text-[var(--ink-muted)] hover:bg-[var(--paper-inset)]"
-                                                >
-                                                    {tSettings('toolbox.common.cancel')}
-                                                </button>
-                                                <button
-                                                    onClick={handleSaveCookie}
-                                                    disabled={!cookieForm.domain.trim() || !cookieForm.name.trim() || !cookieForm.value.trim()}
-                                                    className="rounded-md bg-[var(--accent)] px-3 py-1.5 text-xs font-medium text-[var(--on-accent)] disabled:opacity-40"
-                                                >
-                                                    {cookieForm.editIndex !== null
-                                                        ? tSettings('toolbox.dialogs.playwright.update')
-                                                        : tSettings('toolbox.common.add')}
-                                                </button>
-                                            </div>
-                                        </div>
-                                    )}
                                 </div>
                             )}
 

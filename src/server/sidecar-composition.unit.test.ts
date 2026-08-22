@@ -27,7 +27,6 @@ describe('Sidecar production composition', () => {
     ['POST', '/api/process/graceful-shutdown', 'global'],
     ['POST', '/api/browser/session/retire', 'global'],
     ['POST', '/api/mcp/oauth/discover', 'global'],
-    ['GET', '/api/browser/identity', 'global'],
     ['POST', '/mcp/playwright', 'global'],
     ['GET', '/api/runtime/models?type=codex', 'common'],
     ['GET', '/api/runtime/permission-modes?type=codex', 'common'],

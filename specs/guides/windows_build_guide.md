@@ -186,7 +186,7 @@ src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 6. **上传构建产物** - 上传到 R2
 7. **上传更新清单** - 上传 JSON 文件
 
-`publish_windows.ps1` 只发布 Windows 桌面 App 和自动更新清单，不上传 Managed Codex Runtime 资源。
+`publish_windows.ps1` 只发布 Windows 桌面 App 和自动更新清单，不上传 Managed Codex Runtime，也不上传「浏览器」Chromium 资源。
 
 ### publish_managed_codex_runtime.ps1
 
@@ -208,6 +208,16 @@ src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 | `CF_ZONE_ID` | Cloudflare Zone ID (可选，用于清除 CDN 缓存) |
 | `CF_API_TOKEN` | Cloudflare API Token (可选) |
 | `MANAGED_CODEX_WINDOWS_PUBLISHER` | 可选，Windows Authenticode publisher 断言；默认 `OpenAI OpCo, LLC` |
+
+### 「浏览器」Runtime（Windows x64）
+
+这是独立于桌面 App build 的可选资源发行步骤。`build_windows.ps1` / `publish_windows.ps1` 不会调用它，也不会把 Chrome 放进 installer：
+
+```powershell
+npm run package:browser-runtime -- --platform win32-x64
+```
+
+打包器从 `src\shared\managed-browser-runtime.json` 与已安装的 Playwright dependency graph 锁定 revision，下载 Chromium + Headless Shell + FFmpeg，拒绝 Firefox/WebKit 和 symlink，验证主 `chrome.exe` Authenticode，并使用 Tauri minisign key 签署 artifact/manifest。将 `dist\browser-runtime\sets\<runtime-set>\win32-x64\` 上传到同名不可变 R2 path 后，必须用 Windows release-like App 验证首次安装、更新进度、重启恢复和有头窗口。正式产物缺签名或远端 exact set 不可读时，不能发布锁定它的 App 版本。
 
 ---
 

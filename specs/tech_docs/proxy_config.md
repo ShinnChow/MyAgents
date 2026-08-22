@@ -334,7 +334,7 @@ let client = reqwest::Client::builder()
 | Provider-owned SDK/runtime/fetch | Provider selection | Rust/Node provider-aware helper |
 | OpenAI Bridge subprocess | **代理变量被剥离** | SDK→Bridge 是 loopback；Bridge→upstream 由 `getProxyForProviderUrl(providerId, url)` 按 Provider owner 选择 overlay / inherited |
 | Plugin Bridge | Rust `apply_proxy_env()` + Node `initializeProxyStateFromCurrentSettings({providerOwnedConsumers:false})` | 加载社区插件前安装 package-pinned global fetch/dispatcher；跟随 general；SOCKS5 在 Bridge 进程内建本地 HTTP bridge；变化后沿 Channel lifecycle 重启 |
-| Updater / Managed Runtime 下载 | Rust reqwest / updater builder | 跟随 general；既有安全直连 fallback 不扩张 |
+| Updater / Managed Runtime /「浏览器」资源下载 | Rust reqwest / updater builder | 跟随 general；浏览器 manifest/artifact 仍固定一方 HTTPS origin、禁 redirect 并在代理后执行同一验签 |
 
 ### SOCKS5 桥接机制
 

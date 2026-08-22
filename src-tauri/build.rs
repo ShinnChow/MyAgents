@@ -12,11 +12,54 @@ const SPACE_BUILD_ENV_KEYS: &[&str] = &[
     "MYAGENTS_SPACE_CLIENT_ID",
 ];
 const MANAGED_CODEX_RUNTIME_LOCK_PATH: &str = "../src/shared/managed-codex-runtime.json";
+const MANAGED_BROWSER_RUNTIME_LOCK_PATH: &str = "../src/shared/managed-browser-runtime.json";
 
 fn main() {
     expose_managed_codex_runtime_lock();
+    expose_managed_browser_runtime_lock();
     expose_space_build_env();
     tauri_build::build()
+}
+
+fn expose_managed_browser_runtime_lock() {
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("CARGO_MANIFEST_DIR is required");
+    let lock_path = manifest_dir.join(MANAGED_BROWSER_RUNTIME_LOCK_PATH);
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    let content = fs::read_to_string(&lock_path).unwrap_or_else(|error| {
+        panic!(
+            "Failed to read Browser runtime lock {}: {error}",
+            lock_path.display()
+        )
+    });
+    let lock: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|error| {
+        panic!(
+            "Invalid Browser runtime lock {}: {error}",
+            lock_path.display()
+        )
+    });
+    let runtime_set = required_runtime_lock_string(&lock, "runtimeSet", &lock_path);
+    let revision = required_runtime_lock_string(&lock, "chromiumRevision", &lock_path);
+    let browser_version = required_runtime_lock_string(&lock, "chromiumBrowserVersion", &lock_path);
+    let playwright_mcp_version =
+        required_runtime_lock_string(&lock, "playwrightMcpVersion", &lock_path);
+    let playwright_core_version =
+        required_runtime_lock_string(&lock, "playwrightCoreVersion", &lock_path);
+    if !runtime_set
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        panic!("Browser runtimeSet contains unsupported characters: {runtime_set:?}");
+    }
+    if !revision.bytes().all(|byte| byte.is_ascii_digit()) {
+        panic!("Browser chromiumRevision must be numeric: {revision:?}");
+    }
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_RUNTIME_SET={runtime_set}");
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_REVISION={revision}");
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_VERSION={browser_version}");
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_PLAYWRIGHT_MCP_VERSION={playwright_mcp_version}");
+    println!("cargo:rustc-env=MYAGENTS_BROWSER_PLAYWRIGHT_CORE_VERSION={playwright_core_version}");
 }
 
 fn expose_managed_codex_runtime_lock() {

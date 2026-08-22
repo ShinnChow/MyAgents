@@ -873,10 +873,6 @@ export default function TabProvider({
     const [unifiedLogs, setUnifiedLogs] = useState<LogEntry[]>([]);
     const [systemInitInfo, setSystemInitInfo] = useState<SystemInitInfo | null>(null);
     const [mcpEffectiveSnapshot, setMcpEffectiveSnapshot] = useState<McpEffectiveSnapshot | null>(null);
-    const [browserProfileWait, setBrowserProfileWait] = useState<{
-        requestId: string;
-        queuePosition: number | null;
-    } | null>(null);
     const [sdkSlashCommands, setSdkSlashCommands] = useState<SlashCommand[]>([]);
     // Issue #194 — runtime diagnostics snapshot for external runtimes (Codex
     // today; Claude Code / Gemini later). Replaces the previously-hardcoded
@@ -1181,41 +1177,8 @@ export default function TabProvider({
         setPendingExitPlanMode(null);
         setPendingEnterPlanMode(null);
         setQueuedMessages([]);
-        setBrowserProfileWait(null);
         startedQueueIdsRef.current.clear();
         clearAllBackgroundTaskStatuses(currentSessionIdRef.current);
-    }, []);
-
-    useEffect(() => {
-        if (!isTauri()) return;
-        const controller = new AbortController();
-        void listenWithCleanup<{
-            productSessionId?: string;
-            requestId?: string;
-            state?: 'queued' | 'granted' | 'cancelled';
-            queuePosition?: number | null;
-        }>('browser:profile-wait', ({ payload }) => {
-            if (
-                !payload.productSessionId
-                || payload.productSessionId !== currentSessionIdRef.current
-                || !payload.requestId
-            ) return;
-            if (payload.state === 'queued') {
-                setBrowserProfileWait({
-                    requestId: payload.requestId,
-                    queuePosition: typeof payload.queuePosition === 'number'
-                        ? payload.queuePosition
-                        : null,
-                });
-                return;
-            }
-            if (payload.state === 'granted' || payload.state === 'cancelled') {
-                setBrowserProfileWait(previous => (
-                    previous?.requestId === payload.requestId ? null : previous
-                ));
-            }
-        }, controller.signal);
-        return () => controller.abort();
     }, []);
 
     // Reset pagination state (firstItemIndex + hasMoreBefore + in-flight guard)
@@ -4316,7 +4279,6 @@ export default function TabProvider({
                 // the connection live again; Tab config hydration keys off it.
                 setIsConnected(false);
                 setMcpEffectiveSnapshot(null);
-                setBrowserProfileWait(null);
                 resetTabServerUrlCache(tabId);
                 const restore = persistedRestoreLifecycleRef.current;
                 if (isPendingSessionId(restartedSid)) return;
@@ -5377,7 +5339,6 @@ export default function TabProvider({
         unifiedLogs,
         systemInitInfo,
         mcpEffectiveSnapshot,
-        browserProfileWait,
         sdkSlashCommands,
         runtimeDiagnostics,
         agentError,
@@ -5422,7 +5383,7 @@ export default function TabProvider({
         forceExecuteQueuedMessage,
     }), [
         tabId, agentDir, currentSessionId, messages, historyMessages, streamingMessage, firstItemIndex, hasMoreBefore, isLoading, isSessionLoading, sessionRestoreError, sessionRestoreMode, sessionState, sessionRuntime, sessionRuntimeSource, sessionMeta,
-        logs, unifiedLogs, systemInitInfo, mcpEffectiveSnapshot, browserProfileWait, sdkSlashCommands, runtimeDiagnostics, agentError, systemStatus, systemNotice, contextUsage, agentPlanTodos, lastTerminalReason, pendingPermission, pendingAskUserQuestion, pendingExitPlanMode, pendingEnterPlanMode, toolCompleteCount, queuedMessages, isConnected,
+        logs, unifiedLogs, systemInitInfo, mcpEffectiveSnapshot, sdkSlashCommands, runtimeDiagnostics, agentError, systemStatus, systemNotice, contextUsage, agentPlanTodos, lastTerminalReason, pendingPermission, pendingAskUserQuestion, pendingExitPlanMode, pendingEnterPlanMode, toolCompleteCount, queuedMessages, isConnected,
         setMessages, appendLog, appendUnifiedLog, clearUnifiedLogs, sendMessage, stopResponse, retryCurrentSessionRestore, loadOlderMessages, resetSession, adoptMigratedSession,
         apiGetJson, postJson, apiPutJson, apiDeleteJson, respondPermission, respondAskUserQuestion, respondExitPlanMode, cancelQueuedMessage, forceExecuteQueuedMessage
     ]);

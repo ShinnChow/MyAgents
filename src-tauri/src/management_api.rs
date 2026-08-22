@@ -132,20 +132,8 @@ pub async fn start_management_api() -> Result<u16, String> {
             post(browser_session_adopt_handler),
         )
         .route(
-            "/api/browser/profile/acquire",
-            post(browser_profile_acquire_handler),
-        )
-        .route(
-            "/api/browser/profile/cancel",
-            post(browser_profile_cancel_handler),
-        )
-        .route(
-            "/api/browser/profile/release",
-            post(browser_profile_release_handler),
-        )
-        .route(
-            "/api/browser/profile/status",
-            post(browser_profile_status_handler),
+            "/api/browser/resource/resolve",
+            post(browser_resource_resolve_handler),
         )
         .route(
             "/api/browser/identity/read",
@@ -154,10 +142,6 @@ pub async fn start_management_api() -> Result<u16, String> {
         .route(
             "/api/browser/identity/checkpoint",
             post(browser_identity_checkpoint_handler),
-        )
-        .route(
-            "/api/browser/identity/mutate",
-            post(browser_identity_mutate_handler),
         )
         .route("/api/cron/create", post(create_cron_handler))
         .route("/api/cron/list", get(list_cron_handler))
@@ -911,180 +895,6 @@ async fn browser_capability_verify_handler(
         "hostGeneration": binding.host_generation,
     }))
 }
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserProfileRequest {
-    sidecar_id: String,
-    token: String,
-    request_id: String,
-    lease_epoch: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserProfileStatusRequest {
-    sidecar_id: String,
-    token: String,
-    request_id: String,
-    state: String,
-    queue_position: Option<u64>,
-}
-
-async fn browser_profile_acquire_handler(
-    headers: HeaderMap,
-    Json(req): Json<BrowserProfileRequest>,
-) -> (HeaderMap, Json<serde_json::Value>) {
-    if !valid_mcp_request_id(req.request_id.trim()) {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "A valid profile requestId is required",
-        }));
-    }
-    let binding =
-        match verify_global_browser_capability(&headers, req.sidecar_id.trim(), req.token.trim()) {
-            Ok(binding) => binding,
-            Err(value) => return no_store_json(value),
-        };
-    let host_generation = binding.host_generation;
-    let priority = get_sidecar_state()
-        .and_then(|sidecars| sidecars.lock().ok())
-        .and_then(|manager| {
-            manager.resolve_browser_capability_source(
-                &binding.source_sidecar_id,
-                binding.source_generation,
-            )
-        })
-        .map(|source| {
-            if source.interactive {
-                crate::browser_profile_lease::ProfileLeasePriority::Interactive
-            } else {
-                crate::browser_profile_lease::ProfileLeasePriority::Background
-            }
-        })
-        .unwrap_or(crate::browser_profile_lease::ProfileLeasePriority::Background);
-    let admission = crate::browser_profile_lease::acquire_profile_lease(
-        req.request_id.trim(),
-        binding,
-        priority,
-        host_generation,
-        sidecar_is_live,
-    );
-    no_store_json(serde_json::json!({
-        "ok": true,
-        "admitted": admission.admitted,
-        "leaseEpoch": admission.lease_epoch,
-        "queuePosition": admission.queue_position,
-        "retryAfterMs": 100,
-    }))
-}
-
-async fn browser_profile_cancel_handler(
-    headers: HeaderMap,
-    Json(req): Json<BrowserProfileRequest>,
-) -> (HeaderMap, Json<serde_json::Value>) {
-    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
-        return no_store_json(value);
-    }
-    if !valid_mcp_request_id(req.request_id.trim()) {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "A valid profile requestId is required",
-        }));
-    }
-    let Some(host_generation) = request_sidecar_generation(&headers).ok() else {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "Current Global Host generation is required",
-        }));
-    };
-    let cancelled = crate::browser_profile_lease::cancel_owned_profile_request(
-        req.request_id.trim(),
-        host_generation,
-    );
-    no_store_json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
-}
-
-async fn browser_profile_release_handler(
-    headers: HeaderMap,
-    Json(req): Json<BrowserProfileRequest>,
-) -> (HeaderMap, Json<serde_json::Value>) {
-    let Some(lease_epoch) = req.lease_epoch.filter(|epoch| *epoch > 0) else {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "A valid profile leaseEpoch is required",
-        }));
-    };
-    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
-        return no_store_json(value);
-    }
-    if !valid_mcp_request_id(req.request_id.trim()) {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "A valid profile requestId is required",
-        }));
-    }
-    let Some(host_generation) = request_sidecar_generation(&headers).ok() else {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "Current Global Host generation is required",
-        }));
-    };
-    let released = crate::browser_profile_lease::release_owned_profile_request(
-        req.request_id.trim(),
-        lease_epoch,
-        host_generation,
-    );
-    no_store_json(serde_json::json!({ "ok": true, "released": released }))
-}
-
-async fn browser_profile_status_handler(
-    headers: HeaderMap,
-    Json(req): Json<BrowserProfileStatusRequest>,
-) -> (HeaderMap, Json<serde_json::Value>) {
-    if !valid_mcp_request_id(req.request_id.trim())
-        || !matches!(req.state.as_str(), "queued" | "granted" | "cancelled")
-    {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "A valid profile wait status is required",
-        }));
-    }
-    let binding =
-        match verify_global_browser_capability(&headers, req.sidecar_id.trim(), req.token.trim()) {
-            Ok(binding) => binding,
-            Err(value) => return no_store_json(value),
-        };
-    let Some(app_handle) = crate::logger::get_app_handle() else {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "management_unavailable",
-            "error": "App handle is not initialized",
-        }));
-    };
-    let payload = serde_json::json!({
-        "productSessionId": binding.product_session_id,
-        "requestId": req.request_id,
-        "state": req.state,
-        "queuePosition": req.queue_position,
-    });
-    match app_handle.emit("browser:profile-wait", payload) {
-        Ok(()) => no_store_json(serde_json::json!({ "ok": true })),
-        Err(error) => no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "management_unavailable",
-            "error": error.to_string(),
-        })),
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BrowserIdentityReadRequest {
@@ -1103,6 +913,37 @@ fn validate_global_browser_owner(
         }));
     }
     validate_current_sidecar_request(headers, sidecar_id)
+}
+
+async fn browser_resource_resolve_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserIdentityReadRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    match crate::browser_resource::resolve_browser_resource() {
+        Ok(resolution) => no_store_json(serde_json::json!({
+            "ok": true,
+            "executablePath": resolution.executable_path,
+            "revision": resolution.revision,
+        })),
+        Err(status) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": status.error_code.clone().unwrap_or_else(|| {
+                if status.state == "never_installed" {
+                    "BROWSER_RESOURCE_NOT_INSTALLED".to_string()
+                } else if status.state == "unsupported" {
+                    "BROWSER_RESOURCE_UNSUPPORTED".to_string()
+                } else {
+                    "BROWSER_RESOURCE_NOT_READY".to_string()
+                }
+            }),
+            "error": "Browser resources are not ready",
+            "state": status.state,
+            "retryAfterMs": 250,
+        })),
+    }
 }
 
 async fn browser_identity_read_handler(
@@ -1167,101 +1008,6 @@ async fn browser_identity_checkpoint_handler(
         Err(error) => no_store_json(serde_json::json!({
             "ok": false,
             "code": "browser_identity_checkpoint_failed",
-            "error": error,
-        })),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserIdentityMutationRequest {
-    sidecar_id: String,
-    base_revision: u64,
-    operation: String,
-    cookie: Option<serde_json::Value>,
-    previous_name: Option<String>,
-    previous_domain: Option<String>,
-    previous_path: Option<String>,
-    name: Option<String>,
-    domain: Option<String>,
-    path: Option<String>,
-    origin: Option<String>,
-}
-
-async fn browser_identity_mutate_handler(
-    headers: HeaderMap,
-    Json(req): Json<BrowserIdentityMutationRequest>,
-) -> (HeaderMap, Json<serde_json::Value>) {
-    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
-        return no_store_json(value);
-    }
-    let mutation = match req.operation.as_str() {
-        "upsertCookie" => req
-            .cookie
-            .map(|cookie| crate::browser_identity_store::IdentityMutation::UpsertCookie { cookie }),
-        "replaceCookie" => match (
-            req.previous_name,
-            req.previous_domain,
-            req.previous_path,
-            req.cookie,
-        ) {
-            (Some(previous_name), Some(previous_domain), Some(previous_path), Some(cookie))
-                if !previous_name.is_empty()
-                    && !previous_domain.is_empty()
-                    && !previous_path.is_empty() =>
-            {
-                Some(
-                    crate::browser_identity_store::IdentityMutation::ReplaceCookie {
-                        previous_name,
-                        previous_domain,
-                        previous_path,
-                        cookie,
-                    },
-                )
-            }
-            _ => None,
-        },
-        "deleteCookie" => match (req.name, req.domain, req.path) {
-            (Some(name), Some(domain), Some(path))
-                if !name.is_empty() && !domain.is_empty() && !path.is_empty() =>
-            {
-                Some(
-                    crate::browser_identity_store::IdentityMutation::DeleteCookie {
-                        name,
-                        domain,
-                        path,
-                    },
-                )
-            }
-            _ => None,
-        },
-        "deleteOrigin" => req
-            .origin
-            .filter(|origin| !origin.is_empty())
-            .map(|origin| crate::browser_identity_store::IdentityMutation::DeleteOrigin { origin }),
-        _ => None,
-    };
-    let Some(mutation) = mutation else {
-        return no_store_json(serde_json::json!({
-            "ok": false,
-            "code": "invalid_request",
-            "error": "A valid Browser Identity Store mutation is required",
-        }));
-    };
-    match crate::browser_identity_store::mutate_identity(req.base_revision, mutation) {
-        Ok(snapshot) => no_store_json(serde_json::json!({
-            "ok": true,
-            "revision": snapshot.revision,
-            "state": snapshot.state,
-            "recovery": snapshot.recovery,
-        })),
-        Err(error) => no_store_json(serde_json::json!({
-            "ok": false,
-            "code": if error == "BROWSER_IDENTITY_REVISION_CONFLICT" {
-                "browser_identity_revision_conflict"
-            } else {
-                "browser_identity_mutation_failed"
-            },
             "error": error,
         })),
     }

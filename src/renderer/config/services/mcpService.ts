@@ -6,6 +6,12 @@ import { loadAppConfig, atomicModifyConfig } from './appConfigService';
 import { loadProjects, saveProjects } from './projectService';
 import { apiPostJson } from '@/api/apiFetch';
 import { applyMcpServerConfigAdditions } from '../../../shared/mcpConfig';
+import {
+    DEFAULT_STANDARD_PLAYWRIGHT_ARGS,
+    STANDARD_PLAYWRIGHT_MCP_ID,
+    applyBuiltinBrowserToolToggle,
+    isReservedBuiltinBrowserMcpId,
+} from '../../../shared/browserTools';
 
 /**
  * Detect host platform in the renderer using the same vocabulary as
@@ -36,7 +42,8 @@ function getPlatformFilteredPresets(): McpServerDefinition[] {
 /**
  * Synchronous variant — merges preset + custom MCP servers from an
  * already-loaded `AppConfig`. Same semantics as `getAllMcpServers` (custom
- * overrides preset on id collision; user args/env merged in; presets
+ * overrides ordinary presets on id collision; reserved Browser IDs remain
+ * built-in; user args/env are merged; presets are
  * filtered by host platform), but takes the config as a parameter so
  * callers that already hold an in-memory snapshot (`useConfig().config`)
  * don't pay the disk-read round-trip and don't need an async hook.
@@ -49,8 +56,10 @@ function getPlatformFilteredPresets(): McpServerDefinition[] {
  * v0.2.4 review).
  */
 export function getAllMcpServersFromConfig(config: AppConfig): McpServerDefinition[] {
-    const customServers = Array.isArray(config.mcpServers) ? config.mcpServers : [];
-    // Deduplicate: custom servers with the same ID as a preset override the preset
+    const customServers = (Array.isArray(config.mcpServers) ? config.mcpServers : [])
+        .filter(server => !isReservedBuiltinBrowserMcpId(server.id));
+    // Custom servers may override ordinary presets, but the two product-owned
+    // Browser identities are reserved and always resolve to their presets.
     // (aligned with server-side getAllMcpServers in admin-config.ts)
     const customIds = new Set(customServers.map(s => s.id));
     const allServers = [
@@ -79,20 +88,51 @@ export async function getEnabledMcpServerIds(): Promise<string[]> {
     return Array.isArray(config.mcpEnabledServers) ? config.mcpEnabledServers : [];
 }
 
-export async function toggleMcpServerEnabled(serverId: string, enabled: boolean): Promise<void> {
-    await atomicModifyConfig(c => {
-        const enabledServers = new Set(Array.isArray(c.mcpEnabledServers) ? c.mcpEnabledServers : []);
-        if (enabled) {
-            enabledServers.add(serverId);
-        } else {
-            enabledServers.delete(serverId);
-        }
-        return { ...c, mcpEnabledServers: Array.from(enabledServers) };
-    });
+export function applyMcpServerToggleToConfig(
+    config: AppConfig,
+    serverId: string,
+    enabled: boolean,
+    managedBrowserReady: boolean,
+): AppConfig {
+    const current = Array.isArray(config.mcpEnabledServers) ? config.mcpEnabledServers : [];
+    const shouldPersistPlaywrightDefault = enabled
+        && serverId === STANDARD_PLAYWRIGHT_MCP_ID
+        && config.mcpServerArgs?.[STANDARD_PLAYWRIGHT_MCP_ID] === undefined;
+    return {
+        ...config,
+        mcpEnabledServers: applyBuiltinBrowserToolToggle(
+            current,
+            serverId,
+            enabled,
+            managedBrowserReady,
+        ),
+        ...(shouldPersistPlaywrightDefault ? {
+            mcpServerArgs: {
+                ...(config.mcpServerArgs ?? {}),
+                [STANDARD_PLAYWRIGHT_MCP_ID]: [...DEFAULT_STANDARD_PLAYWRIGHT_ARGS],
+            },
+        } : {}),
+    };
+}
+
+export async function toggleMcpServerEnabled(
+    serverId: string,
+    enabled: boolean,
+    managedBrowserReady: boolean,
+): Promise<void> {
+    await atomicModifyConfig(c => applyMcpServerToggleToConfig(
+        c,
+        serverId,
+        enabled,
+        managedBrowserReady,
+    ));
     console.log('[configService] MCP server toggled:', serverId, enabled);
 }
 
 export async function addCustomMcpServer(server: McpServerDefinition): Promise<void> {
+    if (isReservedBuiltinBrowserMcpId(server.id)) {
+        throw new Error(`MCP ID "${server.id}" is reserved by a built-in Browser tool`);
+    }
     await atomicModifyConfig(c => {
         const customServers = [...(Array.isArray(c.mcpServers) ? c.mcpServers : [])];
         const existingIndex = customServers.findIndex(s => s.id === server.id);

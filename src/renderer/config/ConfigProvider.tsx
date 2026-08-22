@@ -32,7 +32,6 @@ import {
     atomicModifyConfig,
     ensureBundledWorkspace,
     ensureManagedCodexProviderDevGateDefault,
-    ensurePlaywrightBrowserConfigMigration,
     mergePresetCustomModels,
 } from './services/appConfigService';
 import {
@@ -435,12 +434,6 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
     // Startup maintenance may write config, but it must never own the
     // availability of an already-readable disk snapshot.
     const runStartupConfigMaintenance = useCallback(async () => {
-        const playwrightMigration = await ensurePlaywrightBrowserConfigMigration();
-        if (playwrightMigration.migrationError) {
-            console.error(
-                `[ConfigProvider] Playwright browser config migration blocked: ${playwrightMigration.migrationError}`,
-            );
-        }
         await ensureBundledWorkspace();
         try {
             const { invoke } = await import('@tauri-apps/api/core');
