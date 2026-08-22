@@ -14,6 +14,9 @@ describe('managed Browser runtime identity contract', () => {
 
     expect(source).toContain('...(usesManagedBrowserHost ? [MANAGED_BROWSER_MCP_ID] : [])');
     expect(source).toContain('serverId: MANAGED_BROWSER_MCP_ID');
+    expect(source).toContain('await adoptBrowserProductSession(options.sessionId);');
+    expect(source).not.toContain('adoptBrowserProductSession(result.thread.id)');
+    expect(source).not.toContain('adoptBrowserProductSession(codexProc.threadId)');
     expect(source).not.toContain("usesManagedBrowserHost ? ['playwright']");
   });
 });

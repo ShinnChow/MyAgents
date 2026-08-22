@@ -3526,6 +3526,12 @@ export class CodexRuntime implements AgentRuntime {
     let browserCapabilityInitiallyUnavailable = false;
     if (usesManagedBrowserHost) {
       try {
+        // Browser ownership is Product-Session scoped. Codex's native thread
+        // id is a runtime execution identity and must never be projected into
+        // this domain. For a desktop Sidecar that is still keyed by pending-*,
+        // external-session has already minted the future Product Session id in
+        // options.sessionId, so project that owner before issuing the token.
+        await adoptBrowserProductSession(options.sessionId);
         const capability = await acquireBrowserCapability();
         browserHostGeneration = capability.hostGeneration;
         browserCapabilityToken = capability.token;
@@ -3555,17 +3561,6 @@ export class CodexRuntime implements AgentRuntime {
         );
       }
     }
-    const adoptManagedBrowserProductSession = async (productSessionId: string): Promise<void> => {
-      try {
-        await adoptBrowserProductSession(productSessionId);
-      } catch (error) {
-        if (!browserCapabilityInitiallyUnavailable) throw error;
-        console.warn(
-          '[codex] Browser Product Session adoption deferred with Host recovery:',
-          summarizeCodexErrorForLog(error),
-        );
-      }
-    };
     const desiredRuntimeMcpServers = runtimeMcpServers ?? [];
     if (runtimeSource !== 'managed-provider') releaseManagedCodexMcpAdmission();
     const mcpAdmission = runtimeSource === 'managed-provider'
@@ -3705,9 +3700,7 @@ export class CodexRuntime implements AgentRuntime {
       browserRecoveryTimer = setTimeout(() => {
         browserRecoveryTimer = null;
         if (codexProc.exited) return;
-        void (codexProc.threadId
-          ? adoptBrowserProductSession(codexProc.threadId)
-          : Promise.resolve())
+        void adoptBrowserProductSession(options.sessionId)
           .then(() => acquireBrowserCapability())
           .then(capability => {
             if (codexProc.exited) return;
@@ -4054,7 +4047,6 @@ export class CodexRuntime implements AgentRuntime {
         console.log(`[codex] RPC thread/resume: ${JSON.stringify(summarizeCodexThreadParamsForLog(resumeParams))}`);
         const result = await codexProc.rpc.call('thread/resume', resumeParams, 30_000) as { thread: { id: string } };
         codexProc.threadId = result.thread.id;
-        if (usesManagedBrowserHost) await adoptManagedBrowserProductSession(result.thread.id);
 
         // Emit synthetic session_init — thread/resume doesn't trigger notifications
         // but external-session needs it for session ID sync and frontend needs
@@ -4085,7 +4077,6 @@ export class CodexRuntime implements AgentRuntime {
         console.log(`[codex] RPC thread/start: ${JSON.stringify(summarizeCodexThreadParamsForLog(startParams))}`);
         const result = await codexProc.rpc.call('thread/start', startParams, 30_000) as { thread: { id: string }; model: string };
         codexProc.threadId = result.thread.id;
-        if (usesManagedBrowserHost) await adoptManagedBrowserProductSession(result.thread.id);
 
         // Emit session_init so external-session.ts captures threadId
         onEvent({

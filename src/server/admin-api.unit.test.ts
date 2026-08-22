@@ -130,6 +130,7 @@ vi.mock('./session-engine', () => ({
 let scratch: string;
 let prevHome: string | undefined;
 let prevUserProfile: string | undefined;
+let prevSidecarId: string | undefined;
 
 function writeJson(path: string, value: unknown): void {
   writeFileSync(path, JSON.stringify(value, null, 2), 'utf-8');
@@ -148,8 +149,10 @@ beforeEach(() => {
   mkdirSync(join(scratch, '.myagents'), { recursive: true });
   prevHome = process.env.HOME;
   prevUserProfile = process.env.USERPROFILE;
+  prevSidecarId = process.env.MYAGENTS_SIDECAR_ID;
   process.env.HOME = scratch;
   process.env.USERPROFILE = scratch;
+  process.env.MYAGENTS_SIDECAR_ID = 'test-session-sidecar';
   vi.resetModules();
   agentSessionMocks.agentDir = undefined;
   agentSessionMocks.getSidecarPort.mockReturnValue(0);
@@ -182,6 +185,8 @@ afterEach(() => {
   else process.env.HOME = prevHome;
   if (prevUserProfile === undefined) delete process.env.USERPROFILE;
   else process.env.USERPROFILE = prevUserProfile;
+  if (prevSidecarId === undefined) delete process.env.MYAGENTS_SIDECAR_ID;
+  else process.env.MYAGENTS_SIDECAR_ID = prevSidecarId;
   rmSync(scratch, { recursive: true, force: true });
 });
 
@@ -2784,6 +2789,36 @@ describe('admin-api MCP add contract', () => {
 });
 
 describe('admin-api MCP connectivity test', () => {
+  it('diagnoses the managed Browser through its Session capability instead of spawning the sentinel', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      url: 'http://127.0.0.1:31415/mcp/playwright',
+      token: 'a'.repeat(32),
+      hostGeneration: 7,
+    });
+
+    const { handleMcpTest } = await import('./admin-api');
+    const result = await handleMcpTest({ id: 'myagents-browser' });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        id: 'myagents-browser',
+        type: 'application-host',
+        state: 'ready',
+        sessionScoped: true,
+        hostGeneration: 7,
+      },
+    });
+    expect(result.hint).toContain('internal projection marker');
+    expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+      '/api/browser/capability/acquire',
+      'POST',
+      { sidecarId: 'test-session-sidecar' },
+      { parentSignal: undefined },
+    );
+  });
+
   it('rejects a configured stdio command that exists but exits before MCP initialize', async () => {
     writeJson(join(scratch, '.myagents', 'config.json'), {
       mcpServers: [{

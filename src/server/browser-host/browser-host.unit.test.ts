@@ -62,7 +62,7 @@ function initializeRequest(token = TOKEN_A): Request {
 function capability(token: string) {
   return {
     productSessionId: token === TOKEN_A ? 'session-a' : 'session-b',
-    workspacePath: token === TOKEN_A ? '/workspace/a' : '/workspace/b',
+    workspacePath: '/workspace/a',
     hostGeneration: 7,
   };
 }
@@ -121,6 +121,7 @@ describe('PlaywrightBrowserHost', () => {
       },
     }));
     expect(crossSession.status).toBe(403);
+    expect(registry.rekeyProductSession).not.toHaveBeenCalled();
 
     await host.handleRequest(new Request('http://127.0.0.1/mcp/browser', {
       method: 'DELETE',
@@ -134,6 +135,77 @@ describe('PlaywrightBrowserHost', () => {
     expect(registry.releaseConnection).toHaveBeenCalledOnce();
     await host.shutdown();
     expect(registry.releaseConnection).toHaveBeenCalledOnce();
+  });
+
+  it('accepts a rotated capability for the same Product Session connection', async () => {
+    const registry = fakeRegistry();
+    const host = new PlaywrightBrowserHost({
+      registry: registry as unknown as BrowserContextRegistry,
+      verifyCapability: vi.fn(async () => capability(TOKEN_A)),
+    });
+
+    const initialized = await host.handleRequest(initializeRequest(TOKEN_A));
+    const sessionId = String(initialized.headers.get('mcp-session-id'));
+    const closedWithRotatedCapability = await host.handleRequest(new Request('http://127.0.0.1/mcp/browser', {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${TOKEN_B}`,
+        Accept: 'application/json, text/event-stream',
+        Host: '127.0.0.1',
+        'mcp-session-id': sessionId,
+      },
+    }));
+
+    expect(closedWithRotatedCapability.status).not.toBe(403);
+    expect(registry.releaseConnection).toHaveBeenCalledOnce();
+    await host.shutdown();
+  });
+
+  it('does not let an invalid result for the old capability retire a rotated connection', async () => {
+    const registry = fakeRegistry();
+    let rejectOldCapability!: (error: Error) => void;
+    let verificationCount = 0;
+    const verifyCapability = vi.fn(async (token: string) => {
+      verificationCount += 1;
+      if (verificationCount === 2 && token === TOKEN_A) {
+        return await new Promise<ReturnType<typeof capability>>((_, reject) => {
+          rejectOldCapability = reject;
+        });
+      }
+      return capability(TOKEN_A);
+    });
+    const host = new PlaywrightBrowserHost({
+      registry: registry as unknown as BrowserContextRegistry,
+      verifyCapability,
+    });
+
+    const initialized = await host.handleRequest(initializeRequest(TOKEN_A));
+    const sessionId = String(initialized.headers.get('mcp-session-id'));
+    const sweep = (host as unknown as { sweepCapabilities(): Promise<void> }).sweepCapabilities();
+    await vi.waitFor(() => expect(verificationCount).toBe(2));
+
+    const rotated = await host.handleRequest(request({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/list',
+      params: {},
+    }, TOKEN_B, sessionId));
+    expect(rotated.status).toBe(200);
+
+    const staleError = new Error('old capability expired');
+    staleError.name = 'browser_capability_invalid';
+    rejectOldCapability(staleError);
+    await sweep;
+
+    expect(registry.releaseConnection).not.toHaveBeenCalled();
+    const stillLive = await host.handleRequest(request({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/list',
+      params: {},
+    }, TOKEN_B, sessionId));
+    expect(stillLive.status).toBe(200);
+    await host.shutdown();
   });
 
   it('rejects an oversized chunked body before connection creation', async () => {

@@ -246,9 +246,14 @@ export class PlaywrightBrowserHost {
       if (connection.retiring) {
         return jsonError(409, 'BROWSER_CONNECTION_REPLACED', 'Browser MCP connection was replaced');
       }
-      if (!tokensEqual(connection.token, token) || !this.reconcileConnectionBinding(connection, binding)) {
+      if (!this.reconcileConnectionBinding(connection, binding)) {
         return jsonError(403, 'BROWSER_CONNECTION_FORBIDDEN', 'Browser MCP connection belongs to another Session');
       }
+      // Rust has already authenticated the presented capability and resolved
+      // it back to the same Product Session/workspace/Host generation. Accept
+      // credential rotation for that owner (for example after a Session
+      // Sidecar restart) and keep the connection's sweep credential current.
+      if (!tokensEqual(connection.token, token)) connection.token = token;
     } else if (request.method === 'POST') {
       const requestShape = requestBodyMethod(parsedBody);
       if (requestShape.method !== 'initialize') {
@@ -495,7 +500,9 @@ export class PlaywrightBrowserHost {
   ): boolean {
     if (sameBinding(connection.binding, binding)) return true;
     if (
-      connection.binding.hostGeneration !== binding.hostGeneration
+      !connection.binding.productSessionId.startsWith('pending-')
+      || binding.productSessionId.startsWith('pending-')
+      || connection.binding.hostGeneration !== binding.hostGeneration
       || connection.binding.workspacePath !== binding.workspacePath
       || !this.dependencies.registry.rekeyProductSession(
         connection.binding.productSessionId,
@@ -523,8 +530,13 @@ export class PlaywrightBrowserHost {
     const candidates = new Set([...this.connections.values(), ...this.pendingConnections]);
     await Promise.allSettled([...candidates].map(async connection => {
       if (connection.closed) return;
+      const verifiedToken = connection.token;
       try {
-        const binding = await this.dependencies.verifyCapability(connection.token);
+        const binding = await this.dependencies.verifyCapability(verifiedToken);
+        // A request may rotate this connection's capability while the control
+        // plane is verifying the old credential. Discard that stale result;
+        // the next bounded sweep will verify the current token.
+        if (!tokensEqual(connection.token, verifiedToken)) return;
         if (!this.reconcileConnectionBinding(connection, binding)) {
           await this.disposeConnection(connection);
         }
@@ -532,7 +544,11 @@ export class PlaywrightBrowserHost {
         // Rust returns this stable code only when the source or Host
         // generation is no longer live. Transient control-plane failures keep
         // the Context and are retried by the next bounded sweep.
-        if (error instanceof Error && error.name === 'browser_capability_invalid') {
+        if (
+          tokensEqual(connection.token, verifiedToken)
+          && error instanceof Error
+          && error.name === 'browser_capability_invalid'
+        ) {
           await this.disposeConnection(connection);
         }
       }

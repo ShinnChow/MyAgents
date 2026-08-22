@@ -86,7 +86,7 @@ import {
   type PersistedAgentWorkspaceProjection,
 } from './utils/agent-workspace-identity';
 import { buildProactiveAgentTogglePatch } from '../shared/proactiveAgentPolicy';
-import { isReservedBuiltinBrowserMcpId } from '../shared/browserTools';
+import { isReservedBuiltinBrowserMcpId, MANAGED_BROWSER_MCP_ID } from '../shared/browserTools';
 
 // Long-running sidecar operations need their own budget. Anchored to the
 // sidecar's internal `FETCH_TIMEOUT_MS` (300s for tarball download) plus a
@@ -624,6 +624,44 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
   }
   if ((server.type === 'sse' || server.type === 'http') && !server.url) {
     return { success: false, error: `MCP server '${id}' has no URL configured` };
+  }
+
+  // Application Browser Host: __browser_host__ is a product-owned projection
+  // sentinel, never an executable. A generic stdio handshake would therefore
+  // produce the misleading `spawn __browser_host__ ENOENT`. Acquiring the
+  // current Session's capability is the non-disruptive readiness check: opening
+  // a second MCP connection here would retire the live Session connection.
+  if (server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__') {
+    try {
+      const { acquireBrowserCapability } = await import('./browser-host/capability-client');
+      const capability = await acquireBrowserCapability();
+      return {
+        success: true,
+        data: {
+          id,
+          type: 'application-host',
+          state: 'ready',
+          sessionScoped: true,
+          hostGeneration: capability.hostGeneration,
+        },
+        hint: 'MyAgents Browser Host is ready for the current Product Session. __browser_host__ is an internal projection marker, not a PATH executable.',
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `MyAgents Browser Host is unavailable for the current Product Session: ${error instanceof Error ? error.message : String(error)}`,
+        data: {
+          id,
+          type: 'application-host',
+          state: 'unavailable',
+          sessionScoped: true,
+        },
+        recoveryHint: {
+          recoveryCommand: 'myagents mcp test myagents-browser',
+          message: 'Run this check from an active MyAgents Agent Session after the application Browser Host is ready.',
+        },
+      };
+    }
   }
 
   // Built-in MCP: delegate to registry.
