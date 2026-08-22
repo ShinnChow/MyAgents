@@ -159,6 +159,37 @@ describe('NotificationCenterFlyout', () => {
     expect(screen.getByText(taskComment.excerpt)).toBeInTheDocument();
   });
 
+  it('uses text tone alone for read state and clamps comment excerpts to three lines', () => {
+    const readTaskComment = { ...taskComment, id: 'task-comment:read', isRead: true };
+    renderFlyout({
+      snapshot: snapshot({
+        items: [taskComment, readTaskComment],
+        feedCutoff: { createdAt: readTaskComment.createdAt, id: readTaskComment.id },
+      }),
+    });
+
+    const unreadItem = screen.getByLabelText(String(i18n.t('app:notificationCenter.unread')));
+    const readItem = screen.getByLabelText(String(i18n.t('app:notificationCenter.read')));
+    expect(unreadItem.querySelector('[data-notification-headline]')).toHaveClass(
+      'font-medium',
+      'text-[var(--ink)]',
+    );
+    expect(readItem.querySelector('[data-notification-headline]')).toHaveClass(
+      'font-normal',
+      'text-[var(--ink-muted)]',
+    );
+    expect(unreadItem.querySelector('[data-notification-detail]')).toHaveClass(
+      'line-clamp-3',
+      'text-[var(--ink-secondary)]',
+    );
+    expect(readItem.querySelector('[data-notification-detail]')).toHaveClass(
+      'line-clamp-3',
+      'text-[var(--ink-muted)]/75',
+    );
+    expect(unreadItem.querySelector('[aria-hidden="true"]')).not.toBeInTheDocument();
+    expect(unreadItem.querySelector('svg')).not.toBeInTheDocument();
+  });
+
   it('marks all read against the loaded feed cutoff without activating a row', async () => {
     const onMarkAllRead = vi.fn(async () => undefined);
     renderFlyout({ onMarkAllRead });

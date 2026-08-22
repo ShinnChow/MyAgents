@@ -1302,9 +1302,9 @@ MyAgents 使用“双层注意力导航”：全局侧边栏回答“产品能�
 
 展开态从上到下依次为：原生窗口 chrome 与固定收起控制、独立产品身份行、新对话/搜索/任务/团队/技能与工具的连续主导航、Agent 工作区树、底部小助理/设置；其中团队入口仅在 Team Space 实验室开关开启且当前构建能力可用时出现，关闭后展开态与 rail 均不保留失效入口。主导航项与底部入口使用 32px 命中高度且不添加行间距；从主导航到 Agent 工作区、再到底部入口均不使用横分割线，主要层级只依靠 8–12px 组间留白、工作区标题和选中面，不将每组包成卡片。
 
-通知 Bell 是 App Shell 的常驻底部入口，不受登录态或 Team Space UI 偏好隐藏；有未读时只在 16px Bell 右上角显示 6px `--accent-warm` 圆点，不显示数字。点击打开与 rail 工作区 hover 面板同材质的 fixed 非模态面板，展开/rail 时都从当前侧栏右侧起，宽度上限 380px、高度 440px，并与工作区 flyout、小助理 popover 和其它 close-layer 互斥；外部点击、Escape、Cmd+W 关闭并按入口恢复焦点。面板 header 只保留“消息中心”主标题与“全部已读”，不显示“官方公告”等 scope 副标题；正文独立滚动，加载、空态、局部错误和加载更多不改变外壳尺寸。
+通知 Bell 是 App Shell 的常驻底部入口，不受登录态或 Team Space UI 偏好隐藏；有未读时只在 16px Bell 右上角显示 6px `--accent-warm` 圆点，不显示数字。点击打开与 rail 工作区 hover 面板同材质的 fixed 非模态面板，展开/rail 时都从当前侧栏右侧起，宽度上限 380px、高度 440px，并与工作区 flyout、小助理 popover 和其它 close-layer 互斥；外部点击、Escape、Cmd+W 关闭并按入口恢复焦点。面板 header 只保留“消息中心”主标题与“全部已读”，不显示“官方公告”等 scope 副标题；列表项不显示来源图标或未读红点，只用未读深色 / 已读灰色的标题与正文区分状态，正文最多三行后省略；正文独立滚动，加载、空态、局部错误和加载更多不改变外壳尺寸。
 
-通知行使用 14px 标题、12px 摘要/时间和 32px 类型图标槽；未读只增加行首 6px 暖色点与中等字重，已读降为 muted，不使用整行高饱和底色。行 hover 复用 `--hover-bg`。点击是唯一 read trigger，并随后执行 target；外链失败保留面板与原 URL 复制入口，Space route 接纳后关闭面板。公告中文客户端显示中文槽，所有非中文显示“其他”并在空值时回退中文。
+通知行使用 14px 标题和 12px 摘要/时间，不预留类型图标槽；未读标题为 ink 中等字重、正文为 secondary，已读标题与正文降为 muted，不使用点状标记或整行高饱和底色。行 hover 复用 `--hover-bg`。点击是唯一 read trigger，并随后执行 target；外链失败保留面板与原 URL 复制入口，Space route 接纳后关闭面板。公告中文客户端显示中文槽，所有非中文显示“其他”并在空值时回退中文。
 
 全局侧栏根面与顶部 Tab 标题栏共同消费 Theme-owned `--global-sidebar-bg`。九套 Theme 的 light/dark 均在自身 `--paper` 与 `--paper-inset` 之间提供一个略深于页面的值，使两块 App Shell chrome 同时能与右侧 `--paper` 页面和 `--paper-elevated` 对话面形成克制分区；该色差独立承担分区，不再叠加侧栏右侧竖线或标题栏底部横线。该结构 Token 不替代通用 Paper 层级：右侧页面、卡片与弹层继续使用原有 Token，工作区/Session hover 与 active 也不随侧栏底色重算。
 
@@ -1440,6 +1440,7 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.58 | 2026-08-22 | **消息列表视觉减法**：通知项移除来源图标和列表内未读红点，以标题/正文深浅表达未读状态；正文统一最多三行省略 |
 | 2.8.57 | 2026-08-22 | **Task 详情密度与宽度收口**：移除正文冗余标题、文档路径折叠 home 为 `~`；补齐主栏到 Markdown/代码/表格的 `min-width: 0` 约束；右栏摘要去 Card 化，执行记录统一小字号并按每次 5 条渐进展开 |
 | 2.8.56 | 2026-08-21 | **Task 详情视觉收口**：Header 合并为状态/标题/主动作/更多/关闭单行；评论使用紧凑 Markdown，Agent 身份行直达所属 Session；composer 收敛为两行起步、有限增长的吸底输入；属性栏宽窗加宽、窄窗切 Sheet，并移除 status history、progress 与独立 verify 展示 |
 | 2.8.55 | 2026-08-21 | **Chat 窗口呈现与滚动连续性**：focus 与 renderable surface 解耦，可见失焦窗口保持完整滚动交互且重新聚焦零滚动命令；最小化/隐藏按 native presentation generation 冻结 Virtuoso，并在容器非零后按 follow 或 message anchor 单次恢复 |
