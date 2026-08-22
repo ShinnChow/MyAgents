@@ -40,6 +40,8 @@ export interface ExecutionModeEditorProps extends ExecutionModeState {
   setIntervalMinutes: (n: number) => void;
   setCronExpression: (s: string) => void;
   setCronTimezone: (s: string) => void;
+  /** Creation surfaces can hide this recurring-only policy for one-shot tasks. */
+  showSessionStrategy?: boolean;
   disabled?: boolean;
 }
 
@@ -82,13 +84,13 @@ export function ExecutionModeEditor({
   setIntervalMinutes,
   setCronExpression,
   setCronTimezone,
+  showSessionStrategy = true,
   disabled,
 }: ExecutionModeEditorProps) {
   const { t } = useTranslation('task');
   const isScheduled = executionMode === 'scheduled';
   const isRecurring = executionMode === 'recurring';
   const isLoop = executionMode === 'loop';
-  const showSessionStrategy = true;
 
   // Seed the timezone on first render if the recurring task doesn't
   // have one yet — `CronExpressionInput` picks its displayed tz from

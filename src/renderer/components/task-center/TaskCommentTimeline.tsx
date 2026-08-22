@@ -24,7 +24,6 @@ import type {
   TaskComment,
   TaskCommentReplySummary,
 } from "@/../shared/types/taskComment";
-import { taskCommentQuote } from "@/../shared/types/taskComment";
 import { extractErrorMessage } from "./errors";
 
 interface Props {
@@ -369,7 +368,7 @@ export function TaskCommentTimeline({
                         : parentSummary.author.label || t("comments.you")
                       : "";
                   const parentQuote = parent
-                    ? taskCommentQuote(parent.body)
+                    ? parent.body.trim()
                     : parentSummary?.quote;
                   const highlighted = targetCommentId === comment.id;
                   const retryable =
@@ -453,7 +452,7 @@ export function TaskCommentTimeline({
                             author: parentAuthor,
                             quote: parentQuote,
                           })}
-                          className="mt-2 block max-w-full truncate rounded-r-md border-l-2 border-[var(--line-strong)] bg-[var(--line-strong)] px-2 py-1 text-left text-xs text-[var(--ink-muted)] disabled:cursor-default"
+                          className="mt-2 block w-full min-w-0 truncate rounded-r-md border-l-2 border-[var(--line)] bg-[var(--hover-bg)] px-2 py-1 text-left text-xs text-[var(--ink-muted)] disabled:cursor-default"
                         >
                           {parentQuote}
                         </button>
@@ -519,10 +518,10 @@ export function TaskCommentTimeline({
       <div className="z-10 shrink-0 border-t border-[var(--line-subtle)] bg-[var(--paper-elevated)] px-8 py-2.5 max-sm:px-5">
         <div className="mx-auto max-w-[860px]">
           {replyTo && (
-            <div className="mb-1.5 flex items-center gap-2 rounded-r-lg bg-[var(--line-strong)] px-2.5 py-1.5 text-xs text-[var(--ink-muted)]">
+            <div className="mb-1.5 flex items-center gap-2 rounded-r-lg border-l-2 border-[var(--line)] bg-[var(--hover-bg)] px-2.5 py-1.5 text-xs text-[var(--ink-muted)]">
               <CornerUpLeft className="h-3.5 w-3.5 shrink-0" />
               <span className="min-w-0 flex-1 truncate">
-                {taskCommentQuote(replyTo.body)}
+                {replyTo.body.trim()}
               </span>
               <button
                 type="button"

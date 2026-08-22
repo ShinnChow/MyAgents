@@ -5,6 +5,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
+import type { PendingAppRoute } from '@/../shared/appRoute';
 import type { Tab } from '@/types/tab';
 import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
@@ -20,6 +21,7 @@ vi.mock('@/context/TabProvider', () => ({
 
 // Stub the heavy page subtrees so importing App stays cheap and side-effect free.
 const chatRenderSpy = vi.hoisted(() => vi.fn());
+const taskCenterRenderSpy = vi.hoisted(() => vi.fn());
 vi.mock('@/pages/Chat', () => ({
   default: ({ windowPresentation }: { windowPresentation: MainWindowPresentation }) => {
     chatRenderSpy(windowPresentation);
@@ -39,7 +41,12 @@ vi.mock('@/pages/Settings', () => ({
     );
   },
 }));
-vi.mock('@/pages/TaskCenter', () => ({ default: () => <div data-testid="taskcenter" /> }));
+vi.mock('@/pages/TaskCenter', () => ({
+  default: ({ pendingRoute }: { pendingRoute?: PendingAppRoute | null }) => {
+    taskCenterRenderSpy(pendingRoute ?? null);
+    return <div data-testid="taskcenter" />;
+  },
+}));
 vi.mock('@/components/ChatBootOverlay', () => ({
   default: () => <div data-testid="chat-boot-overlay" />,
 }));
@@ -218,5 +225,56 @@ describe('restored live chat tab', () => {
     view.rerender(contents('settings'));
     expect(screen.getByTestId('settings-draft')).toHaveValue('provider draft');
     expect(screen.getByTestId('capabilities-draft')).toHaveValue('mcp draft');
+  });
+
+  it('projects every new Task route while the singleton Task Center stays active', async () => {
+    taskCenterRenderSpy.mockClear();
+    const taskCenterTab = restoredTab({
+      id: 'task-center-tab',
+      agentDir: null,
+      sessionId: null,
+      view: 'taskcenter',
+      title: 'Task Center',
+    });
+    const route = (generation: number): PendingAppRoute => ({
+      generation,
+      route: {
+        version: 1,
+        name: 'task.comment',
+        params: { taskId: 'task-1', commentId: 'comment-1' },
+      },
+    });
+    const view = render(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        taskPendingRoute={null}
+      />,
+    );
+
+    view.rerender(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        taskPendingRoute={route(1)}
+      />,
+    );
+    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ generation: 1 }),
+    ));
+
+    view.rerender(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        taskPendingRoute={route(2)}
+      />,
+    );
+    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ generation: 2 }),
+    ));
   });
 });

@@ -440,7 +440,10 @@ describe('Task Center UX refinements', () => {
     expect(screen.getByText('Execution 8')).toBeInTheDocument();
     expect(screen.queryByText('Execution 7')).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: '展开更多' }));
+    const expandMore = screen.getByRole('button', { name: '展开更多' });
+    expect(expandMore).toHaveClass('w-full', 'justify-between');
+    expect(expandMore.querySelector('svg')).toBeInTheDocument();
+    fireEvent.click(expandMore);
     expect(screen.getByText('Execution 7')).toBeInTheDocument();
     expect(screen.queryByText('Execution 2')).not.toBeInTheDocument();
 
@@ -476,7 +479,7 @@ describe('Task Center UX refinements', () => {
     expect(screen.queryByText('/Users/zhihu/.myagents/tasks/task-1/task.md')).not.toBeInTheDocument();
   });
 
-  it('starts the create task form with name, task demand, checklist, and workspace configuration', async () => {
+  it('starts the manual create form with one canonical task document and workspace configuration', async () => {
     render(
       <DispatchTaskDialog
         defaultWorkspacePath="/Users/me/mino"
@@ -497,14 +500,36 @@ describe('Task Center UX refinements', () => {
 
     const name = screen.getByText('任务名称');
     const taskDemand = screen.getByText('任务需求 Task.md');
-    const checklist = screen.getByText('验收清单');
     const workspace = screen.getByText('Agent 工作区');
+    expect(screen.queryByText('验收清单')).not.toBeInTheDocument();
 
     await waitFor(() => {
       expect(name.compareDocumentPosition(taskDemand) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      expect(taskDemand.compareDocumentPosition(checklist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      expect(checklist.compareDocumentPosition(workspace) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(taskDemand.compareDocumentPosition(workspace) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
+  });
+
+  it('shows conversation strategy and pre-trigger checks only for recurring creation', () => {
+    render(
+      <DispatchTaskDialog
+        defaultWorkspacePath="/Users/me/mino"
+        initialMode="manual"
+        onClose={vi.fn()}
+        onDispatched={vi.fn()}
+        onDiscuss={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText('会话策略')).not.toBeInTheDocument();
+    expect(screen.queryByText('触发前检测')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '定时一次' }));
+    expect(screen.queryByText('会话策略')).not.toBeInTheDocument();
+    expect(screen.queryByText('触发前检测')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '周期触发' }));
+    expect(screen.getByText('会话策略')).toBeInTheDocument();
+    expect(screen.getByText('触发前检测')).toBeInTheDocument();
   });
 
   it('defaults to the accessible smart flow and retains its draft when launch is rejected', async () => {
@@ -539,7 +564,7 @@ describe('Task Center UX refinements', () => {
     expect(screen.getByRole('tab', { name: '手动' })).toHaveAttribute('aria-selected', 'true');
   });
 
-  it('merges the optional manual acceptance checklist into the one task.md payload', async () => {
+  it('submits the manual task.md directly as the canonical task document', async () => {
     taskApiMocks.taskCreateDirect.mockResolvedValue(task({
       name: '整理交付清单',
       executionMode: 'once',
@@ -562,15 +587,11 @@ describe('Task Center UX refinements', () => {
     fireEvent.change(screen.getByPlaceholderText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。'), {
       target: { value: '# 目标\n整理本周交付。' },
     });
-    fireEvent.click(screen.getByRole('button', { name: /验收清单/ }));
-    fireEvent.change(screen.getByPlaceholderText(/curl \/health 返回 200/), {
-      target: { value: '- npm test 全绿' },
-    });
     fireEvent.click(screen.getByRole('button', { name: '创建任务' }));
 
     await waitFor(() => expect(taskApiMocks.taskCreateDirect).toHaveBeenCalledWith(
       expect.objectContaining({
-        taskMdContent: '# 目标\n整理本周交付。\n\n# verify.md\n\n- npm test 全绿',
+        taskMdContent: '# 目标\n整理本周交付。',
       }),
     ));
     expect(taskApiMocks.taskWriteDoc).not.toHaveBeenCalled();
@@ -604,7 +625,12 @@ describe('Task Center UX refinements', () => {
 
     await waitFor(() => {
       expect(taskApiMocks.taskCreateDirect).toHaveBeenCalledWith(
-        expect.objectContaining({ tags: [] }),
+        expect.objectContaining({
+          tags: [],
+          runMode: 'new-session',
+          preselectedSessionId: undefined,
+          trigger: undefined,
+        }),
       );
     });
   });
@@ -626,7 +652,7 @@ describe('Task Center UX refinements', () => {
     };
     __setTaskCenterSessionsForTest([other, existing]);
     taskApiMocks.taskCreateDirect.mockResolvedValue(task({
-      executionMode: 'once',
+      executionMode: 'recurring',
       runMode: 'single-session',
       preselectedSessionId: existing.id,
       status: 'todo',
@@ -649,6 +675,7 @@ describe('Task Center UX refinements', () => {
     fireEvent.change(screen.getByPlaceholderText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。'), {
       target: { value: '构建失败后分析日志。' },
     });
+    fireEvent.click(screen.getByRole('button', { name: '周期触发' }));
     fireEvent.click(screen.getByRole('button', { name: '连续对话' }));
     // The actual current Session is selected by default; opening that selector
     // must still expose the distinction from other workspace Sessions.

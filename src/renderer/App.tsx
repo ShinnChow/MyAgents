@@ -485,15 +485,14 @@ export const MemoizedTabContent = memo(function TabContent({
     prev.updateInstalling === next.updateInstalling &&
     prev.updatePreparing === next.updatePreparing &&
     prev.sessionNotificationBadgeCounts === next.sessionNotificationBadgeCounts &&
-    // Reference equality — each OPEN_TASK_CENTER dispatch allocates a
-    // fresh intent object (or `null`), so identity comparison is enough.
-    // Without this line, a user re-clicking the Launcher's search icon
-    // while Task Center is already active would see their new intent
-    // dropped: isActive stays true, tab ref stays the same, so memo
-    // returns true and the new `pendingIntent` prop never reaches the
-    // TaskCenter tab. (v0.1.69 cross-review C1)
+    // Reference equality — every App-owned Task Center intent/route
+    // allocates a fresh object (or `null`), so identity comparison is
+    // enough. These data props must stay in the comparator: when the
+    // singleton Task Center is already active, neither the tab nor
+    // `isActive` changes, and omitting one would silently drop navigation.
     prev.taskCenterPendingIntent === next.taskCenterPendingIntent &&
     prev.taskCenterCurrentSessionId === next.taskCenterCurrentSessionId &&
+    prev.taskPendingRoute === next.taskPendingRoute &&
     prev.spacePendingRoute === next.spacePendingRoute
   );
 });

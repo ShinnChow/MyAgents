@@ -17,8 +17,6 @@ import { useTranslation } from 'react-i18next';
 import {
   Activity,
   Bell,
-  ChevronDown,
-  ChevronRight,
   Clock,
   Flag,
   Zap,
@@ -35,7 +33,6 @@ import { taskCreateDirect, taskRun } from '@/api/taskCenter';
 import NotificationConfigEditor from '@/components/task-center/NotificationConfigEditor';
 import { splitWithTagHighlights } from '@/utils/parseThoughtTags';
 import { workspacePathsEqual } from '@/../shared/workspacePath';
-import { mergeTaskMarkdown } from '@/../shared/taskDocuments';
 import type { TaskCreateIntent, TaskCreateMode, TaskDiscussionRequest } from '@/../shared/taskDiscussion';
 import type {
   EndConditions,
@@ -152,8 +149,6 @@ export function DispatchTaskDialog({
   });
   const [triggerValid, setTriggerValid] = useState(true);
   const [taskMd, setTaskMd] = useState(thought?.content ?? '');
-  const [verifyMd, setVerifyMd] = useState('');
-  const [verifyExpanded, setVerifyExpanded] = useState(false);
 
   // Schedule-specific state (mirrors cron TaskCreateModal fields)
   const [atDateTime, setAtDateTime] = useState(() =>
@@ -237,9 +232,10 @@ export function DispatchTaskDialog({
     if (!name.trim()) errs.push(t('dispatch.validation.nameRequired'));
     if (!workspace) errs.push(t('dispatch.validation.workspaceRequired'));
     if (!taskMd.trim()) errs.push(t('dispatch.validation.taskMdRequired'));
-    if (!triggerValid) errs.push(t('trigger.validation.invalid'));
+    if (isRecurring && !triggerValid) errs.push(t('trigger.validation.invalid'));
     if (
-      runMode === 'single-session'
+      isRecurring
+      && runMode === 'single-session'
       && !sessionOptions.some((option) => option.value === preselectedSessionId)
     ) {
       errs.push(t('trigger.validation.sessionRequired'));
@@ -258,13 +254,13 @@ export function DispatchTaskDialog({
     name,
     workspace,
     taskMd,
+    isRecurring,
     triggerValid,
     runMode,
     preselectedSessionId,
     sessionOptions,
     isScheduled,
     atDateTime,
-    isRecurring,
     intervalMinutes,
     showEndConditions,
     endConditionMode,
@@ -311,6 +307,7 @@ export function DispatchTaskDialog({
           })()
         : undefined;
       const advancedCron = cronExpression.trim();
+      const effectiveRunMode: TaskRunMode = isRecurring ? runMode : 'new-session';
       const executionOverrides = projectTaskExecutionOverrides({
         providers,
         runtime: advRuntime,
@@ -323,11 +320,11 @@ export function DispatchTaskDialog({
         executor: 'agent',
         workspaceId: workspace.id,
         workspacePath: workspace.path,
-        taskMdContent: mergeTaskMarkdown(taskMd, verifyMd),
+        taskMdContent: taskMd,
         executionMode,
-        runMode,
-        preselectedSessionId: runMode === 'single-session' ? preselectedSessionId : undefined,
-        trigger: trigger.detector.type === 'command' ? trigger : undefined,
+        runMode: effectiveRunMode,
+        preselectedSessionId: effectiveRunMode === 'single-session' ? preselectedSessionId : undefined,
+        trigger: isRecurring && trigger.detector.type === 'command' ? trigger : undefined,
         endConditions: ec,
         dispatchAt,
         intervalMinutes: isRecurring && !advancedCron ? intervalMinutes : undefined,
@@ -384,7 +381,6 @@ export function DispatchTaskDialog({
     cronTimezone,
     name,
     taskMd,
-    verifyMd,
     executionMode,
     isOnce,
     runMode,
@@ -545,41 +541,6 @@ export function DispatchTaskDialog({
               />
             </div>
 
-            {/* Optional acceptance input is folded by default and merged into
-                canonical task.md; it never creates a second document for new
-                Tasks. */}
-            <div className="rounded-[var(--radius-lg)] border border-[var(--line-subtle)] bg-[var(--paper)]">
-              <button
-                type="button"
-                onClick={() => setVerifyExpanded((v) => !v)}
-                className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-medium text-[var(--ink-secondary)] hover:text-[var(--ink)]"
-              >
-                {verifyExpanded ? (
-                  <ChevronDown className="h-3.5 w-3.5" />
-                ) : (
-                  <ChevronRight className="h-3.5 w-3.5" />
-                )}
-                {t('dispatch.verifyTitle')}
-                <span className="text-xs font-normal text-[var(--ink-muted)]/80">
-                  {t('dispatch.verifyHint')}
-                </span>
-              </button>
-              {verifyExpanded && (
-                <div className="border-t border-[var(--line-subtle)] p-3">
-                  <textarea
-                    value={verifyMd}
-                    onChange={(e) => setVerifyMd(e.target.value)}
-                    rows={6}
-                    placeholder={t('dispatch.verifyPlaceholder')}
-                    className={`${INPUT_CLS} resize-y font-mono text-sm`}
-                  />
-                  <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
-                    {t('dispatch.verifyDescription')}
-                  </p>
-                </div>
-              )}
-            </div>
-
             <div>
               <label className="mb-1.5 block text-sm font-medium text-[var(--ink-secondary)]">
                 {t('dispatch.workspace')}
@@ -638,8 +599,9 @@ export function DispatchTaskDialog({
               setCronExpression={setCronExpression}
               cronTimezone={cronTimezone}
               setCronTimezone={setCronTimezone}
+              showSessionStrategy={isRecurring}
             />
-            {runMode === 'single-session' && !isLoop && (
+            {isRecurring && runMode === 'single-session' && !isLoop && (
               <div className="mt-5">
                 <label className="mb-2 block text-sm font-medium text-[var(--ink-secondary)]">
                   {t('trigger.targetSession')}
@@ -658,16 +620,19 @@ export function DispatchTaskDialog({
             )}
           </FormSection>
 
-          <div className={SECTION_DIVIDER} />
-
-          <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
-            <TriggerEditor
-              value={trigger}
-              workspacePath={workspace?.path ?? ''}
-              onChange={setTrigger}
-              onValidityChange={setTriggerValid}
-            />
-          </FormSection>
+          {isRecurring && (
+            <>
+              <div className={SECTION_DIVIDER} />
+              <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
+                <TriggerEditor
+                  value={trigger}
+                  workspacePath={workspace?.path ?? ''}
+                  onChange={setTrigger}
+                  onValidityChange={setTriggerValid}
+                />
+              </FormSection>
+            </>
+          )}
 
           {showEndConditions && (
             <>

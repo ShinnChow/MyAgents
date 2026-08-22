@@ -259,7 +259,7 @@ describe("TaskCommentTimeline", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows a longer reply preview with a square left edge and stronger fill", async () => {
+  it("uses the available line for a loaded reply quote with a subtle fill", async () => {
     const longBody = "这是用于验证回复引用展示长度的父评论内容，需要超过六十个字符，并继续补充足够多的文字来确认末尾会正确显示省略号而不是过早截断。";
     const reply: TaskComment = {
       ...agentComment,
@@ -277,19 +277,22 @@ describe("TaskCommentTimeline", () => {
     const quote = taskCommentQuote(longBody);
     expect(Array.from(quote.slice(0, -1))).toHaveLength(60);
     const quoteButton = await screen.findByRole("button", {
-      name: `回复 Agent：${quote}`,
+      name: `回复 Agent：${longBody}`,
     });
     expect(quoteButton).toHaveClass(
+      "w-full",
+      "truncate",
       "rounded-r-md",
-      "bg-[var(--line-strong)]",
+      "bg-[var(--hover-bg)]",
     );
     expect(quoteButton).not.toHaveClass("rounded-md");
+    expect(quoteButton).toHaveTextContent(longBody);
 
     fireEvent.click(screen.getAllByRole("button", { name: "回复" })[0]);
-    const composerQuote = screen.getAllByText(quote).at(-1)?.parentElement;
+    const composerQuote = screen.getAllByText(longBody).at(-1)?.parentElement;
     expect(composerQuote).toHaveClass(
       "rounded-r-lg",
-      "bg-[var(--line-strong)]",
+      "bg-[var(--hover-bg)]",
     );
     expect(composerQuote).not.toHaveClass("rounded-lg");
   });

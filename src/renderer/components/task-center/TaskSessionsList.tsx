@@ -18,7 +18,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Clock } from 'lucide-react';
+import { ChevronRight, Clock } from 'lucide-react';
 
 import { getSessions, type SessionMetadata } from '@/api/sessionClient';
 import { CUSTOM_EVENTS } from '@/../shared/constants';
@@ -158,9 +158,10 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
             <button
               type="button"
               onClick={() => setVisibleCount((count) => count + MAX_VISIBLE)}
-              className="mt-1 px-1.5 py-1 text-xs text-[var(--ink-muted)] transition-colors hover:text-[var(--ink)]"
+              className="mt-1 flex w-full items-center justify-between rounded-md px-1.5 py-1.5 text-xs text-[var(--ink-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]"
             >
-              {t('sessions.expandMore')}
+              <span>{t('sessions.expandMore')}</span>
+              <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           )}
         </div>
