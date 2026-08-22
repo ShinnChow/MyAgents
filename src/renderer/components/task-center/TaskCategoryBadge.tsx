@@ -12,9 +12,8 @@
 //   scheduled  → Clock   + --success     ("定时")
 //   recurring  → Repeat  + --info        ("周期")
 //
-// Pair with <TaskStatusBadge> on the top-right: category answers "what
-// kind", status answers "where in its lifecycle". The two chips never
-// conflict because they carry orthogonal information.
+// Category answers “what kind”. List/card status comes from the owning bucket;
+// Task Detail remains the precise lifecycle surface.
 //
 // Historical Cron rows reuse their inferred execution category with a
 // parenthetical "legacy" marker.

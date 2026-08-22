@@ -1,4 +1,4 @@
-// TaskStatusBadge — status chip for the top-right of a task card.
+// TaskStatusBadge — precise lifecycle state shown in Task Detail.
 //
 // Rewired to match the v0.1.69 mockup:
 //   - running          → success (green)   — 进行中 (green + leading dot
@@ -27,10 +27,8 @@
 //                                            don't need an extra visual
 //                                            downgrade
 //
-// Category (loop/once/scheduled/recurring) lives in <TaskCategoryBadge>
-// on the top-left. Status (this component) and category are now two
-// independent visual dimensions: left = "what kind of task", right =
-// "where is it in its lifecycle".
+// List/card surfaces use their owning bucket for lifecycle scanning and keep
+// only the execution-category tag. The detail header retains this exact state.
 
 import type { TaskExecutionState, TaskStatus } from '@/../shared/types/task';
 import { useTranslation } from 'react-i18next';
@@ -43,7 +41,7 @@ interface StatusStyle {
 }
 
 const STATUS_STYLE: Record<TaskStatus, StatusStyle> = {
-  todo: { bg: 'bg-[var(--paper-inset)]', fg: 'text-[var(--ink-muted)]' },
+  todo: { bg: 'bg-[var(--line-strong)]', fg: 'text-[var(--ink-secondary)]' },
   running: {
     bg: 'bg-[var(--success-bg)]',
     fg: 'text-[var(--success)]',
@@ -62,8 +60,8 @@ const STATUS_STYLE: Record<TaskStatus, StatusStyle> = {
     bg: 'bg-[var(--warning-bg)]',
     fg: 'text-[var(--warning)]',
   },
-  stopped: { bg: 'bg-[var(--paper-inset)]', fg: 'text-[var(--ink-subtle)]' },
-  archived: { bg: 'bg-[var(--paper-inset)]', fg: 'text-[var(--ink-subtle)]' },
+  stopped: { bg: 'bg-[var(--line-strong)]', fg: 'text-[var(--ink-secondary)]' },
+  archived: { bg: 'bg-[var(--line-strong)]', fg: 'text-[var(--ink-muted)]' },
   // Pseudo-state (soft-deleted) — only surfaces in audit views.
   deleted: { bg: 'bg-[var(--error-bg)]', fg: 'text-[var(--error)]' },
 };

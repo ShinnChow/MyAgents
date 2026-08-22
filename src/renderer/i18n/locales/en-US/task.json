@@ -107,9 +107,11 @@
     "intervalMinutes": "Every {{count}} minutes",
     "groups": {
       "active": "Active",
+      "recovery": "Needs recovery",
       "pending": "Planned",
       "finished": "Completed"
     },
+    "loadMore": "Load more",
     "actions": {
       "delete": "Delete",
       "edit": "Edit",

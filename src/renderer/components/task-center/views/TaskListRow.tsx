@@ -2,16 +2,14 @@
 // filter. No card chrome (no rounded corners, no shadow, no per-row border
 // box) so the list reads as a table.
 //
-// Layout (left → right): status chip · category chip · name (flex-1) ·
-// workspace · updated-at · overflow menu. Chip order mirrors the card view
-// exactly so switching between the two layouts doesn't rearrange the
-// visual vocabulary.
+// Layout (left → right): category chip · name (flex-1) · workspace ·
+// updated-at / hover Session action · overflow menu. Lifecycle status is
+// expressed by the owning section and remains fully visible in Task Detail.
 
 import type { Task, TaskExecutionMode } from '@/../shared/types/task';
 import { useTranslation } from 'react-i18next';
 import { relativeTime } from '@/utils/taskCenterUtils';
 import { TaskCategoryBadge } from '../TaskCategoryBadge';
-import { TaskStatusBadge } from '../TaskStatusBadge';
 import { TaskTriggerBadge } from '../TaskTriggerBadge';
 import { TaskItemActions, deriveTaskRowStatus } from './TaskItemActions';
 import { ViewSessionButton } from './TaskCardItem';
@@ -46,24 +44,28 @@ export function TaskListRow(props: TaskListRowProps) {
   const category: TaskExecutionMode = task
     ? task.executionMode
     : inferLegacyCategory(legacy);
+  const hasSession = !!task?.sessionIds.length;
 
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onOpen}
-      className={`group flex w-full items-center gap-2 border-b border-[var(--line-subtle)] px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)] ${
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      className={`group flex w-full cursor-pointer items-center gap-2 border-b border-[var(--line-subtle)] px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)] ${
         highlighted ? 'bg-[var(--accent-warm-subtle)]' : ''
       }`}
     >
-      {/* Chip row — status first, category second. Wrapped in a
-          fixed-width flex cluster so rows visually align: the name
-          always starts at the same x-offset regardless of which chips
-          are present. */}
+      {/* Category remains the only row-level tag. Exact lifecycle status is
+          available in Task Detail; the section header supplies scan context. */}
       <div className="flex shrink-0 items-center gap-1.5">
-        <div className="flex items-center gap-1">
-          {task?.trigger?.detector.type === 'command' && <TaskTriggerBadge compact />}
-          <TaskStatusBadge status={status} executionState={task?.executionState} compact />
-        </div>
+        {task?.trigger?.detector.type === 'command' && <TaskTriggerBadge compact />}
         <TaskCategoryBadge mode={category} legacy={isLegacy} compact />
       </div>
       <span className="min-w-0 flex-1 truncate text-sm text-[var(--ink)]">
@@ -74,10 +76,20 @@ export function TaskListRow(props: TaskListRowProps) {
           {workspace}
         </span>
       )}
-      <span className="w-[80px] shrink-0 text-right text-xs text-[var(--ink-muted)]/80">
-        {relativeTime(updatedAt, locale)}
-      </span>
-      <ViewSessionButton task={task} />
+      <div className="group/session-slot relative h-6 w-[88px] shrink-0">
+        <span
+          className={`absolute inset-0 flex items-center justify-end whitespace-nowrap text-xs text-[var(--ink-muted)]/80 transition-opacity ${
+            hasSession ? 'group-hover:opacity-0 group-focus:opacity-0 group-focus-within/session-slot:opacity-0' : ''
+          }`}
+        >
+          {relativeTime(updatedAt, locale)}
+        </span>
+        {hasSession && (
+          <div className="absolute inset-0 flex items-center justify-end">
+            <ViewSessionButton task={task} />
+          </div>
+        )}
+      </div>
       <TaskItemActions
         variant={isLegacy ? 'legacy' : 'task'}
         status={status}
@@ -91,7 +103,7 @@ export function TaskListRow(props: TaskListRowProps) {
         onEdit={onEdit}
         onDelete={onDelete}
       />
-    </button>
+    </div>
   );
 }
 

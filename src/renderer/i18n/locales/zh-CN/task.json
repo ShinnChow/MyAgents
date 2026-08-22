@@ -107,9 +107,11 @@
     "intervalMinutes": "每 {{count}} 分钟",
     "groups": {
       "active": "进行中",
+      "recovery": "待恢复",
       "pending": "规划中",
       "finished": "已完成"
     },
+    "loadMore": "加载更多",
     "actions": {
       "delete": "删除",
       "edit": "编辑",

@@ -1,6 +1,6 @@
 // TaskListPanel — right column of Task Center: task cards + filter bar.
-// Three sections: active (running/verifying), pending (todo/blocked/stopped),
-// finished (done/archived). PRD §7.2.
+// Four sections: active (running/verifying), recovery (stopped/blocked),
+// finished (done/archived), and pending (todo). PRD §7.2.
 //
 // Two render modes: a 2-column card view and a dense single-line list view
 // (default, optimized for quick scan / filter). The choice is persisted in
@@ -63,20 +63,20 @@ interface Props {
   onRouteConsumed?: (generation: number) => void;
 }
 
-type Bucket = 'pending' | 'active' | 'finished';
+type Bucket = 'pending' | 'active' | 'recovery' | 'finished';
 
-// "进行中" 的产品语义是「应当被执行的任务」，不是字面"正在跑"。
-// `stopped`（用户暂停）和 `blocked`（执行受阻）都是**临时子状态**，
-// 任务本身仍被认为该跑 —— 徽章的黄/灰配色已经区分了子状态，列表聚合
-// 不必再按这些小波动分桶。`规划中` 留给真正的新建未调度态（todo）——
-// 任务已被构思并创建，但尚未被调度器首次触发。
+// Buckets are a read-only information architecture projection, not a second
+// lifecycle model. Keep interrupted work out of the literal “进行中” group,
+// while preserving `todo` as work that has not started yet.
 const BUCKET_STATUSES: Record<Bucket, TaskStatus[]> = {
-  active: ['running', 'verifying', 'stopped', 'blocked'],
+  active: ['running', 'verifying'],
+  recovery: ['stopped', 'blocked'],
   pending: ['todo'],
   finished: ['done', 'archived'],
 };
 
 const VIEW_STORAGE_KEY = 'myagents:task-center:view';
+const FINISHED_LIST_PAGE_SIZE = 10;
 
 function loadStoredView(): TaskView {
   if (typeof window === 'undefined') return 'list';
@@ -125,6 +125,7 @@ export function TaskListPanel({
   const [routeRetryNonce, setRouteRetryNonce] = useState(0);
   const [selectedLegacy, setSelectedLegacy] = useState<LegacyCronRow | null>(null);
   const [view, setView] = useState<TaskView>(loadStoredView);
+  const [finishedVisibleCount, setFinishedVisibleCount] = useState(FINISHED_LIST_PAGE_SIZE);
   // Per-id busy flag so only the affected card/row greys out during an action,
   // instead of locking the whole panel.
   const [pendingIds, setPendingIds] = useState<Set<string>>(() => new Set());
@@ -359,6 +360,7 @@ export function TaskListPanel({
 
     const out: Record<Bucket, TaskCardLike[]> = {
       active: [],
+      recovery: [],
       pending: [],
       finished: [],
     };
@@ -392,6 +394,7 @@ export function TaskListPanel({
 
   const clearSearch = useCallback(() => {
     setQuery('');
+    setFinishedVisibleCount(FINISHED_LIST_PAGE_SIZE);
     searchInputRef.current?.blur();
   }, []);
 
@@ -454,6 +457,7 @@ export function TaskListPanel({
       !workspaceOptions.some((o) => o.value === workspaceFilter)
     ) {
       setWorkspaceFilter('');
+      setFinishedVisibleCount(FINISHED_LIST_PAGE_SIZE);
     }
   }, [workspaceFilter, workspaceOptions]);
 
@@ -570,7 +574,10 @@ export function TaskListPanel({
               className={`${searchActive ? 'hidden @[720px]:block' : 'block'} w-7 @[720px]:w-[160px] [&>button]:h-7 [&>button]:justify-center [&>button]:!rounded-full [&>button]:!border-transparent [&>button]:!bg-[var(--paper-inset)] [&>button]:!p-0 [&>button]:active:scale-[0.97] @[720px]:[&>button]:justify-start @[720px]:[&>button]:!rounded-lg @[720px]:[&>button]:!border-[var(--line)] @[720px]:[&>button]:!bg-[var(--paper)] @[720px]:[&>button]:!px-2 [&>button>span:nth-of-type(2)]:sr-only @[720px]:[&>button>span:nth-of-type(2)]:not-sr-only [&>button>svg]:hidden @[720px]:[&>button>svg]:block`}
               value={workspaceFilter}
               options={workspaceOptions}
-              onChange={setWorkspaceFilter}
+              onChange={(nextWorkspace) => {
+                setWorkspaceFilter(nextWorkspace);
+                setFinishedVisibleCount(FINISHED_LIST_PAGE_SIZE);
+              }}
               compact
               placeholder={t('tasks.allWorkspaces')}
               triggerIcon={<Folder className="h-3.5 w-3.5" strokeWidth={1.5} />}
@@ -580,7 +587,10 @@ export function TaskListPanel({
           <SearchPill
             inputRef={searchInputRef}
             value={query}
-            onChange={setQuery}
+            onChange={(nextQuery) => {
+              setQuery(nextQuery);
+              setFinishedVisibleCount(FINISHED_LIST_PAGE_SIZE);
+            }}
             onClear={clearSearch}
             placeholder={t('tasks.searchPlaceholder')}
             collapseWhenNarrow
@@ -624,9 +634,9 @@ export function TaskListPanel({
             {t('tasks.empty')}
           </div>
         ) : (
-          // Order: 进行中 → 已完成 → 规划中. Current work and recent results
-          // lead; long-tail scheduling sits at the bottom. (v0.1.69 polish)
-          (['active', 'finished', 'pending'] as Bucket[]).map((b) => {
+          // Current work leads, interrupted work stays visible, recent results
+          // are bounded, and not-yet-started work remains discoverable below.
+          (['active', 'recovery', 'finished', 'pending'] as Bucket[]).map((b) => {
             const rows = buckets[b];
             if (rows.length === 0) return null;
             return view === 'card' ? (
@@ -639,7 +649,23 @@ export function TaskListPanel({
             ) : (
               <section key={b} className="mb-4">
                 <BucketHeader label={t(`tasks.groups.${b}`)} count={rows.length} />
-                <div>{rows.map(renderRow)}</div>
+                <div>
+                  {(b === 'finished' && query.trim().length === 0
+                    ? rows.slice(0, finishedVisibleCount)
+                    : rows
+                  ).map(renderRow)}
+                </div>
+                {b === 'finished' &&
+                  query.trim().length === 0 &&
+                  rows.length > finishedVisibleCount && (
+                    <button
+                      type="button"
+                      onClick={() => setFinishedVisibleCount((count) => count + FINISHED_LIST_PAGE_SIZE)}
+                      className="mt-1 rounded-[var(--radius-md)] px-3 py-1.5 text-xs font-medium text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] active:translate-y-px"
+                    >
+                      {t('tasks.loadMore')}
+                    </button>
+                  )}
               </section>
             );
           })

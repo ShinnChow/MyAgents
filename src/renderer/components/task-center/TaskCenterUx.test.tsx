@@ -172,6 +172,64 @@ describe('Task Center UX refinements', () => {
     expect(screen.getByTitle(/列表视图|List view/)).toHaveAttribute('aria-pressed', 'true');
   });
 
+  it('separates recoverable work and reveals completed rows ten at a time', async () => {
+    const completed = Array.from({ length: 12 }, (_, index) => task({
+      id: `done-${index + 1}`,
+      name: `已完成任务 ${index + 1}`,
+      status: 'done',
+      executionMode: 'once',
+      updatedAt: Date.parse('2026-08-22T12:00:00+08:00') - index * 1_000,
+    }));
+    taskApiMocks.taskList.mockResolvedValueOnce([
+      task({ id: 'active', name: '正在运行任务', status: 'running' }),
+      task({ id: 'stopped', name: '等待恢复任务', status: 'stopped' }),
+      ...completed,
+      task({ id: 'planned', name: '尚未启动任务', status: 'todo' }),
+    ]);
+
+    render(<TaskListPanel onCreateTask={vi.fn()} />);
+
+    const active = await screen.findByText('进行中');
+    const recovery = screen.getByText('待恢复');
+    const finished = screen.getByText('已完成');
+    const planned = screen.getByText('规划中');
+    expect(active.compareDocumentPosition(recovery) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(recovery.compareDocumentPosition(finished) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(finished.compareDocumentPosition(planned) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('等待恢复任务')).toBeInTheDocument();
+    expect(screen.getByText('已完成任务 10')).toBeInTheDocument();
+    expect(screen.queryByText('已完成任务 11')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '加载更多' }));
+
+    expect(screen.getByText('已完成任务 11')).toBeInTheDocument();
+    expect(screen.getByText('已完成任务 12')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '加载更多' })).not.toBeInTheDocument();
+  });
+
+  it('shows all matching completed rows while searching and resets the list limit afterwards', async () => {
+    taskApiMocks.taskList.mockResolvedValueOnce(
+      Array.from({ length: 12 }, (_, index) => task({
+        id: `report-${index + 1}`,
+        name: `归档报告 ${index + 1}`,
+        status: 'done',
+        executionMode: 'once',
+        updatedAt: Date.parse('2026-08-22T12:00:00+08:00') - index * 1_000,
+      })),
+    );
+
+    render(<TaskListPanel onCreateTask={vi.fn()} />);
+
+    await screen.findByText('归档报告 10');
+    expect(screen.queryByText('归档报告 11')).not.toBeInTheDocument();
+    const search = screen.getByPlaceholderText(/搜索任务|Search tasks/);
+    fireEvent.change(search, { target: { value: '归档报告' } });
+    expect(screen.getByText('归档报告 12')).toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: '' } });
+    expect(screen.queryByText('归档报告 11')).not.toBeInTheDocument();
+  });
+
   it('tracks a run only after using the ordinal accepted by the Task owner', async () => {
     const accepted = task({
       status: 'running',
@@ -262,6 +320,18 @@ describe('Task Center UX refinements', () => {
     expect(screen.queryByText(/上次运行被应用重启中断/)).not.toBeInTheDocument();
   });
 
+  it('keeps exact lifecycle status out of cards while retaining the execution category', () => {
+    render(
+      <TaskCardItem
+        task={task({ executionMode: 'once', status: 'running' })}
+        onOpen={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByText('进行中')).not.toBeInTheDocument();
+    expect(screen.getAllByText('一次性')).not.toHaveLength(0);
+  });
+
   it('marks command Detector tasks in the normal task list surface', () => {
     render(
       <TaskCardItem
@@ -285,6 +355,15 @@ describe('Task Center UX refinements', () => {
     render(<TaskStatusBadge status="stopped" executionState="stop_failed" />);
 
     expect(screen.getByText('停止未确认')).toBeInTheDocument();
+  });
+
+  it('uses a stronger neutral surface for paused detail status', () => {
+    render(<TaskStatusBadge status="stopped" />);
+
+    expect(screen.getByText('已暂停')).toHaveClass(
+      'bg-[var(--line-strong)]',
+      'text-[var(--ink-secondary)]',
+    );
   });
 
   it('offers retry-stop but no generic rerun for terminal attached work', () => {
