@@ -277,6 +277,8 @@ pub struct NotificationNavigation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_is_announcement: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_origin_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud_origin_account_key: Option<String>,
 }
 
@@ -293,6 +295,7 @@ impl NotificationNavigation {
             cloud_notification_id: None,
             cloud_target: None,
             cloud_is_announcement: None,
+            cloud_origin_key: None,
             cloud_origin_account_key: None,
         };
         if navigation.tab_id.is_none()
@@ -320,6 +323,7 @@ impl NotificationNavigation {
         notification_id: String,
         target: crate::space_cloud::notifications::NotificationTarget,
         is_announcement: bool,
+        origin_key: Option<String>,
         origin_account_key: Option<String>,
     ) -> Option<Self> {
         let notification_id = clean_optional_string(Some(notification_id))?;
@@ -330,6 +334,7 @@ impl NotificationNavigation {
             cloud_notification_id: Some(notification_id),
             cloud_target: Some(target),
             cloud_is_announcement: Some(is_announcement),
+            cloud_origin_key: clean_optional_string(origin_key),
             cloud_origin_account_key: clean_optional_string(origin_account_key),
         })
     }
@@ -556,6 +561,7 @@ pub fn show_cloud_notification<R: Runtime>(
     notification_id: String,
     target: crate::space_cloud::notifications::NotificationTarget,
     is_announcement: bool,
+    origin_key: Option<String>,
     origin_account_key: Option<String>,
 ) {
     show_with_navigation_target(
@@ -566,6 +572,7 @@ pub fn show_cloud_notification<R: Runtime>(
             notification_id,
             target,
             is_announcement,
+            origin_key,
             origin_account_key,
         ),
     );
@@ -873,6 +880,7 @@ fn emit_click<R: Runtime>(app: &AppHandle<R>, navigation: Option<NotificationNav
             notification_id,
             target,
             navigation.cloud_is_announcement.unwrap_or(false),
+            navigation.cloud_origin_key.clone(),
             navigation.cloud_origin_account_key.clone(),
         );
         return;
@@ -934,6 +942,31 @@ mod tests {
     #[test]
     fn mac_registry_correlates_stacked_toasts_by_exact_identifier() {
         macos_notifications::test_registry_round_trip();
+    }
+}
+
+#[cfg(test)]
+mod notification_navigation_tests {
+    use super::*;
+
+    #[test]
+    fn cloud_navigation_captures_origin_and_account_identity() {
+        let navigation = NotificationNavigation::for_cloud(
+            "notification-1".to_string(),
+            crate::space_cloud::notifications::NotificationTarget::ExternalUrl {
+                url: "https://example.com/notice".to_string(),
+            },
+            true,
+            Some("origin-a".to_string()),
+            Some("account-a".to_string()),
+        )
+        .expect("cloud navigation");
+
+        assert_eq!(navigation.cloud_origin_key.as_deref(), Some("origin-a"));
+        assert_eq!(
+            navigation.cloud_origin_account_key.as_deref(),
+            Some("account-a")
+        );
     }
 }
 

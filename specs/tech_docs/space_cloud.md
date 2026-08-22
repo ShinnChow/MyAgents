@@ -63,11 +63,11 @@ Rust 领域依赖固定为 `delivery → registered_agents`、`cli → registere
 ### Cloud notification sync
 
 - `space_cloud::notifications` 承载 App 进程级全局通知协调器，不依赖 Team Space Tab、Session Sidecar 或 Registered Agent connector。Cloud source 继续复用根模块的 build capability、optional user session、HTTP/client-context header 与 401 reauth transition，只调用一个 `/api/notifications` feed；TaskStore 另提供本地 Agent Comment locator source。两者只在 snapshot 投影层合并，不改变各自 authority。
-- 匿名身份只投影公开公告，并用本机有界 receipt/cutoff 归一已读；账号身份额外投影私有评论通知，Cloud `hasUnread` 是账号红点权威。本机只保存 pending read/read-all/anonymous merge 元数据，绝不保存私有 feed 内容或 target。
+- 匿名身份只投影公开公告，并用本机有界 receipt/cutoff 归一已读；账号身份额外投影私有评论通知，Cloud `hasUnread` 是账号红点权威。通知协调器把全部 receipt 写入应用全局 `~/.myagents/notification-state.json`：`localTasks` 不带 Space 环境 scope，Cloud 元数据按规范化 base URL hash 的 origin bucket、再按账号 hash 隔离。文件只保存 pending read/read-all/anonymous merge 元数据，绝不保存私有 feed 内容或 target。
 - 前台 1 分钟、失焦/隐藏/托盘 5 分钟，由一个 loop + sync gate 串行；登录、登出、聚焦、网络恢复只 wake。首次进程/身份成功同步只建立 baseline；之后失焦时的新 ID 逐条发系统通知，同一进程每个 ID 至多一次。
 - 账号切换、登出与 credential 401 在网络补拉前同步清空内存 projection。点击 feed item 或系统通知才写 read；read mutation 先落本地 pending，再异步向 Cloud 幂等收敛。
 - 公告 target 只允许 Rust 二次校验后的绝对 HTTP/HTTPS URL；Issue comment target 是 typed `AppRoute`，由 App Shell 和 Space store 完成精确 Space/Issue 导航。
-- 本地 Task Comment 不进入 Cloud feed、账号 ACK 或 private projection。TaskStore 从 durable `comments.jsonl` 异步重建并增量维护有界 index；通知协调器只保存有界 read receipt、做统一排序/分页/红点/OS toast，并以 typed `task.comment` route 打开 Task detail 的 exact Comment。Cloud 不可用或用户未登录时，本地 source 仍可展示、分页和已读。
+- 本地 Task Comment 不进入 Cloud feed、账号 ACK 或 private projection，也不跟随 Space prod/dev 环境切换。TaskStore 从 durable `comments.jsonl` 异步重建并增量维护有界 index；通知协调器只在应用全局状态中保存有界 read receipt、做统一排序/分页/红点/OS toast，并以 typed `task.comment` route 打开 Task detail 的 exact Comment。Cloud 不可用或用户未登录时，本地 source 仍可展示、分页和已读。
 
 ### CLI Goal discovery 与 Issue 元数据更新
 

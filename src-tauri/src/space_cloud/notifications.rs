@@ -20,7 +20,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use super::{
     api_url, capability_base_url, ensure_space_available, http_client, parse_authorized_cloud_data,
     parse_cloud_data, read_current_session, session_path, session_user_id, space_build_capability,
-    space_data_dir, url_component, with_space_client_context_headers, write_private_json_unlocked,
+    url_component, with_space_client_context_headers, write_private_json_unlocked,
     AuthenticatedSpaceSession, SpaceCommandError,
 };
 use crate::app_route::AppRoute;
@@ -248,14 +248,21 @@ struct LocalTaskReceipts {
     cutoff: Option<NotificationSortPoint>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudOriginReceipts {
+    #[serde(default)]
+    announcements: AnnouncementReceipts,
+    #[serde(default)]
+    accounts: BTreeMap<String, AccountPendingState>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedNotificationState {
     version: u8,
     #[serde(default)]
-    announcements: AnnouncementReceipts,
-    #[serde(default)]
-    accounts: BTreeMap<String, AccountPendingState>,
+    cloud_origins: BTreeMap<String, CloudOriginReceipts>,
     #[serde(default)]
     local_tasks: LocalTaskReceipts,
 }
@@ -263,9 +270,8 @@ struct PersistedNotificationState {
 impl Default for PersistedNotificationState {
     fn default() -> Self {
         Self {
-            version: 1,
-            announcements: AnnouncementReceipts::default(),
-            accounts: BTreeMap::new(),
+            version: 2,
+            cloud_origins: BTreeMap::new(),
             local_tasks: LocalTaskReceipts::default(),
         }
     }
@@ -281,6 +287,7 @@ struct RuntimeState {
     load_state: NotificationLoadState,
     auth_state: NotificationAuthState,
     identity_key: Option<String>,
+    origin_key: Option<String>,
     account_key: Option<String>,
     items: Vec<NotificationItem>,
     next_cursor: Option<String>,
@@ -300,6 +307,7 @@ impl Default for RuntimeState {
             load_state: NotificationLoadState::Idle,
             auth_state: NotificationAuthState::SignedOut,
             identity_key: None,
+            origin_key: None,
             account_key: None,
             items: Vec::new(),
             next_cursor: None,
@@ -443,10 +451,21 @@ impl NotificationCenter {
 #[derive(Debug, Clone)]
 struct SyncContext {
     identity_key: String,
+    origin_key: String,
     account_key: Option<String>,
     auth_state: NotificationAuthState,
     base_url: String,
     session: Option<AuthenticatedSpaceSession>,
+}
+
+fn origin_key(base_url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(base_url.trim().trim_end_matches('/').as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn account_key(base_url: &str, user_id: &str) -> String {
@@ -461,21 +480,20 @@ fn account_key(base_url: &str, user_id: &str) -> String {
         .collect()
 }
 
+fn notification_state_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(STATE_FILE)
+}
+
 fn state_path() -> PathBuf {
-    space_data_dir()
-        .or_else(|_| {
-            crate::app_dirs::myagents_data_dir()
-                .map(|path| path.join("space"))
-                .ok_or_else(|| "Home dir not found".to_string())
-        })
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(STATE_FILE)
+    crate::app_dirs::myagents_data_dir()
+        .map(|path| notification_state_path(&path))
+        .unwrap_or_else(|| PathBuf::from(STATE_FILE))
 }
 
 fn load_persisted(path: &Path) -> PersistedNotificationState {
     match std::fs::read_to_string(path) {
         Ok(content) => match serde_json::from_str::<PersistedNotificationState>(&content) {
-            Ok(state) if state.version == 1 => state,
+            Ok(state) if state.version == 2 => state,
             Ok(_) => {
                 ulog_warn!("[NotificationCenter] ignored unsupported local state version");
                 PersistedNotificationState::default()
@@ -541,9 +559,11 @@ fn current_context() -> Result<SyncContext, String> {
     }
     let capability = ensure_space_available()?;
     let configured_base_url = capability_base_url(&capability)?;
+    let configured_origin_key = origin_key(&configured_base_url);
     let Some(session) = read_current_session()? else {
         return Ok(SyncContext {
             identity_key: format!("anonymous:{}", configured_base_url.trim_end_matches('/')),
+            origin_key: configured_origin_key,
             account_key: None,
             auth_state: NotificationAuthState::SignedOut,
             base_url: configured_base_url,
@@ -556,6 +576,7 @@ fn current_context() -> Result<SyncContext, String> {
     if session.authenticated_token().is_none() {
         return Ok(SyncContext {
             identity_key: format!("reauth:{key}"),
+            origin_key: origin_key(&session.base_url),
             account_key: None,
             auth_state: NotificationAuthState::ReauthRequired,
             base_url: session.base_url,
@@ -565,6 +586,7 @@ fn current_context() -> Result<SyncContext, String> {
     let authenticated = AuthenticatedSpaceSession::from_account(session, session_path()?)?;
     Ok(SyncContext {
         identity_key: format!("account:{key}"),
+        origin_key: origin_key(&authenticated.base_url),
         account_key: Some(key),
         auth_state: NotificationAuthState::Authenticated,
         base_url: authenticated.base_url.clone(),
@@ -594,6 +616,7 @@ fn reset_projection_for_identity(center: &NotificationCenter, context: &SyncCont
         runtime.baselines.remove(&context.identity_key);
     }
     runtime.identity_key = Some(context.identity_key.clone());
+    runtime.origin_key = Some(context.origin_key.clone());
     runtime.account_key = context.account_key.clone();
     runtime.auth_state = context.auth_state;
     runtime.load_state = NotificationLoadState::Loading;
@@ -658,6 +681,7 @@ fn normalize_item(
 
 fn normalized_page(
     center: &NotificationCenter,
+    origin_key: &str,
     account_key: Option<&str>,
     mut page: FeedPage,
 ) -> FeedPage {
@@ -665,9 +689,11 @@ fn normalized_page(
         .persisted
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let pending = account_key.and_then(|key| persisted.accounts.get(key));
-    for item in &mut page.items {
-        normalize_item(item, &persisted.announcements, pending);
+    if let Some(origin) = persisted.cloud_origins.get(origin_key) {
+        let pending = account_key.and_then(|key| origin.accounts.get(key));
+        for item in &mut page.items {
+            normalize_item(item, &origin.announcements, pending);
+        }
     }
     page
 }
@@ -734,17 +760,17 @@ async fn post_authenticated(
 }
 
 fn touch_account<'a>(
-    persisted: &'a mut PersistedNotificationState,
+    origin: &'a mut CloudOriginReceipts,
     key: &str,
 ) -> &'a mut AccountPendingState {
-    persisted
+    origin
         .accounts
         .entry(key.to_string())
         .or_default()
         .touched_at = Utc::now().timestamp();
-    if persisted.accounts.len() > MAX_ACCOUNTS {
+    if origin.accounts.len() > MAX_ACCOUNTS {
         let active = key.to_string();
-        let mut oldest = persisted
+        let mut oldest = origin
             .accounts
             .iter()
             .filter(|(candidate, state)| {
@@ -757,12 +783,12 @@ fn touch_account<'a>(
         oldest.sort_by_key(|(_, touched_at)| *touched_at);
         for (candidate, _) in oldest
             .into_iter()
-            .take(persisted.accounts.len().saturating_sub(MAX_ACCOUNTS))
+            .take(origin.accounts.len().saturating_sub(MAX_ACCOUNTS))
         {
-            persisted.accounts.remove(&candidate);
+            origin.accounts.remove(&candidate);
         }
     }
-    persisted
+    origin
         .accounts
         .get_mut(key)
         .expect("active account retained")
@@ -781,11 +807,16 @@ async fn flush_pending(
             .persisted
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let account = persisted.accounts.get(key).cloned().unwrap_or_default();
+        let origin = persisted
+            .cloud_origins
+            .get(&context.origin_key)
+            .cloned()
+            .unwrap_or_default();
+        let account = origin.accounts.get(key).cloned().unwrap_or_default();
         (
-            persisted.announcements.revision,
-            persisted.announcements.ids.clone(),
-            persisted.announcements.cutoff.clone(),
+            origin.announcements.revision,
+            origin.announcements.ids,
+            origin.announcements.cutoff,
             account.merged_announcement_revision,
         )
     };
@@ -816,7 +847,11 @@ async fn flush_pending(
                 .persisted
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let account = touch_account(&mut persisted, key);
+            let origin = persisted
+                .cloud_origins
+                .entry(context.origin_key.clone())
+                .or_default();
+            let account = touch_account(origin, key);
             account.merged_announcement_revision = account
                 .merged_announcement_revision
                 .max(announcement_revision);
@@ -836,8 +871,9 @@ async fn flush_pending(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             persisted
-                .accounts
-                .get(key)
+                .cloud_origins
+                .get(&context.origin_key)
+                .and_then(|origin| origin.accounts.get(key))
                 .map(|account| {
                     account
                         .pending_ids
@@ -862,7 +898,11 @@ async fn flush_pending(
                 .persisted
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let account = touch_account(&mut persisted, key);
+            let origin = persisted
+                .cloud_origins
+                .entry(context.origin_key.clone())
+                .or_default();
+            let account = touch_account(origin, key);
             account
                 .pending_ids
                 .retain(|id| !batch.iter().any(|sent| sent == id));
@@ -881,8 +921,9 @@ async fn flush_pending(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         persisted
-            .accounts
-            .get(key)
+            .cloud_origins
+            .get(&context.origin_key)
+            .and_then(|origin| origin.accounts.get(key))
             .and_then(|account| account.pending_read_all.clone())
     };
     if let Some(cutoff) = pending_cutoff.clone() {
@@ -897,7 +938,11 @@ async fn flush_pending(
                 .persisted
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let account = touch_account(&mut persisted, key);
+            let origin = persisted
+                .cloud_origins
+                .entry(context.origin_key.clone())
+                .or_default();
+            let account = touch_account(origin, key);
             if account.pending_read_all.as_ref() == pending_cutoff.as_ref() {
                 account.pending_read_all = None;
             }
@@ -1062,6 +1107,7 @@ async fn refresh_once(
 
     let first = normalized_page(
         center,
+        &context.origin_key,
         context.account_key.as_deref(),
         fetch_page(&context, None).await?,
     );
@@ -1097,6 +1143,7 @@ async fn refresh_once(
     {
         let page = normalized_page(
             center,
+            &context.origin_key,
             context.account_key.as_deref(),
             fetch_page(&context, cursor.as_deref()).await?,
         );
@@ -1156,6 +1203,7 @@ async fn refresh_once(
                 item.id().to_string(),
                 item.target(),
                 item.is_announcement(),
+                Some(context.origin_key.clone()),
                 context.account_key.clone(),
             );
         }
@@ -1284,6 +1332,7 @@ pub fn agent_comment_appended<R: tauri::Runtime>(
                 item.target(),
                 false,
                 None,
+                None,
             );
         }
     }
@@ -1311,6 +1360,7 @@ pub fn auth_boundary_changed<R: tauri::Runtime>(
         runtime.has_unread = false;
         runtime.visible_limit = PAGE_SIZE;
         runtime.identity_key = None;
+        runtime.origin_key = None;
         runtime.account_key = None;
         runtime.auth_state = auth_state;
         runtime.load_state = NotificationLoadState::Loading;
@@ -1401,7 +1451,12 @@ pub async fn cmd_notification_load_more(
     runtime.is_loading_more = false;
     match result {
         Ok(page) if runtime.identity_key.as_deref() == Some(context.identity_key.as_str()) => {
-            let page = normalized_page(&center, context.account_key.as_deref(), page);
+            let page = normalized_page(
+                &center,
+                &context.origin_key,
+                context.account_key.as_deref(),
+                page,
+            );
             let existing = runtime
                 .items
                 .iter()
@@ -1431,39 +1486,44 @@ pub async fn cmd_notification_load_more(
     Ok(snapshot)
 }
 
-fn record_announcement_read(persisted: &mut PersistedNotificationState, id: &str) {
-    if !persisted
+fn record_announcement_read(origin: &mut CloudOriginReceipts, id: &str) {
+    if !origin
         .announcements
         .ids
         .iter()
         .any(|candidate| candidate == id)
     {
-        persisted.announcements.ids.push(id.to_string());
-        if persisted.announcements.ids.len() > MAX_ANNOUNCEMENT_RECEIPTS {
-            let overflow = persisted
+        origin.announcements.ids.push(id.to_string());
+        if origin.announcements.ids.len() > MAX_ANNOUNCEMENT_RECEIPTS {
+            let overflow = origin
                 .announcements
                 .ids
                 .len()
                 .saturating_sub(MAX_ANNOUNCEMENT_RECEIPTS);
-            persisted.announcements.ids.drain(0..overflow);
+            origin.announcements.ids.drain(0..overflow);
         }
-        persisted.announcements.revision = persisted.announcements.revision.saturating_add(1);
+        origin.announcements.revision = origin.announcements.revision.saturating_add(1);
     }
 }
 
 fn record_read_receipt(
     persisted: &mut PersistedNotificationState,
+    origin_key: &str,
     notification_id: &str,
     is_announcement: bool,
     account_key: Option<&str>,
 ) {
+    let origin = persisted
+        .cloud_origins
+        .entry(origin_key.to_string())
+        .or_default();
     if is_announcement {
-        record_announcement_read(persisted, notification_id);
+        record_announcement_read(origin, notification_id);
     }
     let Some(key) = account_key else {
         return;
     };
-    let account = touch_account(persisted, key);
+    let account = touch_account(origin, key);
     if account.pending_ids.iter().any(|id| id == notification_id) {
         return;
     }
@@ -1591,6 +1651,56 @@ fn persist_receipts_best_effort(center: &NotificationCenter) {
     }
 }
 
+fn runtime_matches_cloud_identity(
+    runtime: &RuntimeState,
+    origin_key: Option<&str>,
+    account_key: Option<&str>,
+) -> bool {
+    runtime.origin_key.as_deref() == origin_key && runtime.account_key.as_deref() == account_key
+}
+
+fn project_item_read_for_identity(
+    runtime: &mut RuntimeState,
+    origin_key: &str,
+    account_key: Option<&str>,
+    notification_id: &str,
+) -> bool {
+    if !runtime_matches_cloud_identity(runtime, Some(origin_key), account_key) {
+        return false;
+    }
+    let changed = runtime
+        .items
+        .iter_mut()
+        .find(|item| item.id() == notification_id)
+        .is_some_and(|item| {
+            let was_unread = !item.is_read();
+            item.set_read();
+            was_unread
+        });
+    if changed
+        && runtime.items.iter().all(NotificationItem::is_read)
+        && runtime.next_cursor.is_none()
+    {
+        runtime.has_unread = false;
+    }
+    changed
+}
+
+fn project_all_read_for_identity(
+    runtime: &mut RuntimeState,
+    origin_key: Option<&str>,
+    account_key: Option<&str>,
+) -> bool {
+    if !runtime_matches_cloud_identity(runtime, origin_key, account_key) {
+        return false;
+    }
+    for item in &mut runtime.items {
+        item.set_read();
+    }
+    runtime.has_unread = false;
+    true
+}
+
 async fn mark_read_local<R: tauri::Runtime>(
     app: &AppHandle<R>,
     center: &NotificationCenter,
@@ -1616,7 +1726,7 @@ async fn mark_read_local<R: tauri::Runtime>(
             target,
         });
     }
-    let (target, is_announcement, account_key) = {
+    let (target, is_announcement, origin_key, account_key) = {
         let runtime = center
             .runtime
             .lock()
@@ -1628,11 +1738,21 @@ async fn mark_read_local<R: tauri::Runtime>(
             .ok_or_else(|| "Notification is no longer available".to_string())?;
         let target = item.target();
         let is_announcement = item.is_announcement();
-        (target, is_announcement, runtime.account_key.clone())
+        let origin_key = runtime
+            .origin_key
+            .clone()
+            .ok_or_else(|| "Notification origin is no longer available".to_string())?;
+        (
+            target,
+            is_announcement,
+            origin_key,
+            runtime.account_key.clone(),
+        )
     };
     mutate_persisted(center, |persisted| {
         record_read_receipt(
             persisted,
+            &origin_key,
             notification_id,
             is_announcement,
             account_key.as_deref(),
@@ -1643,16 +1763,12 @@ async fn mark_read_local<R: tauri::Runtime>(
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(item) = runtime
-            .items
-            .iter_mut()
-            .find(|item| item.id() == notification_id)
-        {
-            item.set_read();
-        }
-        if runtime.items.iter().all(NotificationItem::is_read) && runtime.next_cursor.is_none() {
-            runtime.has_unread = false;
-        }
+        project_item_read_for_identity(
+            &mut runtime,
+            &origin_key,
+            account_key.as_deref(),
+            notification_id,
+        );
     }
     emit_snapshot(app, center);
     center.wake.notify_one();
@@ -1681,13 +1797,17 @@ pub fn cmd_notification_mark_all_read(
     state: tauri::State<'_, ManagedNotificationCenter>,
 ) -> Result<NotificationSnapshot, String> {
     let center = state.inner();
-    let (cloud_cutoff, account_key) = {
+    let (cloud_cutoff, origin_key, account_key) = {
         let runtime = center
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let cutoff = runtime.feed_cutoff.clone();
-        (cutoff, runtime.account_key.clone())
+        (
+            cutoff,
+            runtime.origin_key.clone(),
+            runtime.account_key.clone(),
+        )
     };
     let local_cutoff = {
         let persisted = center
@@ -1703,19 +1823,26 @@ pub fn cmd_notification_mark_all_read(
     if cloud_cutoff.is_none() && local_cutoff.is_none() {
         return Err("Notification snapshot is not ready".to_string());
     }
+    if cloud_cutoff.is_some() && origin_key.is_none() {
+        return Err("Notification origin is no longer available".to_string());
+    }
     mutate_persisted(center, |persisted| {
         if let Some(cutoff) = local_cutoff {
             persisted.local_tasks.cutoff =
                 Some(later_cutoff(persisted.local_tasks.cutoff.take(), cutoff));
         }
-        if let Some(cutoff) = cloud_cutoff.clone() {
-            persisted.announcements.cutoff = Some(later_cutoff(
-                persisted.announcements.cutoff.take(),
+        if let (Some(cutoff), Some(origin_key)) = (cloud_cutoff.clone(), origin_key.as_ref()) {
+            let origin = persisted
+                .cloud_origins
+                .entry(origin_key.clone())
+                .or_default();
+            origin.announcements.cutoff = Some(later_cutoff(
+                origin.announcements.cutoff.take(),
                 cutoff.clone(),
             ));
-            persisted.announcements.revision = persisted.announcements.revision.saturating_add(1);
+            origin.announcements.revision = origin.announcements.revision.saturating_add(1);
             if let Some(key) = account_key.as_deref() {
-                let account = touch_account(persisted, key);
+                let account = touch_account(origin, key);
                 account.pending_read_all =
                     Some(later_cutoff(account.pending_read_all.take(), cutoff));
             }
@@ -1726,10 +1853,7 @@ pub fn cmd_notification_mark_all_read(
             .runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for item in &mut runtime.items {
-            item.set_read();
-        }
-        runtime.has_unread = false;
+        project_all_read_for_identity(&mut runtime, origin_key.as_deref(), account_key.as_deref());
     }
     let snapshot = center.snapshot();
     if let Err(error) = app.emit(UPDATED_EVENT, snapshot.clone()) {
@@ -1764,6 +1888,7 @@ pub fn activate_from_toast<R: tauri::Runtime>(
     notification_id: String,
     target: NotificationTarget,
     is_announcement: bool,
+    origin_key: Option<String>,
     origin_account_key: Option<String>,
 ) {
     let center = app.state::<ManagedNotificationCenter>().inner().clone();
@@ -1797,35 +1922,23 @@ pub fn activate_from_toast<R: tauri::Runtime>(
                 .runtime
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let same_identity = runtime.account_key == origin_account_key;
-            let changed = if same_identity {
-                runtime
-                    .items
-                    .iter_mut()
-                    .find(|item| item.id() == notification_id)
-                    .is_some_and(|item| {
-                        let was_unread = !item.is_read();
-                        item.set_read();
-                        was_unread
-                    })
-            } else {
-                false
-            };
-            if changed
-                && runtime.items.iter().all(NotificationItem::is_read)
-                && runtime.next_cursor.is_none()
-            {
-                runtime.has_unread = false;
-            }
-            changed
+            origin_key.as_deref().is_some_and(|origin_key| {
+                project_item_read_for_identity(
+                    &mut runtime,
+                    origin_key,
+                    origin_account_key.as_deref(),
+                    &notification_id,
+                )
+            })
         };
-        {
+        if let Some(origin_key) = origin_key.as_deref() {
             let mut persisted = center
                 .persisted
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             record_read_receipt(
                 &mut persisted,
+                origin_key,
                 &notification_id,
                 is_announcement,
                 origin_account_key.as_deref(),
@@ -1870,6 +1983,126 @@ mod tests {
             created_at: created_at.to_string(),
             id: id.to_string(),
         }
+    }
+
+    fn announcement(id: &str) -> NotificationItem {
+        serde_json::from_value(json!({
+            "id": id,
+            "kind": "announcement",
+            "createdAt": "2026-08-16T01:00:00.000Z",
+            "isRead": false,
+            "summaryZh": "公告",
+            "summaryOther": null,
+            "target": { "kind": "external_url", "url": "https://example.com" }
+        }))
+        .expect("announcement")
+    }
+
+    #[test]
+    fn notification_state_path_is_application_global() {
+        let root = PathBuf::from("/tmp/myagents-data");
+        assert_eq!(
+            notification_state_path(&root),
+            root.join("notification-state.json")
+        );
+    }
+
+    #[test]
+    fn cloud_receipts_are_origin_scoped_while_task_receipts_are_global() {
+        let mut state = PersistedNotificationState::default();
+        record_read_receipt(&mut state, "origin-a", "announcement-1", true, None);
+        record_local_task_read(
+            &mut state,
+            "task-comment:1",
+            point("2026-08-16T01:00:00.000Z", "task-comment:1"),
+        );
+
+        assert_eq!(
+            state.cloud_origins["origin-a"].announcements.ids,
+            vec!["announcement-1"]
+        );
+        assert!(!state.cloud_origins.contains_key("origin-b"));
+        assert_eq!(state.local_tasks.ids, vec!["task-comment:1"]);
+    }
+
+    #[test]
+    fn anonymous_toast_from_another_origin_cannot_mutate_current_projection() {
+        let runtime = RuntimeState {
+            origin_key: Some("origin-b".to_string()),
+            account_key: None,
+            ..RuntimeState::default()
+        };
+
+        assert!(!runtime_matches_cloud_identity(
+            &runtime,
+            Some("origin-a"),
+            None,
+        ));
+        assert!(runtime_matches_cloud_identity(
+            &runtime,
+            Some("origin-b"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn stale_individual_read_cannot_mutate_replaced_projection() {
+        let mut runtime = RuntimeState {
+            origin_key: Some("origin-b".to_string()),
+            account_key: Some("account-b".to_string()),
+            items: vec![announcement("shared-id")],
+            has_unread: true,
+            ..RuntimeState::default()
+        };
+
+        assert!(!project_item_read_for_identity(
+            &mut runtime,
+            "origin-a",
+            Some("account-a"),
+            "shared-id",
+        ));
+        assert!(!runtime.items[0].is_read());
+        assert!(runtime.has_unread);
+
+        runtime.origin_key = Some("origin-a".to_string());
+        runtime.account_key = Some("account-a".to_string());
+        assert!(project_item_read_for_identity(
+            &mut runtime,
+            "origin-a",
+            Some("account-a"),
+            "shared-id",
+        ));
+        assert!(runtime.items[0].is_read());
+        assert!(!runtime.has_unread);
+    }
+
+    #[test]
+    fn stale_mark_all_cannot_mutate_replaced_projection() {
+        let mut runtime = RuntimeState {
+            origin_key: Some("origin-b".to_string()),
+            account_key: Some("account-b".to_string()),
+            items: vec![announcement("shared-id")],
+            has_unread: true,
+            ..RuntimeState::default()
+        };
+
+        assert!(!project_all_read_for_identity(
+            &mut runtime,
+            Some("origin-a"),
+            Some("account-a"),
+        ));
+        assert!(!runtime.items[0].is_read());
+        assert!(runtime.has_unread);
+
+        runtime.origin_key = Some("origin-a".to_string());
+        runtime.account_key = Some("account-a".to_string());
+        assert!(project_all_read_for_identity(
+            &mut runtime,
+            Some("origin-a"),
+            Some("account-a"),
+        ));
+        assert!(runtime.items[0].is_read());
+        assert!(!runtime.has_unread);
     }
 
     #[test]
@@ -1992,8 +2225,12 @@ mod tests {
     #[test]
     fn persisted_shape_never_contains_private_feed_content() {
         let mut state = PersistedNotificationState::default();
-        state.announcements.ids.push("announcement-1".to_string());
-        state.accounts.insert(
+        let origin = state
+            .cloud_origins
+            .entry("hashed-origin".into())
+            .or_default();
+        origin.announcements.ids.push("announcement-1".to_string());
+        origin.accounts.insert(
             "hashed-account".to_string(),
             AccountPendingState {
                 pending_ids: vec!["private-notification-1".to_string()],
@@ -2047,13 +2284,14 @@ mod tests {
     #[test]
     fn local_receipts_remain_monotonic_when_the_source_index_rotates() {
         let mut state = PersistedNotificationState::default();
+        let origin = state.cloud_origins.entry("origin-a".into()).or_default();
         for index in 0..(MAX_ANNOUNCEMENT_RECEIPTS + 5) {
-            record_announcement_read(&mut state, &format!("a-{index}"));
+            record_announcement_read(origin, &format!("a-{index}"));
         }
-        record_announcement_read(&mut state, "a-10");
-        assert_eq!(state.announcements.ids.len(), MAX_ANNOUNCEMENT_RECEIPTS);
+        record_announcement_read(origin, "a-10");
+        assert_eq!(origin.announcements.ids.len(), MAX_ANNOUNCEMENT_RECEIPTS);
         assert_eq!(
-            state.announcements.revision,
+            origin.announcements.revision,
             (MAX_ANNOUNCEMENT_RECEIPTS + 5) as u64
         );
 
@@ -2078,24 +2316,38 @@ mod tests {
     #[test]
     fn toast_receipt_stays_bound_to_its_origin_account() {
         let mut state = PersistedNotificationState::default();
-        record_read_receipt(&mut state, "private-1", false, Some("account-a"));
-        record_read_receipt(&mut state, "announcement-1", true, Some("account-a"));
+        record_read_receipt(
+            &mut state,
+            "origin-a",
+            "private-1",
+            false,
+            Some("account-a"),
+        );
+        record_read_receipt(
+            &mut state,
+            "origin-a",
+            "announcement-1",
+            true,
+            Some("account-a"),
+        );
+        let origin = &state.cloud_origins["origin-a"];
 
         assert_eq!(
-            state.accounts["account-a"].pending_ids,
+            origin.accounts["account-a"].pending_ids,
             vec!["private-1", "announcement-1"]
         );
-        assert!(!state.accounts.contains_key("account-b"));
-        assert_eq!(state.announcements.ids, vec!["announcement-1"]);
+        assert!(!origin.accounts.contains_key("account-b"));
+        assert_eq!(origin.announcements.ids, vec!["announcement-1"]);
     }
 
     #[test]
     fn anonymous_toast_receipt_never_creates_an_account_queue() {
         let mut state = PersistedNotificationState::default();
-        record_read_receipt(&mut state, "announcement-1", true, None);
+        record_read_receipt(&mut state, "origin-a", "announcement-1", true, None);
+        let origin = &state.cloud_origins["origin-a"];
 
-        assert_eq!(state.announcements.ids, vec!["announcement-1"]);
-        assert!(state.accounts.is_empty());
+        assert_eq!(origin.announcements.ids, vec!["announcement-1"]);
+        assert!(origin.accounts.is_empty());
     }
 
     #[test]
