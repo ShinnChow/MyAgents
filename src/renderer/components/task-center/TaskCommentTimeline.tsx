@@ -317,9 +317,9 @@ export function TaskCommentTimeline({
   );
 
   return (
-    <div ref={timelineRef} className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-8 pt-6 max-sm:px-5">
-        <div className="mx-auto max-w-[860px]">
+    <div ref={timelineRef} className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto px-8 pb-8 pt-4 max-sm:px-5">
+        <div className="mx-auto w-full min-w-0 max-w-[860px]">
           {children}
           <section
             className="mt-10 border-t border-[var(--line-subtle)] pt-7"

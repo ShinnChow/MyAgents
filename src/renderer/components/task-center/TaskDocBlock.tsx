@@ -41,7 +41,6 @@ interface Props {
   task: Task;
   /** Which document — maps 1:1 to the filename stem. */
   doc: TaskDocName;
-  title: string;
   /** Surfaced when the file is missing and `hideWhenEmpty` is false. */
   emptyHint: string;
   /** If true, render nothing when the file is empty (progress.md uses this
@@ -57,7 +56,6 @@ interface Props {
 export function TaskDocBlock({
   task,
   doc,
-  title,
   emptyHint,
   hideWhenEmpty = false,
   collapsible = true,
@@ -135,9 +133,8 @@ export function TaskDocBlock({
   }, [loaded, content]);
 
   // The on-disk path is deterministic (`~/.myagents/tasks/<id>/<doc>.md`)
-  // so we can surface it + an opener button right below the title —
-  // same pattern as the edit panel's DocSectionHeader, so preview and
-  // edit modes don't diverge visually. Declared before the
+  // so we can surface it + an opener button above the content without
+  // repeating a redundant section title. Declared before the
   // hideWhenEmpty short-circuit so the useCallback hook call order
   // stays stable across renders (rules-of-hooks).
   const path = doc === 'task'
@@ -145,7 +142,9 @@ export function TaskDocBlock({
     : doc === 'verify'
       ? task.docs?.verifyMd
       : task.docs?.progressMd;
-  const displayPath = path ?? `~/.myagents/tasks/${task.id}/${doc}.md`;
+  const displayPath = compactTaskDocPath(
+    path ?? `~/.myagents/tasks/${task.id}/${doc}.md`,
+  );
   const handleOpenFile = useCallback(() => {
     if (!path) return;
     void openExternal(path, { workspace: task.workspacePath })
@@ -164,12 +163,8 @@ export function TaskDocBlock({
   const showFade = showCollapseAffordance && !expanded;
 
   return (
-    <section className="mt-4">
-      {/* Title — text-sm(14px) semibold ink, matches the edit panel's section
-          headers so the preview ↔ edit mental model is identical. */}
-      <h3 className="text-sm font-semibold text-[var(--ink)]">{title}</h3>
-      {/* Path + 打开文件夹 on a dedicated row below the title. */}
-      <div className="mb-2 mt-1 flex items-center gap-2">
+    <section className="min-w-0">
+      <div className="mb-2 flex min-w-0 items-center gap-2">
         <button
           type="button"
           disabled={!path}
@@ -195,7 +190,7 @@ export function TaskDocBlock({
           {t('docBlock.loading')}
         </div>
       ) : content ? (
-        <div className="rounded-[var(--radius-lg)] border border-[var(--line-subtle)] bg-[var(--paper)]">
+        <div className="min-w-0 max-w-full overflow-hidden rounded-[var(--radius-lg)] border border-[var(--line-subtle)] bg-[var(--paper)]">
           <div
             // `relative` so the fade gradient can position absolutely.
             // `overflow-hidden` guarantees the clip happens at this layer
@@ -207,7 +202,7 @@ export function TaskDocBlock({
               maxHeight: showCollapseAffordance && !expanded ? COLLAPSED_MAX_PX : 9999,
             }}
           >
-            <div ref={contentRef} className="p-4">
+            <div ref={contentRef} className="min-w-0 max-w-full p-4">
               {/* `compact` keeps the whole Markdown rhythm at the 14px density
                   used by the edit-mode textarea, so preview → edit does not
                   jump in either type size or vertical spacing. */}
@@ -249,6 +244,13 @@ export function TaskDocBlock({
       )}
     </section>
   );
+}
+
+export function compactTaskDocPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/');
+  const myAgentsRoot = '/.myagents/';
+  const markerIndex = normalized.lastIndexOf(myAgentsRoot);
+  return markerIndex >= 0 ? `~${normalized.slice(markerIndex)}` : normalized;
 }
 
 export default TaskDocBlock;

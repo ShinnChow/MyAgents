@@ -660,8 +660,7 @@
     "emptyNeverRun": "尚未执行过",
     "emptyMissing": "相关 session 记录已不存在",
     "openTitle": "打开此次执行的 session（{{id}}）",
-    "expandAll": "展开全部 {{count}} 条",
-    "collapse": "收起"
+    "expandMore": "展开更多"
   },
   "trigger": {
     "sectionTitle": "触发前检测",

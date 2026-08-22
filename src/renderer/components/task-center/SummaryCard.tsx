@@ -1,7 +1,7 @@
 // SummaryCard — the preview-overlay "task at a glance" block.
 //
 // Replaces the previous two sections (`<Meta>` + `<RunStatsSection>`)
-// with a single card whose information architecture matches the edit
+// with a flat summary group whose information architecture matches the edit
 // panel: schedule + workspace/agent + run stats + tags + end
 // conditions, in priority order, with low-value fields hidden behind
 // a "展开更多详情" fold.
@@ -143,7 +143,7 @@ export function SummaryCard({ task, stats }: Props) {
     || task.mcpEnabledServers !== undefined;
 
   return (
-    <div className="rounded-[var(--radius-lg)] border border-[var(--line)] bg-[var(--paper)] px-4 py-3.5">
+    <div className="min-w-0">
       {/* Headline — the single most important line, visually distinct
           from the key/value table below so the user scans schedule
           first, details second. */}

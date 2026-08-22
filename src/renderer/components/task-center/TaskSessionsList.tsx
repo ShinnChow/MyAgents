@@ -12,7 +12,7 @@
 //
 // Visual language mirrors Launcher's 历史对话 list (DESIGN.md §15.6):
 // `rounded-lg hover:bg-[var(--hover-bg)]` row with a timestamp column on
-// the left and truncated title on the right. Timestamp column is 104px
+// the left and truncated title on the right. Timestamp column is 94px
 // (vs Launcher's 56px w-14) because this list shows `MM-DD HH:mm` whereas
 // Launcher's shows `HH:mm` only.
 
@@ -54,7 +54,7 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
   const { t } = useTranslation('task');
   const [sessions, setSessions] = useState<SessionMetadata[]>([]);
   const [loading, setLoading] = useState(true);
-  const [expanded, setExpanded] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(MAX_VISIBLE);
 
   // Fetch all sessions for the task's workspace once, then filter to the
   // task's sessionIds[]. Cheaper than N-round trips; session metadata is
@@ -104,8 +104,8 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
   }, [task.workspacePath, sessionIdsKey]);
 
   const visible = useMemo(
-    () => (expanded ? sessions : sessions.slice(0, MAX_VISIBLE)),
-    [sessions, expanded],
+    () => sessions.slice(0, visibleCount),
+    [sessions, visibleCount],
   );
 
   const handleOpen = (sessionId: string) => {
@@ -143,33 +143,24 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
               type="button"
               onClick={() => handleOpen(session.id)}
               title={t('sessions.openTitle', { id: session.id })}
-              className="group flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+              className="group flex w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1.5 text-left transition-colors hover:bg-[var(--hover-bg)]"
             >
-              <div className="flex w-[104px] shrink-0 items-center gap-1 text-xs text-[var(--ink-muted)]/50">
+              <div className="flex w-[94px] shrink-0 items-center gap-1 text-xs text-[var(--ink-muted)]/60">
                 <Clock className="h-2.5 w-2.5" />
                 <span className="whitespace-nowrap tabular-nums">{formatTimestamp(session.lastActiveAt)}</span>
               </div>
-              <span className="min-w-0 flex-1 truncate text-sm text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
+              <span className="min-w-0 flex-1 truncate text-xs leading-5 text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
                 {getSessionDisplayText(session)}
               </span>
             </button>
           ))}
-          {sessions.length > MAX_VISIBLE && !expanded && (
+          {sessions.length > visibleCount && (
             <button
               type="button"
-              onClick={() => setExpanded(true)}
-              className="mt-1 px-3 py-1 text-xs text-[var(--ink-muted)] transition-colors hover:text-[var(--ink)]"
+              onClick={() => setVisibleCount((count) => count + MAX_VISIBLE)}
+              className="mt-1 px-1.5 py-1 text-xs text-[var(--ink-muted)] transition-colors hover:text-[var(--ink)]"
             >
-              {t('sessions.expandAll', { count: sessions.length })}
-            </button>
-          )}
-          {expanded && sessions.length > MAX_VISIBLE && (
-            <button
-              type="button"
-              onClick={() => setExpanded(false)}
-              className="mt-1 px-3 py-1 text-xs text-[var(--ink-muted)] transition-colors hover:text-[var(--ink)]"
-            >
-              {t('sessions.collapse')}
+              {t('sessions.expandMore')}
             </button>
           )}
         </div>

@@ -190,7 +190,7 @@ const PreComponent: Components['pre'] = ({ children }) => {
 
 // Custom table components for better styling
 const TableComponent: Components['table'] = ({ children }) => (
-  <div className="markdown-table overflow-x-auto rounded-lg border border-[var(--line)]">
+  <div className="markdown-table max-w-full overflow-x-auto rounded-lg border border-[var(--line)]">
     <table className="m-0 min-w-full divide-y divide-[var(--line)]">
       {children}
     </table>
@@ -531,7 +531,7 @@ const Markdown = memo(function Markdown({ children, compact = false, preserveNew
   }, [basePath, workspacePath]);
 
   return (
-    <div className={`markdown-content break-words${compact ? ' markdown-content--compact' : ''}`}>
+    <div className={`markdown-content min-w-0 max-w-full break-words${compact ? ' markdown-content--compact' : ''}`}>
       <ReactMarkdown
         remarkPlugins={preserveNewlines ? MARKDOWN_REMARK_PLUGINS_WITH_BREAKS : MARKDOWN_REMARK_PLUGINS_DEFAULT}
         rehypePlugins={streaming && !raw ? REHYPE_PLUGINS_STREAMING : MARKDOWN_REHYPE_PLUGINS}

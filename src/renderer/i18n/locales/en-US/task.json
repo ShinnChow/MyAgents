@@ -660,8 +660,7 @@
     "emptyNeverRun": "Not run yet",
     "emptyMissing": "Linked session records no longer exist",
     "openTitle": "Open this run's session ({{id}})",
-    "expandAll": "Expand all {{count}}",
-    "collapse": "Collapse"
+    "expandMore": "Show more"
   },
   "trigger": {
     "sectionTitle": "Pre-trigger detection",

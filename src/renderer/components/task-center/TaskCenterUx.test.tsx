@@ -5,6 +5,7 @@ import type { SessionMetadata } from '@/api/sessionClient';
 import type { Task } from '@/../shared/types/task';
 
 import { DispatchTaskDialog } from './DispatchTaskDialog';
+import { TaskDocBlock } from './TaskDocBlock';
 import { TaskSessionsList } from './TaskSessionsList';
 import { TaskStatusBadge } from './TaskStatusBadge';
 import { TaskListPanel } from './TaskListPanel';
@@ -19,6 +20,8 @@ const taskApiMocks = vi.hoisted(() => ({
   taskList: vi.fn(),
   taskRun: vi.fn(),
   taskRerun: vi.fn(),
+  taskReadDoc: vi.fn(),
+  taskOpenDocsDir: vi.fn(),
   taskWriteDoc: vi.fn(),
 }));
 
@@ -43,6 +46,8 @@ vi.mock('@/api/taskCenter', async (importOriginal) => {
     taskList: taskApiMocks.taskList,
     taskRun: taskApiMocks.taskRun,
     taskRerun: taskApiMocks.taskRerun,
+    taskReadDoc: taskApiMocks.taskReadDoc,
+    taskOpenDocsDir: taskApiMocks.taskOpenDocsDir,
     taskWriteDoc: taskApiMocks.taskWriteDoc,
   };
 });
@@ -136,6 +141,8 @@ describe('Task Center UX refinements', () => {
     taskApiMocks.taskGetRunStats.mockResolvedValue({ executionCount: 0 });
     taskApiMocks.taskList.mockResolvedValue([]);
     taskApiMocks.getSessions.mockResolvedValue([]);
+    taskApiMocks.taskReadDoc.mockResolvedValue('# Task body');
+    taskApiMocks.taskOpenDocsDir.mockResolvedValue(undefined);
     __setTaskCenterSessionsForTest([]);
   });
 
@@ -332,6 +339,62 @@ describe('Task Center UX refinements', () => {
     const timestamp = screen.getByText(expectedTaskSessionTimestamp(session.lastActiveAt));
     expect(timestamp).toHaveClass('whitespace-nowrap', 'tabular-nums');
     expect(taskApiMocks.getSessions).toHaveBeenCalledWith('/Users/me/mino');
+  });
+
+  it('reveals Task execution sessions five at a time with compact row typography', async () => {
+    const sessions: SessionMetadata[] = Array.from({ length: 12 }, (_, index) => ({
+      id: `session-${index + 1}`,
+      agentDir: '/Users/me/mino',
+      title: `Execution ${index + 1}`,
+      createdAt: new Date(Date.UTC(2026, 5, 27, 3, index)).toISOString(),
+      lastActiveAt: new Date(Date.UTC(2026, 5, 27, 3, index)).toISOString(),
+    }));
+    taskApiMocks.getSessions.mockResolvedValueOnce(sessions);
+
+    render(
+      <TaskSessionsList
+        task={task({ sessionIds: sessions.map((session) => session.id) })}
+      />,
+    );
+
+    expect(await screen.findByText('Execution 12')).toHaveClass('text-xs');
+    expect(screen.getByText('Execution 8')).toBeInTheDocument();
+    expect(screen.queryByText('Execution 7')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '展开更多' }));
+    expect(screen.getByText('Execution 7')).toBeInTheDocument();
+    expect(screen.queryByText('Execution 2')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '展开更多' }));
+    expect(screen.getByText('Execution 1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '展开更多' })).not.toBeInTheDocument();
+  });
+
+  it('shows the canonical Task path with a home-relative prefix and no redundant heading', async () => {
+    const taskWithDocs = task({
+      docs: {
+        dir: '/Users/zhihu/.myagents/tasks/task-1',
+        taskMd: '/Users/zhihu/.myagents/tasks/task-1/task.md',
+      },
+    });
+
+    render(
+      <TaskDocBlock
+        task={taskWithDocs}
+        doc="task"
+        emptyHint="empty"
+        collapsible={false}
+        onError={vi.fn()}
+      />,
+    );
+
+    expect(
+      await screen.findByRole('button', {
+        name: '~/.myagents/tasks/task-1/task.md',
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('task.md · 执行 Prompt')).not.toBeInTheDocument();
+    expect(screen.queryByText('/Users/zhihu/.myagents/tasks/task-1/task.md')).not.toBeInTheDocument();
   });
 
   it('starts the create task form with name, task demand, checklist, and workspace configuration', async () => {

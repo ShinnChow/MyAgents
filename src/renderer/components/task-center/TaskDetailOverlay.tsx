@@ -662,7 +662,6 @@ export function TaskDetailOverlay({
                 <TaskDocBlock
                   task={task}
                   doc="task"
-                  title={t("detail.taskDocTitle")}
                   emptyHint={t("detail.taskDocEmpty")}
                   collapsible={false}
                   reloadKey={reloadToken}
@@ -671,9 +670,9 @@ export function TaskDetailOverlay({
               </TaskCommentTimeline>
             </main>
 
-            <aside className="hidden w-[380px] shrink-0 overflow-y-auto border-l border-[var(--line-subtle)] bg-[var(--paper)]/60 px-6 py-6 xl:block">
+            <aside className="hidden w-[380px] shrink-0 overflow-y-auto border-l border-[var(--line-subtle)] bg-[var(--paper)]/60 px-5 py-5 xl:block">
               <SummaryCard task={task} stats={runStats} />
-              <div className="mt-6">
+              <div className="mt-5">
                 <TaskSessionsList task={task} onBeforeOpen={onClose} />
               </div>
               {task.trigger?.detector.type === "command" && (
@@ -692,7 +691,7 @@ export function TaskDetailOverlay({
             </aside>
 
             {showMobileProperties && (
-              <aside className="absolute inset-y-0 right-0 z-20 w-[min(380px,88vw)] overflow-y-auto border-l border-[var(--line)] bg-[var(--paper-elevated)] px-5 py-6 shadow-xl xl:hidden">
+              <aside className="absolute inset-y-0 right-0 z-20 w-[min(380px,88vw)] overflow-y-auto border-l border-[var(--line)] bg-[var(--paper-elevated)] px-5 py-5 shadow-xl xl:hidden">
                 <div className="mb-5 flex items-center justify-between">
                   <h3 className="text-sm font-semibold text-[var(--ink)]">
                     {t("detail.properties")}
@@ -706,7 +705,7 @@ export function TaskDetailOverlay({
                   </button>
                 </div>
                 <SummaryCard task={task} stats={runStats} />
-                <div className="mt-6">
+                <div className="mt-5">
                   <TaskSessionsList task={task} onBeforeOpen={onClose} />
                 </div>
                 {task.trigger?.detector.type === "command" && (
