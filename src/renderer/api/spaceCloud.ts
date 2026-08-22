@@ -236,6 +236,12 @@ export interface SpaceGoalSubscription {
   createdAt: string;
 }
 
+export interface SpaceRegisteredAgentSubscriptionReplacement {
+  expectedSubscriptionId: string | null;
+  goalId: string;
+  stateFilter: string[];
+}
+
 export interface SpaceIssue {
   id: string;
   number?: number | null;
@@ -1879,8 +1885,7 @@ export function spaceUpdateRegisteredAgent(input: {
   workspaceId?: string;
   workspacePath?: string;
   workspaceLabel?: string;
-  goalId?: string;
-  stateFilter?: string[];
+  subscriptionReplacement?: SpaceRegisteredAgentSubscriptionReplacement;
   status?: "active" | "disabled";
   issueSubscriptionRunMode?: SpaceIssueSubscriptionRunMode;
 }) {
@@ -1909,31 +1914,6 @@ export function spaceListRegisteredAgents(spaceId = DEFAULT_SPACE_ID) {
   return spaceApi<{ items: SpaceRegisteredAgent[] }>(
     "GET",
     `/api/spaces/${spacePath(spaceId)}/registered-agents`,
-  );
-}
-
-export function spaceCreateRegisteredAgentSubscription(input: {
-  spaceId: string;
-  registeredAgentId: string;
-  goalId: string;
-  stateFilter: string[];
-}) {
-  return spaceApi<{ subscription: SpaceGoalSubscription }>(
-    "POST",
-    `/api/spaces/${spacePath(input.spaceId)}/subscriptions`,
-    {
-      actorType: "registered_agent",
-      actorId: input.registeredAgentId,
-      goalId: input.goalId,
-      stateFilter: input.stateFilter,
-    },
-  );
-}
-
-export function spaceDeleteRegisteredAgentSubscription(subscriptionId: string) {
-  return spaceApi<{ deleted: boolean }>(
-    "DELETE",
-    `/api/subscriptions/${encodeURIComponent(subscriptionId)}`,
   );
 }
 

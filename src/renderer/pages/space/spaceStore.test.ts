@@ -2644,7 +2644,7 @@ describe("spaceStore registered agent actions", () => {
     const updatedAgent = {
       ...fakeAgent,
       displayName: "Renamed Agent",
-      subscriptions: [],
+      subscriptions: [existingSubscription],
       presence: undefined,
       lastOnlineAt: undefined,
       onlineUntil: undefined,

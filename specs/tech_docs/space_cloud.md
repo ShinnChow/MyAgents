@@ -287,5 +287,7 @@ Space Issue 的用户可见编号由云端拥有，不从 opaque `issue.id` 推�
 - 登记与编辑弹窗使用同一套 viewport-safe 三段布局：外框不超过可视区并保留安全边距，header/footer 始终可见，只有中间表单区滚动；不得让整个 overlay 随字段数量越过屏幕边界。
 - “目标与指令”正常态只展示字段名与 placeholder，不重复显示说明文字；校验错误和旧 Agent 缺少 Instruction 的兼容提醒仍显示在输入框下方。
 - Cloud 数据模型与 create/delete API 继续允许一个 Registered Agent 拥有多条 Subscription；Desktop 登记/编辑弹窗暂时只提供一条可编辑订阅，不提供添加多条、逐条删除或重新评估入口。编辑时只替换 UI 当前呈现的一条规则，不得静默删除由其它客户端/API 创建的额外规则。
+- 编辑已登记 Agent 时，Renderer 只提交一次 `cmd_space_update_registered_agent`：同时携带 Instruction revision CAS 与 `subscriptionReplacement { expectedSubscriptionId, goalId, stateFilter }`。Cloud 在同一 D1 mutation 中更新 Agent settings 并精确替换 UI 呈现的 Subscription；目标已存在时采用该行，目标冲突或 expected 已变化时整体返回 `409`，不得先 create/delete 再靠客户端补偿。
+- Cloud 成功响应返回该 Agent 的完整权威 Subscription 集合，并把本次编辑的目标规则置于首位；Rust 在文件锁内以这份集合覆盖 `registered_agents.json` 的本地投影，再把同一快照交给 Renderer。客户端不能根据请求参数乐观拼接 Subscription，也不能用单条响应覆盖或删除隐藏规则。
 - “订阅执行策略”选项固定按“新开对话 → 连续对话”排列，新登记 Agent 默认 `new_session`；编辑已有 Agent 必须保留其权威值，旧数据缺字段仍按历史 `single_session` 回退。
 - `clientId` 是 OAuth public client/build 配置，不是设备标识，不应出现在卡片关键位。

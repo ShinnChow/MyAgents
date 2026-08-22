@@ -267,6 +267,45 @@ pub fn list_local_agents() -> Vec<LocalRegisteredAgentPublic> {
         .collect()
 }
 
+#[cfg(test)]
+pub(crate) fn seed_agent_subscription_for_test(
+    agent_id: &str,
+    subscription_id: &str,
+    goal_id: &str,
+    state_filter: Vec<String>,
+) -> Result<(), String> {
+    let mut state = state().lock().expect("mock state poisoned");
+    let goal_path_label = goal_label(&state, goal_id);
+    let agent = state
+        .agents
+        .iter_mut()
+        .find(|agent| agent.id == agent_id)
+        .ok_or_else(|| format!("Registered Agent not found locally: {agent_id}"))?;
+    agent.subscriptions.push(SpaceGoalSubscriptionSummary {
+        id: subscription_id.to_string(),
+        space_id: agent.space_id.clone(),
+        actor_type: "registered_agent".to_string(),
+        actor_id: agent.id.clone(),
+        goal_id: goal_id.to_string(),
+        include_subtree: true,
+        state_filter,
+        goal_path_label,
+        created_at: "2026-06-24T09:34:00.000Z".to_string(),
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn agent_snapshot_for_test(agent_id: &str) -> Option<LocalRegisteredAgent> {
+    state()
+        .lock()
+        .expect("mock state poisoned")
+        .agents
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .cloned()
+}
+
 pub fn register_agent(
     input: SpaceRegisterAgentInput,
 ) -> Result<LocalRegisteredAgentPublic, String> {
@@ -365,6 +404,12 @@ fn normalize_mock_agent_state_filter(input: Vec<String>) -> Vec<String> {
     } else {
         out
     }
+}
+
+fn mock_agent_state_filters_equal(left: &[String], right: &[String]) -> bool {
+    let left = left.iter().map(String::as_str).collect::<HashSet<_>>();
+    let right = right.iter().map(String::as_str).collect::<HashSet<_>>();
+    left == right
 }
 
 pub fn revoke_agent(id: &str) -> Result<LocalRegisteredAgentPublic, String> {
@@ -3958,11 +4003,52 @@ fn update_agent_api(
                     .collect(),
             )
         });
-    let agent = state
+    let subscription_replacement = body
+        .get("subscriptionReplacement")
+        .map(|value| {
+            let value = value
+                .as_object()
+                .ok_or_else(|| "subscriptionReplacement must be an object".to_string())?;
+            let expected_subscription_id = match value.get("expectedSubscriptionId") {
+                Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
+                Some(Value::Null) => None,
+                _ => {
+                    return Err(
+                        "subscriptionReplacement.expectedSubscriptionId is invalid".to_string()
+                    )
+                }
+            };
+            let goal_id = value
+                .get("goalId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "subscriptionReplacement.goalId is required".to_string())?;
+            let state_filter = normalize_mock_agent_state_filter(
+                value
+                    .get("stateFilter")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect(),
+            );
+            Ok((
+                expected_subscription_id,
+                goal_id.to_string(),
+                goal_label(state, goal_id),
+                state_filter,
+            ))
+        })
+        .transpose()?;
+    let agent_index = state
         .agents
-        .iter_mut()
-        .find(|agent| agent.id == agent_id)
+        .iter()
+        .position(|agent| agent.id == agent_id)
         .ok_or_else(|| format!("Registered Agent not found locally: {}", agent_id))?;
+    let mut candidate = state.agents[agent_index].clone();
+    let agent = &mut candidate;
     let changes_local_binding = body.get("localWorkspaceId").is_some()
         || body.get("localAgentId").is_some()
         || body.get("workspacePath").is_some()
@@ -4047,6 +4133,66 @@ fn update_agent_api(
     if let Some(state_filter) = next_state_filter {
         agent.state_filter = state_filter;
     }
+    if let Some((expected_subscription_id, goal_id, goal_path_label, state_filter)) =
+        subscription_replacement
+    {
+        let expected_exists = expected_subscription_id
+            .as_ref()
+            .is_some_and(|expected_id| {
+                agent
+                    .subscriptions
+                    .iter()
+                    .any(|subscription| subscription.id == *expected_id)
+            });
+        let target = agent
+            .subscriptions
+            .iter()
+            .find(|subscription| subscription.goal_id == goal_id)
+            .cloned();
+        let target_matches = target.as_ref().is_some_and(|subscription| {
+            mock_agent_state_filters_equal(&subscription.state_filter, &state_filter)
+        });
+        if expected_subscription_id.is_some() && !expected_exists && !target_matches {
+            return Err("SUBSCRIPTION_NOT_FOUND".to_string());
+        }
+        if let Some(target) = target.as_ref() {
+            if expected_subscription_id.as_deref() != Some(target.id.as_str()) && !target_matches {
+                return Err("SUBSCRIPTION_TARGET_CONFLICT".to_string());
+            }
+        }
+        if let Some(expected_id) = expected_subscription_id.as_deref() {
+            if target.as_ref().map(|target| target.id.as_str()) != Some(expected_id)
+                || !target_matches
+            {
+                agent
+                    .subscriptions
+                    .retain(|subscription| subscription.id != expected_id);
+            }
+        }
+        if !target_matches {
+            agent.subscriptions.push(SpaceGoalSubscriptionSummary {
+                id: format!("sub_mock_replacement_{}", agent.id),
+                space_id: agent.space_id.clone(),
+                actor_type: "registered_agent".to_string(),
+                actor_id: agent.id.clone(),
+                goal_id: goal_id.clone(),
+                include_subtree: true,
+                state_filter: state_filter.clone(),
+                goal_path_label: goal_path_label.clone(),
+                created_at: "2026-06-24T09:50:00.000Z".to_string(),
+            });
+        }
+        agent.goal_id = Some(goal_id);
+        agent.goal_path_label = goal_path_label;
+        agent.state_filter = state_filter;
+        if let Some(selected_index) = agent.subscriptions.iter().position(|subscription| {
+            subscription.goal_id == agent.goal_id.as_deref().unwrap_or_default()
+                && mock_agent_state_filters_equal(&subscription.state_filter, &agent.state_filter)
+        }) {
+            let selected = agent.subscriptions.remove(selected_index);
+            agent.subscriptions.insert(0, selected);
+        }
+    }
     if let Some(status) = body.get("status").and_then(Value::as_str) {
         if !matches!(status, "active" | "disabled" | "revoked") {
             return Err("Registered Agent status is invalid".to_string());
@@ -4062,24 +4208,9 @@ fn update_agent_api(
     }
     agent.updated_at = "2026-06-24T09:50:00.000Z".to_string();
     let public: LocalRegisteredAgentPublic = agent.clone().into();
-    let subscription = agent
-        .goal_id
-        .as_ref()
-        .map(|goal_id| {
-            json!({
-                "id": format!("sub_{}", agent.id.clone()),
-                "spaceId": agent.space_id.clone(),
-                "actorType": "registered_agent",
-                "actorId": agent.id.clone(),
-                "goalId": goal_id,
-                "includeSubtree": true,
-                "stateFilter": agent.state_filter.clone(),
-                "goalPathLabel": agent.goal_path_label.clone(),
-                "createdAt": agent.created_at.clone()
-            })
-        })
-        .unwrap_or(Value::Null);
-    Ok(json!({
+    let subscriptions = serde_json::to_value(&agent.subscriptions)
+        .map_err(|error| format!("Failed to serialize mock Agent subscriptions: {error}"))?;
+    let response = json!({
         "registeredAgent": {
             "id": agent.id.clone(),
             "spaceId": agent.space_id.clone(),
@@ -4098,11 +4229,14 @@ fn update_agent_api(
             "goalMd": agent.goal_md.clone(),
             "issueSubscriptionRunMode": agent.issue_subscription_run_mode,
             "status": agent.status.clone(),
+            "subscriptions": subscriptions.clone(),
             "createdAt": agent.created_at.clone(),
             "updatedAt": agent.updated_at.clone()
         },
-        "subscription": subscription
-    }))
+        "subscriptions": subscriptions
+    });
+    state.agents[agent_index] = candidate;
+    Ok(response)
 }
 
 fn refresh_issue_counts(state: &mut MockState, issue_id: &str) {

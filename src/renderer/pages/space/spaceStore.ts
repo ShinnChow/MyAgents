@@ -6,13 +6,11 @@ import {
   spaceCommentIssue,
   spaceCreateGoal,
   spaceCompleteIssue,
-  spaceCreateRegisteredAgentSubscription,
   spaceCreateIssue,
   spaceCancelIssueClaim,
   spaceCancelIssueAssignee,
   spaceDeleteSkill,
   spaceDeleteTool,
-  spaceDeleteRegisteredAgentSubscription,
   spaceDownloadIssueAttachment,
   spaceErrorCode,
   spaceErrorSessionBindingId,
@@ -62,13 +60,13 @@ import {
   type SpaceDownloadAttachmentResult,
   type SpaceEvent,
   type SpaceGoal,
-  type SpaceGoalSubscription,
   type SpaceIssue,
   type SpaceIdentitySummary,
   type SpaceIssueDetail,
   type SpaceIssueSubscriptionRunMode,
   type SpaceListItem,
   type SpaceRegisteredAgent,
+  type SpaceRegisteredAgentSubscriptionReplacement,
   type SpaceSession,
   type SpaceSkill,
   type SpaceSkillDetail,
@@ -437,17 +435,10 @@ export interface SpaceActions {
     workspaceId?: string;
     workspacePath?: string;
     workspaceLabel?: string;
-    goalId?: string;
-    stateFilter?: string[];
+    subscriptionReplacement?: SpaceRegisteredAgentSubscriptionReplacement;
     status?: "active" | "disabled";
     issueSubscriptionRunMode?: SpaceIssueSubscriptionRunMode;
   }) => Promise<LocalRegisteredAgent>;
-  createRegisteredAgentSubscription: (input: {
-    registeredAgentId: string;
-    goalId: string;
-    stateFilter: string[];
-  }) => Promise<SpaceGoalSubscription>;
-  deleteRegisteredAgentSubscription: (subscriptionId: string) => Promise<void>;
   reevaluateRegisteredAgent: (id: string) => Promise<number>;
   updateRegisteredAgentAvatar: (input: {
     id: string;
@@ -2994,14 +2985,7 @@ export const actions: SpaceActions = {
           error: null,
           items: state.registeredAgents.items.map((item) =>
             item.id === registeredAgent.id
-              ? {
-                  ...item,
-                  ...registeredAgent,
-                  // PATCH does not mutate or project the Subscription
-                  // collection.  In particular, a remote Agent has no local
-                  // row from which the Rust bridge could reconstruct it.
-                  subscriptions: item.subscriptions ?? [],
-                }
+              ? { ...item, ...registeredAgent }
               : item,
           ),
         },
@@ -3032,79 +3016,6 @@ export const actions: SpaceActions = {
         ),
       });
       return agent;
-    }),
-
-  createRegisteredAgentSubscription: (input) =>
-    withSpaceMutationMetric("agent.subscription.create", async () => {
-      const result = await spaceCreateRegisteredAgentSubscription({
-        spaceId: activeSpaceId(),
-        registeredAgentId: input.registeredAgentId,
-        goalId: input.goalId,
-        stateFilter: input.stateFilter,
-      });
-      const subscription = result.subscription;
-      invalidateRegisteredAgentReads();
-      setState({
-        localAgents: {
-          ...state.localAgents,
-          items: state.localAgents.items.map((agent) =>
-            agent.id === input.registeredAgentId
-              ? {
-                  ...agent,
-                  subscriptions: [
-                    ...agent.subscriptions.filter(
-                      (item) => item.id !== subscription.id,
-                    ),
-                    subscription,
-                  ],
-                }
-              : agent,
-          ),
-        },
-        registeredAgents: {
-          ...state.registeredAgents,
-          items: state.registeredAgents.items.map((agent) =>
-            agent.id === input.registeredAgentId
-              ? {
-                  ...agent,
-                  subscriptions: [
-                    ...(agent.subscriptions ?? []).filter(
-                      (item) => item.id !== subscription.id,
-                    ),
-                    subscription,
-                  ],
-                }
-              : agent,
-          ),
-        },
-      });
-      return subscription;
-    }),
-
-  deleteRegisteredAgentSubscription: (subscriptionId) =>
-    withSpaceMutationMetric("agent.subscription.delete", async () => {
-      await spaceDeleteRegisteredAgentSubscription(subscriptionId);
-      invalidateRegisteredAgentReads();
-      setState({
-        localAgents: {
-          ...state.localAgents,
-          items: state.localAgents.items.map((agent) => ({
-            ...agent,
-            subscriptions: agent.subscriptions.filter(
-              (item) => item.id !== subscriptionId,
-            ),
-          })),
-        },
-        registeredAgents: {
-          ...state.registeredAgents,
-          items: state.registeredAgents.items.map((agent) => ({
-            ...agent,
-            subscriptions: (agent.subscriptions ?? []).filter(
-              (item) => item.id !== subscriptionId,
-            ),
-          })),
-        },
-      });
     }),
 
   reevaluateRegisteredAgent: (id) =>
