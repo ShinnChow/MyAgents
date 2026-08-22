@@ -14,4 +14,13 @@ describe('Settings Browser resource projection contract', () => {
     expect(settingsPageSource).toContain("'cmd_browser_resource_status'");
     expect(settingsPageSource).not.toContain("if (mode !== 'settings' || !isTauriEnvironment()) return;");
   });
+
+  it('keeps standard Playwright at two user-facing profile modes', () => {
+    expect(settingsPageSource).toContain("mode: StandardPlaywrightProfileMode;");
+    expect(settingsPageSource).toContain("mode: 'isolated'");
+    expect(settingsPageSource).toContain("mode: 'persistent'");
+    expect(settingsPageSource).not.toContain("mode: 'upstream'");
+    expect(settingsPageSource).toContain('sm:grid-cols-2');
+    expect(settingsPageSource).toContain("toolbox.dialogs.playwright.userDataDirHint");
+  });
 });

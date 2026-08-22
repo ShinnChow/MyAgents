@@ -194,20 +194,21 @@ export function ToolboxSection({
                 </p>
               )}
               {mcpNeedsConfig[server.id] && <p className="mt-1 text-xs text-[var(--warning)]">{t('toolbox.tools.needsApiKey')}</p>}
-              {isManagedBrowser && (
+              {isManagedBrowser && (browserResourceBusy || browserResourceError || showResourceAction) && (
                 <div className="mt-3 space-y-2">
-                  <p className="text-xs text-[var(--ink-muted)]">{t('toolbox.browserResource.description')}</p>
-                  <div className="flex items-center justify-between gap-3 text-xs" role="status" aria-live="polite">
-                    <span className="text-[var(--ink-muted)]">
-                      {t(`toolbox.browserResource.states.${browserResourceStatus?.state ?? 'checking'}`)}
-                      {browserResourceSize ? ` · ${browserResourceSize}` : ''}
-                    </span>
-                    {typeof browserResourceStatus?.progressPercent === 'number' && browserResourceBusy && (
-                      <span className="font-mono text-[var(--ink-muted)]">
-                        {Math.max(0, Math.min(100, Math.round(browserResourceStatus.progressPercent)))}%
+                  {browserResourceBusy && (
+                    <div className="flex items-center justify-between gap-3 text-xs" role="status" aria-live="polite">
+                      <span className="text-[var(--ink-muted)]">
+                        {t(`toolbox.browserResource.states.${browserResourceStatus?.state ?? 'checking'}`)}
+                        {browserResourceSize ? ` · ${browserResourceSize}` : ''}
                       </span>
-                    )}
-                  </div>
+                      {typeof browserResourceStatus?.progressPercent === 'number' && (
+                        <span className="font-mono text-[var(--ink-muted)]">
+                          {Math.max(0, Math.min(100, Math.round(browserResourceStatus.progressPercent)))}%
+                        </span>
+                      )}
+                    </div>
+                  )}
                   {browserResourceBusy && (
                     <div
                       className="h-1.5 overflow-hidden rounded-full bg-[var(--paper-inset)]"

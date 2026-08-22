@@ -135,13 +135,15 @@ import { AppearanceModeControl } from './components/AppearanceModeControl';
 import { ThemePresetSelect } from './components/ThemePresetSelect';
 import { useResolvedTheme } from '@/theme';
 import {
-    DEFAULT_STANDARD_PLAYWRIGHT_ARGS,
     MANAGED_BROWSER_MCP_ID,
     applyBuiltinBrowserToolToggle,
     isBrowserResourceReady,
     selectLatestBrowserResourceStatus,
     shouldAutoMaintainBrowserResource,
+    splitStandardPlaywrightProfileArgs,
+    standardPlaywrightProfileArgs,
     type BrowserResourceStatus,
+    type StandardPlaywrightProfileMode,
 } from '../../../shared/browserTools';
 import type {
     NetworkProbeResult,
@@ -155,11 +157,6 @@ import { SettingsSidebar } from './components/SettingsSidebar';
 import { SkillsAgentsSection } from './sections/SkillsAgentsSection';
 import { ToolboxSection } from './sections/ToolboxSection';
 import codexModelSelectorOnboarding from '@/assets/onboarding/codex-model-selector.png';
-
-/** Standard Playwright MCP keeps upstream argv semantics; only the absent default is isolated. */
-function getPlaywrightDefaultArgs(): string[] {
-    return [...DEFAULT_STANDARD_PLAYWRIGHT_ARGS];
-}
 
 type ManagedCodexLoginStatus = 'idle' | 'starting' | 'waiting' | 'succeeded' | 'cancelled' | 'error';
 type SubscriptionRefreshResult = { success: true } | { success: false; error: string };
@@ -1023,7 +1020,7 @@ export default function Settings({ mode = 'settings', initialSection, navigation
 
     // Playwright MCP custom settings dialog
     const [playwrightSettings, setPlaywrightSettings] = useState<{
-        mode: 'upstream' | 'persistent' | 'isolated';
+        mode: StandardPlaywrightProfileMode;
         headless: boolean;
         browser: string;
         device: string;
@@ -1352,22 +1349,16 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         // Playwright: open custom config dialog
         if (server.id === 'playwright') {
             const savedArgs = await getMcpServerArgs(server.id);
-            const rawArgs = savedArgs ?? getPlaywrightDefaultArgs();
+            const profile = splitStandardPlaywrightProfileArgs(savedArgs);
             let headless = false;
             let browser = '';
             let device = '';
             let customDevice = '';
-            let userDataDir = '';
-            let mode: 'upstream' | 'persistent' | 'isolated' = savedArgs === undefined
-                ? 'isolated'
-                : 'upstream';
             const extraArgs: string[] = [];
 
-            for (const arg of rawArgs) {
+            for (const arg of profile.remainingArgs) {
                 if (arg === '--headless') {
                     headless = true;
-                } else if (arg === '--isolated') {
-                    mode = 'isolated';
                 } else if (arg.startsWith('--browser=')) {
                     browser = arg.slice('--browser='.length);
                 } else if (arg.startsWith('--device=')) {
@@ -1378,21 +1369,18 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                         device = '__custom__';
                         customDevice = value;
                     }
-                } else if (arg.startsWith('--user-data-dir=')) {
-                    mode = 'persistent';
-                    userDataDir = arg.slice('--user-data-dir='.length);
                 } else {
                     extraArgs.push(arg);
                 }
             }
 
             setPlaywrightSettings({
-                mode,
+                mode: profile.mode,
                 headless,
                 browser,
                 device,
                 customDevice,
-                userDataDir,
+                userDataDir: profile.userDataDir,
                 extraArgs,
                 newArg: '',
             });
@@ -1482,15 +1470,15 @@ export default function Settings({ mode = 'settings', initialSection, navigation
         if (!playwrightSettings) return;
         try {
             const args: string[] = [];
-            if (playwrightSettings.mode === 'isolated') {
-                args.push('--isolated');
-            } else if (playwrightSettings.mode === 'persistent') {
+            if (playwrightSettings.mode === 'persistent') {
                 let userDataDir = playwrightSettings.userDataDir.trim();
                 if (userDataDir.startsWith('~/') || userDataDir === '~') {
                     const home = await homeDir();
                     userDataDir = userDataDir === '~' ? home : await join(home, userDataDir.slice(2));
                 }
-                if (userDataDir) args.push(`--user-data-dir=${userDataDir}`);
+                args.push(...standardPlaywrightProfileArgs(playwrightSettings.mode, userDataDir));
+            } else {
+                args.push(...standardPlaywrightProfileArgs(playwrightSettings.mode, ''));
             }
             if (playwrightSettings.headless) args.push('--headless');
             if (playwrightSettings.browser) args.push(`--browser=${playwrightSettings.browser}`);
@@ -6086,23 +6074,10 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                 <label className="block text-sm font-medium text-[var(--ink)] mb-2">
                                     {tSettings('toolbox.dialogs.playwright.browserMode')}
                                 </label>
-                                <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                                     <button
-                                        onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'upstream' } : null)}
-                                        className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
-                                            playwrightSettings.mode === 'upstream'
-                                                ? 'border-[var(--accent)] bg-[var(--accent)]/5'
-                                                : 'border-[var(--line)] hover:border-[var(--line-strong)]'
-                                        }`}
-                                    >
-                                        <div className={`text-xs font-medium ${playwrightSettings.mode === 'upstream' ? 'text-[var(--accent)]' : 'text-[var(--ink)]'}`}>
-                                            {tSettings('toolbox.dialogs.playwright.upstreamMode')}
-                                        </div>
-                                        <div className="text-xs text-[var(--ink-muted)] mt-0.5 leading-tight">
-                                            {tSettings('toolbox.dialogs.playwright.upstreamModeDescription')}
-                                        </div>
-                                    </button>
-                                    <button
+                                        type="button"
+                                        aria-pressed={playwrightSettings.mode === 'isolated'}
                                         onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'isolated' } : null)}
                                         className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
                                             playwrightSettings.mode === 'isolated'
@@ -6118,6 +6093,8 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                         </div>
                                     </button>
                                     <button
+                                        type="button"
+                                        aria-pressed={playwrightSettings.mode === 'persistent'}
                                         onClick={() => setPlaywrightSettings(prev => prev ? { ...prev, mode: 'persistent' } : null)}
                                         className={`rounded-lg border px-3 py-2.5 text-left transition-colors ${
                                             playwrightSettings.mode === 'persistent'
@@ -6148,6 +6125,9 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                                         placeholder="~/.playwright-mcp-profile"
                                         className="w-full rounded-lg border border-[var(--line)] bg-[var(--paper)] px-3 py-2 text-sm text-[var(--ink)] placeholder-[var(--ink-muted)]/50 outline-none focus:border-[var(--accent)] font-mono"
                                     />
+                                    <p className="mt-1.5 text-xs leading-relaxed text-[var(--ink-muted)]">
+                                        {tSettings('toolbox.dialogs.playwright.userDataDirHint')}
+                                    </p>
                                     <div className="mt-2 rounded-lg bg-[var(--warning-bg)] px-3 py-2 text-xs text-[var(--warning)]">
                                         {tSettings('toolbox.dialogs.playwright.persistentWarning')}
                                     </div>

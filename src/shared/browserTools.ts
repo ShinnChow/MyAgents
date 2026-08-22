@@ -3,6 +3,47 @@ export const MANAGED_BROWSER_MCP_ID = 'myagents-browser' as const;
 
 export const DEFAULT_STANDARD_PLAYWRIGHT_ARGS = ['--isolated'] as const;
 
+export type StandardPlaywrightProfileMode = 'isolated' | 'persistent';
+
+export interface StandardPlaywrightProfileArgs {
+  mode: StandardPlaywrightProfileMode;
+  userDataDir: string;
+  remainingArgs: string[];
+}
+
+/**
+ * Keep the settings UI at two user-facing profile modes while preserving the
+ * upstream argv distinction: an explicit empty argv is persistent with an
+ * upstream-managed directory; only an absent config receives our isolated
+ * default.
+ */
+export function splitStandardPlaywrightProfileArgs(configuredArgs: readonly string[] | undefined): StandardPlaywrightProfileArgs {
+  const args = configuredArgs ?? DEFAULT_STANDARD_PLAYWRIGHT_ARGS;
+  let mode: StandardPlaywrightProfileMode = configuredArgs === undefined ? 'isolated' : 'persistent';
+  let userDataDir = '';
+  const remainingArgs: string[] = [];
+
+  for (const arg of args) {
+    if (arg === '--isolated') {
+      mode = 'isolated';
+      userDataDir = '';
+    } else if (arg.startsWith('--user-data-dir=')) {
+      mode = 'persistent';
+      userDataDir = arg.slice('--user-data-dir='.length);
+    } else {
+      remainingArgs.push(arg);
+    }
+  }
+
+  return { mode, userDataDir, remainingArgs };
+}
+
+export function standardPlaywrightProfileArgs(mode: StandardPlaywrightProfileMode, userDataDir: string): string[] {
+  if (mode === 'isolated') return ['--isolated'];
+  const directory = userDataDir.trim();
+  return directory ? [`--user-data-dir=${directory}`] : [];
+}
+
 /** These product-owned catalogue identities cannot be shadowed by custom MCPs. */
 export function isReservedBuiltinBrowserMcpId(serverId: string): boolean {
   return serverId === STANDARD_PLAYWRIGHT_MCP_ID || serverId === MANAGED_BROWSER_MCP_ID;

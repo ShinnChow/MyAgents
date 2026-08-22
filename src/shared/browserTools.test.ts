@@ -8,6 +8,8 @@ import {
   isReservedBuiltinBrowserMcpId,
   selectLatestBrowserResourceStatus,
   shouldAutoMaintainBrowserResource,
+  splitStandardPlaywrightProfileArgs,
+  standardPlaywrightProfileArgs,
   type BrowserResourceStatus,
 } from './browserTools';
 
@@ -23,6 +25,36 @@ const readyStatus: BrowserResourceStatus = {
 };
 
 describe('built-in browser tool policy', () => {
+  it('maps absent and explicit-empty Playwright argv onto the two profile modes without rewriting compatibility state', () => {
+    expect(splitStandardPlaywrightProfileArgs(undefined)).toEqual({
+      mode: 'isolated',
+      userDataDir: '',
+      remainingArgs: [],
+    });
+    expect(splitStandardPlaywrightProfileArgs([])).toEqual({
+      mode: 'persistent',
+      userDataDir: '',
+      remainingArgs: [],
+    });
+    expect(standardPlaywrightProfileArgs('isolated', '')).toEqual(['--isolated']);
+    expect(standardPlaywrightProfileArgs('persistent', '')).toEqual([]);
+  });
+
+  it('separates only owned profile flags and preserves explicit upstream arguments', () => {
+    expect(splitStandardPlaywrightProfileArgs([
+      '--user-data-dir=/tmp/profile',
+      '--storage-state=/tmp/state.json',
+      '--custom-flag',
+    ])).toEqual({
+      mode: 'persistent',
+      userDataDir: '/tmp/profile',
+      remainingArgs: ['--storage-state=/tmp/state.json', '--custom-flag'],
+    });
+    expect(standardPlaywrightProfileArgs('persistent', '/tmp/profile')).toEqual([
+      '--user-data-dir=/tmp/profile',
+    ]);
+  });
+
   it('reserves only the two exact product-owned catalogue identities', () => {
     expect(isReservedBuiltinBrowserMcpId(STANDARD_PLAYWRIGHT_MCP_ID)).toBe(true);
     expect(isReservedBuiltinBrowserMcpId(MANAGED_BROWSER_MCP_ID)).toBe(true);

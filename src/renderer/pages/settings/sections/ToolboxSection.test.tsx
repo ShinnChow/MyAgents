@@ -62,7 +62,8 @@ describe('ToolboxSection managed Browser resources', () => {
     const callbacks = renderToolbox(status('never_installed', { totalBytes: 261 * 1024 * 1024 }));
 
     expect(screen.getByRole('switch')).toBeDisabled();
-    expect(screen.getByText(/261\.0 MiB/)).toBeInTheDocument();
+    expect(screen.queryByText(/261\.0 MiB/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/需要安装 Chromium 资源后才能启用/)).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '安装资源' }));
     expect(callbacks.onInstallBrowserResource).toHaveBeenCalledOnce();
     expect(callbacks.onToggleMcp).not.toHaveBeenCalled();
