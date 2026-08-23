@@ -26,7 +26,9 @@ import {
 } from '@/api/taskCenter';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import NotificationConfigEditor from '@/components/task-center/NotificationConfigEditor';
+import WorkspaceIcon from '@/components/launcher/WorkspaceIcon';
 import { useToast } from '@/components/Toast';
+import { isProjectActiveForUser } from '@/config/types';
 import { useConfig } from '@/hooks/useConfig';
 import { useCloseLayer } from '@/hooks/useCloseLayer';
 import { useTaskCenterData } from '@/hooks/useTaskCenterData';
@@ -78,8 +80,8 @@ export interface TaskEditPanelProps {
 
 interface Draft {
   name: string;
-  description: string;
-  tagsInput: string;
+  workspaceId: string;
+  workspacePath: string;
   taskMd: string;
   executionMode: TaskExecutionMode;
   runMode: TaskRunMode;
@@ -118,13 +120,22 @@ function taskToDraft(task: Task, taskMd: string): Draft {
   const atDateTime = atSource ? toLocalDateTimeString(new Date(atSource)) : '';
   return {
     name: task.name,
-    description: task.description ?? '',
-    tagsInput: task.tags.join(', '),
+    workspaceId: task.workspaceId,
+    workspacePath: task.workspacePath ?? '',
     taskMd,
     executionMode: task.executionMode,
-    runMode: task.runMode ?? 'new-session',
-    preselectedSessionId: task.preselectedSessionId ?? '',
-    trigger: task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } },
+    runMode: task.executionMode === 'recurring'
+      ? task.runMode ?? 'new-session'
+      : task.executionMode === 'loop'
+        ? 'single-session'
+        : 'new-session',
+    preselectedSessionId:
+      task.executionMode === 'recurring' || task.executionMode === 'loop'
+        ? task.preselectedSessionId ?? ''
+        : '',
+    trigger: task.executionMode === 'recurring'
+      ? task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } }
+      : { source: { type: 'time' }, detector: { type: 'always' } },
     atDateTime,
     intervalMinutes: task.intervalMinutes ?? 30,
     cronExpression: task.cronExpression ?? '',
@@ -174,7 +185,7 @@ export function TaskEditPanel({
   // Discard-confirmation dialog when the draft is dirty.
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
   const toast = useToast();
-  const { providers } = useConfig();
+  const { projects, providers } = useConfig();
 
   // Refs for `focusDoc` — scroll-into-view + caret focus on open. Effect
   // runs on mount only (focusDoc is an intent, not a live mode). For task.md
@@ -260,22 +271,43 @@ export function TaskEditPanel({
   const isRecurring = draft.executionMode === 'recurring';
   const isLoop = draft.executionMode === 'loop';
   const showEndConditions = isRecurring || isLoop;
+  const visibleProjects = useMemo(
+    () => projects.filter(isProjectActiveForUser),
+    [projects],
+  );
+  const workspace = useMemo(
+    () => visibleProjects.find((project) =>
+      workspacePathsEqual(project.path, draft.workspacePath),
+    ) ?? visibleProjects.find((project) => project.id === draft.workspaceId) ?? null,
+    [draft.workspaceId, draft.workspacePath, visibleProjects],
+  );
+  const projectOptions = useMemo(
+    () => visibleProjects.map((project) => ({
+      value: project.path,
+      label:
+        project.displayName || project.name || project.path.split('/').pop() || project.path,
+      icon: <WorkspaceIcon icon={project.icon} size={16} />,
+    })),
+    [visibleProjects],
+  );
   const sessionOptions = useMemo(
     () => sessions
-      .filter((session) => task.workspacePath && workspacePathsEqual(session.agentDir, task.workspacePath))
+      .filter((session) => workspace && workspacePathsEqual(session.agentDir, workspace.path))
       .map((session, index) => ({
         value: session.id,
         label: index === 0
           ? t('trigger.sessionRecent', { title: session.title || session.id })
           : session.title || session.id,
       })),
-    [sessions, t, task.workspacePath],
+    [sessions, t, workspace],
   );
   const preservesLegacyMissingBinding =
     task.runMode === 'single-session' &&
     !task.preselectedSessionId &&
     draft.runMode === 'single-session' &&
-    !draft.preselectedSessionId;
+    !draft.preselectedSessionId &&
+    task.workspacePath !== undefined &&
+    workspacePathsEqual(task.workspacePath, draft.workspacePath);
 
   // Keep runMode aligned with PRD §9.2 defaults when user flips mode.
   const setExecutionMode = useCallback((next: TaskExecutionMode) => {
@@ -283,8 +315,16 @@ export function TaskEditPanel({
       const nextRunMode: TaskRunMode =
         next === 'loop' ? 'single-session'
           : next === 'recurring' ? 'new-session'
-            : d.runMode;
-      return { ...d, executionMode: next, runMode: nextRunMode };
+            : 'new-session';
+      return {
+        ...d,
+        executionMode: next,
+        runMode: nextRunMode,
+        preselectedSessionId: '',
+        trigger: next === 'recurring'
+          ? d.trigger
+          : { source: { type: 'time' }, detector: { type: 'always' } },
+      };
     });
   }, []);
 
@@ -295,10 +335,12 @@ export function TaskEditPanel({
       errs.push(t('edit.validation.taskReadFailed'));
     if (taskMdReadState === 'ok' && !draft.taskMd.trim())
       errs.push(t('edit.validation.taskRequired'));
-    if (!triggerValid) errs.push(t('trigger.validation.invalid'));
+    if (!workspace) errs.push(t('dispatch.validation.workspaceRequired'));
+    if (isRecurring && !triggerValid) errs.push(t('trigger.validation.invalid'));
     if (
+      isRecurring &&
       draft.runMode === 'single-session' &&
-      !draft.preselectedSessionId &&
+      !sessionOptions.some((option) => option.value === draft.preselectedSessionId) &&
       !preservesLegacyMissingBinding
     ) {
       errs.push(t('trigger.validation.sessionRequired'));
@@ -329,7 +371,7 @@ export function TaskEditPanel({
       errs.push(t('edit.validation.endConditionRequired'));
     }
     return errs;
-  }, [draft, isScheduled, isRecurring, preservesLegacyMissingBinding, showEndConditions, taskMdReadState, triggerValid, t]);
+  }, [draft, isScheduled, isRecurring, preservesLegacyMissingBinding, sessionOptions, showEndConditions, taskMdReadState, triggerValid, t, workspace]);
 
   const buildEndConditions = useCallback((): EndConditions | undefined => {
     if (!showEndConditions) return undefined;
@@ -377,10 +419,6 @@ export function TaskEditPanel({
 
   const handleSave = useCallback(async () => {
     if (errors.length > 0 || saving) return;
-    const tags = draft.tagsInput
-      .split(/[,，]/)
-      .map((t) => t.trim())
-      .filter((t) => t.length > 0);
 
     // Build a partial update. `Option<T>` on the Rust side means "don't
     // touch this field" for any key we omit — so we send only what the
@@ -396,10 +434,15 @@ export function TaskEditPanel({
       runtimeConfig: draft.runtimeConfig,
     });
     if (draft.name.trim() !== task.name) payload.name = draft.name.trim();
-    if (draft.description.trim() !== (task.description ?? ''))
-      payload.description = draft.description.trim();
-    const initialTags = task.tags.join(',');
-    if (tags.join(',') !== initialTags) payload.tags = tags;
+    if (
+      workspace &&
+      (workspace.id !== task.workspaceId ||
+        !task.workspacePath ||
+        !workspacePathsEqual(workspace.path, task.workspacePath))
+    ) {
+      payload.workspaceId = workspace.id;
+      payload.workspacePath = workspace.path;
+    }
 
     if (taskMdReadState === 'ok') {
       // Only persist when we actually loaded the current body — a failed
@@ -409,11 +452,22 @@ export function TaskEditPanel({
     }
 
     const modeChanged = draft.executionMode !== task.executionMode;
-    if (modeChanged) payload.executionMode = draft.executionMode;
+    // executionMode is the structural discriminator for runMode, Session and
+    // Trigger fields. Always send it from this full editor so a stale partial
+    // draft cannot merge recurring-only fields into a Task another window has
+    // already changed to Once/Scheduled.
+    payload.executionMode = draft.executionMode;
 
-    const nextRunMode: TaskRunMode = isLoop ? 'single-session' : draft.runMode;
+    const nextRunMode: TaskRunMode = isRecurring
+      ? draft.runMode
+      : isLoop
+        ? 'single-session'
+        : 'new-session';
     if (nextRunMode !== (task.runMode ?? 'new-session')) payload.runMode = nextRunMode;
-    const nextPreselected = nextRunMode === 'single-session' ? draft.preselectedSessionId : '';
+    const nextPreselected =
+      (isRecurring || isLoop) && nextRunMode === 'single-session'
+        ? draft.preselectedSessionId
+        : '';
     if (nextPreselected !== (task.preselectedSessionId ?? '')) {
       payload.preselectedSessionId = nextPreselected;
     }
@@ -425,10 +479,14 @@ export function TaskEditPanel({
       if (modeChanged || initialEc !== nextEc) payload.endConditions = ec;
     }
 
-    const initialTrigger = task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } };
-    if (JSON.stringify(initialTrigger) !== JSON.stringify(draft.trigger)) {
-      if (draft.trigger.detector.type === 'always') payload.clearTrigger = true;
-      else payload.trigger = draft.trigger;
+    if (!isRecurring) {
+      if (task.trigger) payload.clearTrigger = true;
+    } else {
+      const initialTrigger = task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } };
+      if (JSON.stringify(initialTrigger) !== JSON.stringify(draft.trigger)) {
+        if (draft.trigger.detector.type === 'always') payload.clearTrigger = true;
+        else payload.trigger = draft.trigger;
+      }
     }
 
     // Scheduling detail — only forward the field relevant to the target
@@ -549,6 +607,7 @@ export function TaskEditPanel({
     saving,
     task,
     providers,
+    workspace,
     buildEndConditions,
     isScheduled,
     isRecurring,
@@ -596,25 +655,6 @@ export function TaskEditPanel({
                 className={INPUT_CLS}
               />
             </Field>
-            <Field label={t('edit.description')} hint={t('edit.optional')}>
-              <input
-                type="text"
-                value={draft.description}
-                maxLength={200}
-                onChange={(e) => setDraft((d) => ({ ...d, description: e.target.value }))}
-                placeholder={t('edit.descriptionPlaceholder')}
-                className={INPUT_CLS}
-              />
-            </Field>
-            <Field label={t('edit.tags')} hint={t('edit.tagsHint')}>
-              <input
-                type="text"
-                value={draft.tagsInput}
-                onChange={(e) => setDraft((d) => ({ ...d, tagsInput: e.target.value }))}
-                placeholder={t('edit.tagsPlaceholder')}
-                className={INPUT_CLS}
-              />
-            </Field>
           </div>
         </FormSection>
 
@@ -655,10 +695,36 @@ export function TaskEditPanel({
 
         <div className={SECTION_DIVIDER} />
 
+        <FormSection icon={Bot} title={t('dispatch.workspace')}>
+          <CustomSelect
+            value={workspace?.path ?? draft.workspacePath}
+            options={projectOptions}
+            onChange={(workspacePath) => {
+              const selected = visibleProjects.find((project) =>
+                workspacePathsEqual(project.path, workspacePath),
+              );
+              if (!selected) return;
+              setDraft((current) => ({
+                ...current,
+                workspaceId: selected.id,
+                workspacePath: selected.path,
+                preselectedSessionId: '',
+              }));
+            }}
+            placeholder={t('dispatch.workspacePlaceholder')}
+            size="md"
+          />
+          <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
+            {t('dispatch.workspaceHint')}
+          </p>
+        </FormSection>
+
+        <div className={SECTION_DIVIDER} />
+
         {/* 高级配置 — runtime / provider / model / permission / MCP overrides (PRD 0.2.9) */}
         <FormSection icon={Settings2} title={t('edit.advanced')}>
           <TaskAdvancedConfigEditor
-            workspacePath={task.workspacePath}
+            workspacePath={draft.workspacePath}
             runtime={draft.runtime}
             setRuntime={(v) => setDraft((d) => ({ ...d, runtime: v }))}
             providerId={draft.providerId}
@@ -693,8 +759,9 @@ export function TaskEditPanel({
             setCronExpression={(v) => setDraft((d) => ({ ...d, cronExpression: v }))}
             cronTimezone={draft.cronTimezone}
             setCronTimezone={(v) => setDraft((d) => ({ ...d, cronTimezone: v }))}
+            showSessionStrategy={isRecurring}
           />
-          {draft.runMode === 'single-session' && !isLoop && (
+          {isRecurring && draft.runMode === 'single-session' && !isLoop && (
             <div className="mt-5">
               <label className="mb-2 block text-sm font-medium text-[var(--ink-secondary)]">
                 {t('trigger.targetSession')}
@@ -709,27 +776,33 @@ export function TaskEditPanel({
                 placeholder={t('trigger.targetSessionPlaceholder')}
                 size="md"
               />
+              <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
+                {t('trigger.targetSessionHint')}
+              </p>
             </div>
           )}
         </FormSection>
 
-        <div className={SECTION_DIVIDER} />
-
-        <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
-          <TriggerEditor
-            value={draft.trigger}
-            workspacePath={task.workspacePath ?? ''}
-            ownerTaskId={task.id}
-            checkpointState={task.triggerState}
-            onChange={(trigger) => setDraft((current) => ({ ...current, trigger }))}
-            onValidityChange={setTriggerValid}
-          />
-          {task.trigger?.detector.type === 'command' && draft.trigger.detector.type === 'always' && (
-            <p className="mt-3 text-xs leading-relaxed text-[var(--ink-muted)]">
-              {t('trigger.switchAlwaysWarning')}
-            </p>
-          )}
-        </FormSection>
+        {isRecurring && (
+          <>
+            <div className={SECTION_DIVIDER} />
+            <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
+              <TriggerEditor
+                value={draft.trigger}
+                workspacePath={draft.workspacePath}
+                ownerTaskId={task.id}
+                checkpointState={task.triggerState}
+                onChange={(trigger) => setDraft((current) => ({ ...current, trigger }))}
+                onValidityChange={setTriggerValid}
+              />
+              {task.trigger?.detector.type === 'command' && draft.trigger.detector.type === 'always' && (
+                <p className="mt-3 text-xs leading-relaxed text-[var(--ink-muted)]">
+                  {t('trigger.switchAlwaysWarning')}
+                </p>
+              )}
+            </FormSection>
+          </>
+        )}
 
         {showEndConditions && (
           <>
@@ -757,7 +830,7 @@ export function TaskEditPanel({
             <NotificationConfigEditor
               value={draft.notification}
               onChange={(v) => setDraft((d) => ({ ...d, notification: v }))}
-              workspacePath={task.workspacePath}
+              workspacePath={draft.workspacePath}
             />
           </div>
         </FormSection>

@@ -433,6 +433,9 @@ export interface TaskUpdateInput {
   name?: string;
   executor?: TaskExecutor;
   description?: string;
+  /** Workspace identity is an atomic pair: callers must send both fields or neither. */
+  workspaceId?: string;
+  workspacePath?: string;
   executionMode?: TaskExecutionMode;
   runMode?: TaskRunMode;
   endConditions?: EndConditions;

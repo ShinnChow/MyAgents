@@ -5,6 +5,7 @@ import type { SessionMetadata } from '@/api/sessionClient';
 import type { Task } from '@/../shared/types/task';
 
 import { DispatchTaskDialog } from './DispatchTaskDialog';
+import { TaskEditPanel } from './TaskEditPanel';
 import { TaskDocBlock } from './TaskDocBlock';
 import { TaskSessionsList } from './TaskSessionsList';
 import { TaskStatusBadge } from './TaskStatusBadge';
@@ -22,6 +23,7 @@ const taskApiMocks = vi.hoisted(() => ({
   taskRerun: vi.fn(),
   taskReadDoc: vi.fn(),
   taskOpenDocsDir: vi.fn(),
+  taskUpdate: vi.fn(),
   taskWriteDoc: vi.fn(),
 }));
 
@@ -48,6 +50,7 @@ vi.mock('@/api/taskCenter', async (importOriginal) => {
     taskRerun: taskApiMocks.taskRerun,
     taskReadDoc: taskApiMocks.taskReadDoc,
     taskOpenDocsDir: taskApiMocks.taskOpenDocsDir,
+    taskUpdate: taskApiMocks.taskUpdate,
     taskWriteDoc: taskApiMocks.taskWriteDoc,
   };
 });
@@ -58,13 +61,22 @@ vi.mock('@/analytics', () => ({
 
 vi.mock('@/hooks/useConfig', () => ({
   useConfig: () => ({
-    projects: [{
-      id: 'workspace-1',
-      name: 'mino',
-      displayName: 'mino',
-      path: '/Users/me/mino',
-      isHidden: false,
-    }],
+    projects: [
+      {
+        id: 'workspace-1',
+        name: 'mino',
+        displayName: 'mino',
+        path: '/Users/me/mino',
+        isHidden: false,
+      },
+      {
+        id: 'workspace-2',
+        name: 'research',
+        displayName: 'Research Agent',
+        path: '/Users/me/research',
+        isHidden: false,
+      },
+    ],
     providers: [],
   }),
 }));
@@ -143,6 +155,11 @@ describe('Task Center UX refinements', () => {
     taskApiMocks.getSessions.mockResolvedValue([]);
     taskApiMocks.taskReadDoc.mockResolvedValue('# Task body');
     taskApiMocks.taskOpenDocsDir.mockResolvedValue(undefined);
+    taskApiMocks.taskUpdate.mockImplementation(async (input) => task({
+      status: 'stopped',
+      workspaceId: input.workspaceId ?? 'workspace-1',
+      workspacePath: input.workspacePath ?? '/Users/me/mino',
+    }));
     __setTaskCenterSessionsForTest([]);
   });
 
@@ -530,6 +547,85 @@ describe('Task Center UX refinements', () => {
     fireEvent.click(screen.getByRole('button', { name: '周期触发' }));
     expect(screen.getByText('会话策略')).toBeInTheDocument();
     expect(screen.getByText('触发前检测')).toBeInTheDocument();
+  });
+
+  it('keeps Task edit fields and mode-specific controls aligned with manual creation', async () => {
+    render(
+      <TaskEditPanel
+        task={task({
+          status: 'stopped',
+          executionMode: 'once',
+          description: 'legacy description',
+          tags: ['legacy-tag'],
+        })}
+        onSaved={vi.fn()}
+        onCancel={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    await screen.findByDisplayValue('# Task body');
+    expect(screen.queryByText('简短描述')).not.toBeInTheDocument();
+    expect(screen.queryByText('标签')).not.toBeInTheDocument();
+
+    const taskDocument = screen.getByText('task.md · 执行 Prompt');
+    const workspace = screen.getByText('Agent 工作区');
+    const advanced = screen.getAllByText('高级配置')[0];
+    expect(taskDocument.compareDocumentPosition(workspace) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(workspace.compareDocumentPosition(advanced) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    expect(screen.queryByText('会话策略')).not.toBeInTheDocument();
+    expect(screen.queryByText('触发前检测')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '定时一次' }));
+    expect(screen.queryByText('会话策略')).not.toBeInTheDocument();
+    expect(screen.queryByText('触发前检测')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '周期触发' }));
+    expect(screen.getByText('会话策略')).toBeInTheDocument();
+    expect(screen.getByText('触发前检测')).toBeInTheDocument();
+  });
+
+  it('persists workspace reassignment as one pair and normalizes hidden once-only state', async () => {
+    const onSaved = vi.fn();
+    render(
+      <TaskEditPanel
+        task={task({
+          status: 'stopped',
+          executionMode: 'once',
+          runMode: 'single-session',
+          preselectedSessionId: 'legacy-session',
+          trigger: {
+            source: { type: 'time' },
+            detector: {
+              type: 'command',
+              command: { executable: 'node', args: ['detector.js'] },
+            },
+          },
+        })}
+        onSaved={onSaved}
+        onCancel={vi.fn()}
+        onError={vi.fn()}
+      />,
+    );
+
+    await screen.findByDisplayValue('# Task body');
+    fireEvent.click(screen.getByRole('button', { name: 'mino' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Research Agent' }));
+    fireEvent.click(screen.getByRole('button', { name: '保存' }));
+
+    await waitFor(() => expect(taskApiMocks.taskUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: 'workspace-2',
+        workspacePath: '/Users/me/research',
+        executionMode: 'once',
+        runMode: 'new-session',
+        preselectedSessionId: '',
+        clearTrigger: true,
+      }),
+    ));
+    const payload = taskApiMocks.taskUpdate.mock.calls[0][0];
+    expect(payload).not.toHaveProperty('description');
+    expect(payload).not.toHaveProperty('tags');
+    expect(onSaved).toHaveBeenCalledOnce();
   });
 
   it('defaults to the accessible smart flow and retains its draft when launch is rejected', async () => {

@@ -1,6 +1,6 @@
 # MyAgents Design Guide
 
-> **Version**: 2.8.61
+> **Version**: 2.8.62
 > **Last Updated**: 2026-08-23
 > **Status**: Active
 > **Platform**: macOS / Windows Desktop Client
@@ -1430,7 +1430,7 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 侧边栏、Task Center 与 Thought 派发共用 App Shell 唯一创建面板。Header 只显示“新建任务”和“智能 / 手动”Tab，不显示副标题；Tab 支持左右键/Home/End 与 roving focus。侧边栏/Task Center 默认智能，Thought 派发默认手动，关闭后不记忆模式。
 
-智能 Tab 只包含 Agent 工作区选择器与一个大目标输入框，底栏动作为“与 AI 讨论”；启动新 Chat 失败时保留原输入。手动 Tab 只编辑一份 canonical `task.md`，不再提供独立验收输入；保留名称、工作区、执行、通知和高级配置。会话策略、触发前检测与结束条件只在周期触发时出现；立即执行和定时一次统一新建 Session，提交时不得携带隐藏的周期 trigger / Session 选择。面板不展示手工标签输入；空白新建提交空标签，从想法派发只在数据层继承 Thought provenance。
+智能 Tab 只包含 Agent 工作区选择器与一个大目标输入框，底栏动作为“与 AI 讨论”；启动新 Chat 失败时保留原输入。手动 Tab 只编辑一份 canonical `task.md`，不再提供独立验收输入；保留名称、工作区、执行、通知和高级配置。编辑 sheet 与手动创建使用同一字段顺序和模式显隐规则：不展示简短描述或手工标签，Agent 工作区位于高级配置之前并可重新选择。会话策略、触发前检测与结束条件只在周期触发时出现；立即执行和定时一次统一新建 Session，提交时不得携带隐藏的周期 trigger / Session 选择。历史 description / tags 继续由 TaskStore 保留供兼容读取和筛选，表单不再写回；空白新建提交空标签，从想法派发只在数据层继承 Thought provenance。
 
 创建后的详情不是同一表单 modal，而是从右侧进入的全高大 Drawer：宽窗主栏阅读完整 `task.md`，正文前只保留 home-relative（`~/.myagents/...`）文件路径，不重复显示“task.md · 执行 Prompt”标题；主栏所有 flex/Markdown/代码/表格层都必须收敛到可用栏宽，只有代码块和表格自身承担横向滚动。下方按时间正序显示线性评论，底部使用默认两行、最多约六行后内部滚动的紧凑吸底 composer，composer 不重复解释 Session 路由；评论正文使用共享 compact Markdown 排版，主身份为 14px，时间与 Session ID 为 12px，只有 Agent 身份行具有 Session 导航 hover。已加载父评论的回复引用使用左侧直角、右侧小圆角和轻量底色，占满可用的一行后由 CSS 省略；仅页外父评论的持久化摘要继续保持有界。约 360–400px 右栏展示真实状态、调度、工作区、运行配置、Session 与通知；摘要使用扁平信息组而非二次 Card，执行记录默认显示最近 5 条并以整行“展开更多 + 行尾箭头”每次追加 5 条；空间不足时属性栏成为独立 sheet。完整 status history、`progress.md` 和独立 legacy `verify.md` 不在详情展示，底层审计与兼容文件仍保留。Header 为单行，只放状态、单行截断标题、一个生命周期主动作、更多菜单和关闭；Space Issue 等来源标识放在正文区而不挤占标题。编辑位于更多菜单并打开 Drawer 内第二层表单 sheet，dirty 关闭必须确认。Task list、Bell、OS toast 与 typed deep link 都复用该 Drawer，`task.comment` 导航要滚动、focus、高亮 exact Comment 并向读屏器播报；即使 Task Center singleton 已经激活，新的 route generation 也必须重新投送。
 
@@ -1442,6 +1442,7 @@ Task Center 的列表与卡片只保留执行类型 tag，生命周期状态由�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.62 | 2026-08-23 | **Task 编辑与创建对齐**：编辑 sheet 移除简短描述和标签，把可持久化的 Agent 工作区选择放在高级配置之前；立即执行/定时一次隐藏并清理周期专属会话与触发状态 |
 | 2.8.61 | 2026-08-23 | **Task route 与创建表单收口**：active Task Center 重复通知仍投送新 route generation；引用改为轻量满行省略，执行记录使用整行 disclosure；手动创建移除独立验收，仅周期任务显示会话与触发策略 |
 | 2.8.60 | 2026-08-22 | **Task 列表层级收口**：列表/卡片移除重复状态 tag；按进行中、待恢复、已完成、规划中分组；列表完成项按 10 条渐进展开，搜索不截断；会话入口在 hover/focus 时复用日期槽；详情状态使用更清晰的实色底 |
 | 2.8.59 | 2026-08-22 | **Task 评论层级微调**：主身份提升至 14px；回复引用改为左侧直角、强化底色并放宽到 60 code point；移除 composer 重复的 Session 路由说明 |

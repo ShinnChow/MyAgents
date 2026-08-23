@@ -1172,6 +1172,12 @@ pub struct TaskUpdateInput {
     pub executor: Option<TaskExecutor>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Workspace identity is an atomic pair. A caller must update both the
+    /// stable project id and its absolute execution path in the same write.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
     #[serde(default)]
     pub execution_mode: Option<TaskExecutionMode>,
     #[serde(default)]
@@ -3052,7 +3058,7 @@ impl TaskStore {
         self.update_with_task_control_and_session_probe(
             input,
             task_control,
-            session_metadata_exists,
+            session_metadata_matches_workspace,
         )
         .await
     }
@@ -3061,11 +3067,25 @@ impl TaskStore {
         &self,
         input: TaskUpdateInput,
         _task_control: &crate::task_scheduler::TaskControlGuard,
-        session_exists: F,
+        session_matches_workspace: F,
     ) -> Result<Task, String>
     where
-        F: Fn(&str) -> bool,
+        F: Fn(&str, &str) -> bool,
     {
+        let projected_workspace = match (&input.workspace_id, &input.workspace_path) {
+            (None, None) => None,
+            (Some(workspace_id), Some(workspace_path)) => {
+                let workspace_id = workspace_id.trim();
+                if workspace_id.is_empty() {
+                    return Err("workspaceId is empty".to_string());
+                }
+                Some((
+                    workspace_id.to_string(),
+                    canonicalize_workspace_path(workspace_path)?,
+                ))
+            }
+            _ => return Err("workspaceId and workspacePath must be updated together".to_string()),
+        };
         if crate::task_scheduler::get_task_scheduler()
             .execution_projection(&input.id)
             .await
@@ -3135,6 +3155,7 @@ impl TaskStore {
             .await?;
         let interval_updated = input.interval_minutes.is_some();
         let cron_expression_updated = input.cron_expression.is_some();
+        let execution_mode_updated = input.execution_mode.is_some();
         let existing = inner
             .get(&input.id)
             .ok_or_else(|| String::from(TaskOpError::not_found(&input.id)))?
@@ -3181,6 +3202,10 @@ impl TaskStore {
         }
         if let Some(v) = input.description {
             updated.description = Some(v);
+        }
+        if let Some((workspace_id, workspace_path)) = projected_workspace {
+            updated.workspace_id = workspace_id;
+            updated.workspace_path = workspace_path;
         }
         if let Some(v) = input.execution_mode {
             updated.execution_mode = v;
@@ -3308,6 +3333,15 @@ impl TaskStore {
         // needs them.
         match updated.execution_mode {
             TaskExecutionMode::Once => {
+                // Session strategy and pre-trigger detection are recurring-only.
+                // Enforce this on the merged row, not merely when the mode field
+                // is present, so a stale partial editor cannot reintroduce them
+                // after another writer has already switched the Task to Once.
+                if execution_mode_updated {
+                    updated.run_mode = Some(TaskRunMode::NewSession);
+                    updated.preselected_session_id = None;
+                    updated.trigger = None;
+                }
                 updated.interval_minutes = None;
                 updated.cron_expression = None;
                 updated.cron_timezone = None;
@@ -3323,6 +3357,11 @@ impl TaskStore {
                 // legacy-upgrade path), the deadline has no remaining
                 // meaning here and only confuses later readers that still
                 // treat `endConditions.deadline` as "when to stop running".
+                if execution_mode_updated {
+                    updated.run_mode = Some(TaskRunMode::NewSession);
+                    updated.preselected_session_id = None;
+                    updated.trigger = None;
+                }
                 updated.interval_minutes = None;
                 updated.cron_expression = None;
                 updated.cron_timezone = None;
@@ -3345,7 +3384,9 @@ impl TaskStore {
         }
 
         let session_binding_updated = updated.run_mode != existing.run_mode
-            || updated.preselected_session_id != existing.preselected_session_id;
+            || updated.preselected_session_id != existing.preselected_session_id
+            || updated.workspace_id != existing.workspace_id
+            || updated.workspace_path != existing.workspace_path;
         if session_binding_updated {
             validate_new_task_session_binding(
                 updated.run_mode,
@@ -3356,7 +3397,7 @@ impl TaskStore {
                     .preselected_session_id
                     .as_deref()
                     .expect("single-session binding validated above");
-                if !session_exists(session_id) {
+                if !session_matches_workspace(session_id, &updated.workspace_path) {
                     return Err(format!(
                         "preselectedSessionId does not reference an existing Session: {}",
                         session_id
@@ -4417,6 +4458,10 @@ pub(crate) fn validate_task_update_execution_routing(
     validate_task_execution_routing(&provider_id, &model, &runtime, &runtime_config)
 }
 
+fn session_metadata_matches_workspace(session_id: &str, workspace_path: &str) -> bool {
+    crate::sidecar::runtime_identity::session_metadata_matches_workspace(session_id, workspace_path)
+}
+
 fn session_metadata_exists(session_id: &str) -> bool {
     crate::sidecar::runtime_identity::resolve_session_runtime_identity_full(session_id).is_some()
 }
@@ -5475,6 +5520,8 @@ mod tests {
             name: None,
             executor: None,
             description: None,
+            workspace_id: None,
+            workspace_path: None,
             execution_mode: None,
             run_mode: None,
             end_conditions: None,
@@ -5851,7 +5898,7 @@ mod tests {
         let task_control = crate::task_scheduler::acquire_task_control(&created.id).await;
 
         let error = store
-            .update_with_task_control_and_session_probe(update, &task_control, |_| false)
+            .update_with_task_control_and_session_probe(update, &task_control, |_, _| false)
             .await
             .unwrap_err();
         assert_eq!(
@@ -6684,7 +6731,7 @@ mod tests {
         let updated = assert_waits_for_session_lifecycle("attached-secondary", async move {
             let task_control = crate::task_scheduler::acquire_task_control(&task_id).await;
             store_for_update
-                .update_with_task_control_and_session_probe(update, &task_control, |_| true)
+                .update_with_task_control_and_session_probe(update, &task_control, |_, _| true)
                 .await
         })
         .await;
@@ -6897,6 +6944,8 @@ mod tests {
                 name: Some("new".to_string()),
                 executor: None,
                 description: None,
+                workspace_id: None,
+                workspace_path: None,
                 execution_mode: None,
                 run_mode: None,
                 end_conditions: None,
@@ -6926,6 +6975,120 @@ mod tests {
             .await
             .expect_err("should reject");
         assert!(err.contains("update_rejected_running"));
+    }
+
+    #[tokio::test]
+    async fn update_workspace_requires_and_persists_an_atomic_identity_pair() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let original_ws = dir.path().join("workspace-original");
+        let next_ws = dir.path().join("workspace-next");
+        std::fs::create_dir_all(&original_ws).unwrap();
+        std::fs::create_dir_all(&next_ws).unwrap();
+        let data_dir = dir.path().join("data");
+        let store = TaskStore::new(data_dir.clone());
+        let created = store
+            .create_direct(sample_direct_input(&original_ws))
+            .await
+            .unwrap();
+
+        let mut id_only = empty_update_input(&created.id);
+        id_only.workspace_id = Some("ws-next".to_string());
+        let error = store
+            .update(id_only)
+            .await
+            .expect_err("pair must be atomic");
+        assert!(error.contains("must be updated together"));
+        assert_eq!(
+            store.get(&created.id).await.unwrap().workspace_id,
+            "ws-myagents"
+        );
+
+        let mut relative_path = empty_update_input(&created.id);
+        relative_path.workspace_id = Some("ws-next".to_string());
+        relative_path.workspace_path = Some("relative/workspace".to_string());
+        let error = store
+            .update(relative_path)
+            .await
+            .expect_err("workspace path must remain absolute");
+        assert!(error.contains("workspacePath must be absolute"));
+
+        let mut paired = empty_update_input(&created.id);
+        paired.workspace_id = Some(" ws-next ".to_string());
+        paired.workspace_path = Some(format!(" {} ", next_ws.display()));
+        let updated = store.update(paired).await.unwrap();
+        assert_eq!(updated.workspace_id, "ws-next");
+        assert_eq!(updated.workspace_path, next_ws.to_string_lossy());
+
+        let reloaded = TaskStore::new(data_dir).get(&created.id).await.unwrap();
+        assert_eq!(reloaded.workspace_id, "ws-next");
+        assert_eq!(reloaded.workspace_path, next_ws.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn stale_recurring_editor_reapplies_its_mode_instead_of_hidden_state() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let command_trigger = crate::task_trigger::TaskTrigger {
+            source: crate::task_trigger::TaskTriggerSource::Time,
+            detector: crate::task_trigger::TaskTriggerDetector::Command {
+                command: crate::task_trigger::TaskTriggerCommand {
+                    executable: "node".to_string(),
+                    args: vec!["detector.mjs".to_string()],
+                    cwd: None,
+                },
+                timeout_ms: None,
+            },
+        };
+
+        for execution_mode in [TaskExecutionMode::Once, TaskExecutionMode::Scheduled] {
+            let mut create = sample_direct_input(&ws);
+            create.name = format!("stale editor {execution_mode:?}");
+            create.execution_mode = TaskExecutionMode::Recurring;
+            create.run_mode = Some(TaskRunMode::NewSession);
+            create.interval_minutes = Some(30);
+            create.trigger = Some(command_trigger.clone());
+            let created = store.create_direct(create).await.unwrap();
+
+            let mut first_writer = empty_update_input(&created.id);
+            first_writer.execution_mode = Some(execution_mode);
+            if execution_mode == TaskExecutionMode::Scheduled {
+                first_writer.dispatch_at = Some(now_ms() + 60_000);
+            }
+            let first = store.update(first_writer).await.unwrap();
+            assert_eq!(first.run_mode, Some(TaskRunMode::NewSession));
+            assert!(first.preselected_session_id.is_none());
+            assert!(first.trigger.is_none());
+
+            // A second full editor still holds the old recurring snapshot. It
+            // must submit that structural discriminator alongside its dependent
+            // fields, producing a coherent last-writer-wins recurring row rather
+            // than hidden recurring state under the first writer's mode.
+            let mut stale_writer = empty_update_input(&created.id);
+            stale_writer.execution_mode = Some(TaskExecutionMode::Recurring);
+            stale_writer.run_mode = Some(TaskRunMode::SingleSession);
+            stale_writer.preselected_session_id = Some("stale-session".to_string());
+            stale_writer.trigger = Some(command_trigger.clone());
+            stale_writer.interval_minutes = Some(30);
+            let task_control = crate::task_scheduler::acquire_task_control(&created.id).await;
+            let final_task = store
+                .update_with_task_control_and_session_probe(stale_writer, &task_control, |_, _| {
+                    true
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(final_task.execution_mode, TaskExecutionMode::Recurring);
+            assert_eq!(final_task.run_mode, Some(TaskRunMode::SingleSession));
+            assert_eq!(
+                final_task.preselected_session_id.as_deref(),
+                Some("stale-session")
+            );
+            assert!(final_task.effective_trigger().is_command());
+        }
     }
 
     #[tokio::test]
@@ -7413,6 +7576,8 @@ mod tests {
                 name: None,
                 executor: None,
                 description: None,
+                workspace_id: None,
+                workspace_path: None,
                 execution_mode: None,
                 run_mode: None,
                 end_conditions: None,

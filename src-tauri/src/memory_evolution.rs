@@ -387,6 +387,8 @@ async fn reconcile_existing_job(
             name: Some(spec.name.to_string()),
             executor: None,
             description: Some(desired_description.to_string()),
+            workspace_id: None,
+            workspace_path: None,
             execution_mode: Some(TaskExecutionMode::Recurring),
             run_mode: Some(TaskRunMode::NewSession),
             end_conditions: Some(TaskEndConditions::default()),
