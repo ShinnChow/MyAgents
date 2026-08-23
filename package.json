@@ -101,6 +101,7 @@
     "monaco-editor": "^0.55.1",
     "pdfjs-dist": "^5.7.284",
     "pinyin-pro": "^3.28.1",
+    "playwright": "1.59.0-alpha-1771104257000",
     "qrcode": "^1.5.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

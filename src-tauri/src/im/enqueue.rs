@@ -362,7 +362,7 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let client = Client::new();
+        let client = crate::local_http::json_client(std::time::Duration::from_secs(5));
         let message = test_group_message();
         for context in [
             test_group_context(vec![]),

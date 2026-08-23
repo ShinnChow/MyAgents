@@ -463,6 +463,10 @@ fn transition(
 }
 
 fn http_client(timeout: Duration, use_proxy: bool) -> Result<reqwest::Client, String> {
+    // This client downloads the official Browser artifact from an external
+    // host, so it must retain the configured proxy path instead of using the
+    // localhost-only `local_http` builder.
+    #[allow(clippy::disallowed_methods)]
     let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
@@ -1613,7 +1617,7 @@ mod tests {
         extract_archive(&archive_path, temp.path(), &artifact).expect("extract official archive");
         let executable = temp.path().join(artifact.executable_relative_path);
         assert!(executable.is_file());
-        let version = std::process::Command::new(&executable)
+        let version = crate::process_cmd::new(&executable)
             .arg("--version")
             .output()
             .expect("launch locked Browser executable");
