@@ -46,6 +46,13 @@ describe('codex command context', () => {
     expect(context.commandPath).toBeTruthy();
   });
 
+  it('keeps the desired update target out of Managed Codex launch admission', () => {
+    const adapterSource = readFileSync(new URL('codex.ts', import.meta.url), 'utf8');
+
+    expect(adapterSource).not.toContain('MANAGED_CODEX_REQUIRED_RUNTIME');
+    expect(adapterSource).not.toContain('assertManagedCodexRuntimeConformanceVersion');
+  });
+
   it('uses managed runtime path and isolated CODEX_HOME for managed-provider', () => {
     const platform = platformKey();
     if (!platform) {
@@ -129,7 +136,7 @@ describe('codex command context', () => {
     vi.stubEnv('HOME', tempHome);
     vi.stubEnv('USERPROFILE', tempHome);
 
-    const staleVersion = '0.0.0-previous';
+    const staleVersion = '0.146.0';
     const root = join(tempHome, '.myagents', 'runtimes', 'codex');
     const installDir = join(root, staleVersion, platform);
     mkdirSync(installDir, { recursive: true });
@@ -142,6 +149,7 @@ describe('codex command context', () => {
 
     const context = resolveCodexCommandContext({ source: 'managed-provider' });
 
+    expect(staleVersion).not.toBe(MANAGED_CODEX_REQUIRED_RUNTIME.version);
     expect(context.commandPath).toBe(binary);
     expect(context.version).toBe(staleVersion);
   });
