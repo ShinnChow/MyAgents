@@ -14,6 +14,8 @@ import type { BrowserContextRegistry } from './context-registry';
 
 const TOKEN_A = 'a'.repeat(32);
 const TOKEN_B = 'b'.repeat(32);
+const BROWSER_HOST_PORT = 31_415;
+const BROWSER_HOST_AUTHORITY = `127.0.0.1:${BROWSER_HOST_PORT}`;
 
 function fakeRegistry() {
   return {
@@ -33,13 +35,13 @@ function fakeRegistry() {
 }
 
 function request(body: unknown, token = TOKEN_A, sessionId?: string): Request {
-  return new Request('http://127.0.0.1/mcp/browser', {
+  return new Request(`http://${BROWSER_HOST_AUTHORITY}/mcp/browser`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
-      Host: '127.0.0.1',
+      Host: BROWSER_HOST_AUTHORITY,
       ...(sessionId ? { 'mcp-session-id': sessionId } : {}),
     },
     body: JSON.stringify(body),
@@ -99,9 +101,30 @@ describe('PlaywrightBrowserHost', () => {
     }
   });
 
+  it.each([
+    `127.0.0.1:${BROWSER_HOST_PORT + 1}`,
+    `localhost:${BROWSER_HOST_PORT}`,
+  ])('rejects Browser MCP authority %s', async rejectedAuthority => {
+    const registry = fakeRegistry();
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
+      registry: registry as unknown as BrowserContextRegistry,
+      verifyCapability: vi.fn(async token => capability(token)),
+    });
+    const wrongAuthority = initializeRequest();
+    wrongAuthority.headers.set('host', rejectedAuthority);
+
+    const rejected = await host.handleRequest(wrongAuthority);
+
+    expect(rejected.status).toBe(403);
+    await expect(rejected.json()).resolves.toMatchObject({
+      error: { message: `Invalid Host header: ${rejectedAuthority}` },
+    });
+    await host.shutdown();
+  });
+
   it('binds an initialized MCP connection to one capability and releases it exactly once', async () => {
     const registry = fakeRegistry();
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async token => capability(token)),
     });
@@ -112,23 +135,23 @@ describe('PlaywrightBrowserHost', () => {
     expect(sessionId).toBeTruthy();
     expect(registry.retainConnection).toHaveBeenCalledWith('session-a');
 
-    const crossSession = await host.handleRequest(new Request('http://127.0.0.1/mcp/browser', {
+    const crossSession = await host.handleRequest(new Request(`http://${BROWSER_HOST_AUTHORITY}/mcp/browser`, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${TOKEN_B}`,
-        Host: '127.0.0.1',
+        Host: BROWSER_HOST_AUTHORITY,
         'mcp-session-id': String(sessionId),
       },
     }));
     expect(crossSession.status).toBe(403);
     expect(registry.rekeyProductSession).not.toHaveBeenCalled();
 
-    await host.handleRequest(new Request('http://127.0.0.1/mcp/browser', {
+    await host.handleRequest(new Request(`http://${BROWSER_HOST_AUTHORITY}/mcp/browser`, {
       method: 'DELETE',
       headers: {
         Authorization: `Bearer ${TOKEN_A}`,
         Accept: 'application/json, text/event-stream',
-        Host: '127.0.0.1',
+        Host: BROWSER_HOST_AUTHORITY,
         'mcp-session-id': String(sessionId),
       },
     }));
@@ -139,19 +162,19 @@ describe('PlaywrightBrowserHost', () => {
 
   it('accepts a rotated capability for the same Product Session connection', async () => {
     const registry = fakeRegistry();
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async () => capability(TOKEN_A)),
     });
 
     const initialized = await host.handleRequest(initializeRequest(TOKEN_A));
     const sessionId = String(initialized.headers.get('mcp-session-id'));
-    const closedWithRotatedCapability = await host.handleRequest(new Request('http://127.0.0.1/mcp/browser', {
+    const closedWithRotatedCapability = await host.handleRequest(new Request(`http://${BROWSER_HOST_AUTHORITY}/mcp/browser`, {
       method: 'DELETE',
       headers: {
         Authorization: `Bearer ${TOKEN_B}`,
         Accept: 'application/json, text/event-stream',
-        Host: '127.0.0.1',
+        Host: BROWSER_HOST_AUTHORITY,
         'mcp-session-id': sessionId,
       },
     }));
@@ -174,7 +197,7 @@ describe('PlaywrightBrowserHost', () => {
       }
       return capability(TOKEN_A);
     });
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability,
     });
@@ -210,16 +233,16 @@ describe('PlaywrightBrowserHost', () => {
 
   it('rejects an oversized chunked body before connection creation', async () => {
     const registry = fakeRegistry();
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async token => capability(token)),
     });
-    const oversized = new Request('http://127.0.0.1/mcp/browser', {
+    const oversized = new Request(`http://${BROWSER_HOST_AUTHORITY}/mcp/browser`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${TOKEN_A}`,
         'Content-Type': 'application/json',
-        Host: '127.0.0.1',
+        Host: BROWSER_HOST_AUTHORITY,
       },
       body: `{"payload":"${'x'.repeat(4 * 1024 * 1024)}"}`,
     });
@@ -234,7 +257,7 @@ describe('PlaywrightBrowserHost', () => {
     vi.useFakeTimers();
     const registry = fakeRegistry();
     let sourceIsLive = true;
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async () => {
         if (!sourceIsLive) {
@@ -255,7 +278,7 @@ describe('PlaywrightBrowserHost', () => {
 
   it('routes cancellation to only the pending Context acquisition', async () => {
     const registry = fakeRegistry();
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async token => capability(token)),
     });
@@ -276,7 +299,7 @@ describe('PlaywrightBrowserHost', () => {
   it('rekeys a live connection when Rust materializes its provisional Session id', async () => {
     const registry = fakeRegistry();
     let productSessionId = 'pending-tab-a';
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async () => ({
         productSessionId,
@@ -288,12 +311,12 @@ describe('PlaywrightBrowserHost', () => {
     const sessionId = String(initialized.headers.get('mcp-session-id'));
     productSessionId = 'real-session-a';
 
-    const response = await host.handleRequest(new Request('http://127.0.0.1/mcp/browser', {
+    const response = await host.handleRequest(new Request(`http://${BROWSER_HOST_AUTHORITY}/mcp/browser`, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${TOKEN_A}`,
         Accept: 'application/json, text/event-stream',
-        Host: '127.0.0.1',
+        Host: BROWSER_HOST_AUTHORITY,
         'mcp-session-id': sessionId,
       },
     }));
@@ -306,7 +329,7 @@ describe('PlaywrightBrowserHost', () => {
 
   it('cancels an active resource waiter before waiting for Host shutdown drain', async () => {
     const registry = fakeRegistry();
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async token => capability(token)),
     });
@@ -342,7 +365,7 @@ describe('PlaywrightBrowserHost', () => {
 
   it('supersedes an abandoned transport for the same exact Session binding', async () => {
     const registry = fakeRegistry();
-    const host = new PlaywrightBrowserHost({
+    const host = new PlaywrightBrowserHost(BROWSER_HOST_PORT, {
       registry: registry as unknown as BrowserContextRegistry,
       verifyCapability: vi.fn(async token => capability(token)),
     });
@@ -352,11 +375,11 @@ describe('PlaywrightBrowserHost', () => {
 
     expect(replacement.status).toBe(200);
     expect(registry.releaseConnection).toHaveBeenCalledOnce();
-    const stale = await host.handleRequest(new Request('http://127.0.0.1/mcp/browser', {
+    const stale = await host.handleRequest(new Request(`http://${BROWSER_HOST_AUTHORITY}/mcp/browser`, {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${TOKEN_A}`,
-        Host: '127.0.0.1',
+        Host: BROWSER_HOST_AUTHORITY,
         'mcp-session-id': String(firstSessionId),
       },
     }));

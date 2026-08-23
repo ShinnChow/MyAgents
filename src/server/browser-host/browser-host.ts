@@ -178,6 +178,7 @@ async function readBoundedJsonBody(request: Request): Promise<
 
 export class PlaywrightBrowserHost {
   private readonly dependencies: PlaywrightBrowserHostDependencies;
+  private readonly allowedHosts: string[];
   private readonly connections = new Map<string, HostConnection>();
   private readonly pendingConnections = new Set<HostConnection>();
   private capabilitySweepTimer: ReturnType<typeof setTimeout> | null = null;
@@ -186,7 +187,10 @@ export class PlaywrightBrowserHost {
   private readonly hostDrainWaiters = new Set<() => void>();
   private closing = false;
 
-  constructor(dependencies: Partial<PlaywrightBrowserHostDependencies> = {}) {
+  constructor(
+    httpPort: number,
+    dependencies: Partial<PlaywrightBrowserHostDependencies> = {},
+  ) {
     const registry = dependencies.registry ?? new BrowserContextRegistry({
       onContextClosed: productSessionId => {
         void this.retireConnectionsForProductSession(productSessionId);
@@ -197,6 +201,7 @@ export class PlaywrightBrowserHost {
       registry,
       ...dependencies,
     };
+    this.allowedHosts = [`127.0.0.1:${httpPort}`];
   }
 
   async handleRequest(request: Request): Promise<Response> {
@@ -388,7 +393,7 @@ export class PlaywrightBrowserHost {
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: randomUUID,
       enableJsonResponse: true,
-      allowedHosts: ['127.0.0.1', 'localhost'],
+      allowedHosts: this.allowedHosts,
       enableDnsRebindingProtection: true,
       onsessioninitialized: sessionId => {
         assignedSessionId = sessionId;

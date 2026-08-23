@@ -1794,7 +1794,7 @@ async function main() {
   const ensureBrowserHost = async (): Promise<import('./browser-host').PlaywrightBrowserHost> => {
     if (!browserHostPromise) {
       browserHostPromise = import('./browser-host').then(({ PlaywrightBrowserHost }) => (
-        new PlaywrightBrowserHost()
+        new PlaywrightBrowserHost(port)
       ));
     }
     return browserHostPromise;
