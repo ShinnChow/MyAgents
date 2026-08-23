@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { CliToolsSection } from '@/components/CliToolsSection';
 import type { McpServerDefinition } from '@/config/types';
 import type { OfficialToolDefinition, OfficialToolId } from '@/../shared/official-tools';
-import { MANAGED_BROWSER_MCP_ID, isBrowserResourceReady, type BrowserResourceStatus } from '@/../shared/browserTools';
+import { MANAGED_BROWSER_MCP_ID, hasUserEditableMcpSettings, isBrowserResourceReady, type BrowserResourceStatus } from '@/../shared/browserTools';
 
 interface ToolboxSectionProps {
   cliToolRegistryEnabled?: boolean;
@@ -157,7 +157,7 @@ export function ToolboxSection({
                   {isEnabling && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--info)]" />}
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  {!isManagedBrowser && (
+                  {hasUserEditableMcpSettings(server.id) && (
                     <button
                       onClick={() => (server.isBuiltin ? onEditBuiltinMcp(server) : onEditMcp(server))}
                       className="rounded-lg p-1.5 text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"

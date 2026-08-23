@@ -44,6 +44,7 @@ import CronTaskStatusBar from '../cron/CronTaskStatusBar';
 import GoalStatusBar from '../goal/GoalStatusBar';
 import { useUndoStack } from '@/hooks/useUndoStack';
 import { mcpServerState, type McpEffectiveServerState } from '../../../shared/mcpEffectiveState';
+import { hasUserEditableMcpSettings } from '../../../shared/browserTools';
 import { CUSTOM_EVENTS } from '../../../shared/constants';
 import { reasoningEffortChoices, REASONING_EFFORT_DESCRIPTIONS, REASONING_EFFORT_DEFAULT } from '../../../shared/reasoningEffort';
 import { retainFocusOnMouseDown } from '@/utils/focusRetention';
@@ -2102,18 +2103,20 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                                   </div>
                                 )}
                               </div>
-                              <button
-                                type="button"
-                                title={t('input.settings')}
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setShowToolMenu(false);
-                                  window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_SETTINGS, { detail: { section: 'mcp', mcpServerId: server.id } }));
-                                }}
-                                className="ml-2 shrink-0 rounded p-0.5 text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
-                              >
-                                <Settings2 className="h-3.5 w-3.5" />
-                              </button>
+                              {hasUserEditableMcpSettings(server.id) && (
+                                <button
+                                  type="button"
+                                  title={t('input.settings')}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setShowToolMenu(false);
+                                    window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_SETTINGS, { detail: { section: 'mcp', mcpServerId: server.id } }));
+                                  }}
+                                  className="ml-2 shrink-0 rounded p-0.5 text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
+                                >
+                                  <Settings2 className="h-3.5 w-3.5" />
+                                </button>
+                              )}
                               <button
                                 type="button"
                                 onClick={(e) => {

@@ -4,6 +4,7 @@ import {
   MANAGED_BROWSER_MCP_ID,
   STANDARD_PLAYWRIGHT_MCP_ID,
   applyBuiltinBrowserExecutionToolToggle,
+  hasUserEditableMcpSettings,
   isBrowserResourceReady,
   isReservedBuiltinBrowserMcpId,
   selectLatestBrowserResourceStatus,
@@ -60,6 +61,12 @@ describe('built-in browser tool policy', () => {
     expect(isReservedBuiltinBrowserMcpId(MANAGED_BROWSER_MCP_ID)).toBe(true);
     expect(isReservedBuiltinBrowserMcpId('playwright-custom')).toBe(false);
     expect(isReservedBuiltinBrowserMcpId('MyAgents-Browser')).toBe(false);
+  });
+
+  it('does not treat the fixed managed Browser contract as generic MCP settings', () => {
+    expect(hasUserEditableMcpSettings(MANAGED_BROWSER_MCP_ID)).toBe(false);
+    expect(hasUserEditableMcpSettings(STANDARD_PLAYWRIGHT_MCP_ID)).toBe(true);
+    expect(hasUserEditableMcpSettings('custom-browser')).toBe(true);
   });
 
   it('atomically replaces the peer when either built-in entry is enabled', () => {

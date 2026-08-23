@@ -7,6 +7,7 @@ import { ImagePreviewProvider } from '@/context/ImagePreviewContext';
 import type { Provider } from '@/config/types';
 import { i18n } from '@/i18n';
 import { CUSTOM_EVENTS } from '../../shared/constants';
+import { MANAGED_BROWSER_MCP_ID } from '../../shared/browserTools';
 import {
   CC_PERMISSION_MODES,
   CODEX_PERMISSION_MODES,
@@ -547,6 +548,27 @@ describe('SimpleChatInput send paths', () => {
     expect(screen.getByText('Configured only')).toBeInTheDocument();
     expect(screen.queryByText('39 tools ready')).not.toBeInTheDocument();
     expect(screen.getByText('Unavailable')).toBeInTheDocument();
+  });
+
+  it('does not expose generic MCP settings for the fixed managed Browser', async () => {
+    await i18n.changeLanguage('en-US');
+    const user = userEvent.setup();
+    renderInput({
+      runtime: 'builtin',
+      mcpServers: [
+        { id: MANAGED_BROWSER_MCP_ID, name: 'Managed Browser' },
+        { id: 'playwright', name: 'Playwright' },
+      ],
+      globalMcpEnabled: [MANAGED_BROWSER_MCP_ID, 'playwright'],
+      workspaceMcpEnabled: [MANAGED_BROWSER_MCP_ID],
+    });
+
+    await user.click(screen.getByTitle('Use tools'));
+
+    const managedBrowserRow = screen.getByText('Managed Browser').parentElement?.parentElement;
+    const playwrightRow = screen.getByText('Playwright').parentElement?.parentElement;
+    expect(managedBrowserRow?.querySelector('button[title="Settings"]')).toBeNull();
+    expect(playwrightRow?.querySelector('button[title="Settings"]')).not.toBeNull();
   });
 
   it('shows Goal and scheduled Task state independently', async () => {

@@ -137,6 +137,7 @@ import { ThemePresetSelect } from './components/ThemePresetSelect';
 import { useResolvedTheme } from '@/theme';
 import {
     MANAGED_BROWSER_MCP_ID,
+    hasUserEditableMcpSettings,
     isBrowserResourceReady,
     selectLatestBrowserResourceStatus,
     shouldAutoMaintainBrowserResource,
@@ -1314,6 +1315,8 @@ export default function Settings({ mode = 'settings', initialSection, navigation
 
     // Edit builtin MCP server settings (extra args + env)
     const handleEditBuiltinMcp = async (server: McpServerDefinition) => {
+        if (!hasUserEditableMcpSettings(server.id)) return;
+
         // Edge TTS: open custom config dialog
         if (server.id === 'edge-tts') {
             const savedEnv = await getMcpServerEnv(server.id);

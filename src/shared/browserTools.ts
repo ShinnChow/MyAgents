@@ -50,6 +50,14 @@ export function isReservedBuiltinBrowserMcpId(serverId: string): boolean {
 }
 
 /**
+ * The managed Browser has a fixed product-owned runtime contract. Generic MCP
+ * args/env are not Browser settings and must not be exposed as if they were.
+ */
+export function hasUserEditableMcpSettings(serverId: string): boolean {
+  return serverId !== MANAGED_BROWSER_MCP_ID;
+}
+
+/**
  * The two MyAgents-owned browser entries intentionally expose overlapping
  * browser_* tools. Keep a single execution selection (Session, Agent default,
  * Launcher, or Task override) mutually exclusive for these exact preset IDs:
