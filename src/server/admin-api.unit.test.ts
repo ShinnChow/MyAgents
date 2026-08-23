@@ -157,7 +157,10 @@ beforeEach(() => {
   agentSessionMocks.agentDir = undefined;
   agentSessionMocks.getSidecarPort.mockReturnValue(0);
   agentSessionMocks.setMcpServers.mockClear();
-  managementApiMocks.managementApi.mockClear();
+  // Clear queued `mockResolvedValueOnce` entries as well as call history.
+  // Some handlers make platform-dependent auxiliary calls; leaving an unused
+  // one-shot response here can otherwise leak into the next test in the file.
+  managementApiMocks.managementApi.mockReset();
   managementApiMocks.managementApi.mockResolvedValue({ ok: true, taskUpdated: 0, cronUpdated: 0 });
   analyticsMocks.trackServer.mockClear();
   runtimeModelMocks.queryRuntimeModels.mockClear();
