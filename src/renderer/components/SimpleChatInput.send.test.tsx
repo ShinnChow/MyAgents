@@ -464,11 +464,11 @@ describe('SimpleChatInput send paths', () => {
     expect(screen.getByText('Playwright')).toBeInTheDocument();
     expect(screen.getByText('Browser automation')).toBeInTheDocument();
     expect(screen.getByText('tavily-search')).toBeInTheDocument();
-    expect(toolsButton).toHaveTextContent('3');
+    expect(toolsButton).toHaveTextContent('2');
     expect(screen.queryByText('browser_click')).not.toBeInTheDocument();
   });
 
-  it('shows Managed Runtime desired MCP status and counts only ready tools', async () => {
+  it('counts Managed Runtime MCP rows and only shows error status details', async () => {
     await i18n.changeLanguage('en-US');
     const user = userEvent.setup();
     renderInput({
@@ -490,7 +490,7 @@ describe('SimpleChatInput send paths', () => {
         observedAt: 1,
         dispatch: { state: 'released', releaseReason: 'timeout' },
         servers: [
-          { id: 'playwright', desired: true, state: 'starting', toolCount: 0, attemptGeneration: 2, updatedAt: 1 },
+          { id: 'playwright', desired: true, state: 'failed', toolCount: 0, errorCode: 'startup_failed', attemptGeneration: 2, updatedAt: 1 },
           { id: 'search', desired: true, state: 'ready', toolCount: 3, attemptGeneration: 2, updatedAt: 1 },
         ],
         tools: ['mcp__search__one', 'mcp__search__two', 'mcp__search__three'],
@@ -498,15 +498,15 @@ describe('SimpleChatInput send paths', () => {
     });
 
     const toolsButton = screen.getByTitle('Use tools');
-    expect(toolsButton).toHaveTextContent('3');
+    expect(toolsButton).toHaveTextContent('2');
     await user.click(toolsButton);
     expect(screen.getByText('Playwright')).toBeInTheDocument();
-    expect(screen.getByText(/Starting/)).toBeInTheDocument();
-    expect(screen.getByText('3 tools ready')).toBeInTheDocument();
+    expect(screen.getByText('Unavailable')).toBeInTheDocument();
+    expect(screen.queryByText('3 tools ready')).not.toBeInTheDocument();
     expect(screen.queryByText('stale')).not.toBeInTheDocument();
   });
 
-  it('keeps workspace MCP configuration editable with Managed Codex builtin input chrome', async () => {
+  it('counts editable MCP rows and hides healthy child-tool cardinality', async () => {
     await i18n.changeLanguage('en-US');
     const user = userEvent.setup();
     renderInput({
@@ -517,17 +517,36 @@ describe('SimpleChatInput send paths', () => {
         { id: 'configured-only', name: 'Configured only' },
       ],
       globalMcpEnabled: ['playwright', 'configured-only'],
-      workspaceMcpEnabled: ['playwright', 'configured-only'],
+      workspaceMcpEnabled: ['playwright', 'playwright', 'configured-only'],
+      mcpEffectiveSnapshot: {
+        sessionId: 'session-a',
+        runtime: 'codex',
+        runtimeSource: 'managed-provider',
+        runtimeGeneration: 2,
+        configGeneration: 4,
+        configFingerprint: 'revision-4',
+        catalogGeneration: 3,
+        revision: 8,
+        observedAt: 1,
+        dispatch: { state: 'released', releaseReason: 'ready' },
+        servers: [
+          { id: 'playwright', desired: true, state: 'ready', toolCount: 39, attemptGeneration: 2, updatedAt: 1 },
+          { id: 'configured-only', desired: true, state: 'failed', toolCount: 0, errorCode: 'startup_failed', attemptGeneration: 2, updatedAt: 1 },
+        ],
+        tools: Array.from({ length: 39 }, (_, index) => `mcp__playwright__tool_${index}`),
+      },
     });
 
     const toolsButton = screen.getByTitle('Use tools');
+    expect(toolsButton).toHaveTextContent('2');
     await user.click(toolsButton);
 
-    expect(toolsButton).toHaveTextContent(/^Tools$/);
     const playwrightRow = screen.getByText('Playwright').parentElement?.parentElement;
     expect(playwrightRow).not.toBeNull();
     expect(playwrightRow?.querySelector('button')).not.toBeNull();
     expect(screen.getByText('Configured only')).toBeInTheDocument();
+    expect(screen.queryByText('39 tools ready')).not.toBeInTheDocument();
+    expect(screen.getByText('Unavailable')).toBeInTheDocument();
   });
 
   it('shows Goal and scheduled Task state independently', async () => {

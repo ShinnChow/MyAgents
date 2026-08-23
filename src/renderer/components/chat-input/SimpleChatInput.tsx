@@ -43,7 +43,7 @@ import QueuedMessagesPanel from '../QueuedMessageBubble';
 import CronTaskStatusBar from '../cron/CronTaskStatusBar';
 import GoalStatusBar from '../goal/GoalStatusBar';
 import { useUndoStack } from '@/hooks/useUndoStack';
-import { mcpServerState, readyMcpToolCount } from '../../../shared/mcpEffectiveState';
+import { mcpServerState, type McpEffectiveServerState } from '../../../shared/mcpEffectiveState';
 import { CUSTOM_EVENTS } from '../../../shared/constants';
 import { reasoningEffortChoices, REASONING_EFFORT_DESCRIPTIONS, REASONING_EFFORT_DEFAULT } from '../../../shared/reasoningEffort';
 import { retainFocusOnMouseDown } from '@/utils/focusRetention';
@@ -103,6 +103,12 @@ function runtimeMcpServerId(toolName: string): string | null {
   const remainder = toolName.slice('mcp__'.length);
   const separator = remainder.indexOf('__');
   return separator > 0 ? remainder.slice(0, separator) : null;
+}
+
+function isMcpErrorState(
+  state: McpEffectiveServerState,
+): state is Extract<McpEffectiveServerState, 'failed' | 'needs_auth'> {
+  return state === 'failed' || state === 'needs_auth';
 }
 
 function ModelSelectionScrollSync({
@@ -419,17 +425,17 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
       .filter(server => server.desired)
       .map(server => configuredServers.get(server.id) ?? { id: server.id, name: server.id });
   }, [isExternalRuntime, mcpEffectiveSnapshot, mcpServers, runtimeMcpServers]);
-  const effectiveToolCount = useMemo(() => {
-    const effectiveMcpCount = mcpEffectiveSnapshot
-      ? readyMcpToolCount(mcpEffectiveSnapshot)
-      : isExternalRuntime
-        ? runtimeMcpTools.length
-        : 0;
-    const effectiveOfficialCount = workspaceOfficialToolEnabled.filter(
-      id => visibleOfficialTools.some(tool => tool.id === id),
+  const enabledToolEntryCount = useMemo(() => {
+    const enabledMcpEntryCount = isExternalRuntime
+      ? externalMcpServers.length
+      : new Set(mcpServers
+        .filter(server => globalMcpEnabled.includes(server.id) && workspaceMcpEnabled.includes(server.id))
+        .map(server => server.id)).size;
+    const enabledOfficialEntryCount = visibleOfficialTools.filter(
+      tool => workspaceOfficialToolEnabled.includes(tool.id),
     ).length;
-    return effectiveMcpCount + effectiveOfficialCount;
-  }, [isExternalRuntime, mcpEffectiveSnapshot, runtimeMcpTools.length, visibleOfficialTools, workspaceOfficialToolEnabled]);
+    return enabledMcpEntryCount + enabledOfficialEntryCount;
+  }, [externalMcpServers.length, globalMcpEnabled, isExternalRuntime, mcpServers, visibleOfficialTools, workspaceMcpEnabled, workspaceOfficialToolEnabled]);
 
   // #324 — 推理强度 submenu (fixed bottom row of the model menu). Opens on
   // hover/click of the row; 120ms close delay + an invisible hover bridge
@@ -1966,9 +1972,9 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
               >
                 <Wrench className="h-3.5 w-3.5" />
                 <span className="toolbar-label">{t('input.toolsLabel')}</span>
-                {effectiveToolCount > 0 && (
+                {enabledToolEntryCount > 0 && (
                   <span className="text-xs text-[var(--ink-muted)]">
-                    {effectiveToolCount}
+                    {enabledToolEntryCount}
                   </span>
                 )}
               </button>
@@ -2052,18 +2058,14 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                           )}
                           {mcpEffectiveSnapshot && (() => {
                             const effective = mcpServerState(mcpEffectiveSnapshot, server.id);
-                            if (!effective || effective.state === 'disabled') return null;
+                            if (!effective || !isMcpErrorState(effective.state)) return null;
                             return (
                               <div className="mt-0.5 flex items-center gap-1 text-xs text-[var(--ink-muted)]">
-                                <span className={`h-1.5 w-1.5 rounded-full ${effective.state === 'ready' ? 'bg-emerald-500' : effective.state === 'failed' || effective.state === 'needs_auth' ? 'bg-amber-500' : 'bg-[var(--accent)] animate-pulse'}`} />
+                                <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
                                 <span>
-                                  {effective.state === 'ready'
-                                    ? t('input.mcpStatus.readyTools', { count: effective.toolCount })
-                                    : effective.state === 'needs_auth'
-                                      ? t('input.mcpStatus.needsAuth')
-                                      : effective.state === 'failed'
-                                        ? t('input.mcpStatus.unavailable')
-                                        : t('input.mcpStatus.starting')}
+                                  {effective.state === 'needs_auth'
+                                    ? t('input.mcpStatus.needsAuth')
+                                    : t('input.mcpStatus.unavailable')}
                                 </span>
                               </div>
                             );
@@ -2089,17 +2091,13 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
                                     {server.description}
                                   </div>
                                 )}
-                                {isEnabled && effective && effective.state !== 'disabled' && (
+                                {isEnabled && effective && isMcpErrorState(effective.state) && (
                                   <div className="mt-0.5 flex items-center gap-1 text-xs text-[var(--ink-muted)]">
-                                    <span className={`h-1.5 w-1.5 rounded-full ${effective.state === 'ready' ? 'bg-emerald-500' : effective.state === 'failed' || effective.state === 'needs_auth' ? 'bg-amber-500' : 'bg-[var(--accent)] animate-pulse'}`} />
+                                    <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
                                     <span>
-                                      {effective.state === 'ready'
-                                        ? t('input.mcpStatus.readyTools', { count: effective.toolCount })
-                                        : effective.state === 'needs_auth'
-                                          ? t('input.mcpStatus.needsAuth')
-                                          : effective.state === 'failed'
-                                            ? t('input.mcpStatus.unavailable')
-                                            : t('input.mcpStatus.starting')}
+                                      {effective.state === 'needs_auth'
+                                        ? t('input.mcpStatus.needsAuth')
+                                        : t('input.mcpStatus.unavailable')}
                                     </span>
                                   </div>
                                 )}
