@@ -23,7 +23,7 @@ import {
   CODEX_SKILL_LIST_TIMEOUT_MS,
   configureCodexSkillExtraRoots,
   createCodexMcpStartupBarrier,
-  assertManagedCodexExtensionProtocolVersion,
+  assertManagedCodexRuntimeConformanceVersion,
   initializeCodexRpc,
   KNOWN_CODEX_SERVER_REQUEST_METHODS,
   mapCodexTurnCompletedNotification,
@@ -58,12 +58,12 @@ describe('Codex app-server protocol helpers', () => {
     return dir;
   }
 
-  it('fails closed when the Managed Codex extension protocol drifts', () => {
-    expect(() => assertManagedCodexExtensionProtocolVersion('0.146.0')).not.toThrow();
-    expect(() => assertManagedCodexExtensionProtocolVersion('0.147.0')).toThrow(
-      /exact-version conformance/i,
+  it('fails closed when the Managed Codex binary drifts from the runtime lock', () => {
+    expect(() => assertManagedCodexRuntimeConformanceVersion('0.149.0')).not.toThrow();
+    expect(() => assertManagedCodexRuntimeConformanceVersion('0.146.0')).toThrow(
+      /require conformed app-server 0\.149\.0/i,
     );
-    expect(() => assertManagedCodexExtensionProtocolVersion(undefined)).toThrow(/resolved unknown/i);
+    expect(() => assertManagedCodexRuntimeConformanceVersion(undefined)).toThrow(/resolved unknown/i);
   });
 
   it('materializes native Agent role prompt, model, and Skill references deterministically', () => {

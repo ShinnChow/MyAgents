@@ -175,13 +175,8 @@ import type {
   ManagedCodexExtensionSnapshot,
   ManagedCodexExtensionUpdateResult,
 } from './managed-codex/extensions/contracts';
-import { MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION } from './managed-codex/extensions/contracts';
+import { attachManagedCodexHostTools } from './managed-codex/extensions/host-dispatcher';
 import {
-  attachManagedCodexHostTools,
-  managedCodexHostCatalogFingerprint,
-} from './managed-codex/extensions/host-dispatcher';
-import {
-  getActiveManagedCodexHostCatalog,
   getManagedCodexDesiredSnapshot,
   getManagedCodexExtensionStatus,
   getManagedCodexSessionEnabledPluginIds,
@@ -194,13 +189,10 @@ import {
   resolveManagedCodexMcpSelection,
   resetManagedCodexExtensionState,
   setManagedCodexDesiredSnapshot,
-  setActiveManagedCodexHostCatalog,
   setManagedCodexExtensionRestartPending,
   setManagedCodexSessionEnabledPluginIds,
   setManagedCodexSessionMcpServers,
   setManagedCodexRuntimeDiagnostics,
-  setPendingManagedCodexHostCatalogBirth,
-  takePendingManagedCodexHostCatalogBirth,
 } from './external-session/extensions';
 import {
   canDrainExternalOperations,
@@ -1459,37 +1451,15 @@ async function ensureExternalSessionMetadataForRealUserTurn(params: {
 
   const pendingBirth = pendingBirthForSession(sessionId);
   const existing = getSessionMetadata(sessionId);
-  const nativeThreadId = getExternalRuntimeSessionId();
-  const activeHostCatalog = getActiveManagedCodexHostCatalog();
-  const bornHostCatalog = activeHostCatalog?.threadId === nativeThreadId
-    ? activeHostCatalog
-    : null;
   if (existing) {
     const runtimeSessionId = pendingBirth?.runtimeSessionId;
     if (existing.materializationState === 'prepared') {
-      if (bornHostCatalog) {
-        await updateSessionMetadata(sessionId, {
-          managedCodexExtensionProtocolVersion: MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION,
-          managedCodexHostCatalogFingerprint: bornHostCatalog.fingerprint,
-        });
-      }
       clearPendingExternalSessionBirth(sessionId);
       return { preparedExisting: true, runtimeSessionId };
-    } else if (
-      (runtimeSessionId && existing.runtimeSessionId !== runtimeSessionId)
-      || (bornHostCatalog
-        && (existing.managedCodexExtensionProtocolVersion !== MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION
-          || existing.managedCodexHostCatalogFingerprint !== bornHostCatalog.fingerprint))
-    ) {
+    } else if (runtimeSessionId && existing.runtimeSessionId !== runtimeSessionId) {
       try {
         const updated = await updateSessionMetadata(sessionId, {
-          ...(runtimeSessionId ? { runtimeSessionId } : {}),
-          ...(bornHostCatalog
-            ? {
-                managedCodexExtensionProtocolVersion: MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION,
-                managedCodexHostCatalogFingerprint: bornHostCatalog.fingerprint,
-              }
-            : {}),
+          runtimeSessionId,
         });
         if (!updated) {
           console.warn(`[external-session] runtimeSessionId patch skipped for ${sessionId}: metadata disappeared during ${origin}`);
@@ -1542,10 +1512,6 @@ async function ensureExternalSessionMetadataForRealUserTurn(params: {
   });
   if (pendingBirth?.runtimeSessionId) {
     meta.runtimeSessionId = pendingBirth.runtimeSessionId;
-  }
-  if (bornHostCatalog) {
-    meta.managedCodexExtensionProtocolVersion = MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION;
-    meta.managedCodexHostCatalogFingerprint = bornHostCatalog.fingerprint;
   }
 
   await saveSessionMetadata(meta);
@@ -3124,49 +3090,11 @@ async function _doStartExternalSession(options: {
       sessionId: options.sessionId,
       workspacePath: options.workspacePath,
     });
-    const desiredHostCatalogFingerprint = managedCodexHostCatalogFingerprint(
-      managedCodexExtensionSnapshot.dynamicTools,
-    );
-    const emptyHostCatalogFingerprint = managedCodexHostCatalogFingerprint([]);
-    const resumeHostCatalogMismatch = Boolean(
-      options.resumeSessionId
-      && (
-        existingMetadataAtStart?.managedCodexExtensionProtocolVersion
-          !== MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION
-        || existingMetadataAtStart?.managedCodexHostCatalogFingerprint
-          !== desiredHostCatalogFingerprint
-      )
-      && (
-        managedCodexExtensionSnapshot.dynamicTools.length > 0
-        || (existingMetadataAtStart?.managedCodexHostCatalogFingerprint
-          && existingMetadataAtStart.managedCodexHostCatalogFingerprint
-            !== emptyHostCatalogFingerprint)
-      ),
-    );
-    if (resumeHostCatalogMismatch) {
-      managedCodexExtensionSnapshot.hostToolDispatcher?.dispose(
-        'Native thread Host tool catalog differs from the desired Session catalog',
-      );
-      managedCodexExtensionSnapshot = {
-        ...managedCodexExtensionSnapshot,
-        dynamicTools: [],
-        hostToolDispatcher: undefined,
-        components: [
-          ...managedCodexExtensionSnapshot.components.filter(result => result.component !== 'host_tools'),
-          {
-            component: 'host_tools',
-            state: 'unsupported',
-            code: 'host_tools_catalog_immutable',
-            message: 'Start a new Product Session to apply the changed Host tool catalog.',
-            requiresUserAction: true,
-          },
-        ],
-      };
-    } else if (!options.resumeSessionId) {
-      setPendingManagedCodexHostCatalogBirth({
-        fingerprint: desiredHostCatalogFingerprint,
-      });
-    }
+    // Codex fixes a dynamic-tool catalog at native thread birth. A resumed
+    // Product Session keeps that visibility, but always receives the current
+    // dispatcher: stable tools continue to work, while removed or
+    // schema-invalid tools fail only their individual call. Newly added tools
+    // become visible when a new native thread is created.
     setManagedCodexDesiredSnapshot(managedCodexExtensionSnapshot, 'no-live-process');
   }
   if (shouldTrackPendingExternalSessionBirth({
@@ -3403,11 +3331,6 @@ async function _doStartExternalSession(options: {
             sessionId: options.sessionId,
             workspacePath: options.workspacePath,
           });
-          setPendingManagedCodexHostCatalogBirth({
-            fingerprint: managedCodexHostCatalogFingerprint(
-              managedCodexExtensionSnapshot.dynamicTools,
-            ),
-          });
           setManagedCodexDesiredSnapshot(managedCodexExtensionSnapshot, 'no-live-process');
         }
         assertExternalTurnPromotionCurrent(options.dispatchPromotion ?? null);
@@ -3452,7 +3375,6 @@ async function _doStartExternalSession(options: {
     }
     console.log(`[external-session] ${runtimeType} process started, pid=${process.pid}`);
   } catch (err) {
-    setPendingManagedCodexHostCatalogBirth(null);
     const failure = options.dispatchPromotion?.signal.aborted
       && !(err instanceof ExternalTurnPromotionCanceledError)
       ? new ExternalTurnPromotionCanceledError()
@@ -6769,15 +6691,6 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
       // CC: session_id from hook; Codex: threadId from thread/start response; Gemini: from session/new
       if (event.sessionId) {
         setExternalRuntimeSessionId(event.sessionId);
-        const bornHostCatalog = isManagedCodexProductRuntime()
-          ? takePendingManagedCodexHostCatalogBirth()
-          : null;
-        if (bornHostCatalog) {
-          setActiveManagedCodexHostCatalog({
-            threadId: event.sessionId,
-            fingerprint: bornHostCatalog.fingerprint,
-          });
-        }
         // Persist to SessionMetadata for cross-restart resume.
         // During pre-warm, metadata may not exist yet. Attempt update; if
         // metadata doesn't exist yet, store the ID in the pending birth record
@@ -6802,12 +6715,6 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
             runtime: getCurrentRuntimeType(),
             runtimeSource: getCurrentRuntimeSource(),
             runtimeSessionId: targetRuntimeId,
-            ...(bornHostCatalog
-              ? {
-                  managedCodexExtensionProtocolVersion: MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION,
-                  managedCodexHostCatalogFingerprint: bornHostCatalog.fingerprint,
-                }
-              : {}),
           })
             .then((updated) => {
               if (

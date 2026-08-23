@@ -23,8 +23,6 @@ let lastFailure: string | null = null;
 let sessionEnabledPluginIds: string[] | null = null;
 let sessionMcpServers: McpServerDefinition[] | null = null;
 let extensionRestartPending = false;
-let pendingHostCatalogBirth: { fingerprint: string } | null = null;
-let activeHostCatalog: { threadId: string; fingerprint: string } | null = null;
 let runtimeDiagnostics: RuntimeDiagnostics | null = null;
 
 function applyFingerprint(snapshot: ManagedCodexExtensionSnapshot): string {
@@ -196,29 +194,6 @@ export function isManagedCodexExtensionRestartPending(): boolean {
   return extensionRestartPending;
 }
 
-function clearManagedCodexHostCatalogState(): void {
-  pendingHostCatalogBirth = null;
-  activeHostCatalog = null;
-}
-
-export function setPendingManagedCodexHostCatalogBirth(value: { fingerprint: string } | null): void {
-  pendingHostCatalogBirth = value;
-}
-
-export function takePendingManagedCodexHostCatalogBirth(): { fingerprint: string } | null {
-  const value = pendingHostCatalogBirth;
-  pendingHostCatalogBirth = null;
-  return value;
-}
-
-export function setActiveManagedCodexHostCatalog(value: { threadId: string; fingerprint: string } | null): void {
-  activeHostCatalog = value;
-}
-
-export function getActiveManagedCodexHostCatalog(): { threadId: string; fingerprint: string } | null {
-  return activeHostCatalog;
-}
-
 export function setManagedCodexRuntimeDiagnostics(value: RuntimeDiagnostics): void {
   runtimeDiagnostics = value;
 }
@@ -240,5 +215,4 @@ export function resetManagedCodexExtensionState(): void {
   sessionMcpServers = null;
   extensionRestartPending = false;
   runtimeDiagnostics = null;
-  clearManagedCodexHostCatalogState();
 }

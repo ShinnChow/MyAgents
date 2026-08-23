@@ -61,6 +61,8 @@ class FakeRuntime implements AgentRuntime {
   readonly type: RuntimeType = 'codex';
   readonly sentMessages: string[] = [];
   readonly startSessionInitialMessages: Array<string | undefined> = [];
+  readonly startSessionResumeIds: Array<string | undefined> = [];
+  readonly startSessionHasHostDispatcher: boolean[] = [];
   readonly steeredMessages: Array<{ message: string; clientUserMessageId?: string }> = [];
   readonly conversationBranches: Array<{ kind: 'through-turn' | 'before-turn'; runtimeTurnId: string }> = [];
   compactCalls = 0;
@@ -195,6 +197,10 @@ class FakeRuntime implements AgentRuntime {
 
   async startSession(options: SessionStartOptions, onEvent: UnifiedEventCallback): Promise<RuntimeProcess> {
     this.startSessionInitialMessages.push(options.initialTurn?.message);
+    this.startSessionResumeIds.push(options.resumeSessionId);
+    this.startSessionHasHostDispatcher.push(Boolean(
+      options.managedCodexExtensions?.hostToolDispatcher,
+    ));
     const gate = this.startGate;
     if (gate) {
       await gate;
@@ -414,6 +420,7 @@ async function createHarness(
     deferMessagePersistOnCall?: number;
     rejectMessagePersist?: boolean;
     runtimeSource?: 'system-cli' | 'managed-provider';
+    withManagedHostDispatcher?: boolean;
     omittedLoadedSkillNames?: readonly string[];
     unavailableProjectedSkillNames?: readonly string[];
     config?: Record<string, unknown>;
@@ -513,6 +520,28 @@ async function createHarness(
     isExternalRuntime: (type: RuntimeType | undefined) => Boolean(type && type !== 'builtin'),
     isRuntimeSupported: () => true,
   }));
+  if (options.withManagedHostDispatcher) {
+    vi.doMock('./managed-codex/extensions/host-dispatcher', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('./managed-codex/extensions/host-dispatcher')>();
+      const descriptors = [{
+        name: 'myagents__mcp__test__stable_tool',
+        description: 'Stable historical Host tool',
+        inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      }];
+      return {
+        ...actual,
+        attachManagedCodexHostTools: vi.fn(async ({ snapshot }) => ({
+          ...snapshot,
+          dynamicTools: descriptors,
+          hostToolDispatcher: {
+            descriptors,
+            dispatch: vi.fn(async () => ({ success: true, contentItems: [] })),
+            dispose: vi.fn(),
+          },
+        })),
+      };
+    });
+  }
   vi.doMock('../sse', async (importOriginal) => {
     const actual = await importOriginal<typeof import('../sse')>();
     return {
@@ -607,6 +636,7 @@ afterEach(async () => {
   vi.doUnmock('../utils/im-mirror');
   vi.doUnmock('./utils/kill-with-escalation');
   vi.doUnmock('./external-session/transcript-persistence');
+  vi.doUnmock('./managed-codex/extensions/host-dispatcher');
 });
 
 function desktopRequest(sessionId: string, workspacePath: string, text: string): DesktopMessageRequest {
@@ -634,6 +664,58 @@ function runInjectedTurn(harness: Harness, request: TestInjectedTurnRequest) {
 }
 
 describe('external SessionEngine with fake runtime', () => {
+  it('resumes a healthy 0.146 Product Session with the current Host dispatcher', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'historical session continued' },
+    ], {
+      runtimeSource: 'managed-provider',
+      withManagedHostDispatcher: true,
+    });
+    const sessionId = 'session-managed-codex-0146-history';
+    const workspacePath = join(harness.home, 'workspace');
+    const legacyMetadata = {
+      id: sessionId,
+      agentDir: workspacePath,
+      title: 'Historical Managed Codex Session',
+      createdAt: '2026-08-01T00:00:00.000Z',
+      lastActiveAt: '2026-08-01T00:00:00.000Z',
+      unifiedSession: true,
+      runtime: 'codex',
+      runtimeSource: 'managed-provider',
+      runtimeSessionId: 'codex-thread-created-by-0.146',
+      managedCodexExtensionProtocolVersion: '0.146.0',
+      managedCodexHostCatalogFingerprint: 'legacy-catalog-fingerprint',
+    } as unknown as Parameters<typeof harness.sessionStore.saveSessionMetadata>[0];
+    await harness.sessionStore.saveSessionMetadata(legacyMetadata);
+
+    await expect(harness.externalSession.restoreExternalSessionState(
+      sessionId,
+      workspacePath,
+      { type: 'desktop' },
+    )).resolves.toEqual({ success: true });
+
+    const sent = await runInjectedTurn(harness, {
+      prompt: 'continue historical work',
+      sessionId,
+      workspacePath,
+      scenario: { type: 'desktop' },
+      timeoutMs: 2_000,
+      pollMs: 10,
+    });
+    expect(sent).toMatchObject({ success: true });
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+
+    expect(harness.runtime.startSessionResumeIds).toEqual(['codex-thread-created-by-0.146']);
+    expect(harness.runtime.startSessionHasHostDispatcher).toEqual([true]);
+    expect(harness.sessionStore.getSessionData(sessionId)?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'user', content: 'continue historical work' }),
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.stringContaining('historical session continued'),
+      }),
+    ]));
+  });
+
   it('prewarms and sends with historical project copies of required Skills', async () => {
     const harness = await createHarness([
       { kind: 'success', text: 'required project winners admitted' },

@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Managed Codex 升级至 0.149.0**：继续使用原有已适配能力，不自动开放新增实验接口；0.146 创建的健康历史 Session 可直接续跑，不再因协议版本或 Host 工具目录指纹变化要求新建会话。
 - **Space 套餐包含 Tool 配额**：桌面端 Space 设置页显示团队 Tool 用量，并与 Free、Pro 和 Official 的云端配额保持一致。
 - **系统通知点击精确关联**：macOS、Windows 与 Linux 都使用每条系统通知自身的原生点击回调，多条通知堆叠时不会再依赖窗口聚焦猜测目标；启动和登录补拉只建立基线，不轰炸历史提醒。
 

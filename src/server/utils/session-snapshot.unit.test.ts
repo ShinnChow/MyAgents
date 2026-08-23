@@ -258,18 +258,23 @@ describe('snapshotForOwnedSession — reasoning effort capture (#324)', () => {
 });
 
 describe('snapshotForForkedSession', () => {
-  it('preserves the Managed Codex Host catalog identity on a Product Session fork', () => {
+  it('does not propagate legacy Managed Codex protocol or Host catalog gates', () => {
     const source = {
       runtime: 'codex',
       runtimeSource: 'managed-provider',
       configSnapshotAt: '2026-08-08T00:00:00.000Z',
       managedCodexExtensionProtocolVersion: '0.146.0',
       managedCodexHostCatalogFingerprint: 'catalog-fingerprint',
-    } as SessionMetadata;
+    } as unknown as SessionMetadata & Record<string, unknown>;
 
-    expect(snapshotForForkedSession(source)).toMatchObject({
-      managedCodexExtensionProtocolVersion: '0.146.0',
-      managedCodexHostCatalogFingerprint: 'catalog-fingerprint',
+    const snapshot = snapshotForForkedSession(source);
+
+    expect(snapshot).toEqual({
+      runtime: 'codex',
+      runtimeSource: 'managed-provider',
+      configSnapshotAt: '2026-08-08T00:00:00.000Z',
     });
+    expect(snapshot).not.toHaveProperty('managedCodexExtensionProtocolVersion');
+    expect(snapshot).not.toHaveProperty('managedCodexHostCatalogFingerprint');
   });
 });

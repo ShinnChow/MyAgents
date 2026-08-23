@@ -18,7 +18,10 @@ import type {
   RuntimeProxyPolicy, RuntimeDiagnosticIssue,
   RuntimeSource,
 } from '../../shared/types/runtime';
-import type { McpServerDefinition } from '../../shared/config-types';
+import {
+  MANAGED_CODEX_REQUIRED_RUNTIME,
+  type McpServerDefinition,
+} from '../../shared/config-types';
 import { MANAGED_BROWSER_MCP_ID } from '../../shared/browserTools';
 import {
   acquireBrowserCapability,
@@ -69,21 +72,21 @@ import type {
   ManagedCodexHostToolResult,
   ManagedCodexSkillSpec,
 } from './managed-codex/extensions/contracts';
-import { MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION } from './managed-codex/extensions/contracts';
 import {
   projectManagedCodexMcpLaunchConfig,
 } from './managed-codex/extensions/mcp-launch-projection';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
 /**
- * Extension RPCs below are verified against this exact app-server schema.
- * Keep this independent from the downloadable runtime lock: changing only the
- * lock must fail closed until conformance and this contract advance together.
+ * Managed extension RPCs are verified against the exact binary selected by the
+ * single runtime lock. The lock cannot be advanced until schema generation and
+ * exact-binary conformance pass; duplicating its version here would create a
+ * second authority that can drift from packaging and installation.
  */
-export function assertManagedCodexExtensionProtocolVersion(version: string | undefined): void {
-  if (version !== MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION) {
+export function assertManagedCodexRuntimeConformanceVersion(version: string | undefined): void {
+  if (version !== MANAGED_CODEX_REQUIRED_RUNTIME.version) {
     throw new Error(
-      `Managed Codex extensions require app-server ${MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION}; `
+      `Managed Codex extensions require conformed app-server ${MANAGED_CODEX_REQUIRED_RUNTIME.version}; `
       + `resolved ${version ?? 'unknown'}. Re-run exact-version conformance before upgrading.`,
     );
   }
@@ -3506,7 +3509,7 @@ export class CodexRuntime implements AgentRuntime {
       ? options.managedCodexExtensions
       : undefined;
     if (extensionSnapshot) {
-      assertManagedCodexExtensionProtocolVersion(context.version);
+      assertManagedCodexRuntimeConformanceVersion(context.version);
     }
     const extensionMaterialization = materializeManagedCodexExtensions(extensionSnapshot);
     let runtimeMcpServers = extensionSnapshot?.mcpServers ?? options.mcpServers;

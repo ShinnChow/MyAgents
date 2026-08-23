@@ -70,7 +70,7 @@ describe('runtime UI projection', () => {
       components: [{
         component: 'host_tools',
         state: 'unsupported',
-        code: 'host_tools_catalog_immutable',
+        code: 'host_tools_connect_failed',
         requiresUserAction: true,
       }],
     })).toBe('unsupported');

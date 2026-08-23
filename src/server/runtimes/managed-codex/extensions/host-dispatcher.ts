@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -35,25 +34,6 @@ type ConnectedServer = {
   clientTransport: InMemoryTransport;
   serverTransport: InMemoryTransport;
 };
-
-function stableCatalogValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(stableCatalogValue);
-  if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, stableCatalogValue(entry)]),
-  );
-}
-
-export function managedCodexHostCatalogFingerprint(
-  descriptors: readonly ManagedCodexDynamicToolSpec[],
-): string {
-  const catalog = [...descriptors]
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .map(descriptor => stableCatalogValue(descriptor));
-  return createHash('sha256').update(JSON.stringify(catalog)).digest('hex');
-}
 
 /** Cached builtin MCP instances reconnect across Codex process generations. */
 const serverReleaseByInstance = new WeakMap<McpServer, Promise<void>>();
