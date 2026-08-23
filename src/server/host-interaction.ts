@@ -5,6 +5,18 @@ const CHANNEL_INTERACTION_TOOLS = ['EnterPlanMode', 'ExitPlanMode'] as const;
 
 export type ChannelInteractionTool = typeof CHANNEL_INTERACTION_TOOLS[number] | 'AskUserQuestion';
 
+/**
+ * Resolve the optional group-specific tool deny overlay for one IM request.
+ * Group channels are unrestricted by default; private messages never inherit
+ * a group-only deny list.
+ */
+export function resolveImGroupToolsDeny(
+  sourceType: 'private' | 'group' | undefined,
+  configured: readonly string[] | undefined,
+): string[] {
+  return sourceType === 'group' ? [...(configured ?? [])] : [];
+}
+
 export function normalizeHostInteractionCapability(value: unknown): HostInteractionCapability {
   if (!value || typeof value !== 'object') return DEFAULT_HOST_INTERACTION;
   const askUserQuestion = (value as { askUserQuestion?: unknown }).askUserQuestion;

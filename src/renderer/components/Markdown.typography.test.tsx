@@ -9,6 +9,10 @@ const markdownStyles = readFileSync(
   resolve(process.cwd(), "src/renderer/components/Markdown.css"),
   "utf8",
 );
+const codeBlockSource = readFileSync(
+  resolve(process.cwd(), "src/renderer/components/markdown/CodeBlock.tsx"),
+  "utf8",
+);
 
 describe("Markdown typography contract", () => {
   it("uses one default rhythm for normal chat and document rendering", () => {
@@ -34,6 +38,7 @@ describe("Markdown typography contract", () => {
 
     const root = container.querySelector(".markdown-content");
     expect(root).toBeInTheDocument();
+    expect(root).toHaveClass("min-w-0", "max-w-full");
     expect(root).not.toHaveClass("markdown-content--compact");
     expect(root?.querySelector("h1")).toHaveClass(
       "markdown-heading",
@@ -51,7 +56,15 @@ describe("Markdown typography contract", () => {
     );
     expect(root?.querySelector("table")?.parentElement).toHaveClass(
       "markdown-table",
+      "max-w-full",
     );
+  });
+
+  it("keeps wide code content inside the host width", () => {
+    expect(codeBlockSource).toContain(
+      "w-full min-w-0 max-w-full overflow-hidden",
+    );
+    expect(codeBlockSource).toContain('className="overflow-x-auto"');
   });
 
   it("makes compact a whole-system density variant", () => {

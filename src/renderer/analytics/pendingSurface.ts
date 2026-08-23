@@ -46,6 +46,8 @@ export function birthContextForSurface(surface: Surface): PendingSessionBirthCon
       return { surface, entryIntent: 'thought_alignment', hasInitialMessage: true };
     case 'bug_report':
       return { surface, entryIntent: 'support_diagnostics', hasInitialMessage: true, assistantEntry: 'support_diagnostics' };
+    case 'space_tools':
+      return { surface, entryIntent: 'tool_install', hasInitialMessage: true, assistantEntry: 'space_tool_install' };
     case 'agent_setup':
       return { surface, entryIntent: 'workspace_init', hasInitialMessage: true };
     default:

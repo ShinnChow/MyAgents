@@ -1,11 +1,9 @@
 // TaskSessionsList — "任务执行" section inside Task Detail overlay.
 //
 // Renders the sessions on which a task has actually executed. Population is
-// driven by Rust `cron_task.rs::execute_task_directly` calling
-// `task_store.append_session` after it picks the `effective_session_id` for
-// each tick — one new entry per tick for new_session mode, one dedup'd
-// stable row for single_session mode. See the append block around
-// `cron_task.rs:2130` for the contract; `append_session` is idempotent.
+// driven by the execution adapter's admission callback, after the target
+// Session has accepted the first Task turn. This keeps Task ↔ Session
+// relations durable without exposing speculative, pre-admission rows.
 //
 // Clicking a row fires `OPEN_SESSION_IN_NEW_TAB`, routed by App.tsx to a
 // freshly pre-seeded Chat tab (never hijacks the active tab). Clicking
@@ -14,13 +12,13 @@
 //
 // Visual language mirrors Launcher's 历史对话 list (DESIGN.md §15.6):
 // `rounded-lg hover:bg-[var(--hover-bg)]` row with a timestamp column on
-// the left and truncated title on the right. Timestamp column is 104px
+// the left and truncated title on the right. Timestamp column is 94px
 // (vs Launcher's 56px w-14) because this list shows `MM-DD HH:mm` whereas
 // Launcher's shows `HH:mm` only.
 
 import { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Clock } from 'lucide-react';
+import { ChevronRight, Clock } from 'lucide-react';
 
 import { getSessions, type SessionMetadata } from '@/api/sessionClient';
 import { CUSTOM_EVENTS } from '@/../shared/constants';
@@ -56,7 +54,7 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
   const { t } = useTranslation('task');
   const [sessions, setSessions] = useState<SessionMetadata[]>([]);
   const [loading, setLoading] = useState(true);
-  const [expanded, setExpanded] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(MAX_VISIBLE);
 
   // Fetch all sessions for the task's workspace once, then filter to the
   // task's sessionIds[]. Cheaper than N-round trips; session metadata is
@@ -106,8 +104,8 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
   }, [task.workspacePath, sessionIdsKey]);
 
   const visible = useMemo(
-    () => (expanded ? sessions : sessions.slice(0, MAX_VISIBLE)),
-    [sessions, expanded],
+    () => sessions.slice(0, visibleCount),
+    [sessions, visibleCount],
   );
 
   const handleOpen = (sessionId: string) => {
@@ -121,10 +119,8 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
 
   return (
     <div>
-      {/* Title matches the `text-sm font-semibold text-[var(--ink)]`
-          style used by TaskDocBlock / StatusHistoryList headers, so the
-          overlay reads as a series of same-weight sections rather than
-          an eyebrow label hidden between larger doc blocks. */}
+      {/* Keep section titles at one consistent weight so the property rail
+          reads as a short hierarchy instead of a stack of unrelated cards. */}
       <div className="mb-2 flex items-baseline gap-2">
         <h3 className="text-sm font-semibold text-[var(--ink)]">{t('sessions.title')}</h3>
         <span className="text-xs tabular-nums text-[var(--ink-muted)]">
@@ -142,38 +138,30 @@ export function TaskSessionsList({ task, onBeforeOpen }: Props) {
       ) : (
         <div className="space-y-0.5">
           {visible.map((session) => (
-            <div
+            <button
               key={session.id}
-              role="button"
+              type="button"
               onClick={() => handleOpen(session.id)}
               title={t('sessions.openTitle', { id: session.id })}
-              className="group flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2 text-left transition-colors hover:bg-[var(--hover-bg)]"
+              className="group flex w-full cursor-pointer items-center gap-2 rounded-md px-1.5 py-1.5 text-left transition-colors hover:bg-[var(--hover-bg)]"
             >
-              <div className="flex w-[104px] shrink-0 items-center gap-1 text-xs text-[var(--ink-muted)]/50">
+              <div className="flex w-[94px] shrink-0 items-center gap-1 text-xs text-[var(--ink-muted)]/60">
                 <Clock className="h-2.5 w-2.5" />
                 <span className="whitespace-nowrap tabular-nums">{formatTimestamp(session.lastActiveAt)}</span>
               </div>
-              <span className="min-w-0 flex-1 truncate text-sm text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
+              <span className="min-w-0 flex-1 truncate text-xs leading-5 text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
                 {getSessionDisplayText(session)}
               </span>
-            </div>
-          ))}
-          {sessions.length > MAX_VISIBLE && !expanded && (
-            <button
-              type="button"
-              onClick={() => setExpanded(true)}
-              className="mt-1 px-3 py-1 text-xs text-[var(--ink-muted)] transition-colors hover:text-[var(--ink)]"
-            >
-              {t('sessions.expandAll', { count: sessions.length })}
             </button>
-          )}
-          {expanded && sessions.length > MAX_VISIBLE && (
+          ))}
+          {sessions.length > visibleCount && (
             <button
               type="button"
-              onClick={() => setExpanded(false)}
-              className="mt-1 px-3 py-1 text-xs text-[var(--ink-muted)] transition-colors hover:text-[var(--ink)]"
+              onClick={() => setVisibleCount((count) => count + MAX_VISIBLE)}
+              className="mt-1 flex w-full items-center justify-between rounded-md px-1.5 py-1.5 text-xs text-[var(--ink-muted)] transition-colors hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]"
             >
-              {t('sessions.collapse')}
+              <span>{t('sessions.expandMore')}</span>
+              <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
             </button>
           )}
         </div>

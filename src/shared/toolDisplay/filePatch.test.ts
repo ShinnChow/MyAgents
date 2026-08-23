@@ -415,6 +415,87 @@ describe('filePatch render model', () => {
     expect(model?.changes[0]?.rows.every((row) => row.oldLine === undefined && row.newLine === undefined)).toBe(true);
   });
 
+  it('renders MultiEdit result structuredPatch as one authoritative unified diff', () => {
+    const model = resolveFilePatchRenderModel({
+      name: 'MultiEdit',
+      input: {
+        file_path: '/tmp/multi.ts',
+        edits: [
+          { old_string: 'a', new_string: 'b' },
+          { old_string: 'c', new_string: 'd' },
+        ],
+      },
+      result: JSON.stringify({
+        filePath: '/tmp/multi.ts',
+        originalFile: 'a\nc\n',
+        structuredPatch: [
+          { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-a', '+b'] },
+          { oldStart: 2, oldLines: 1, newStart: 2, newLines: 1, lines: ['-c', '+d'] },
+        ],
+      }),
+    });
+
+    expect(model).toMatchObject({
+      source: 'builtin',
+      summary: { files: 1, added: 2, removed: 2 },
+      changes: [{ path: '/tmp/multi.ts', kind: 'update', lineNumbers: 'exact', added: 2, removed: 2 }],
+    });
+  });
+
+  it('renders input-only MultiEdit edits as per-edit old/new changes on one file', () => {
+    const model = resolveFilePatchRenderModel({
+      name: 'MultiEdit',
+      input: {
+        file_path: '/tmp/multi.ts',
+        edits: [
+          { old_string: 'foo', new_string: 'bar' },
+          { old_string: 'baz', new_string: 'qux' },
+        ],
+      },
+    });
+
+    expect(model).toMatchObject({
+      source: 'builtin',
+      summary: { files: 1, added: 2, removed: 2 },
+    });
+    expect(model?.changes).toHaveLength(2);
+    expect(model?.changes[0]).toMatchObject({ kind: 'update', path: '/tmp/multi.ts', viewKind: 'old-new', lineNumbers: 'unavailable' });
+    expect(model?.changes[1]).toMatchObject({ kind: 'update', path: '/tmp/multi.ts', viewKind: 'old-new', lineNumbers: 'unavailable' });
+  });
+
+  it('bounds MultiEdit input projection to the file budget without unbounded growth', () => {
+    const edits = Array.from({ length: FILE_PATCH_MAX_FILE_BUDGET + 20 }, (_, i) => ({
+      old_string: `a${i}`,
+      new_string: `b${i}`,
+    }));
+    const model = resolveFilePatchRenderModel({
+      name: 'MultiEdit',
+      input: { file_path: '/tmp/multi.ts', edits },
+    });
+
+    expect(model?.hasHiddenContent).toBe(true);
+    expect(model?.changes).toHaveLength(FILE_PATCH_MAX_FILE_BUDGET);
+  });
+
+  it('accepts a MultiEdit result without originalFile (lenient result shape)', () => {
+    const model = resolveFilePatchRenderModel({
+      name: 'MultiEdit',
+      input: { file_path: '/tmp/multi.ts', edits: [{ old_string: 'a', new_string: 'b' }] },
+      result: JSON.stringify({
+        filePath: '/tmp/multi.ts',
+        structuredPatch: [
+          { oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-a', '+b'] },
+        ],
+      }),
+    });
+
+    expect(model).toMatchObject({
+      source: 'builtin',
+      summary: { files: 1, added: 1, removed: 1 },
+      changes: [{ path: '/tmp/multi.ts', kind: 'update', lineNumbers: 'exact' }],
+    });
+  });
+
   it('parses ordered Codex add/update/delete/move changes without reading completed text boundaries', () => {
     const changes = [
       {

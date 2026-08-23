@@ -1,12 +1,59 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  assertProductSystemSkillCandidate,
   normalizeProjectCapabilitySelection,
   parseProjectCapabilityId,
   projectCapabilityId,
 } from './projectCapabilities';
+import { TASK_ALIGNMENT_SKILL_REQUIREMENT } from './systemSkills';
+import type { EffectiveProjectCapabilitySnapshot } from './projectCapabilities';
+
+function productSnapshot(overrides: Partial<EffectiveProjectCapabilitySnapshot['enabledSkills'][number]> = {}): EffectiveProjectCapabilitySnapshot {
+  const candidate = {
+    id: 'global:skill:myagents-task-alignment',
+    kind: 'skill' as const,
+    source: 'global' as const,
+    sourceLocalId: 'myagents-task-alignment',
+    canonicalName: 'myagents-task-alignment',
+    name: 'myagents-task-alignment',
+    description: 'Task discussion',
+    path: '/skills/myagents-task-alignment/SKILL.md',
+    required: true,
+    systemOwned: true,
+    enabled: true,
+    contentSha256: TASK_ALIGNMENT_SKILL_REQUIREMENT.contentSha256,
+    ...overrides,
+  };
+  return {
+    workspacePath: '/workspace',
+    agentId: 'agent',
+    revision: 'capability-revision',
+    integrityRevision: 'inventory-revision',
+    integrityIssues: [],
+    candidates: [candidate],
+    enabledSkills: [candidate],
+    enabledCommands: [],
+  };
+}
 
 describe('project capability selection contract', () => {
+  it('admits only the exact app-owned Task alignment winner', () => {
+    expect(assertProductSystemSkillCandidate(
+      productSnapshot(),
+      TASK_ALIGNMENT_SKILL_REQUIREMENT,
+    ).source).toBe('global');
+
+    expect(() => assertProductSystemSkillCandidate(
+      productSnapshot({ source: 'project', systemOwned: false }),
+      TASK_ALIGNMENT_SKILL_REQUIREMENT,
+    )).toThrow('not the app-owned global winner');
+    expect(() => assertProductSystemSkillCandidate(
+      productSnapshot({ contentSha256: 'tampered' }),
+      TASK_ALIGNMENT_SKILL_REQUIREMENT,
+    )).toThrow('does not match the app bundle');
+  });
+
   it('defaults to enabled by normalizing an absent override to empty disabled lists', () => {
     expect(normalizeProjectCapabilitySelection(undefined)).toEqual({
       version: 1,

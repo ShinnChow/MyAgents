@@ -57,6 +57,7 @@ import {
   type OfficialToolSettings,
 } from '../../shared/official-tools';
 import { applyMcpServerConfigAdditions } from '../../shared/mcpConfig';
+import { isReservedBuiltinBrowserMcpId } from '../../shared/browserTools';
 import {
   coerceModelForRuntime,
   getDefaultRuntimePermissionMode,
@@ -489,9 +490,10 @@ function getPresetMcpServers(): McpServerDefinition[] {
 export function getAllMcpServers(config?: AdminAppConfig): McpServerDefinition[] {
   const c = config ?? loadConfig();
   const presets = getPresetMcpServers();
-  const custom = c.mcpServers ?? [];
+  const custom = (c.mcpServers ?? []).filter(server => !isReservedBuiltinBrowserMcpId(server.id));
 
-  // Custom servers can override presets with same ID
+  // Custom servers can override ordinary presets, but not the two exact
+  // product-owned Browser identities.
   const customIds = new Set(custom.map(s => s.id));
   const merged = [
     ...presets.filter(p => !customIds.has(p.id)),
@@ -1592,6 +1594,11 @@ export function resolveWorkspaceConfig(
       mcpServers = getEffectiveMcpServers(agentDir);
     }
   }
+  console.log(
+    includeMcp
+      ? `[config] mcpResolution=resolved mcpCount=${mcpServers.length}`
+      : '[config] mcpResolution=skipped',
+  );
 
   // --- Resolve MyAgents official CLI tools ---
   const globalOfficialTools = new Set(getGloballyEnabledOfficialToolIds(config));

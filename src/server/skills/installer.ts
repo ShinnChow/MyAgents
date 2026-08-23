@@ -7,17 +7,26 @@
  *   - Apply subPath / skillName hints from the resolver
  *   - Produce a preview (for ambiguous installs) OR a concrete plan (for unambiguous ones)
  *
- * Does NOT write to disk — caller is responsible for using the existing
- * zip-slip-protected write path in `/api/skill/upload`.
+ * Publishing is staged beside the managed skills root, then serialized under
+ * the shared cross-process file lock so readers never observe half-written
+ * skill directories.
  */
 
-import { writeFileSync } from 'fs';
-import { dirname, join, resolve, sep } from 'path';
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
+import { basename, dirname, join, resolve, sep } from 'path';
 import { load as yamlLoad, FAILSAFE_SCHEMA } from 'js-yaml';
 import { parseFullSkillContent } from '../../shared/slashCommands';
 import type { ExtractedTree } from './tarball-fetcher';
 import type { ResolvedSkillSource } from './url-resolver';
 import { ensureDirSync } from '../utils/fs-utils';
+import { FileBusyError, withFileLock } from '../utils/file-lock';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -127,20 +136,34 @@ export function buildInstallPayload(
 ): Map<string, Map<string, Buffer>> {
   const result = new Map<string, Map<string, Buffer>>();
   for (const cand of candidates) {
-    const prefix = cand.rootPath === '' ? '' : `${cand.rootPath.replace(/\/+$/, '')}/`;
-    const folderFiles = new Map<string, Buffer>();
-    for (const [path, buf] of tree.files) {
-      if (prefix === '' || path.startsWith(prefix)) {
-        const rel = prefix === '' ? path : path.slice(prefix.length);
-        if (!rel) continue;
-        folderFiles.set(rel, buf);
-      }
-    }
+    const folderFiles = buildInstallPayloadForCandidate(tree, cand);
     if (folderFiles.size > 0) {
       result.set(cand.suggestedFolderName, folderFiles);
     }
   }
   return result;
+}
+
+/** Candidate-keyed form avoids collisions when two roots share one suggested name. */
+export function buildInstallPayloadForCandidate(
+  tree: ExtractedTree,
+  cand: SkillCandidate,
+): Map<string, Buffer> {
+  const prefix = cand.rootPath === '' ? '' : `${cand.rootPath.replace(/\/+$/, '')}/`;
+  const folderFiles = new Map<string, Buffer>();
+  for (const [path, buf] of tree.files) {
+    if (prefix !== '' && !path.startsWith(prefix)) continue;
+    const rel = prefix === '' ? path : path.slice(prefix.length);
+    if (!rel) continue;
+    // Runtime inventory intentionally requires the convention-reserved exact
+    // filename. Accept common case variants at import time, then canonicalize.
+    const installedRel = /^skill\.md$/i.test(rel) ? 'SKILL.md' : rel;
+    if (folderFiles.has(installedRel)) {
+      throw new SkillInstallError(`Skill 包含大小写冲突的重复路径：${installedRel}`, 422);
+    }
+    folderFiles.set(installedRel, buf);
+  }
+  return folderFiles;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,16 +338,214 @@ function tryParseMarketplace(tree: ExtractedTree): InstallAnalysis | null {
  * before calling, or passing a fresh path).
  */
 export function writeSkillFiles(skillDir: string, files: Map<string, Buffer>): void {
-  ensureDirSync(skillDir);
+  const resolvedSkillDir = resolve(skillDir);
+  ensureDirSync(resolvedSkillDir);
   for (const [rel, data] of files) {
-    const fullPath = resolve(join(skillDir, rel));
+    const fullPath = resolve(join(resolvedSkillDir, rel));
     // Zip-slip: resolved path MUST stay within skillDir
-    if (!fullPath.startsWith(skillDir + sep) && fullPath !== skillDir) {
-      console.warn(`[writeSkillFiles] Blocked zip-slip path: ${rel}`);
-      continue;
+    if (!fullPath.startsWith(resolvedSkillDir + sep) && fullPath !== resolvedSkillDir) {
+      throw new SkillInstallError(`Skill 包含非法写入路径：${rel}`, 422);
     }
     const dir = dirname(fullPath);
     ensureDirSync(dir);
     writeFileSync(fullPath, data);
+  }
+}
+
+export class SkillInstallError extends Error {
+  readonly statusCode: number;
+
+  constructor(message: string, statusCode = 500) {
+    super(message);
+    this.name = 'SkillInstallError';
+    this.statusCode = statusCode;
+  }
+}
+
+export interface SkillPublishTarget {
+  folderName: string;
+  files: Map<string, Buffer>;
+  name: string;
+  description: string;
+  overwrite: boolean;
+}
+
+export interface PublishedSkill {
+  folderName: string;
+  path: string;
+  name: string;
+  description: string;
+}
+
+/** Existence check that treats dangling symlinks as occupied targets. */
+export function pathEntryExistsNoFollow(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/** Portable collision identity for managed Skill folder names. */
+export function skillTargetCollisionKey(folderName: string): string {
+  return folderName.normalize('NFC').toLocaleLowerCase('en-US');
+}
+
+function assertManagedSkillsRoot(baseDirInput: string): string {
+  const baseDir = resolve(baseDirInput);
+  ensureDirSync(dirname(baseDir));
+  if (!pathEntryExistsNoFollow(baseDir)) {
+    mkdirSync(baseDir, { recursive: true });
+  }
+
+  const stat = lstatSync(baseDir);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new SkillInstallError(`Skill 安装根目录不是普通物理目录：${baseDir}`, 400);
+  }
+  return baseDir;
+}
+
+function assertTargetFolderName(folderName: string): void {
+  if (
+    !folderName
+    || folderName === '.'
+    || folderName === '..'
+    || basename(folderName) !== folderName
+    || folderName.includes('/')
+    || folderName.includes('\\')
+  ) {
+    throw new SkillInstallError(`非法 Skill 目录名：${folderName}`, 400);
+  }
+}
+
+/**
+ * Stage every managed Skill as a complete physical directory and publish each
+ * with a same-filesystem rename. Conflict decisions are repeated while holding
+ * the install lock; overwritten directories are retained as backups until the
+ * complete batch succeeds and are restored on any publish failure.
+ */
+export async function publishSkillInstallPlan(
+  baseDirInput: string,
+  targets: SkillPublishTarget[],
+): Promise<PublishedSkill[]> {
+  if (targets.length === 0) {
+    throw new SkillInstallError('没有任何 Skill 可安装', 400);
+  }
+
+  const baseDir = assertManagedSkillsRoot(baseDirInput);
+  const seen = new Set<string>();
+  for (const target of targets) {
+    assertTargetFolderName(target.folderName);
+    const collisionKey = skillTargetCollisionKey(target.folderName);
+    if (seen.has(collisionKey)) {
+      throw new SkillInstallError(`多个 Skill 解析到同一个文件夹名“${target.folderName}”`, 409);
+    }
+    seen.add(collisionKey);
+    if (target.files.size === 0) {
+      throw new SkillInstallError(`Skill“${target.folderName}”没有可安装文件`, 422);
+    }
+  }
+
+  // A sibling staging directory guarantees rename() stays on one filesystem.
+  const stagingRoot = mkdtempSync(`${baseDir}.install-staging-`);
+  const payloadRoot = join(stagingRoot, 'payload');
+  const backupRoot = join(stagingRoot, 'backup');
+  mkdirSync(payloadRoot);
+  mkdirSync(backupRoot);
+  let preserveForRecovery = false;
+
+  try {
+    targets.forEach((target, index) => {
+      const stagedDir = join(payloadRoot, String(index));
+      writeSkillFiles(stagedDir, target.files);
+      let manifestStat;
+      try {
+        manifestStat = lstatSync(join(stagedDir, 'SKILL.md'));
+      } catch {
+        throw new SkillInstallError(`Skill“${target.folderName}”缺少 SKILL.md`, 422);
+      }
+      if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) {
+        throw new SkillInstallError(`Skill“${target.folderName}”的 SKILL.md 不是普通文件`, 422);
+      }
+    });
+
+    try {
+      return await withFileLock(
+        { lockPath: `${baseDir}.install.lock`, timeoutMs: 10_000 },
+        async () => {
+          // Recheck every conflict under the authority lock before moving any
+          // existing target or publishing any staged directory.
+          for (const target of targets) {
+            const targetPath = join(baseDir, target.folderName);
+            if (pathEntryExistsNoFollow(targetPath) && !target.overwrite) {
+              throw new SkillInstallError(`技能“${target.folderName}”已存在`, 409);
+            }
+          }
+
+          const backups: Array<{ targetPath: string; backupPath: string }> = [];
+          const published: string[] = [];
+          try {
+            targets.forEach((target, index) => {
+              const targetPath = join(baseDir, target.folderName);
+              if (pathEntryExistsNoFollow(targetPath)) {
+                const backupPath = join(backupRoot, String(index));
+                renameSync(targetPath, backupPath);
+                backups.push({ targetPath, backupPath });
+              }
+
+              renameSync(join(payloadRoot, String(index)), targetPath);
+              published.push(targetPath);
+            });
+          } catch (publishError) {
+            const recoveryErrors: string[] = [];
+            for (const targetPath of published.reverse()) {
+              try {
+                rmSync(targetPath, { recursive: true, force: true });
+              } catch (error) {
+                recoveryErrors.push(`移除新目录 ${targetPath} 失败：${(error as Error).message}`);
+              }
+            }
+            for (const { targetPath, backupPath } of backups.reverse()) {
+              try {
+                if (pathEntryExistsNoFollow(targetPath)) {
+                  rmSync(targetPath, { recursive: true, force: true });
+                }
+                renameSync(backupPath, targetPath);
+              } catch (error) {
+                recoveryErrors.push(`恢复旧目录 ${targetPath} 失败：${(error as Error).message}`);
+              }
+            }
+
+            if (recoveryErrors.length > 0) {
+              preserveForRecovery = true;
+              throw new SkillInstallError(
+                `Skill 发布失败且回滚不完整；恢复数据保留在 ${stagingRoot}。`
+                + `原始错误：${(publishError as Error).message}；${recoveryErrors.join('；')}`,
+                500,
+              );
+            }
+            throw publishError;
+          }
+
+          return targets.map(target => ({
+            folderName: target.folderName,
+            path: join(baseDir, target.folderName),
+            name: target.name,
+            description: target.description,
+          }));
+        },
+      );
+    } catch (error) {
+      if (error instanceof FileBusyError) {
+        throw new SkillInstallError('Skill 安装目录正被另一个操作占用，请稍后重试', 409);
+      }
+      throw error;
+    }
+  } finally {
+    if (!preserveForRecovery) {
+      rmSync(stagingRoot, { recursive: true, force: true });
+    }
   }
 }

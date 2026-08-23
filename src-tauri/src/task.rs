@@ -2,12 +2,10 @@
 //!
 //! Tasks are workspace-scoped execution units. The primary index lives in
 //! `~/.myagents/tasks.jsonl` (one task per line, atomic full-rewrite on change).
-//! Associated markdown documents live under `~/.myagents/tasks/<taskId>/{task.md,
-//! verify.md, progress.md, alignment.md}` (moved out of the workspace in
-//! v0.1.69 — see `task_docs_dir` doc for the rationale). This module
-//! manages `task.md` and `progress.md` but treats `verify.md` /
-//! `alignment.md` as externally managed (written by `/task-alignment` skill
-//! + Agent).
+//! Associated markdown documents live under `~/.myagents/tasks/<taskId>/`.
+//! `task.md` is the complete execution context. Older verify.md/progress.md/
+//! alignment.md files remain readable; a non-empty legacy verify.md is lazily
+//! appended to task.md before detail, edit, or dispatch.
 //!
 //! See PRD `specs/prd/prd_0.1.69_task_center.md`:
 //! - §3.2 — schema
@@ -17,11 +15,11 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -121,10 +119,32 @@ pub enum TaskStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TaskExecutionTrigger {
     Scheduled,
     Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskLastExecution {
+    pub at: i64,
+    pub trigger: TaskExecutionTrigger,
+    pub success: bool,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TaskExecutionSettlement {
+    pub success: bool,
+    pub duration_ms: u64,
+    pub session_id: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -543,6 +563,14 @@ pub struct Task {
     pub last_scheduled_at: Option<i64>,
     #[serde(default)]
     pub execution_count: u32,
+    /// Consecutive failed scheduled AI turns. Manual run-now is observational
+    /// and does not change this counter. A successful scheduled turn resets it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub consecutive_execution_failures: u32,
+    /// Authoritative summary used by Task Center. `cron_runs` remains an audit
+    /// projection and must not be stitched back into current Task state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_execution: Option<TaskLastExecution>,
     /// Durable receipt for the most recently admitted command-trigger event.
     /// It closes the cross-file crash window between Task outcome accounting
     /// and clearing the Trigger outbox. Startup may safely settle a matching
@@ -566,6 +594,10 @@ impl Task {
     pub fn effective_trigger(&self) -> TaskTrigger {
         self.trigger.clone().unwrap_or_default()
     }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 pub(crate) fn task_bound_session_ids(task: &Task) -> Vec<String> {
@@ -626,15 +658,298 @@ pub struct TaskDocs {
     pub dir: String,
     /// task.md — always created at task creation; always surfaced.
     pub task_md: String,
-    /// verify.md — present when the AI or user has written verification rules.
+    /// Legacy verify.md — preserved after its content is merged into task.md.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_md: Option<String>,
-    /// progress.md — present when the AI has started recording execution progress.
+    /// Legacy progress.md — preserved for compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress_md: Option<String>,
-    /// alignment.md — present when the task was created via /task-alignment.
+    /// Legacy alignment.md — preserved for compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alignment_md: Option<String>,
+}
+
+pub const TASK_COMMENT_BODY_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskCommentAuthor {
+    User {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    Agent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCommentAdmissionState {
+    PendingSession,
+    Sending,
+    Accepted,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCommentAdmission {
+    pub state: TaskCommentAdmissionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskComment {
+    pub id: String,
+    pub task_id: String,
+    pub body: String,
+    pub author: TaskCommentAuthor,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_comment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<TaskCommentAdmission>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCommentPage {
+    pub items: Vec<TaskComment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_parents: Vec<TaskCommentReplySummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCommentReplySummary {
+    pub comment_id: String,
+    pub author: TaskCommentAuthor,
+    pub created_at: i64,
+    pub quote: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskCommentContextPage {
+    pub items: Vec<TaskComment>,
+    pub target_comment_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reply_parents: Vec<TaskCommentReplySummary>,
+}
+
+/// Bounded notification locator derived from durable Agent comments. It keeps
+/// only navigation/sort metadata and a short plain-text excerpt; full comment
+/// bodies remain exclusively in comments.jsonl.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAgentCommentLocator {
+    pub notification_id: String,
+    pub task_id: String,
+    pub task_name: String,
+    pub comment_id: String,
+    pub created_at: i64,
+    pub agent_label: Option<String>,
+    pub session_id: String,
+    pub excerpt: String,
+}
+
+#[derive(Debug, Default)]
+struct TaskCommentNotificationIndex {
+    ready: bool,
+    partial_error: bool,
+    items: Vec<TaskAgentCommentLocator>,
+    pending_during_rebuild: Vec<TaskAgentCommentLocator>,
+    /// Mutations that race the asynchronous startup rebuild. `None` means the
+    /// Task was deleted; `Some(name)` is the current display name.
+    task_projections: HashMap<String, Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskCommentNotificationSource {
+    pub ready: bool,
+    pub partial_error: bool,
+    pub items: Vec<TaskAgentCommentLocator>,
+}
+
+const MAX_TASK_COMMENT_NOTIFICATION_INDEX: usize = 5_000;
+
+fn task_comment_excerpt(body: &str) -> String {
+    let normalized = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = normalized.chars();
+    let excerpt = chars.by_ref().take(180).collect::<String>();
+    if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
+fn next_task_comment_timestamp(comments: &[TaskComment]) -> i64 {
+    comments
+        .last()
+        .map(|comment| comment.created_at.saturating_add(1))
+        .unwrap_or_default()
+        .max(now_ms())
+}
+
+fn task_comment_quote(body: &str) -> String {
+    let mut points = body.trim().chars();
+    // UI reply previews are deliberately more generous than the compact
+    // delivery reminder injected into a Session.
+    let quote: String = points.by_ref().take(60).collect();
+    if points.next().is_some() {
+        format!("{quote}…")
+    } else {
+        quote
+    }
+}
+
+fn ordinary_task_for_comment<'a>(
+    tasks: &'a HashMap<String, Task>,
+    task_id: &str,
+) -> Result<&'a Task, String> {
+    let task = tasks
+        .get(task_id)
+        .filter(|task| !task.deleted)
+        .ok_or_else(|| String::from(TaskOpError::not_found(task_id)))?;
+    if is_managed_task(task) {
+        return Err(MANAGED_TASK_ERROR.to_string());
+    }
+    Ok(task)
+}
+
+fn reply_parent_summaries(
+    all_comments: &[TaskComment],
+    visible_comments: &[TaskComment],
+) -> Vec<TaskCommentReplySummary> {
+    let visible_ids = visible_comments
+        .iter()
+        .map(|comment| comment.id.as_str())
+        .collect::<HashSet<_>>();
+    let parent_ids = visible_comments
+        .iter()
+        .filter_map(|comment| comment.reply_to_comment_id.as_deref())
+        .filter(|parent_id| !visible_ids.contains(parent_id))
+        .collect::<HashSet<_>>();
+    all_comments
+        .iter()
+        .filter(|comment| parent_ids.contains(comment.id.as_str()))
+        .map(|comment| TaskCommentReplySummary {
+            comment_id: comment.id.clone(),
+            author: comment.author.clone(),
+            created_at: comment.created_at,
+            quote: task_comment_quote(&comment.body),
+        })
+        .collect()
+}
+
+fn agent_comment_locator(task: &Task, comment: &TaskComment) -> Option<TaskAgentCommentLocator> {
+    let TaskCommentAuthor::Agent { label, session_id } = &comment.author else {
+        return None;
+    };
+    Some(TaskAgentCommentLocator {
+        notification_id: format!("task-comment:{}", comment.id),
+        task_id: task.id.clone(),
+        task_name: task.name.clone(),
+        comment_id: comment.id.clone(),
+        created_at: comment.created_at,
+        agent_label: label.clone(),
+        session_id: session_id.clone(),
+        excerpt: task_comment_excerpt(&comment.body),
+    })
+}
+
+fn sort_and_bound_comment_locators(items: &mut Vec<TaskAgentCommentLocator>) {
+    items.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.notification_id.cmp(&left.notification_id))
+    });
+    items.dedup_by(|left, right| left.notification_id == right.notification_id);
+    items.truncate(MAX_TASK_COMMENT_NOTIFICATION_INDEX);
+}
+
+fn spawn_comment_notification_rebuild(
+    index_handle: Arc<StdRwLock<TaskCommentNotificationIndex>>,
+    artifacts_root: PathBuf,
+    tasks: Vec<Task>,
+) {
+    std::thread::spawn(move || {
+        let mut items = Vec::new();
+        let mut partial_error = false;
+        for task in tasks {
+            let path = artifacts_root.join(&task.id).join("comments.jsonl");
+            let file = match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    partial_error = true;
+                    continue;
+                }
+            };
+            for line in BufReader::new(file).lines() {
+                let Ok(line) = line else {
+                    partial_error = true;
+                    continue;
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<TaskComment>(&line) {
+                    Ok(comment) => {
+                        if let Some(locator) = agent_comment_locator(&task, &comment) {
+                            items.push(locator);
+                            if items.len() >= MAX_TASK_COMMENT_NOTIFICATION_INDEX * 2 {
+                                sort_and_bound_comment_locators(&mut items);
+                            }
+                        }
+                    }
+                    Err(_) => partial_error = true,
+                }
+            }
+        }
+        sort_and_bound_comment_locators(&mut items);
+        let mut index = index_handle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        items.extend(index.pending_during_rebuild.drain(..));
+        items.retain_mut(|item| match index.task_projections.get(&item.task_id) {
+            Some(Some(name)) => {
+                item.task_name.clone_from(name);
+                true
+            }
+            Some(None) => false,
+            None => true,
+        });
+        sort_and_bound_comment_locators(&mut items);
+        index.items = items;
+        index.partial_error = partial_error;
+        index.ready = true;
+    });
 }
 
 /// Build a [`TaskDocs`] for a task id by resolving `task_docs_dir()` and
@@ -793,62 +1108,6 @@ pub struct TaskCreateDirectInput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskCreateFromAlignmentInput {
-    pub name: String,
-    pub executor: TaskExecutor,
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Optional from v0.1.69 — when missing, read from the alignment dir's
-    /// `metadata.json` (written at the 「AI 讨论」 launch point). Lets the
-    /// AI caller pass just `--name` and inherit the rest from session
-    /// metadata instead of re-typing 3 long UUIDs.
-    #[serde(default)]
-    pub workspace_id: Option<String>,
-    #[serde(default)]
-    pub workspace_path: Option<String>,
-    /// Source directory `~/.myagents/tasks/<alignmentSessionId>/` — its
-    /// contents are moved (renamed) to `~/.myagents/tasks/<newTaskId>/`.
-    pub alignment_session_id: String,
-    pub execution_mode: TaskExecutionMode,
-    #[serde(default)]
-    pub run_mode: Option<TaskRunMode>,
-    #[serde(default)]
-    pub end_conditions: Option<TaskEndConditions>,
-    #[serde(default)]
-    pub trigger: Option<TaskTrigger>,
-    // ── Execution overrides (must stay in lockstep with TaskCreateDirectInput) ──
-    // Without these fields the Bun admin-api would accept `--model` /
-    // `--permissionMode` flags from the CLI, validate them, enrich the success
-    // response as if the override took effect — and then serde would silently
-    // drop the keys here, leaving the persisted Task with `None` for both.
-    // That's exactly the silent-data-loss bug the cross-review flagged.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// PRD 0.2.9 — Per-task provider id override. MUST be paired with
-    /// `model` (validated by `validate_task_provider_routing`).
-    #[serde(default)]
-    pub provider_id: Option<String>,
-    #[serde(default)]
-    pub permission_mode: Option<String>,
-    #[serde(default)]
-    pub preselected_session_id: Option<String>,
-    #[serde(default)]
-    pub runtime: Option<String>,
-    #[serde(default)]
-    pub runtime_config: Option<serde_json::Value>,
-    /// Per-task MCP enable list override (PRD 0.2.4 §需求 4).
-    #[serde(default)]
-    pub mcp_enabled_servers: Option<Vec<String>>,
-    #[serde(default)]
-    pub source_thought_id: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub notification: Option<NotificationConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub enum TaskCreateAttachedSource {
     #[serde(rename = "space-issue")]
     SpaceIssue,
@@ -880,18 +1139,27 @@ pub struct TaskCreateAttachedInput {
     pub notification: Option<NotificationConfig>,
 }
 
-/// Sidecar metadata persisted to `~/.myagents/tasks/<alignmentSessionId>/metadata.json`
-/// at the moment the 「AI 讨论」 flow creates the alignment session. Lets
-/// `create_from_alignment` inherit the workspace + thought ids without the
-/// AI caller having to re-pass them through the CLI.
+/// Trusted context persisted for a Task discussion. Discussion artifacts live
+/// outside the Task store and never create a task row by themselves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AlignmentSessionMetadata {
+pub struct TaskDiscussionMetadata {
+    pub discussion_id: String,
     pub workspace_id: String,
     pub workspace_path: String,
     #[serde(default)]
     pub source_thought_id: Option<String>,
+    #[serde(default)]
+    pub source_thought_tags: Vec<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedTaskDiscussion {
+    pub discussion_id: String,
+    pub discussion_dir: String,
+    pub candidates_dir: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -904,6 +1172,12 @@ pub struct TaskUpdateInput {
     pub executor: Option<TaskExecutor>,
     #[serde(default)]
     pub description: Option<String>,
+    /// Workspace identity is an atomic pair. A caller must update both the
+    /// stable project id and its absolute execution path in the same write.
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
     #[serde(default)]
     pub execution_mode: Option<TaskExecutionMode>,
     #[serde(default)]
@@ -1169,6 +1443,13 @@ pub struct TaskStore {
     /// `~/.myagents/tasks/` root used by `task_docs_dir`; deriving it from the
     /// store data dir keeps tests and alternate app data roots isolated.
     task_artifacts_root: PathBuf,
+    comment_notification_index: Arc<StdRwLock<TaskCommentNotificationIndex>>,
+    /// Persisted `sending` receipts become `unknown` only once per Task after
+    /// process start. Ordinary reads must never reinterpret a live admission
+    /// as a restart recovery.
+    comments_needing_recovery: Arc<StdMutex<HashSet<String>>>,
+    #[cfg(test)]
+    fail_next_acceptance_comment_persist: std::sync::atomic::AtomicBool,
 }
 
 impl TaskStore {
@@ -1201,14 +1482,147 @@ impl TaskStore {
                 ulog_info!("[task] startup recovery updates persisted");
             }
         }
+        let comments_needing_recovery = Arc::new(StdMutex::new(
+            initial.keys().cloned().collect::<HashSet<_>>(),
+        ));
+        let comment_notification_index =
+            Arc::new(StdRwLock::new(TaskCommentNotificationIndex::default()));
+        let rebuild_tasks = initial
+            .values()
+            .filter(|task| !task.deleted && !is_managed_task(task))
+            .cloned()
+            .collect::<Vec<_>>();
+        // The comment source is rebuilt away from the startup/UI thread. Until
+        // it completes, notification snapshots report the local source as
+        // loading while Cloud notifications remain usable.
+        spawn_comment_notification_rebuild(
+            comment_notification_index.clone(),
+            task_artifacts_root.clone(),
+            rebuild_tasks,
+        );
         let store = Self {
             inner: Arc::new(RwLock::new(initial)),
             jsonl_path,
             load_error,
             task_artifacts_root,
+            comment_notification_index,
+            comments_needing_recovery,
+            #[cfg(test)]
+            fail_next_acceptance_comment_persist: std::sync::atomic::AtomicBool::new(false),
         };
         store.cleanup_orphaned_trigger_state();
         store
+    }
+
+    pub fn agent_comment_notification_source(&self) -> TaskCommentNotificationSource {
+        let index = self
+            .comment_notification_index
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut items = index.items.clone();
+        items.extend(index.pending_during_rebuild.clone());
+        items.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.notification_id.cmp(&left.notification_id))
+        });
+        items.dedup_by(|left, right| left.notification_id == right.notification_id);
+        items.truncate(MAX_TASK_COMMENT_NOTIFICATION_INDEX);
+        TaskCommentNotificationSource {
+            ready: index.ready,
+            partial_error: index.partial_error,
+            items,
+        }
+    }
+
+    fn index_agent_comment(&self, locator: TaskAgentCommentLocator) {
+        let mut index = self
+            .comment_notification_index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(index.task_projections.get(&locator.task_id), Some(None)) {
+            return;
+        }
+        if !index.ready {
+            index.pending_during_rebuild.push(locator);
+            if index.pending_during_rebuild.len() >= MAX_TASK_COMMENT_NOTIFICATION_INDEX * 2 {
+                sort_and_bound_comment_locators(&mut index.pending_during_rebuild);
+            }
+            return;
+        }
+        index
+            .items
+            .retain(|item| item.notification_id != locator.notification_id);
+        index.items.push(locator);
+        sort_and_bound_comment_locators(&mut index.items);
+    }
+
+    /// Retry a startup index scan that completed partially. Notification
+    /// refreshes call this opportunistically, so transient file errors recover
+    /// without adding another polling owner or blocking the UI thread.
+    pub async fn retry_comment_notification_index_if_partial(&self) {
+        let should_retry = {
+            let mut index = self
+                .comment_notification_index
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !index.ready || !index.partial_error {
+                false
+            } else {
+                index.ready = false;
+                index.partial_error = false;
+                true
+            }
+        };
+        if !should_retry {
+            return;
+        }
+        let tasks = self
+            .inner
+            .read()
+            .await
+            .values()
+            .filter(|task| !task.deleted && !is_managed_task(task))
+            .cloned()
+            .collect::<Vec<_>>();
+        spawn_comment_notification_rebuild(
+            self.comment_notification_index.clone(),
+            self.task_artifacts_root.clone(),
+            tasks,
+        );
+    }
+
+    fn reconcile_task_comment_notification_index(&self, task: &Task) {
+        let mut index = self
+            .comment_notification_index
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let projection = (!task.deleted && !is_managed_task(task)).then(|| task.name.clone());
+        index
+            .task_projections
+            .insert(task.id.clone(), projection.clone());
+        if let Some(name) = projection.as_ref() {
+            for item in index
+                .items
+                .iter_mut()
+                .filter(|item| item.task_id == task.id)
+            {
+                item.task_name.clone_from(name);
+            }
+            for item in index
+                .pending_during_rebuild
+                .iter_mut()
+                .filter(|item| item.task_id == task.id)
+            {
+                item.task_name.clone_from(name);
+            }
+        } else {
+            index.items.retain(|item| item.task_id != task.id);
+            index
+                .pending_during_rebuild
+                .retain(|item| item.task_id != task.id);
+        }
     }
 
     /// A deleted or non-command Task cannot own Trigger runtime state. The Task
@@ -1262,6 +1676,446 @@ impl TaskStore {
             return Err("trigger state path escaped Task artifact root".to_string());
         }
         Ok(resolved)
+    }
+
+    fn comments_path(&self, task_id: &str) -> Result<PathBuf, String> {
+        validate_safe_id(task_id, "taskId")?;
+        let resolved = self
+            .task_artifacts_root
+            .join(task_id)
+            .join("comments.jsonl");
+        if !resolved.starts_with(&self.task_artifacts_root) {
+            return Err("comments path escaped Task artifact root".to_string());
+        }
+        Ok(resolved)
+    }
+
+    fn load_comments_file(
+        path: &Path,
+        recover_interrupted_sending: bool,
+    ) -> Result<(Vec<TaskComment>, bool), String> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), false));
+            }
+            Err(error) => return Err(format!("open comments: {error}")),
+        };
+        let mut comments = Vec::new();
+        let mut normalized = false;
+        for (index, line) in BufReader::new(file).lines().enumerate() {
+            let line =
+                line.map_err(|error| format!("read comments line {}: {error}", index + 1))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut comment: TaskComment = serde_json::from_str(&line)
+                .map_err(|error| format!("parse comments line {}: {error}", index + 1))?;
+            if recover_interrupted_sending
+                && comment
+                    .admission
+                    .as_ref()
+                    .is_some_and(|value| value.state == TaskCommentAdmissionState::Sending)
+            {
+                if let Some(admission) = comment.admission.as_mut() {
+                    admission.state = TaskCommentAdmissionState::Unknown;
+                    admission.error = Some(
+                        "Delivery may have been accepted before the app restarted; retry explicitly if needed"
+                            .to_string(),
+                    );
+                }
+                normalized = true;
+            }
+            comments.push(comment);
+        }
+        comments.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok((comments, normalized))
+    }
+
+    fn load_task_comments(&self, task_id: &str, path: &Path) -> Result<Vec<TaskComment>, String> {
+        let recover = {
+            let mut pending = self
+                .comments_needing_recovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.remove(task_id)
+        };
+        let loaded = Self::load_comments_file(path, recover);
+        let (comments, normalized) = match loaded {
+            Ok(value) => value,
+            Err(error) => {
+                if recover {
+                    self.comments_needing_recovery
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(task_id.to_string());
+                }
+                return Err(error);
+            }
+        };
+        if normalized {
+            if let Err(error) = Self::persist_comments_file(path, &comments) {
+                self.comments_needing_recovery
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(task_id.to_string());
+                return Err(error);
+            }
+        }
+        Ok(comments)
+    }
+
+    fn persist_comments_file(path: &Path, comments: &[TaskComment]) -> Result<(), String> {
+        let mut content = String::new();
+        for comment in comments {
+            let line = serde_json::to_string(comment)
+                .map_err(|error| format!("serialize task comment: {error}"))?;
+            content.push_str(&line);
+            content.push('\n');
+        }
+        write_atomic_text(path, &content).map_err(|error| format!("persist comments: {error}"))
+    }
+
+    fn validate_comment_body(body: &str) -> Result<String, String> {
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return Err("comment body is empty".to_string());
+        }
+        if body.len() > TASK_COMMENT_BODY_MAX_BYTES {
+            return Err(format!(
+                "comment body exceeds {} byte limit",
+                TASK_COMMENT_BODY_MAX_BYTES
+            ));
+        }
+        Ok(body)
+    }
+
+    pub async fn list_comments(
+        &self,
+        task_id: &str,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<TaskCommentPage, String> {
+        let limit = limit.clamp(1, 100);
+        let guard = self.inner.write().await;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
+        let path = self.comments_path(&task.id)?;
+        let comments = self.load_task_comments(task_id, &path)?;
+        let end = match before {
+            Some(cursor) => comments
+                .iter()
+                .position(|comment| comment.id == cursor)
+                .ok_or_else(|| format!("comment cursor not found: {cursor}"))?,
+            None => comments.len(),
+        };
+        let start = end.saturating_sub(limit);
+        let items = comments[start..end].to_vec();
+        let next_before = (start > 0).then(|| items[0].id.clone());
+        let reply_parents = reply_parent_summaries(&comments, &items);
+        Ok(TaskCommentPage {
+            items,
+            next_before,
+            next_after: None,
+            reply_parents,
+        })
+    }
+
+    pub async fn list_comments_after(
+        &self,
+        task_id: &str,
+        after: &str,
+        limit: usize,
+    ) -> Result<TaskCommentPage, String> {
+        let limit = limit.clamp(1, 100);
+        let guard = self.inner.write().await;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
+        let path = self.comments_path(&task.id)?;
+        let comments = self.load_task_comments(task_id, &path)?;
+        let start = comments
+            .iter()
+            .position(|comment| comment.id == after)
+            .ok_or_else(|| format!("comment cursor not found: {after}"))?
+            .saturating_add(1);
+        let end = start.saturating_add(limit).min(comments.len());
+        let items = comments[start..end].to_vec();
+        let next_after = (end < comments.len())
+            .then(|| items.last().map(|item| item.id.clone()))
+            .flatten();
+        let reply_parents = reply_parent_summaries(&comments, &items);
+        Ok(TaskCommentPage {
+            items,
+            next_before: None,
+            next_after,
+            reply_parents,
+        })
+    }
+
+    pub async fn comment_context(
+        &self,
+        task_id: &str,
+        comment_id: &str,
+        radius: usize,
+    ) -> Result<TaskCommentContextPage, String> {
+        let guard = self.inner.write().await;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
+        let path = self.comments_path(&task.id)?;
+        let comments = self.load_task_comments(task_id, &path)?;
+        let target = comments
+            .iter()
+            .position(|comment| comment.id == comment_id)
+            .ok_or_else(|| format!("comment not found: {comment_id}"))?;
+        let start = target.saturating_sub(radius.clamp(1, 50));
+        let end = (target + radius.clamp(1, 50) + 1).min(comments.len());
+        let items = comments[start..end].to_vec();
+        let reply_parents = reply_parent_summaries(&comments, &items);
+        Ok(TaskCommentContextPage {
+            items,
+            target_comment_id: comment_id.to_string(),
+            previous_before: (start > 0).then(|| comments[start].id.clone()),
+            next_after: (end < comments.len()).then(|| comments[end - 1].id.clone()),
+            reply_parents,
+        })
+    }
+
+    pub async fn create_user_comment(
+        &self,
+        task_id: &str,
+        body: &str,
+        reply_to_comment_id: Option<&str>,
+    ) -> Result<TaskComment, String> {
+        self.ensure_writable()?;
+        let body = Self::validate_comment_body(body)?;
+        let guard = self.inner.write().await;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
+        let path = self.comments_path(&task.id)?;
+        let mut comments = self.load_task_comments(task_id, &path)?;
+        let target_session_id = if let Some(parent_id) = reply_to_comment_id {
+            comments
+                .iter()
+                .find(|comment| comment.id == parent_id)
+                .ok_or_else(|| format!("reply comment not found: {parent_id}"))?
+                .conversation_session_id
+                .clone()
+        } else {
+            task.session_ids
+                .iter()
+                .rev()
+                .find(|session_id| session_metadata_exists(session_id))
+                .cloned()
+                .or_else(|| {
+                    task.preselected_session_id
+                        .as_ref()
+                        .filter(|session_id| session_metadata_exists(session_id))
+                        .cloned()
+                })
+        };
+        // The persisted file is the linear timeline authority. Millisecond
+        // clocks can tie during rapid replies, so advance from the last row to
+        // preserve the user's observable order without a second sequence.
+        let now = next_task_comment_timestamp(&comments);
+        let comment = TaskComment {
+            id: Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            body,
+            author: TaskCommentAuthor::User { label: None },
+            created_at: now,
+            reply_to_comment_id: reply_to_comment_id.map(str::to_string),
+            conversation_session_id: target_session_id.clone(),
+            admission: Some(TaskCommentAdmission {
+                state: if target_session_id.is_some() {
+                    TaskCommentAdmissionState::Sending
+                } else {
+                    TaskCommentAdmissionState::PendingSession
+                },
+                target_session_id,
+                attempt_id: Some(Uuid::new_v4().to_string()),
+                accepted_at: None,
+                error: None,
+            }),
+        };
+        comments.push(comment.clone());
+        Self::persist_comments_file(&path, &comments)?;
+        drop(guard);
+        emit_task_event(
+            "task:comment-changed",
+            serde_json::json!({ "taskId": task_id, "commentId": comment.id, "event": "created" }),
+        );
+        Ok(comment)
+    }
+
+    pub async fn append_agent_comment(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        body: &str,
+        reply_to_comment_id: Option<&str>,
+    ) -> Result<TaskComment, String> {
+        self.ensure_writable()?;
+        validate_safe_id(session_id, "sessionId")?;
+        let body = Self::validate_comment_body(body)?;
+        let guard = self.inner.write().await;
+        let task = ordinary_task_for_comment(&guard, task_id)?;
+        if !task_bound_session_ids(task)
+            .iter()
+            .any(|value| value == session_id)
+        {
+            return Err(format!(
+                "session {session_id} is not associated with task {task_id}"
+            ));
+        }
+        let task_for_index = task.clone();
+        let path = self.comments_path(&task.id)?;
+        let mut comments = self.load_task_comments(task_id, &path)?;
+        if let Some(parent_id) = reply_to_comment_id {
+            if !comments.iter().any(|comment| comment.id == parent_id) {
+                return Err(format!("reply comment not found: {parent_id}"));
+            }
+        }
+        let comment = TaskComment {
+            id: Uuid::new_v4().to_string(),
+            task_id: task.id.clone(),
+            body,
+            author: TaskCommentAuthor::Agent {
+                label: None,
+                session_id: session_id.to_string(),
+            },
+            created_at: next_task_comment_timestamp(&comments),
+            reply_to_comment_id: reply_to_comment_id.map(str::to_string),
+            conversation_session_id: Some(session_id.to_string()),
+            admission: None,
+        };
+        comments.push(comment.clone());
+        Self::persist_comments_file(&path, &comments)?;
+        drop(guard);
+        if let Some(locator) = agent_comment_locator(&task_for_index, &comment) {
+            self.index_agent_comment(locator);
+        }
+        emit_task_event(
+            "task:comment-changed",
+            serde_json::json!({
+                "taskId": task_id,
+                "commentId": comment.id,
+                "event": "agent_created",
+            }),
+        );
+        Ok(comment)
+    }
+
+    pub async fn update_comment_admission(
+        &self,
+        task_id: &str,
+        comment_id: &str,
+        state: TaskCommentAdmissionState,
+        error: Option<String>,
+    ) -> Result<TaskComment, String> {
+        let guard = self.inner.write().await;
+        ordinary_task_for_comment(&guard, task_id)?;
+        let path = self.comments_path(task_id)?;
+        let mut comments = self.load_task_comments(task_id, &path)?;
+        let comment = comments
+            .iter_mut()
+            .find(|comment| comment.id == comment_id)
+            .ok_or_else(|| format!("comment not found: {comment_id}"))?;
+        let admission = comment
+            .admission
+            .as_mut()
+            .ok_or_else(|| "agent comments do not have delivery admission".to_string())?;
+        admission.state = state;
+        admission.error = error.map(|value| value.chars().take(500).collect());
+        admission.accepted_at = (state == TaskCommentAdmissionState::Accepted).then(now_ms);
+        let updated = comment.clone();
+        Self::persist_comments_file(&path, &comments)?;
+        drop(guard);
+        emit_task_event(
+            "task:comment-changed",
+            serde_json::json!({ "taskId": task_id, "commentId": comment_id, "event": "admission" }),
+        );
+        Ok(updated)
+    }
+
+    pub async fn claim_pending_comments(
+        &self,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<Vec<TaskComment>, String> {
+        let guard = self.inner.write().await;
+        ordinary_task_for_comment(&guard, task_id)?;
+        let path = self.comments_path(task_id)?;
+        let mut comments = self.load_task_comments(task_id, &path)?;
+        let mut claimed = Vec::new();
+        for comment in &mut comments {
+            let Some(admission) = comment.admission.as_mut() else {
+                continue;
+            };
+            if admission.state != TaskCommentAdmissionState::PendingSession
+                || comment.conversation_session_id.is_some()
+            {
+                continue;
+            }
+            comment.conversation_session_id = Some(session_id.to_string());
+            admission.state = TaskCommentAdmissionState::Sending;
+            admission.target_session_id = Some(session_id.to_string());
+            admission.attempt_id = Some(Uuid::new_v4().to_string());
+            admission.error = None;
+            claimed.push(comment.clone());
+        }
+        if !claimed.is_empty() {
+            Self::persist_comments_file(&path, &comments)?;
+        }
+        drop(guard);
+        if !claimed.is_empty() {
+            emit_task_event(
+                "task:comment-changed",
+                serde_json::json!({ "taskId": task_id, "event": "claimed" }),
+            );
+        }
+        Ok(claimed)
+    }
+
+    pub async fn retry_comment(
+        &self,
+        task_id: &str,
+        comment_id: &str,
+    ) -> Result<TaskComment, String> {
+        let guard = self.inner.write().await;
+        ordinary_task_for_comment(&guard, task_id)?;
+        let path = self.comments_path(task_id)?;
+        let mut comments = self.load_task_comments(task_id, &path)?;
+        let comment = comments
+            .iter_mut()
+            .find(|comment| comment.id == comment_id)
+            .ok_or_else(|| format!("comment not found: {comment_id}"))?;
+        let admission = comment
+            .admission
+            .as_mut()
+            .ok_or_else(|| "agent comments cannot be retried".to_string())?;
+        if !matches!(
+            admission.state,
+            TaskCommentAdmissionState::Failed | TaskCommentAdmissionState::Unknown
+        ) {
+            return Err("only failed or unknown comments can be retried".to_string());
+        }
+        let target = admission
+            .target_session_id
+            .clone()
+            .ok_or_else(|| "comment has no exact target Session".to_string())?;
+        comment.conversation_session_id = Some(target);
+        admission.state = TaskCommentAdmissionState::Sending;
+        admission.attempt_id = Some(Uuid::new_v4().to_string());
+        admission.accepted_at = None;
+        admission.error = None;
+        let updated = comment.clone();
+        Self::persist_comments_file(&path, &comments)?;
+        drop(guard);
+        emit_task_event(
+            "task:comment-changed",
+            serde_json::json!({ "taskId": task_id, "commentId": comment_id, "event": "retry" }),
+        );
+        Ok(updated)
     }
 
     /// Acquire every Session lifecycle that the projected Task state will
@@ -1530,8 +2384,14 @@ impl TaskStore {
         // explicit runtime (closes the "Agent runtime later flips to
         // external" cross-talk hole). Idempotent.
         pin_runtime_for_provider_id(&input.provider_id, &mut input.runtime);
-        // PRD 0.2.9 — Provider routing invariants (pairing + runtime-exclusion).
-        validate_task_provider_routing(&input.provider_id, &input.model, &input.runtime)?;
+        // Provider/runtime identity invariants are enforced by the Task owner
+        // for every ingress, not only by the Agent-facing Node preflight.
+        validate_task_execution_routing(
+            &input.provider_id,
+            &input.model,
+            &input.runtime,
+            &input.runtime_config,
+        )?;
         let managed_kind = normalize_managed_kind(input.managed_kind)?;
         // Cron expression validation at the boundary — same contract as
         // `update()`; ensures the scheduler never gets handed a malformed
@@ -1601,6 +2461,8 @@ impl TaskStore {
             last_executed_at: None,
             last_scheduled_at: None,
             execution_count: 0,
+            consecutive_execution_failures: 0,
+            last_execution: None,
             last_activation_event_id: None,
             status_history: vec![StatusTransition {
                 from: None,
@@ -1709,7 +2571,12 @@ impl TaskStore {
         }
         // PRD 0.2.9 — Same pin+validate sequence as create_direct.
         pin_runtime_for_provider_id(&input.provider_id, &mut input.runtime);
-        validate_task_provider_routing(&input.provider_id, &input.model, &input.runtime)?;
+        validate_task_execution_routing(
+            &input.provider_id,
+            &input.model,
+            &input.runtime,
+            &input.runtime_config,
+        )?;
         let managed_kind = normalize_managed_kind(input.managed_kind)?;
         if !matches!(
             initial_status,
@@ -1765,6 +2632,8 @@ impl TaskStore {
             last_executed_at: None,
             last_scheduled_at: None,
             execution_count: 0,
+            consecutive_execution_failures: 0,
+            last_execution: None,
             last_activation_event_id: None,
             status_history: vec![StatusTransition {
                 from: None,
@@ -1847,237 +2716,6 @@ impl TaskStore {
                 "actor": TransitionActor::System.as_str(),
                 "source": TransitionSource::Migration.as_str(),
                 "message": message,
-                "event": "created",
-            }),
-        );
-        Ok(t)
-    }
-
-    pub async fn create_from_alignment(
-        &self,
-        input: TaskCreateFromAlignmentInput,
-    ) -> Result<Task, String> {
-        self.create_from_alignment_with_origin(
-            input,
-            TransitionActor::Agent,
-            Some(TransitionSource::Cli),
-        )
-        .await
-    }
-
-    pub async fn create_from_alignment_with_origin(
-        &self,
-        mut input: TaskCreateFromAlignmentInput,
-        actor: TransitionActor,
-        source: Option<TransitionSource>,
-    ) -> Result<Task, String> {
-        validate_ordinary_caller_origin(actor, source)?;
-        validate_task_name(&input.name)?;
-        validate_safe_id(&input.alignment_session_id, "alignmentSessionId")?;
-        validate_new_task_session_binding(input.run_mode, input.preselected_session_id.as_deref())?;
-        if let Some(trigger) = input.trigger.as_ref() {
-            validate_task_trigger(trigger)?;
-        }
-        // PRD 0.2.9 — Same pin+validate sequence as create_direct.
-        pin_runtime_for_provider_id(&input.provider_id, &mut input.runtime);
-        validate_task_provider_routing(&input.provider_id, &input.model, &input.runtime)?;
-        // The AI-discussion path (想法 → /task-alignment → create-from-alignment)
-        // does not surface schedule fields in its input contract, yet the
-        // `executionMode` is passed through unchanged. If we accept recurring /
-        // scheduled / loop here we persist a Task with `interval_minutes=None`,
-        // `cron_expression=None`, `dispatch_at=None` — a subsequent `task run`
-        // fails with "no resolvable schedule" and the user cannot fix it from
-        // the CLI (no --cron flag on this subcommand). Gate at the boundary so
-        // the error surfaces at creation time with actionable guidance.
-        if !matches!(input.execution_mode, TaskExecutionMode::Once) {
-            return Err(format!(
-                "create-from-alignment only supports executionMode=once; \
-                 to set a schedule, create the task and then `myagents task update <id> \
-                 --cronExpression <expr>` or use `create-direct` (got {:?})",
-                input.execution_mode
-            ));
-        }
-
-        let src = task_docs_dir(&input.alignment_session_id)?;
-        if !src.exists() {
-            return Err(format!("alignment dir not found: {}", src.display()));
-        }
-
-        // Resolve workspace_id / workspace_path: explicit args win; if missing,
-        // try to read `<alignment_dir>/metadata.json` (written at 「AI 讨论」
-        // launch time). Falling back to the sidecar file means AI callers can
-        // just pass `--name` — no need to re-type UUIDs already baked in at
-        // session creation.
-        // Distinguish "file missing" from "file corrupt":
-        // - missing → fallback to explicit args (the documented happy path)
-        // - corrupt → log and fall back, so post-mortem log search reveals
-        //   the real cause instead of the misleading "workspaceId missing"
-        //   error that would otherwise surface below.
-        let meta_path = src.join("metadata.json");
-        let metadata: Option<AlignmentSessionMetadata> = match fs::read_to_string(&meta_path) {
-            Ok(s) => match serde_json::from_str::<AlignmentSessionMetadata>(&s) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    ulog_warn!(
-                        "[task] alignment metadata.json parse failed at {}: {} — falling back to explicit args",
-                        meta_path.display(),
-                        e,
-                    );
-                    None
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                ulog_warn!(
-                    "[task] alignment metadata.json read failed at {}: {} — falling back to explicit args",
-                    meta_path.display(),
-                    e,
-                );
-                None
-            }
-        };
-
-        let workspace_id = input
-            .workspace_id
-            .clone()
-            .or_else(|| metadata.as_ref().map(|m| m.workspace_id.clone()))
-            .ok_or_else(|| {
-                "workspaceId missing — pass --workspaceId or ensure alignment metadata.json exists"
-                    .to_string()
-            })?;
-        let raw_workspace_path = input
-            .workspace_path
-            .clone()
-            .or_else(|| metadata.as_ref().map(|m| m.workspace_path.clone()))
-            .ok_or_else(|| {
-                "workspacePath missing — pass --workspacePath or ensure alignment metadata.json exists"
-                    .to_string()
-            })?;
-        let workspace_path = canonicalize_workspace_path(&raw_workspace_path)?;
-        let source_thought_id = input
-            .source_thought_id
-            .clone()
-            .or_else(|| metadata.as_ref().and_then(|m| m.source_thought_id.clone()));
-
-        let now = now_ms();
-        let id = Uuid::new_v4().to_string();
-        let dst = task_docs_dir(&id)?;
-        let bound_session_id = if input.run_mode == Some(TaskRunMode::SingleSession) {
-            input.preselected_session_id.clone()
-        } else {
-            None
-        };
-        let bound_session_refs = bound_session_id
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let session_lifecycle =
-            crate::sidecar::acquire_session_lifecycle(&bound_session_refs).await;
-        if let Some(session_id) = bound_session_id.as_deref() {
-            if !session_metadata_exists(session_id) {
-                return Err(format!(
-                    "preselectedSessionId does not reference an existing Session: {}",
-                    session_id
-                ));
-            }
-        }
-
-        let t = Task {
-            id: id.clone(),
-            name: input.name,
-            executor: input.executor,
-            description: input.description,
-            workspace_id,
-            workspace_path: workspace_path.clone(),
-            execution_mode: input.execution_mode,
-            run_mode: input.run_mode,
-            end_conditions: input.end_conditions,
-            interval_minutes: None,
-            cron_expression: None,
-            cron_timezone: None,
-            start_at: None,
-            recurring_window: None,
-            dispatch_at: None,
-            trigger: input.trigger,
-            // Per-task overrides — surface the CLI-provided values so the
-            // execution path in Bun (`/cron/execute-sync` via T15 snapshot
-            // resolution) actually picks them up. Prior to v0.1.69's
-            // cross-review fixes these were hardcoded `None` which silently
-            // dropped every `--model` / `--permissionMode` flag passed to
-            // `task create-from-alignment`.
-            model: input.model,
-            provider_id: input.provider_id,
-            permission_mode: input.permission_mode,
-            preselected_session_id: input.preselected_session_id,
-            runtime: input.runtime,
-            runtime_config: input.runtime_config,
-            mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
-            managed_kind: None,
-            source_thought_id,
-            session_ids: Vec::new(),
-            status: TaskStatus::Todo,
-            tags: input.tags,
-            created_at: now,
-            updated_at: now,
-            last_executed_at: None,
-            last_scheduled_at: None,
-            execution_count: 0,
-            last_activation_event_id: None,
-            status_history: vec![StatusTransition {
-                from: None,
-                to: TaskStatus::Todo,
-                at: now,
-                actor,
-                message: Some("created (ai-aligned)".to_string()),
-                source,
-            }],
-            notification: input.notification,
-            dispatch_origin: TaskDispatchOrigin::AiAligned,
-            external_source: None,
-            deleted: false,
-            deleted_at: None,
-        };
-
-        // Transactional order (PRD design):
-        // 1. Persist the row to jsonl FIRST. If this fails, the alignment dir is
-        //    untouched — retry is safe.
-        // 2. Move the alignment dir to `~/.myagents/tasks/<newId>/`. If this fails, we unwind
-        //    the row from jsonl so the store stays consistent.
-        // 3. Swap in-memory state only after both succeed.
-        self.ensure_writable()?;
-        let mut inner = self.inner.write().await;
-        let mut next = inner.clone();
-        next.insert(id.clone(), t.clone());
-        Self::persist_locked(&self.jsonl_path, &next)?;
-
-        if let Err(e) = move_alignment_dir(&src, &dst) {
-            // Roll back jsonl — remove the task row we just persisted.
-            next.remove(&id);
-            if let Err(persist_err) = Self::persist_locked(&self.jsonl_path, &next) {
-                ulog_warn!(
-                    "[task] create_from_alignment rollback failed: {} (original error: {})",
-                    persist_err,
-                    e
-                );
-            }
-            return Err(format!("move alignment dir: {}", e));
-        }
-
-        *inner = next;
-        drop(inner);
-        drop(session_lifecycle);
-        ulog_info!("[task] created ai-aligned id={} name={}", id, t.name);
-
-        emit_task_event(
-            "task:status-changed",
-            serde_json::json!({
-                "taskId": t.id,
-                "from": serde_json::Value::Null,
-                "to": TaskStatus::Todo.as_str(),
-                "at": t.created_at,
-                "actor": TransitionActor::Agent.as_str(),
-                "source": TransitionSource::Cli.as_str(),
-                "message": "created (ai-aligned)",
                 "event": "created",
             }),
         );
@@ -2173,6 +2811,8 @@ impl TaskStore {
             last_executed_at: Some(now),
             last_scheduled_at: None,
             execution_count: 0,
+            consecutive_execution_failures: 0,
+            last_execution: None,
             last_activation_event_id: None,
             status_history: vec![created_transition, attached_transition],
             notification: input.notification,
@@ -2274,6 +2914,43 @@ impl TaskStore {
             return Err(MANAGED_TASK_ERROR.to_string());
         }
         Ok(task)
+    }
+
+    /// Merge a legacy verify.md into an ordinary Task's task.md using the
+    /// deliberately simple compatibility shape. System-managed jobs own their
+    /// generated task.md, so this compatibility helper is a no-op for them.
+    /// The legacy file remains untouched and the exact heading makes repeated
+    /// calls idempotent.
+    pub async fn ensure_legacy_verify_merged(&self, id: &str) -> Result<(), String> {
+        self.ensure_writable()?;
+        let inner = self.inner.write().await;
+        let task = inner
+            .get(id)
+            .ok_or_else(|| String::from(TaskOpError::not_found(id)))?;
+        if is_managed_task(task) {
+            return Ok(());
+        }
+        let dir = task_docs_dir(&task.id)?;
+        let verify = match fs::read_to_string(dir.join("verify.md")) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("read verify.md: {error}")),
+        };
+        let verify = verify.trim();
+        if verify.is_empty() {
+            return Ok(());
+        }
+        let task_path = dir.join("task.md");
+        let task_markdown =
+            fs::read_to_string(&task_path).map_err(|error| format!("read task.md: {error}"))?;
+        if task_markdown
+            .lines()
+            .any(|line| line.trim() == "# verify.md")
+        {
+            return Ok(());
+        }
+        let merged = format!("{}\n\n# verify.md\n\n{}", task_markdown.trim_end(), verify,);
+        write_atomic_text(&task_path, &merged)
     }
 
     /// Check-and-write `~/.myagents/tasks/<id>/<filename>` atomically with respect to
@@ -2381,7 +3058,7 @@ impl TaskStore {
         self.update_with_task_control_and_session_probe(
             input,
             task_control,
-            session_metadata_exists,
+            session_metadata_matches_workspace,
         )
         .await
     }
@@ -2390,11 +3067,25 @@ impl TaskStore {
         &self,
         input: TaskUpdateInput,
         _task_control: &crate::task_scheduler::TaskControlGuard,
-        session_exists: F,
+        session_matches_workspace: F,
     ) -> Result<Task, String>
     where
-        F: Fn(&str) -> bool,
+        F: Fn(&str, &str) -> bool,
     {
+        let projected_workspace = match (&input.workspace_id, &input.workspace_path) {
+            (None, None) => None,
+            (Some(workspace_id), Some(workspace_path)) => {
+                let workspace_id = workspace_id.trim();
+                if workspace_id.is_empty() {
+                    return Err("workspaceId is empty".to_string());
+                }
+                Some((
+                    workspace_id.to_string(),
+                    canonicalize_workspace_path(workspace_path)?,
+                ))
+            }
+            _ => return Err("workspaceId and workspacePath must be updated together".to_string()),
+        };
         if crate::task_scheduler::get_task_scheduler()
             .execution_projection(&input.id)
             .await
@@ -2430,6 +3121,9 @@ impl TaskStore {
                 "preselectedSessionId is only valid with runMode=single-session".to_string(),
             );
         }
+        if input.prompt.is_some() {
+            self.ensure_legacy_verify_merged(&input.id).await?;
+        }
         let projected_run_mode = input.run_mode;
         let projected_preselected_session_id = input.preselected_session_id.clone();
         let (mut inner, session_lifecycle) = self
@@ -2461,6 +3155,7 @@ impl TaskStore {
             .await?;
         let interval_updated = input.interval_minutes.is_some();
         let cron_expression_updated = input.cron_expression.is_some();
+        let execution_mode_updated = input.execution_mode.is_some();
         let existing = inner
             .get(&input.id)
             .ok_or_else(|| String::from(TaskOpError::not_found(&input.id)))?
@@ -2507,6 +3202,10 @@ impl TaskStore {
         }
         if let Some(v) = input.description {
             updated.description = Some(v);
+        }
+        if let Some((workspace_id, workspace_path)) = projected_workspace {
+            updated.workspace_id = workspace_id;
+            updated.workspace_path = workspace_path;
         }
         if let Some(v) = input.execution_mode {
             updated.execution_mode = v;
@@ -2617,7 +3316,12 @@ impl TaskStore {
         // external-exclusion rule fires correctly, and after all field merges
         // (including clear_provider_override) so the rules see the actual
         // post-update shape, not the input fragments.
-        validate_task_provider_routing(&updated.provider_id, &updated.model, &updated.runtime)?;
+        validate_task_execution_routing(
+            &updated.provider_id,
+            &updated.model,
+            &updated.runtime,
+            &updated.runtime_config,
+        )?;
         updated.updated_at = now_ms();
 
         // Mode-transition hygiene: `run_mode` / `end_conditions` / the
@@ -2629,6 +3333,15 @@ impl TaskStore {
         // needs them.
         match updated.execution_mode {
             TaskExecutionMode::Once => {
+                // Session strategy and pre-trigger detection are recurring-only.
+                // Enforce this on the merged row, not merely when the mode field
+                // is present, so a stale partial editor cannot reintroduce them
+                // after another writer has already switched the Task to Once.
+                if execution_mode_updated {
+                    updated.run_mode = Some(TaskRunMode::NewSession);
+                    updated.preselected_session_id = None;
+                    updated.trigger = None;
+                }
                 updated.interval_minutes = None;
                 updated.cron_expression = None;
                 updated.cron_timezone = None;
@@ -2644,6 +3357,11 @@ impl TaskStore {
                 // legacy-upgrade path), the deadline has no remaining
                 // meaning here and only confuses later readers that still
                 // treat `endConditions.deadline` as "when to stop running".
+                if execution_mode_updated {
+                    updated.run_mode = Some(TaskRunMode::NewSession);
+                    updated.preselected_session_id = None;
+                    updated.trigger = None;
+                }
                 updated.interval_minutes = None;
                 updated.cron_expression = None;
                 updated.cron_timezone = None;
@@ -2666,7 +3384,9 @@ impl TaskStore {
         }
 
         let session_binding_updated = updated.run_mode != existing.run_mode
-            || updated.preselected_session_id != existing.preselected_session_id;
+            || updated.preselected_session_id != existing.preselected_session_id
+            || updated.workspace_id != existing.workspace_id
+            || updated.workspace_path != existing.workspace_path;
         if session_binding_updated {
             validate_new_task_session_binding(
                 updated.run_mode,
@@ -2677,7 +3397,7 @@ impl TaskStore {
                     .preselected_session_id
                     .as_deref()
                     .expect("single-session binding validated above");
-                if !session_exists(session_id) {
+                if !session_matches_workspace(session_id, &updated.workspace_path) {
                     return Err(format!(
                         "preselectedSessionId does not reference an existing Session: {}",
                         session_id
@@ -2716,11 +3436,6 @@ impl TaskStore {
             if prompt.trim().is_empty() {
                 return Err("prompt is empty".to_string());
             }
-            if matches!(updated.dispatch_origin, TaskDispatchOrigin::AiAligned) {
-                return Err(
-                    "ai-aligned tasks use /task-implement; edit alignment.md instead".to_string(),
-                );
-            }
             let dir = task_docs_dir(&updated.id)?;
             fs::create_dir_all(&dir).map_err(|e| format!("mkdir task dir: {}", e))?;
             write_atomic_text(&dir.join("task.md"), prompt)?;
@@ -2733,6 +3448,7 @@ impl TaskStore {
         drop(inner);
         drop(session_lifecycle);
 
+        self.reconcile_task_comment_notification_index(&updated);
         if leaves_command_mode {
             if let Err(error) = self.remove_trigger_state(&updated.id).await {
                 ulog_warn!(
@@ -2886,14 +3602,9 @@ impl TaskStore {
             None
         };
 
-        // NB: progress.md is intentionally NOT touched here. It's the
-        // AI's own workspace document — `/task-alignment` creates it
-        // with a structured template and `/task-implement` updates it
-        // via standard Read / Edit / Write tools. The program code only
-        // writes `status_history` (authoritative audit log, above). The
-        // UI's "执行日志" panel reads progress.md directly from disk.
-        // (v0.1.69+: previously `append_progress_line` polluted the AI's
-        // doc with machine-format lines — removed.)
+        // Legacy progress.md is intentionally not touched here. New ordinary
+        // Tasks use task.md as their single semantic contract; TaskStore's
+        // status_history remains the authoritative machine audit trail.
 
         // PRD §10.2.1 step 6: notification dispatch (desktop + bot) for
         // subscribed transitions. Side-effects fire AFTER persist so a
@@ -2992,6 +3703,114 @@ impl TaskStore {
         Ok(updated)
     }
 
+    /// Publish a newly admitted execution Session and claim every comment
+    /// that was waiting for the first Session under one TaskStore write lock.
+    /// A concurrent user comment therefore observes exactly one side of the
+    /// boundary: either it already exists and is claimed here, or it is
+    /// created afterwards and directly targets the now-visible Session.
+    pub async fn append_session_and_claim_pending_comments(
+        &self,
+        id: &str,
+        session_id: &str,
+    ) -> Result<(Task, Vec<TaskComment>), String> {
+        self.ensure_writable()?;
+        let projected_session_id = session_id.to_string();
+        let (mut inner, session_lifecycle) = self
+            .lock_for_session_protection(id, move |task| {
+                let mut projected = task.clone();
+                if !projected
+                    .session_ids
+                    .iter()
+                    .any(|value| value == &projected_session_id)
+                {
+                    projected.session_ids.push(projected_session_id.clone());
+                }
+                task_protected_session_ids(&projected)
+            })
+            .await?;
+
+        let path = self.comments_path(id)?;
+        let managed = inner.get(id).is_some_and(is_managed_task);
+        let original_comments = if managed {
+            Vec::new()
+        } else {
+            self.load_task_comments(id, &path)?
+        };
+        let mut comments = original_comments.clone();
+        let mut claimed = Vec::new();
+        for comment in &mut comments {
+            let Some(admission) = comment.admission.as_mut() else {
+                continue;
+            };
+            if admission.state != TaskCommentAdmissionState::PendingSession
+                || comment.conversation_session_id.is_some()
+            {
+                continue;
+            }
+            comment.conversation_session_id = Some(session_id.to_string());
+            admission.state = TaskCommentAdmissionState::Sending;
+            admission.target_session_id = Some(session_id.to_string());
+            admission.attempt_id = Some(Uuid::new_v4().to_string());
+            admission.error = None;
+            claimed.push(comment.clone());
+        }
+        #[cfg(test)]
+        if !claimed.is_empty()
+            && self
+                .fail_next_acceptance_comment_persist
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("injected acceptance comment persist failure".to_string());
+        }
+        if !claimed.is_empty() {
+            Self::persist_comments_file(&path, &comments)?;
+        }
+        // Publish the relation only after the pending-comment claim is
+        // durable. Otherwise a comments write failure exposes a Session that
+        // later comments can target while the older backlog is still pending.
+        let existing = inner
+            .get(id)
+            .ok_or_else(|| String::from(TaskOpError::not_found(id)))?
+            .clone();
+        let mut updated = existing;
+        let changed = !updated.session_ids.iter().any(|value| value == session_id);
+        if changed {
+            updated.session_ids.push(session_id.to_string());
+            updated.updated_at = now_ms();
+            let mut next = inner.clone();
+            next.insert(updated.id.clone(), updated.clone());
+            if let Err(error) = Self::persist_locked(&self.jsonl_path, &next) {
+                if !claimed.is_empty() {
+                    if let Err(rollback_error) =
+                        Self::persist_comments_file(&path, &original_comments)
+                    {
+                        ulog_warn!(
+                            "[task-comment] acceptance rollback failed task={} persist_error={} rollback_error={}",
+                            id,
+                            error,
+                            rollback_error
+                        );
+                    }
+                }
+                return Err(error);
+            }
+            *inner = next;
+        }
+        drop(inner);
+        drop(session_lifecycle);
+
+        if changed {
+            Self::emit_session_appended(&updated, session_id);
+        }
+        if !claimed.is_empty() {
+            emit_task_event(
+                "task:comment-changed",
+                serde_json::json!({ "taskId": id, "event": "claimed" }),
+            );
+        }
+        Ok((updated, claimed))
+    }
+
     /// Commit a Session binding while the caller retains that Session's
     /// lifecycle guard. Scheduler reservation uses this to publish transient
     /// execution ownership and durable TaskStore binding under one guard.
@@ -3011,87 +3830,39 @@ impl TaskStore {
         Ok(updated)
     }
 
-    fn set_execution_session_locked(
-        &self,
-        inner: &mut HashMap<String, Task>,
-        id: &str,
-        session_id: &str,
-    ) -> Result<(Task, bool), String> {
-        let existing = inner
-            .get(id)
-            .ok_or_else(|| String::from(TaskOpError::not_found(id)))?
-            .clone();
-        let mut updated = existing;
-        let appended = !updated.session_ids.iter().any(|value| value == session_id);
-        updated.preselected_session_id = Some(session_id.to_string());
-        if appended {
-            updated.session_ids.push(session_id.to_string());
-        }
-        updated.updated_at = now_ms();
-        let mut next = inner.clone();
-        next.insert(updated.id.clone(), updated.clone());
-        Self::persist_locked(&self.jsonl_path, &next)?;
-        *inner = next;
-        Ok((updated, appended))
-    }
-
-    /// Rebind a scheduler-selected Session while the caller owns both the old
-    /// and replacement Session lifecycles. Existing `session_ids` history is
-    /// preserved; a never-materialized preselection is not fabricated into a
-    /// completed-run history entry.
-    pub(crate) async fn set_execution_session_with_lifecycle_held(
+    /// Replace a deleted fixed Session identity while the scheduler holds
+    /// lifecycle guards for both the stale and replacement IDs.
+    pub(crate) async fn rebind_missing_single_session_with_lifecycle_held(
         &self,
         id: &str,
-        session_id: String,
-        replaced_session_id: Option<&str>,
-    ) -> Result<Task, String> {
-        self.ensure_writable()?;
-        let mut inner = self.inner.write().await;
-        let result = self.set_execution_session_locked(&mut inner, id, &session_id);
-        drop(inner);
-        let (updated, appended) = result?;
-        if appended {
-            Self::emit_session_appended(&updated, &session_id);
-        }
-        if let Some(replaced_session_id) = replaced_session_id {
-            emit_task_event(
-                "task:session-rebound",
-                serde_json::json!({
-                    "taskId": updated.id,
-                    "replacedSessionId": replaced_session_id,
-                    "sessionId": session_id,
-                    "reason": "session_missing",
-                }),
-            );
-        }
-        Ok(updated)
-    }
-
-    /// Commit one completed scheduler attempt to the Task authority. Run
-    /// details remain in the existing JSONL history keyed by the same Task id.
-    pub async fn record_execution_if_status(
-        &self,
-        id: &str,
-        trigger: TaskExecutionTrigger,
-        expected_status: TaskStatus,
+        expected_session_id: &str,
+        replacement_session_id: &str,
     ) -> Result<Option<Task>, String> {
         self.ensure_writable()?;
         let mut inner = self.inner.write().await;
-        let existing = inner
-            .get(id)
-            .ok_or_else(|| String::from(TaskOpError::not_found(id)))?
-            .clone();
-        if existing.status != expected_status || existing.deleted {
+        let Some(existing) = inner.get(id).cloned() else {
+            return Err(String::from(TaskOpError::not_found(id)));
+        };
+        if existing.run_mode != Some(TaskRunMode::SingleSession)
+            || existing.preselected_session_id.as_deref() != Some(expected_session_id)
+            || existing.deleted
+        {
             return Ok(None);
         }
+
         let mut updated = existing;
-        let executed_at = now_ms();
-        updated.execution_count = updated.execution_count.saturating_add(1);
-        updated.last_executed_at = Some(executed_at);
-        if trigger == TaskExecutionTrigger::Scheduled {
-            updated.last_scheduled_at = Some(executed_at);
+        updated.preselected_session_id = Some(replacement_session_id.to_string());
+        updated
+            .session_ids
+            .retain(|session_id| session_id != expected_session_id);
+        if updated
+            .session_ids
+            .iter()
+            .all(|session_id| session_id != replacement_session_id)
+        {
+            updated.session_ids.push(replacement_session_id.to_string());
         }
-        updated.updated_at = executed_at;
+        updated.updated_at = now_ms();
 
         let mut next = inner.clone();
         next.insert(updated.id.clone(), updated.clone());
@@ -3100,29 +3871,29 @@ impl TaskStore {
         drop(inner);
 
         emit_task_event(
-            "task:execution-complete",
+            "task:session-rebound",
             serde_json::json!({
                 "taskId": updated.id,
-                "executionCount": updated.execution_count,
-                "lastExecutedAt": updated.last_executed_at,
+                "fromSessionId": expected_session_id,
+                "toSessionId": replacement_session_id,
             }),
         );
         Ok(Some(updated))
     }
 
-    /// Atomically commit an admitted command-trigger turn to the Task row.
+    /// Atomically settle one completed AI turn into the Task authority.
     ///
-    /// The Trigger outbox is a separate crash-durable file. We therefore
-    /// persist the execution count, event receipt, and any terminal Task
-    /// transition together *before* clearing that outbox. If the app exits in
-    /// between, startup recognizes the receipt and settles the matching event
-    /// without dispatching the AI turn again.
-    pub(crate) async fn record_activation_execution_if_status(
+    /// The Task row owns the current outcome summary, counters, consecutive
+    /// scheduled failure count, and any terminal status transition. The
+    /// append-only `cron_runs` file is written afterwards as an audit
+    /// projection and is never read back to reconstruct these facts.
+    pub(crate) async fn settle_execution_if_status(
         &self,
         id: &str,
-        event_id: &str,
+        activation_event_id: Option<&str>,
         trigger: TaskExecutionTrigger,
         expected_status: TaskStatus,
+        settlement: TaskExecutionSettlement,
         terminal: Option<TaskExecutionTerminalTransition>,
     ) -> Result<Option<Task>, String> {
         self.ensure_writable()?;
@@ -3143,27 +3914,43 @@ impl TaskStore {
         if existing.deleted {
             return Ok(None);
         }
-        if existing.last_activation_event_id.as_deref() == Some(event_id) {
+        if activation_event_id.is_some()
+            && existing.last_activation_event_id.as_deref() == activation_event_id
+        {
             return Ok(Some(existing));
         }
         if existing.status != expected_status {
             return Ok(None);
         }
-
         let mut updated = existing;
         let executed_at = now_ms();
         updated.execution_count = updated.execution_count.saturating_add(1);
         updated.last_executed_at = Some(executed_at);
-        updated.last_activation_event_id = Some(event_id.to_string());
         if trigger == TaskExecutionTrigger::Scheduled {
             updated.last_scheduled_at = Some(executed_at);
+            updated.consecutive_execution_failures = if settlement.success {
+                0
+            } else {
+                updated.consecutive_execution_failures.saturating_add(1)
+            };
+        }
+        updated.last_execution = Some(TaskLastExecution {
+            at: executed_at,
+            trigger,
+            success: settlement.success,
+            duration_ms: settlement.duration_ms,
+            session_id: settlement.session_id,
+            error: settlement.error,
+        });
+        if let Some(event_id) = activation_event_id {
+            updated.last_activation_event_id = Some(event_id.to_string());
         }
         let transition = if let Some(terminal) = terminal {
             if !matches!(terminal.status, TaskStatus::Done | TaskStatus::Blocked)
                 || !is_transition_legal(updated.status, terminal.status)
             {
                 return Err(format!(
-                    "invalid activation terminal transition: {} -> {}",
+                    "invalid execution terminal transition: {} -> {}",
                     updated.status.as_str(),
                     terminal.status.as_str()
                 ));
@@ -3197,7 +3984,8 @@ impl TaskStore {
                 "taskId": updated.id,
                 "executionCount": updated.execution_count,
                 "lastExecutedAt": updated.last_executed_at,
-                "activationEventId": event_id,
+                "success": updated.last_execution.as_ref().map(|value| value.success),
+                "activationEventId": activation_event_id,
             }),
         );
         if let Some(transition) = transition.as_ref() {
@@ -3376,6 +4164,7 @@ impl TaskStore {
             .stop_with_control_held(id, &task_control)
             .await?;
         if before.deleted {
+            self.reconcile_task_comment_notification_index(&before);
             if let Err(error) = self.remove_trigger_state(id).await {
                 ulog_warn!(
                     "[task] deleted Trigger state cleanup deferred to startup retry task={}: {}",
@@ -3418,6 +4207,7 @@ impl TaskStore {
         }
         *inner = next;
         drop(inner);
+        self.reconcile_task_comment_notification_index(&updated);
         if let Err(error) = self.remove_trigger_state(id).await {
             ulog_warn!(
                 "[task] deleted Trigger state cleanup deferred to startup retry task={}: {}",
@@ -3589,6 +4379,89 @@ fn validate_task_provider_routing(
     Ok(())
 }
 
+fn validate_task_execution_routing(
+    provider_id: &Option<String>,
+    model: &Option<String>,
+    runtime: &Option<String>,
+    runtime_config: &Option<serde_json::Value>,
+) -> Result<(), String> {
+    validate_task_provider_routing(provider_id, model, runtime)?;
+    let Some(config) = runtime_config.as_ref() else {
+        return Ok(());
+    };
+    let object = config
+        .as_object()
+        .ok_or_else(|| "runtimeConfig must be a JSON object".to_string())?;
+    if object
+        .get("model")
+        .is_some_and(|value| !value.is_null() && !value.is_string())
+    {
+        return Err("runtimeConfig.model must be a string".to_string());
+    }
+    let Some(source_value) = object.get("source") else {
+        return Ok(());
+    };
+    let source = source_value
+        .as_str()
+        .ok_or_else(|| "runtimeConfig.source must be a string".to_string())?;
+    if !matches!(source, "system-cli" | "managed-provider") {
+        return Err(format!(
+            "invalid runtimeConfig.source '{source}'; valid values: system-cli, managed-provider"
+        ));
+    }
+    if source == "managed-provider" && runtime.as_deref() != Some("codex") {
+        return Err("runtimeConfig.source=managed-provider requires runtime=codex".to_string());
+    }
+    Ok(())
+}
+
+/// Validate the execution-routing slice of a Task update against the current
+/// row without mutating it. Cron compatibility uses this while a Running Task
+/// is still Running, before its stop→update→restart sequence begins.
+pub(crate) fn validate_task_update_execution_routing(
+    existing: &Task,
+    input: &TaskUpdateInput,
+) -> Result<(), String> {
+    if input.clear_provider_override
+        && input
+            .provider_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+    {
+        return Err("providerId 与 clearProviderOverride=true 冲突 — 调用方必须二选一".to_string());
+    }
+    let mut provider_id = existing.provider_id.clone();
+    let mut model = existing.model.clone();
+    let mut runtime = existing.runtime.clone();
+    let mut runtime_config = existing.runtime_config.clone();
+    if let Some(value) = input.model.as_ref() {
+        model = (!value.trim().is_empty()).then(|| value.clone());
+    }
+    if let Some(value) = input.provider_id.as_ref() {
+        provider_id = (!value.trim().is_empty()).then(|| value.clone());
+    }
+    if input.clear_provider_override {
+        provider_id = None;
+        model = None;
+    }
+    if let Some(value) = input.runtime.as_ref() {
+        runtime = Some(value.clone());
+    }
+    if let Some(value) = input.runtime_config.as_ref() {
+        runtime_config = Some(value.clone());
+    }
+    if input.clear_runtime_override {
+        runtime = None;
+        runtime_config = None;
+    }
+    pin_runtime_for_provider_id(&provider_id, &mut runtime);
+    validate_task_execution_routing(&provider_id, &model, &runtime, &runtime_config)
+}
+
+fn session_metadata_matches_workspace(session_id: &str, workspace_path: &str) -> bool {
+    crate::sidecar::runtime_identity::session_metadata_matches_workspace(session_id, workspace_path)
+}
+
 fn session_metadata_exists(session_id: &str) -> bool {
     crate::sidecar::runtime_identity::resolve_session_runtime_identity_full(session_id).is_some()
 }
@@ -3729,56 +4602,36 @@ pub(crate) fn write_atomic_text(path: &Path, content: &str) -> Result<(), String
     Ok(())
 }
 
-/// Move `src` directory to `dst`. Tries `fs::rename` first (fast path, atomic on
-/// the same filesystem). On cross-filesystem or other error, falls back to
-/// `copy_dir_recursive` + `remove_dir_all(src)`. Symlinks and unusual file types
-/// return `Err` — task docs must be plain files/dirs only.
-fn move_alignment_dir(src: &Path, dst: &Path) -> Result<(), String> {
-    if fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
-    fs::create_dir_all(dst).map_err(|e| format!("mkdir dst: {}", e))?;
-    copy_dir_recursive(src, dst).map_err(|e| format!("copy: {}", e))?;
-    fs::remove_dir_all(src).map_err(|e| format!("remove src: {}", e))?;
-    Ok(())
-}
-
-/// Construct the first-message prompt for a dispatch tick (PRD §9.3.1).
-///
-/// - `dispatchOrigin='direct'`   → `执行任务：<task.md 正文>`
-/// - `dispatchOrigin='ai-aligned'` → `/task-implement` slash command (the skill
-///    reads `~/.myagents/tasks/<id>/{task,verify,progress,alignment}.md` on its own)
+/// Construct the first-message prompt for a dispatch tick. Every ordinary Task
+/// receives its complete task.md; dispatchOrigin is provenance only.
 ///
 /// Returns `None` if the store isn't initialized or the task doesn't exist.
 /// Returns `Some(Err(...))` for unrecoverable I/O such as a missing task.md.
 pub async fn build_dispatch_prompt(task_id: &str) -> Option<Result<String, String>> {
     let store = get_task_store()?;
     let task = store.get(task_id).await?;
+    if task.dispatch_origin != TaskDispatchOrigin::AttachedSession {
+        if let Err(error) = store.ensure_legacy_verify_merged(task_id).await {
+            return Some(Err(error));
+        }
+    }
     Some(compose_dispatch_prompt(&task))
 }
 
 fn compose_dispatch_prompt(task: &Task) -> Result<String, String> {
     match task.dispatch_origin {
-        TaskDispatchOrigin::AiAligned => {
-            // The task-implement skill discovers the four alignment docs from
-            // `~/.myagents/tasks/<taskId>/` on its own. We just need to invoke it.
-            Ok(format!("/task-implement {}", task.id))
-        }
         TaskDispatchOrigin::AttachedSession => Err(format!(
             "attached-session task {} is already bound to a live session and cannot be dispatched",
             task.id
         )),
-        TaskDispatchOrigin::Direct => {
+        TaskDispatchOrigin::Direct | TaskDispatchOrigin::AiAligned => {
             let dir = task_docs_dir(&task.id)?;
             let task_md = dir.join("task.md");
             match fs::read_to_string(&task_md) {
                 Ok(body) => {
                     let trimmed = body.trim();
                     if trimmed.is_empty() {
-                        Err(format!(
-                            "task.md is empty for direct-dispatch task {}",
-                            task.id
-                        ))
+                        Err(format!("task.md is empty for task {}", task.id))
                     } else {
                         Ok(format!("执行任务：{}", trimmed))
                     }
@@ -3929,33 +4782,6 @@ fn emit_task_event(event: &str, payload: serde_json::Value) {
     }
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            fs::create_dir_all(&target)?;
-            copy_dir_recursive(&entry.path(), &target)?;
-        } else if ty.is_file() {
-            fs::copy(entry.path(), target)?;
-        } else {
-            // Symlinks / sockets / fifos — refuse loudly rather than silently skip
-            // (CC + Codex review: previous `// symlinks skipped` comment led to
-            // cross-device semantics divergence when `fs::rename` preserved them
-            // but the fallback dropped them).
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported file type in alignment dir: {}",
-                    entry.path().display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 // ================ Static access for Management API ================
 //
 // The Rust Management API (src/management_api.rs) serves HTTP requests from
@@ -4006,21 +4832,6 @@ pub async fn cmd_task_create_direct(
 }
 
 #[tauri::command]
-pub async fn cmd_task_create_from_alignment(
-    task_state: tauri::State<'_, ManagedTaskStore>,
-    thought_state: tauri::State<'_, crate::thought::ManagedThoughtStore>,
-    input: TaskCreateFromAlignmentInput,
-) -> Result<Task, String> {
-    crate::task_application::TaskApplication::new(
-        task_state.inner().as_ref(),
-        Some(thought_state.inner().as_ref()),
-    )
-    .create_from_alignment(input)
-    .await
-    .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
 pub async fn cmd_task_create_attached(
     task_state: tauri::State<'_, ManagedTaskStore>,
     input: TaskCreateAttachedInput,
@@ -4047,6 +4858,9 @@ pub async fn cmd_task_get(
     state: tauri::State<'_, ManagedTaskStore>,
     id: String,
 ) -> Result<Option<TaskWithDocs>, String> {
+    if state.get(&id).await.is_some() {
+        state.ensure_legacy_verify_merged(&id).await?;
+    }
     let task = match state.get_ordinary(&id).await {
         Ok(task) => task,
         Err(error) if error == String::from(TaskOpError::not_found(&id)) => return Ok(None),
@@ -4193,48 +5007,219 @@ pub async fn cmd_task_append_session(
         .map_err(|error| error.to_string())
 }
 
-/// Persist alignment-session sidecar metadata to
-/// `~/.myagents/tasks/<alignmentSessionId>/metadata.json`.
-///
-/// Called at the moment the frontend spawns an 「AI 讨论」 session so that
-/// `create_from_alignment` can later inherit workspace_id / workspace_path /
-/// source_thought_id from the file instead of demanding the AI caller
-/// re-pass them through the CLI. See the read side in
-/// `TaskStore::create_from_alignment`.
-///
-/// Creates the alignment dir on demand — the frontend reaches here BEFORE
-/// the AI has written any docs into that dir, so we must be the one that
-/// ensures its existence. `validate_safe_id` guards against `..` / slashes
-/// in the id per the rest of this module's path-safety pattern.
 #[tauri::command]
-pub async fn cmd_task_write_alignment_metadata(
-    alignment_session_id: String,
+pub async fn cmd_task_list_comments(
+    state: tauri::State<'_, ManagedTaskStore>,
+    id: String,
+    before: Option<String>,
+    after: Option<String>,
+    limit: Option<usize>,
+) -> Result<TaskCommentPage, String> {
+    if before.is_some() && after.is_some() {
+        return Err("comment pagination accepts only one of before or after".to_string());
+    }
+    if let Some(after) = after.as_deref() {
+        state
+            .list_comments_after(&id, after, limit.unwrap_or(50))
+            .await
+    } else {
+        state
+            .list_comments(&id, before.as_deref(), limit.unwrap_or(50))
+            .await
+    }
+}
+
+#[tauri::command]
+pub async fn cmd_task_get_comment_context(
+    state: tauri::State<'_, ManagedTaskStore>,
+    id: String,
+    comment_id: String,
+) -> Result<TaskCommentContextPage, String> {
+    state.comment_context(&id, &comment_id, 25).await
+}
+
+#[tauri::command]
+pub async fn cmd_task_create_user_comment(
+    app_handle: tauri::AppHandle,
+    task_state: tauri::State<'_, ManagedTaskStore>,
+    sidecar_state: tauri::State<'_, crate::sidecar::ManagedSidecarManager>,
+    id: String,
+    body: String,
+    reply_to_comment_id: Option<String>,
+) -> Result<TaskComment, String> {
+    crate::task_application::TaskApplication::new(task_state.inner().as_ref(), None)
+        .create_user_comment(
+            &app_handle,
+            sidecar_state.inner(),
+            &id,
+            &body,
+            reply_to_comment_id.as_deref(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn cmd_task_retry_comment(
+    app_handle: tauri::AppHandle,
+    task_state: tauri::State<'_, ManagedTaskStore>,
+    sidecar_state: tauri::State<'_, crate::sidecar::ManagedSidecarManager>,
+    id: String,
+    comment_id: String,
+) -> Result<TaskComment, String> {
+    crate::task_application::TaskApplication::new(task_state.inner().as_ref(), None)
+        .retry_user_comment(&app_handle, sidecar_state.inner(), &id, &comment_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Prepare a durable, non-Task artifact root for one AI discussion. Candidate
+/// task.md files may be written under `candidates/`, but no Task row or
+/// schedule exists until the Agent calls the ordinary create-direct API after
+/// explicit user confirmation.
+#[tauri::command]
+pub async fn cmd_task_prepare_discussion(
+    discussion_id: String,
     workspace_id: String,
     workspace_path: String,
     source_thought_id: Option<String>,
-) -> Result<(), String> {
-    validate_safe_id(&alignment_session_id, "alignmentSessionId")?;
-    let dir = task_docs_dir(&alignment_session_id)?;
-    fs::create_dir_all(&dir).map_err(|e| format!("mkdir alignment dir: {}", e))?;
-    let meta = AlignmentSessionMetadata {
+    source_thought_tags: Option<Vec<String>>,
+) -> Result<PreparedTaskDiscussion, String> {
+    validate_safe_id(&discussion_id, "discussionId")?;
+    let root = crate::app_dirs::myagents_data_dir()
+        .ok_or_else(|| "cannot resolve MyAgents data dir".to_string())?
+        .join("task-discussions");
+    if fs::symlink_metadata(&root)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err("Task discussion root may not be a symlink".to_string());
+    }
+    let dir = root.join(&discussion_id);
+    if !dir.starts_with(&root) {
+        return Err("Task discussion path escaped artifact root".to_string());
+    }
+    let candidates = dir.join("candidates");
+    fs::create_dir_all(&candidates)
+        .map_err(|e| format!("mkdir Task discussion candidates: {e}"))?;
+    let meta = TaskDiscussionMetadata {
+        discussion_id: discussion_id.clone(),
         workspace_id,
         workspace_path,
         source_thought_id,
+        source_thought_tags: source_thought_tags.unwrap_or_default(),
         created_at: now_ms(),
     };
     let json = serde_json::to_string_pretty(&meta)
-        .map_err(|e| format!("serialize alignment metadata: {}", e))?;
-    // Atomic tmp+rename — matches the module's `write_atomic_text` convention
-    // (task.md / progress.md writes). Concurrent writers for the same
-    // alignment id cannot produce a half-written file; a crash mid-write
-    // leaves the old file (or no file) but never a corrupt one.
+        .map_err(|e| format!("serialize Task discussion metadata: {e}"))?;
     write_atomic_text(&dir.join("metadata.json"), &json)?;
     ulog_debug!(
-        "[task] wrote alignment metadata id={} thought={:?}",
-        alignment_session_id,
+        "[task] prepared discussion id={} thought={:?}",
+        discussion_id,
         meta.source_thought_id,
     );
-    Ok(())
+    Ok(PreparedTaskDiscussion {
+        discussion_id,
+        discussion_dir: dir.to_string_lossy().into_owned(),
+        candidates_dir: candidates.to_string_lossy().into_owned(),
+    })
+}
+
+const TASK_DISCUSSION_CANDIDATE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Re-read an app-owned smart-discussion candidate at the authoritative Rust
+/// boundary immediately before Task creation. Generic CLI files outside the
+/// discussion root return `None`; paths that claim to be candidates but have
+/// an invalid shape, symlink, oversized body, or stale/unreadable file fail
+/// closed instead of trusting the CLI's earlier snapshot.
+pub fn read_owned_discussion_candidate(raw_path: &str) -> Result<Option<String>, String> {
+    let root = crate::app_dirs::myagents_data_dir()
+        .ok_or_else(|| "cannot resolve MyAgents data dir".to_string())?
+        .join("task-discussions");
+    read_owned_discussion_candidate_under(&root, raw_path)
+}
+
+fn read_owned_discussion_candidate_under(
+    root: &Path,
+    raw_path: &str,
+) -> Result<Option<String>, String> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    if fs::symlink_metadata(root)
+        .map_err(|error| format!("inspect Task discussion root: {error}"))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Task discussion root may not be a symlink".to_string());
+    }
+    let canonical_root =
+        fs::canonicalize(root).map_err(|error| format!("resolve Task discussion root: {error}"))?;
+    let supplied = PathBuf::from(raw_path);
+    if let Ok(metadata) = fs::symlink_metadata(&supplied) {
+        if metadata.file_type().is_symlink() {
+            return Err("Task discussion candidate may not be a symlink".to_string());
+        }
+    }
+    let canonical_file = match fs::canonicalize(&supplied) {
+        Ok(path) => path,
+        Err(error) => {
+            // Only candidate-shaped paths fail closed. Ordinary external CLI
+            // files have already been read by the CLI and are not app-owned.
+            if supplied.starts_with(root) || supplied.starts_with(&canonical_root) {
+                return Err(format!("resolve Task discussion candidate: {error}"));
+            }
+            return Ok(None);
+        }
+    };
+    if !canonical_file.starts_with(&canonical_root) {
+        return Ok(None);
+    }
+    if !supplied.starts_with(root) {
+        return Err("Task discussion candidate must use its app-owned path".to_string());
+    }
+    let relative = canonical_file
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Task discussion candidate escaped its root".to_string())?;
+    let components = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if components.len() != 4 || components[1] != "candidates" || components[3] != "task.md" {
+        return Err(
+            "Task discussion candidate must be <discussion>/candidates/<candidate>/task.md"
+                .to_string(),
+        );
+    }
+    validate_safe_id(&components[0], "discussionId")?;
+    validate_safe_id(&components[2], "candidateId")?;
+
+    let mut cursor = root.to_path_buf();
+    for component in &components {
+        cursor.push(component);
+        let metadata = fs::symlink_metadata(&cursor)
+            .map_err(|error| format!("inspect Task discussion candidate: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("Task discussion candidate may not contain symlinks".to_string());
+        }
+    }
+    let metadata = fs::metadata(&canonical_file)
+        .map_err(|error| format!("inspect Task discussion candidate: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Task discussion candidate is not a regular file".to_string());
+    }
+    if metadata.len() > TASK_DISCUSSION_CANDIDATE_MAX_BYTES {
+        return Err("Task discussion candidate exceeds the 1 MB limit".to_string());
+    }
+    let content = fs::read_to_string(&canonical_file)
+        .map_err(|error| format!("read Task discussion candidate: {error}"))?;
+    if content.contains('\0') {
+        return Err("Task discussion candidate contains NUL bytes".to_string());
+    }
+    if content.trim().is_empty() {
+        return Err("Task discussion candidate is empty".to_string());
+    }
+    Ok(Some(content))
 }
 
 #[tauri::command]
@@ -4268,19 +5253,15 @@ pub async fn cmd_task_delete(
 ///
 /// - `task`: the executor prompt (`~/.myagents/tasks/<id>/task.md`). Authored by the user
 ///   at dispatch, editable from the task detail overlay.
-/// - `verify`: acceptance criteria (`~/.myagents/tasks/<id>/verify.md`). Optional; may
-///   be authored by the user or produced by the alignment flow. Returns an
-///   empty string when the file does not yet exist.
-/// - `progress`: read-only execution log (`~/.myagents/tasks/<id>/progress.md`). Agents
-///   append to this file during runs; the UI renders it but does not write.
-/// - `alignment`: AI-discussion decision record (`~/.myagents/tasks/<id>/alignment.md`).
-///   Written by `/task-alignment` skill directly; read-only from the UI.
+/// - `verify`, `progress`, `alignment`: retained legacy documents. They are
+///   read-only compatibility surfaces except for the legacy verify editor API.
 #[tauri::command]
 pub async fn cmd_task_read_doc(
     state: tauri::State<'_, ManagedTaskStore>,
     id: String,
     doc: String,
 ) -> Result<String, String> {
+    state.ensure_legacy_verify_merged(&id).await?;
     let task = state.get_ordinary(&id).await?;
     let filename = task_doc_filename(&doc)?;
     let path = task_docs_dir(&task.id)?.join(filename);
@@ -4291,8 +5272,9 @@ pub async fn cmd_task_read_doc(
     }
 }
 
-/// Write `task.md` or `verify.md` for a Task. `progress.md` is agent-only
-/// (the CLI / SDK tool appends to it) and is rejected here. The running/
+/// Write the single editable Task authority, `task.md`. Legacy `verify.md`,
+/// `progress.md`, and `alignment.md` remain read-only compatibility inputs.
+/// The running/
 /// verifying lock is enforced atomically with the file write inside
 /// `TaskStore::write_doc` — status check and file mutation happen under
 /// the same lock so a concurrent `update_status(running)` can't land in
@@ -4304,22 +5286,14 @@ pub async fn cmd_task_write_doc(
     doc: String,
     content: String,
 ) -> Result<(), String> {
-    let filename = task_doc_filename(&doc)?;
-    // progress.md + alignment.md are AI-owned workspace documents — the
-    // `/task-alignment` skill creates alignment.md and `/task-implement`
-    // writes progress.md using standard Read / Edit / Write tools against
-    // the absolute path in `Task.docs`. The UI has no editor for them, so
-    // this Tauri command (which backs `TaskEditPanel`) rejects writes to
-    // both names — catches an accidental misroute rather than silently
-    // corrupting the AI's workbook.
-    if filename == "progress.md" || filename == "alignment.md" {
+    if doc != "task" {
         return Err(format!(
-            "{} is AI-owned and not writable via this API",
-            filename
+            "{} is a read-only legacy document; edit task.md instead",
+            task_doc_filename(&doc)?
         ));
     }
     state.get_ordinary(&id).await?;
-    state.write_doc(&id, filename, &content).await
+    state.write_doc(&id, "task.md", &content).await
 }
 
 /// Reveal `~/.myagents/tasks/<id>/` in the OS file manager so the user
@@ -4368,8 +5342,8 @@ pub async fn cmd_task_open_docs_dir(
     Ok(())
 }
 
-/// Aggregate runtime telemetry from the Task authority and its run-history
-/// projection. No scheduler state is persisted separately.
+/// Aggregate runtime telemetry from the Task authority. The append-only run
+/// history is an audit projection and is deliberately not consulted here.
 ///
 /// The renderer uses this in the detail overlay's "运行统计" section
 /// without having to stitch three data sources together.
@@ -4410,9 +5384,8 @@ pub async fn cmd_task_get_run_stats(
             .map(|value| value.timestamp_millis()),
     };
 
-    let runs = crate::cron_task::read_cron_runs(&task.id, 1);
-    if let Some(last) = runs.last() {
-        stats.last_success = Some(last.ok);
+    if let Some(last) = task.last_execution.as_ref() {
+        stats.last_success = Some(last.success);
         stats.last_duration_ms = Some(last.duration_ms as i64);
     }
 
@@ -4517,6 +5490,15 @@ mod tests {
         }
     }
 
+    fn successful_settlement() -> TaskExecutionSettlement {
+        TaskExecutionSettlement {
+            success: true,
+            duration_ms: 12,
+            session_id: Some("test-session".to_string()),
+            error: None,
+        }
+    }
+
     fn status_input(
         id: &str,
         to: TaskStatus,
@@ -4538,6 +5520,8 @@ mod tests {
             name: None,
             executor: None,
             description: None,
+            workspace_id: None,
+            workspace_path: None,
             execution_mode: None,
             run_mode: None,
             end_conditions: None,
@@ -4658,6 +5642,99 @@ mod tests {
             .await;
         assert_eq!(visible_to_system.len(), 1);
         assert_eq!(visible_to_system[0].id, created.id);
+
+        let mut reconcile = empty_update_input(&created.id);
+        reconcile.prompt = Some("updated managed memory instructions".to_string());
+        store
+            .update(reconcile)
+            .await
+            .expect("the dedicated managed-task owner must be able to reconcile task.md");
+        assert_eq!(
+            std::fs::read_to_string(task_docs_dir(&created.id).unwrap().join("task.md")).unwrap(),
+            "updated managed memory instructions"
+        );
+
+        std::fs::write(
+            task_docs_dir(&created.id).unwrap().join("verify.md"),
+            "legacy ordinary verification",
+        )
+        .unwrap();
+        store
+            .ensure_legacy_verify_merged(&created.id)
+            .await
+            .expect("ordinary legacy migration must be a no-op for managed jobs");
+        assert_eq!(
+            compose_dispatch_prompt(&store.get(&created.id).await.unwrap()).unwrap(),
+            "执行任务：updated managed memory instructions"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_managed_tasks_reject_the_local_comment_surface() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let mut input = sample_direct_input(&ws);
+        input.managed_kind = Some(MANAGED_KIND_MEMORY_GARDENER.to_string());
+        let managed = store.create_system_managed_direct(input).await.unwrap();
+
+        assert_eq!(
+            store
+                .create_user_comment(&managed.id, "should stay internal", None)
+                .await
+                .unwrap_err(),
+            MANAGED_TASK_ERROR
+        );
+        assert_eq!(
+            store
+                .list_comments(&managed.id, None, 50)
+                .await
+                .unwrap_err(),
+            MANAGED_TASK_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_notification_index_ignores_historical_managed_comments() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let data = dir.path().join("data");
+        let store = TaskStore::new(data.clone());
+        let mut input = sample_direct_input(&ws);
+        input.managed_kind = Some(MANAGED_KIND_MEMORY_GARDENER.to_string());
+        let managed = store.create_system_managed_direct(input).await.unwrap();
+        let comments_path = data.join("tasks").join(&managed.id).join("comments.jsonl");
+        std::fs::create_dir_all(comments_path.parent().unwrap()).unwrap();
+        let historical = TaskComment {
+            id: "historical-managed-comment".to_string(),
+            task_id: managed.id.clone(),
+            body: "Internal maintenance result".to_string(),
+            author: TaskCommentAuthor::Agent {
+                label: None,
+                session_id: "managed-session".to_string(),
+            },
+            created_at: now_ms(),
+            reply_to_comment_id: None,
+            conversation_session_id: Some("managed-session".to_string()),
+            admission: None,
+        };
+        TaskStore::persist_comments_file(&comments_path, &[historical]).unwrap();
+        drop(store);
+
+        let recovered = TaskStore::new(data);
+        for _ in 0..100 {
+            if recovered.agent_comment_notification_source().ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let source = recovered.agent_comment_notification_source();
+        assert!(source.ready);
+        assert!(source.items.is_empty());
     }
 
     #[test]
@@ -4821,7 +5898,7 @@ mod tests {
         let task_control = crate::task_scheduler::acquire_task_control(&created.id).await;
 
         let error = store
-            .update_with_task_control_and_session_probe(update, &task_control, |_| false)
+            .update_with_task_control_and_session_probe(update, &task_control, |_, _| false)
             .await
             .unwrap_err();
         assert_eq!(
@@ -4905,10 +5982,13 @@ mod tests {
         assert_eq!(imported.execution_count, 5);
 
         let current = store
-            .record_execution_if_status(
+            .settle_execution_if_status(
                 &task.id,
+                None,
                 TaskExecutionTrigger::Scheduled,
                 TaskStatus::Stopped,
+                successful_settlement(),
+                None,
             )
             .await
             .unwrap()
@@ -4993,19 +6073,93 @@ mod tests {
         let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
 
         let scheduled = store
-            .record_execution_if_status(&task.id, TaskExecutionTrigger::Scheduled, task.status)
+            .settle_execution_if_status(
+                &task.id,
+                None,
+                TaskExecutionTrigger::Scheduled,
+                task.status,
+                successful_settlement(),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         let manual = store
-            .record_execution_if_status(&task.id, TaskExecutionTrigger::Manual, task.status)
+            .settle_execution_if_status(
+                &task.id,
+                None,
+                TaskExecutionTrigger::Manual,
+                task.status,
+                successful_settlement(),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
 
         assert_eq!(manual.last_scheduled_at, scheduled.last_scheduled_at);
         assert!(manual.last_executed_at >= scheduled.last_executed_at);
+    }
+
+    #[tokio::test]
+    async fn scheduled_success_resets_consecutive_failures_and_updates_authoritative_summary() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+
+        let mut current = task;
+        for attempt in 1..=4 {
+            current = store
+                .settle_execution_if_status(
+                    &current.id,
+                    None,
+                    TaskExecutionTrigger::Scheduled,
+                    current.status,
+                    TaskExecutionSettlement {
+                        success: false,
+                        duration_ms: attempt,
+                        session_id: Some(format!("failed-{attempt}")),
+                        error: Some("temporary failure".to_string()),
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(current.consecutive_execution_failures, 4);
+        assert_eq!(current.execution_count, 4);
+        assert_eq!(current.last_execution.as_ref().unwrap().duration_ms, 4);
+        assert!(!current.last_execution.as_ref().unwrap().success);
+
+        let recovered = store
+            .settle_execution_if_status(
+                &current.id,
+                None,
+                TaskExecutionTrigger::Scheduled,
+                current.status,
+                successful_settlement(),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.consecutive_execution_failures, 0);
+        assert_eq!(recovered.execution_count, 5);
+        assert!(recovered.last_execution.as_ref().unwrap().success);
+        assert_eq!(
+            recovered
+                .last_execution
+                .as_ref()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("test-session")
+        );
     }
 
     #[tokio::test]
@@ -5070,11 +6224,12 @@ mod tests {
             .unwrap();
 
         let committed = store
-            .record_activation_execution_if_status(
+            .settle_execution_if_status(
                 &task.id,
-                "build-319",
+                Some("build-319"),
                 TaskExecutionTrigger::Scheduled,
                 TaskStatus::Running,
+                successful_settlement(),
                 Some(TaskExecutionTerminalTransition {
                     status: TaskStatus::Done,
                     message: "Task execution completed".to_string(),
@@ -5102,11 +6257,12 @@ mod tests {
         // idempotent; startup can now settle only the matching pending event.
         let recovered = TaskStore::new(data_dir);
         let replay = recovered
-            .record_activation_execution_if_status(
+            .settle_execution_if_status(
                 &task.id,
-                "build-319",
+                Some("build-319"),
                 TaskExecutionTrigger::Scheduled,
                 TaskStatus::Running,
+                successful_settlement(),
                 None,
             )
             .await
@@ -5204,7 +6360,14 @@ mod tests {
             .unwrap();
 
         let committed = store
-            .record_execution_if_status(&task.id, TaskExecutionTrigger::Scheduled, TaskStatus::Todo)
+            .settle_execution_if_status(
+                &task.id,
+                None,
+                TaskExecutionTrigger::Scheduled,
+                TaskStatus::Todo,
+                successful_settlement(),
+                None,
+            )
             .await
             .unwrap();
 
@@ -5285,6 +6448,50 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&md).unwrap(), "处理 Space Issue");
         let dispatch_err = compose_dispatch_prompt(&created).unwrap_err();
         assert!(dispatch_err.contains("attached-session"));
+    }
+
+    #[tokio::test]
+    async fn legacy_verify_is_merged_once_and_preserved() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let created = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+        let docs = task_docs_dir(&created.id).unwrap();
+        std::fs::write(docs.join("verify.md"), "- run focused tests\n").unwrap();
+
+        store
+            .ensure_legacy_verify_merged(&created.id)
+            .await
+            .unwrap();
+        store
+            .ensure_legacy_verify_merged(&created.id)
+            .await
+            .unwrap();
+
+        let task_md = std::fs::read_to_string(docs.join("task.md")).unwrap();
+        assert_eq!(task_md.matches("# verify.md").count(), 1);
+        assert!(task_md.ends_with("# verify.md\n\n- run focused tests"));
+        assert_eq!(
+            std::fs::read_to_string(docs.join("verify.md")).unwrap(),
+            "- run focused tests\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_ai_aligned_origin_dispatches_complete_task_markdown() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let mut created = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+        created.dispatch_origin = TaskDispatchOrigin::AiAligned;
+
+        let prompt = compose_dispatch_prompt(&created).unwrap();
+        assert!(prompt.starts_with("执行任务："));
+        assert!(!prompt.contains("/task-implement"));
     }
 
     #[tokio::test]
@@ -5524,7 +6731,7 @@ mod tests {
         let updated = assert_waits_for_session_lifecycle("attached-secondary", async move {
             let task_control = crate::task_scheduler::acquire_task_control(&task_id).await;
             store_for_update
-                .update_with_task_control_and_session_probe(update, &task_control, |_| true)
+                .update_with_task_control_and_session_probe(update, &task_control, |_, _| true)
                 .await
         })
         .await;
@@ -5737,6 +6944,8 @@ mod tests {
                 name: Some("new".to_string()),
                 executor: None,
                 description: None,
+                workspace_id: None,
+                workspace_path: None,
                 execution_mode: None,
                 run_mode: None,
                 end_conditions: None,
@@ -5766,6 +6975,120 @@ mod tests {
             .await
             .expect_err("should reject");
         assert!(err.contains("update_rejected_running"));
+    }
+
+    #[tokio::test]
+    async fn update_workspace_requires_and_persists_an_atomic_identity_pair() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let original_ws = dir.path().join("workspace-original");
+        let next_ws = dir.path().join("workspace-next");
+        std::fs::create_dir_all(&original_ws).unwrap();
+        std::fs::create_dir_all(&next_ws).unwrap();
+        let data_dir = dir.path().join("data");
+        let store = TaskStore::new(data_dir.clone());
+        let created = store
+            .create_direct(sample_direct_input(&original_ws))
+            .await
+            .unwrap();
+
+        let mut id_only = empty_update_input(&created.id);
+        id_only.workspace_id = Some("ws-next".to_string());
+        let error = store
+            .update(id_only)
+            .await
+            .expect_err("pair must be atomic");
+        assert!(error.contains("must be updated together"));
+        assert_eq!(
+            store.get(&created.id).await.unwrap().workspace_id,
+            "ws-myagents"
+        );
+
+        let mut relative_path = empty_update_input(&created.id);
+        relative_path.workspace_id = Some("ws-next".to_string());
+        relative_path.workspace_path = Some("relative/workspace".to_string());
+        let error = store
+            .update(relative_path)
+            .await
+            .expect_err("workspace path must remain absolute");
+        assert!(error.contains("workspacePath must be absolute"));
+
+        let mut paired = empty_update_input(&created.id);
+        paired.workspace_id = Some(" ws-next ".to_string());
+        paired.workspace_path = Some(format!(" {} ", next_ws.display()));
+        let updated = store.update(paired).await.unwrap();
+        assert_eq!(updated.workspace_id, "ws-next");
+        assert_eq!(updated.workspace_path, next_ws.to_string_lossy());
+
+        let reloaded = TaskStore::new(data_dir).get(&created.id).await.unwrap();
+        assert_eq!(reloaded.workspace_id, "ws-next");
+        assert_eq!(reloaded.workspace_path, next_ws.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn stale_recurring_editor_reapplies_its_mode_instead_of_hidden_state() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let command_trigger = crate::task_trigger::TaskTrigger {
+            source: crate::task_trigger::TaskTriggerSource::Time,
+            detector: crate::task_trigger::TaskTriggerDetector::Command {
+                command: crate::task_trigger::TaskTriggerCommand {
+                    executable: "node".to_string(),
+                    args: vec!["detector.mjs".to_string()],
+                    cwd: None,
+                },
+                timeout_ms: None,
+            },
+        };
+
+        for execution_mode in [TaskExecutionMode::Once, TaskExecutionMode::Scheduled] {
+            let mut create = sample_direct_input(&ws);
+            create.name = format!("stale editor {execution_mode:?}");
+            create.execution_mode = TaskExecutionMode::Recurring;
+            create.run_mode = Some(TaskRunMode::NewSession);
+            create.interval_minutes = Some(30);
+            create.trigger = Some(command_trigger.clone());
+            let created = store.create_direct(create).await.unwrap();
+
+            let mut first_writer = empty_update_input(&created.id);
+            first_writer.execution_mode = Some(execution_mode);
+            if execution_mode == TaskExecutionMode::Scheduled {
+                first_writer.dispatch_at = Some(now_ms() + 60_000);
+            }
+            let first = store.update(first_writer).await.unwrap();
+            assert_eq!(first.run_mode, Some(TaskRunMode::NewSession));
+            assert!(first.preselected_session_id.is_none());
+            assert!(first.trigger.is_none());
+
+            // A second full editor still holds the old recurring snapshot. It
+            // must submit that structural discriminator alongside its dependent
+            // fields, producing a coherent last-writer-wins recurring row rather
+            // than hidden recurring state under the first writer's mode.
+            let mut stale_writer = empty_update_input(&created.id);
+            stale_writer.execution_mode = Some(TaskExecutionMode::Recurring);
+            stale_writer.run_mode = Some(TaskRunMode::SingleSession);
+            stale_writer.preselected_session_id = Some("stale-session".to_string());
+            stale_writer.trigger = Some(command_trigger.clone());
+            stale_writer.interval_minutes = Some(30);
+            let task_control = crate::task_scheduler::acquire_task_control(&created.id).await;
+            let final_task = store
+                .update_with_task_control_and_session_probe(stale_writer, &task_control, |_, _| {
+                    true
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(final_task.execution_mode, TaskExecutionMode::Recurring);
+            assert_eq!(final_task.run_mode, Some(TaskRunMode::SingleSession));
+            assert_eq!(
+                final_task.preselected_session_id.as_deref(),
+                Some("stale-session")
+            );
+            assert!(final_task.effective_trigger().is_command());
+        }
     }
 
     #[tokio::test]
@@ -6128,6 +7451,89 @@ mod tests {
     }
 
     #[test]
+    fn discussion_candidate_is_reread_only_from_the_owned_shape() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("task-discussions");
+        let candidate = root
+            .join("discussion-1")
+            .join("candidates")
+            .join("candidate-1")
+            .join("task.md");
+        std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        std::fs::write(&candidate, "# Current candidate\n").unwrap();
+
+        assert_eq!(
+            read_owned_discussion_candidate_under(&root, candidate.to_str().unwrap()).unwrap(),
+            Some("# Current candidate\n".to_string())
+        );
+        std::fs::write(&candidate, "# Updated after CLI snapshot\n").unwrap();
+        assert_eq!(
+            read_owned_discussion_candidate_under(&root, candidate.to_str().unwrap()).unwrap(),
+            Some("# Updated after CLI snapshot\n".to_string())
+        );
+
+        let generic = dir.path().join("ordinary-task.md");
+        std::fs::write(&generic, "ordinary").unwrap();
+        assert_eq!(
+            read_owned_discussion_candidate_under(&root, generic.to_str().unwrap()).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discussion_candidate_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("task-discussions");
+        let candidate_dir = root
+            .join("discussion-1")
+            .join("candidates")
+            .join("candidate-1");
+        std::fs::create_dir_all(&candidate_dir).unwrap();
+        let target = candidate_dir.join("target.md");
+        std::fs::write(&target, "shadow").unwrap();
+        let candidate = candidate_dir.join("task.md");
+        symlink(&target, &candidate).unwrap();
+
+        assert!(
+            read_owned_discussion_candidate_under(&root, candidate.to_str().unwrap())
+                .unwrap_err()
+                .contains("symlink")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discussion_candidate_rejects_a_symlinked_artifact_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let external = dir.path().join("external");
+        let candidate = external
+            .join("discussion-1")
+            .join("candidates")
+            .join("candidate-1")
+            .join("task.md");
+        std::fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        std::fs::write(&candidate, "# Outside candidate\n").unwrap();
+        let root = dir.path().join("task-discussions");
+        symlink(&external, &root).unwrap();
+        let supplied = root
+            .join("discussion-1")
+            .join("candidates")
+            .join("candidate-1")
+            .join("task.md");
+
+        assert!(
+            read_owned_discussion_candidate_under(&root, supplied.to_str().unwrap())
+                .unwrap_err()
+                .contains("root may not be a symlink")
+        );
+    }
+
+    #[test]
     fn normalize_mcp_override_preserves_explicit_empty() {
         assert_eq!(normalize_mcp_override(None), None);
         assert_eq!(normalize_mcp_override(Some(vec![])), Some(vec![]));
@@ -6170,6 +7576,8 @@ mod tests {
                 name: None,
                 executor: None,
                 description: None,
+                workspace_id: None,
+                workspace_path: None,
                 execution_mode: None,
                 run_mode: None,
                 end_conditions: None,
@@ -6245,6 +7653,54 @@ mod tests {
         // 6. External runtime without provider override — accepted (the
         //    common case for codex/gemini/cc tasks).
         assert!(validate_task_provider_routing(&None, &None, &Some("codex".into()),).is_ok());
+    }
+
+    #[test]
+    fn validate_task_execution_routing_enforces_runtime_config_source() {
+        let managed = Some(serde_json::json!({
+            "source": "managed-provider",
+            "model": "gpt-5.6-sol",
+        }));
+        assert!(
+            validate_task_execution_routing(&None, &None, &Some("codex".into()), &managed,).is_ok()
+        );
+        assert!(
+            validate_task_execution_routing(&None, &None, &Some("gemini".into()), &managed,)
+                .unwrap_err()
+                .contains("requires runtime=codex")
+        );
+        assert!(validate_task_execution_routing(
+            &None,
+            &None,
+            &Some("codex".into()),
+            &Some(serde_json::json!({ "source": "mystery" })),
+        )
+        .unwrap_err()
+        .contains("invalid runtimeConfig.source"));
+    }
+
+    #[tokio::test]
+    async fn update_rejects_managed_provider_config_on_latest_non_codex_row() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let mut create = sample_direct_input(&ws);
+        create.runtime = Some("gemini".to_string());
+        let created = store.create_direct(create).await.unwrap();
+        let mut update = empty_update_input(&created.id);
+        update.runtime_config = Some(serde_json::json!({
+            "source": "managed-provider",
+            "model": "gpt-5.6-sol",
+        }));
+
+        let error = store.update(update).await.unwrap_err();
+
+        assert!(error.contains("requires runtime=codex"));
+        let unchanged = store.get(&created.id).await.unwrap();
+        assert_eq!(unchanged.runtime.as_deref(), Some("gemini"));
+        assert!(unchanged.runtime_config.is_none());
     }
 
     /// PRD 0.2.9 — verify `pin_runtime_for_provider_id` materialises
@@ -6491,6 +7947,399 @@ mod tests {
         assert_eq!(
             reloaded.session_ids,
             vec!["sess-1".to_string(), "sess-2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_comments_preserve_exact_session_and_rebuild_agent_notification_source() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let data = dir.path().join("data");
+        let store = TaskStore::new(data.clone());
+        for _ in 0..100 {
+            if store.agent_comment_notification_source().ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+
+        // A direct user comment has no valid execution Session yet and stays
+        // pending without mutating Task lifecycle.
+        let pending = store
+            .create_user_comment(&task.id, "Please also check docs", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.admission.as_ref().map(|value| value.state),
+            Some(TaskCommentAdmissionState::PendingSession)
+        );
+        assert_eq!(store.get(&task.id).await.unwrap().status, TaskStatus::Todo);
+
+        let (_, claimed) = store
+            .append_session_and_claim_pending_comments(&task.id, "session-exact")
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed
+                .iter()
+                .map(|comment| comment.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![pending.id.as_str()]
+        );
+        let agent = store
+            .append_agent_comment(&task.id, "session-exact", "Found two risks", None)
+            .await
+            .unwrap();
+        let reply = store
+            .create_user_comment(&task.id, "Fix only the first", Some(&agent.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.conversation_session_id.as_deref(),
+            Some("session-exact")
+        );
+        assert_eq!(
+            reply
+                .admission
+                .as_ref()
+                .and_then(|value| value.target_session_id.as_deref()),
+            Some("session-exact")
+        );
+        let live_page = store.list_comments(&task.id, None, 50).await.unwrap();
+        assert!(live_page
+            .items
+            .iter()
+            .filter_map(|item| item.admission.as_ref())
+            .all(|admission| { admission.state == TaskCommentAdmissionState::Sending }));
+
+        let source = store.agent_comment_notification_source();
+        let indexed = source
+            .items
+            .iter()
+            .find(|item| item.comment_id == agent.id)
+            .expect("new Agent comment is incrementally indexed");
+        assert_eq!(indexed.task_id, task.id);
+        assert_eq!(indexed.excerpt, "Found two risks");
+
+        let mut rename = empty_update_input(&task.id);
+        rename.name = Some("Renamed risk review".to_string());
+        store.update(rename).await.unwrap();
+        assert_eq!(
+            store
+                .agent_comment_notification_source()
+                .items
+                .iter()
+                .find(|item| item.comment_id == agent.id)
+                .map(|item| item.task_name.as_str()),
+            Some("Renamed risk review")
+        );
+
+        // A persisted in-flight admission is ambiguous after restart and is
+        // normalized to unknown rather than silently retried.
+        drop(store);
+        let recovered = TaskStore::new(data);
+        let page = recovered.list_comments(&task.id, None, 50).await.unwrap();
+        let recovered_reply = page.items.iter().find(|item| item.id == reply.id).unwrap();
+        assert_eq!(
+            recovered_reply.admission.as_ref().map(|value| value.state),
+            Some(TaskCommentAdmissionState::Unknown)
+        );
+        for _ in 0..100 {
+            if recovered.agent_comment_notification_source().ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let rebuilt = recovered.agent_comment_notification_source();
+        assert!(rebuilt.ready);
+        assert_eq!(
+            rebuilt
+                .items
+                .iter()
+                .find(|item| item.comment_id == agent.id)
+                .map(|item| item.task_name.as_str()),
+            Some("Renamed risk review")
+        );
+
+        recovered.delete(&task.id).await.unwrap();
+        assert!(recovered
+            .agent_comment_notification_source()
+            .items
+            .iter()
+            .all(|item| item.task_id != task.id));
+    }
+
+    #[tokio::test]
+    async fn task_comment_pages_and_context_keep_one_linear_timeline() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+
+        for index in 0..7 {
+            store
+                .create_user_comment(&task.id, &format!("comment {index}"), None)
+                .await
+                .unwrap();
+        }
+
+        let newest = store.list_comments(&task.id, None, 3).await.unwrap();
+        assert_eq!(
+            newest
+                .items
+                .iter()
+                .map(|item| item.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["comment 4", "comment 5", "comment 6"]
+        );
+        let previous = store
+            .list_comments(&task.id, newest.next_before.as_deref(), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            previous
+                .items
+                .iter()
+                .map(|item| item.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["comment 1", "comment 2", "comment 3"]
+        );
+        assert!(previous.next_before.is_some());
+
+        let all = store.list_comments(&task.id, None, 100).await.unwrap();
+        let target = &all.items[3];
+        let context = store
+            .comment_context(&task.id, &target.id, 2)
+            .await
+            .unwrap();
+        assert_eq!(context.target_comment_id, target.id);
+        assert_eq!(
+            context
+                .items
+                .iter()
+                .map(|item| item.body.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "comment 1",
+                "comment 2",
+                "comment 3",
+                "comment 4",
+                "comment 5"
+            ]
+        );
+        assert!(context.previous_before.is_some());
+        assert!(context.next_after.is_some());
+
+        let newer = store
+            .list_comments_after(&task.id, context.next_after.as_deref().unwrap(), 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            newer
+                .items
+                .iter()
+                .map(|item| item.body.as_str())
+                .collect::<Vec<_>>(),
+            vec!["comment 6"]
+        );
+
+        let parent = all.items.first().unwrap();
+        store
+            .create_user_comment(&task.id, "reply to oldest", Some(&parent.id))
+            .await
+            .unwrap();
+        let latest = store.list_comments(&task.id, None, 1).await.unwrap();
+        assert_eq!(latest.reply_parents.len(), 1);
+        assert_eq!(latest.reply_parents[0].comment_id, parent.id);
+        assert_eq!(latest.reply_parents[0].quote, "comment 0");
+    }
+
+    #[test]
+    fn task_comment_display_quote_keeps_sixty_code_points() {
+        let body = "字".repeat(61);
+        assert_eq!(task_comment_quote(&body), format!("{}…", "字".repeat(60)));
+    }
+
+    #[tokio::test]
+    async fn failed_pending_claim_does_not_publish_the_new_session_relation() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+        let pending = store
+            .create_user_comment(&task.id, "Older pending requirement", None)
+            .await
+            .unwrap();
+        store
+            .fail_next_acceptance_comment_persist
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = store
+            .append_session_and_claim_pending_comments(&task.id, "session-new")
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected acceptance comment persist failure"));
+        assert!(store.get(&task.id).await.unwrap().session_ids.is_empty());
+        let page = store.list_comments(&task.id, None, 50).await.unwrap();
+        let unchanged = page
+            .items
+            .iter()
+            .find(|comment| comment.id == pending.id)
+            .unwrap();
+        assert_eq!(unchanged.conversation_session_id, None);
+        assert_eq!(
+            unchanged.admission.as_ref().map(|value| value.state),
+            Some(TaskCommentAdmissionState::PendingSession)
+        );
+    }
+
+    #[test]
+    fn deleted_task_projection_rejects_a_late_agent_comment_locator() {
+        let dir = tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        {
+            let mut index = store
+                .comment_notification_index
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            index.ready = true;
+            index
+                .task_projections
+                .insert("deleted-task".to_string(), None);
+        }
+        store.index_agent_comment(TaskAgentCommentLocator {
+            notification_id: "task-comment:late".to_string(),
+            task_id: "deleted-task".to_string(),
+            task_name: "Deleted".to_string(),
+            comment_id: "late".to_string(),
+            created_at: 1,
+            agent_label: None,
+            session_id: "session-1".to_string(),
+            excerpt: "late write".to_string(),
+        });
+
+        assert!(store.agent_comment_notification_source().items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_comment_notification_index_retries_after_source_repair() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let data = dir.path().join("data");
+        let store = TaskStore::new(data.clone());
+        while !store.agent_comment_notification_source().ready {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+        let comments_path = data.join("tasks").join(&task.id).join("comments.jsonl");
+        std::fs::create_dir_all(comments_path.parent().unwrap()).unwrap();
+        std::fs::write(&comments_path, "{malformed\n").unwrap();
+        {
+            let mut index = store
+                .comment_notification_index
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            index.ready = true;
+            index.partial_error = true;
+        }
+        store.retry_comment_notification_index_if_partial().await;
+        for _ in 0..100 {
+            if store.agent_comment_notification_source().ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(store.agent_comment_notification_source().partial_error);
+
+        let comment = TaskComment {
+            id: "recovered-comment".to_string(),
+            task_id: task.id.clone(),
+            body: "Recovered source".to_string(),
+            author: TaskCommentAuthor::Agent {
+                label: None,
+                session_id: "session-1".to_string(),
+            },
+            created_at: 2,
+            reply_to_comment_id: None,
+            conversation_session_id: Some("session-1".to_string()),
+            admission: None,
+        };
+        TaskStore::persist_comments_file(&comments_path, &[comment]).unwrap();
+        store.retry_comment_notification_index_if_partial().await;
+        for _ in 0..100 {
+            let source = store.agent_comment_notification_source();
+            if source.ready && !source.partial_error {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let recovered = store.agent_comment_notification_source();
+        assert!(recovered.ready);
+        assert!(!recovered.partial_error);
+        assert_eq!(recovered.items[0].comment_id, "recovered-comment");
+    }
+
+    #[tokio::test]
+    async fn large_comment_history_rebuild_is_async_and_keeps_a_bounded_projection() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let data = dir.path().join("data");
+        let store = TaskStore::new(data.clone());
+        let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+        drop(store);
+
+        let comments_path = data.join("tasks").join(&task.id).join("comments.jsonl");
+        std::fs::create_dir_all(comments_path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&comments_path).unwrap();
+        let mut writer = std::io::BufWriter::new(file);
+        for index in 0..20_000 {
+            let comment = TaskComment {
+                id: format!("agent-{index:05}"),
+                task_id: task.id.clone(),
+                body: format!("result {index}"),
+                author: TaskCommentAuthor::Agent {
+                    label: None,
+                    session_id: "session-large".to_string(),
+                },
+                created_at: index,
+                reply_to_comment_id: None,
+                conversation_session_id: Some("session-large".to_string()),
+                admission: None,
+            };
+            serde_json::to_writer(&mut writer, &comment).unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+        writer.flush().unwrap();
+
+        let started = std::time::Instant::now();
+        let rebuilt = TaskStore::new(data);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "TaskStore construction must not synchronously scan comment history"
+        );
+        for _ in 0..1_000 {
+            if rebuilt.agent_comment_notification_source().ready {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let source = rebuilt.agent_comment_notification_source();
+        assert!(source.ready);
+        assert_eq!(source.items.len(), MAX_TASK_COMMENT_NOTIFICATION_INDEX);
+        assert_eq!(
+            source.items.first().map(|item| item.comment_id.as_str()),
+            Some("agent-19999")
         );
     }
 

@@ -221,6 +221,43 @@ pub fn resolve_session_runtime_identity_full(session_id: &str) -> Option<Runtime
     resolve_session_runtime_identity_full_from_json(session_id, &content)
 }
 
+/// Session binding validation for workspace-scoped owners such as Tasks.
+/// `sessions.json` owns the persisted Session identity, including the
+/// workspace in which that Session was created; callers must not bind an
+/// existing Session to a Task executing in a different workspace.
+pub fn session_metadata_matches_workspace(session_id: &str, workspace_path: &str) -> bool {
+    let Some(sessions_path) = dirs::home_dir().map(|home| home.join(".myagents/sessions.json"))
+    else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(sessions_path) else {
+        return false;
+    };
+    session_metadata_matches_workspace_from_json(session_id, workspace_path, &content)
+}
+
+fn session_metadata_matches_workspace_from_json(
+    session_id: &str,
+    workspace_path: &str,
+    content: &str,
+) -> bool {
+    let Ok(sessions) = serde_json::from_str::<serde_json::Value>(strip_bom(content)) else {
+        return false;
+    };
+    sessions.as_array().is_some_and(|sessions| {
+        sessions.iter().any(|session| {
+            session.get("id").and_then(|value| value.as_str()) == Some(session_id)
+                && session
+                    .get("agentDir")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|agent_dir| {
+                        crate::cron_task::normalize_path(agent_dir)
+                            == crate::cron_task::normalize_path(workspace_path)
+                    })
+        })
+    })
+}
+
 #[cfg(test)]
 pub(super) fn resolve_session_runtime_identity_from_json(
     session_id: &str,
@@ -622,5 +659,28 @@ mod tests {
             std::path::Path::new("/repo/a"),
         )
         .is_none());
+    }
+
+    #[test]
+    fn session_workspace_match_uses_persisted_session_identity() {
+        let sessions = serde_json::json!([
+            { "id": "session-a", "agentDir": "/repo/a", "runtime": "builtin" },
+            { "id": "session-b", "agentDir": "/repo/b", "runtime": "codex" }
+        ])
+        .to_string();
+
+        assert!(session_metadata_matches_workspace_from_json(
+            "session-a",
+            "/repo/a/",
+            &sessions,
+        ));
+        assert!(!session_metadata_matches_workspace_from_json(
+            "session-a",
+            "/repo/b",
+            &sessions,
+        ));
+        assert!(!session_metadata_matches_workspace_from_json(
+            "missing", "/repo/a", &sessions,
+        ));
     }
 }

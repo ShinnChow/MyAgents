@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 2,
+  "playwrightMcpVersion": "0.0.68",
+  "playwrightCoreVersion": "1.59.0-alpha-1771104257000",
+  "chromiumRevision": "1212",
+  "chromiumBrowserVersion": "146.0.7680.0",
+  "runtimeSet": "playwright-1.59.0-alpha-1771104257000-chromium-1212",
+  "officialArtifacts": {
+    "darwin-arm64": {
+      "sourceUrl": "https://cdn.playwright.dev/builds/cft/146.0.7680.0/mac-arm64/chrome-mac-arm64.zip",
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.0/mac-arm64/chrome-mac-arm64.zip",
+      "sha256": "8a378e5ff4252d94bb23c509af694b151e99dc88e71099052398cf4eb01a1680",
+      "archiveSizeBytes": 176745207,
+      "unpackedSizeBytes": 353157834,
+      "entryCount": 652,
+      "archiveRoot": "chrome-mac-arm64",
+      "executableRelativePath": "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+    },
+    "darwin-x64": {
+      "sourceUrl": "https://cdn.playwright.dev/builds/cft/146.0.7680.0/mac-x64/chrome-mac-x64.zip",
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.0/mac-x64/chrome-mac-x64.zip",
+      "sha256": "4f85787e84092691ba6288a5ea95c8c46a9e89c996f9a0455c73ee558c42fe98",
+      "archiveSizeBytes": 186014795,
+      "unpackedSizeBytes": 363877782,
+      "entryCount": 652,
+      "archiveRoot": "chrome-mac-x64",
+      "executableRelativePath": "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+    },
+    "win32-x64": {
+      "sourceUrl": "https://cdn.playwright.dev/builds/cft/146.0.7680.0/win64/chrome-win64.zip",
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.0/win64/chrome-win64.zip",
+      "sha256": "d8b000b9a4be03adf87d866452868b5780920cf97bb00a904b3597c0bbfb0bc0",
+      "archiveSizeBytes": 191469249,
+      "unpackedSizeBytes": 428406131,
+      "entryCount": 308,
+      "archiveRoot": "chrome-win64",
+      "executableRelativePath": "chrome-win64/chrome.exe"
+    },
+    "linux-x64": {
+      "sourceUrl": "https://cdn.playwright.dev/builds/cft/146.0.7680.0/linux64/chrome-linux64.zip",
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.0/linux64/chrome-linux64.zip",
+      "sha256": "6b3550372c9d912dd016d3333a8821e903f97277fb1fab503c9fa6ad426dd2a7",
+      "archiveSizeBytes": 182868460,
+      "unpackedSizeBytes": 389103821,
+      "entryCount": 310,
+      "archiveRoot": "chrome-linux64",
+      "executableRelativePath": "chrome-linux64/chrome"
+    },
+    "linux-arm64": {
+      "sourceUrl": "https://cdn.playwright.dev/builds/chromium/1212/chromium-linux-arm64.zip",
+      "url": "https://cdn.playwright.dev/builds/chromium/1212/chromium-linux-arm64.zip",
+      "sha256": "da0e6af6376948fa868d2fc01cf1ebb68b8ac7f083590a676a07d7d93c87debb",
+      "archiveSizeBytes": 195001446,
+      "unpackedSizeBytes": 639969403,
+      "entryCount": 474,
+      "archiveRoot": "chrome-linux",
+      "executableRelativePath": "chrome-linux/chrome"
+    }
+  }
+}

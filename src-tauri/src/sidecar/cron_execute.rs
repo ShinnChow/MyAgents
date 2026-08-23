@@ -85,6 +85,12 @@ pub struct BackgroundTurnResponse {
     pub termination_unconfirmed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Structured failure classification from SessionEngine. Task policy must
+    /// not infer permanence from localized error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ai_requested_exit: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,6 +116,8 @@ fn unconfirmed_transport_response(session_id: &str, error: String) -> Background
         turn_dispatched: false,
         termination_unconfirmed: true,
         error: Some(error),
+        code: Some("transport_unconfirmed".to_string()),
+        status: Some(503),
         ai_requested_exit: None,
         exit_reason: None,
         output_text: None,
@@ -378,7 +386,7 @@ async fn execute_background_turn<R: Runtime, P: serde::Serialize>(
     );
 
     // Parse response
-    let result: BackgroundTurnResponse = match serde_json::from_str(&body) {
+    let mut result: BackgroundTurnResponse = match serde_json::from_str(&body) {
         Ok(result) => result,
         Err(error) => {
             let message = format!(
@@ -398,6 +406,9 @@ async fn execute_background_turn<R: Runtime, P: serde::Serialize>(
             return Ok(unconfirmed_transport_response(&session_id, message));
         }
     };
+    if result.status.is_none() {
+        result.status = Some(status.as_u16());
+    }
 
     ulog_info!(
         "[sidecar] Background turn {} parsed response: success={}, error={:?}, ai_requested_exit={:?}",

@@ -270,6 +270,31 @@ describe('SseConnection — listener cleanup invariants', () => {
         await conn.disconnect();
     });
 
+    it('parses the runtime-neutral MCP effective snapshot as JSON', async () => {
+        const conn = new SseConnection('test-tab', { current: 'session-a' });
+        const handler = vi.fn();
+        conn.setEventHandler(handler);
+        await conn.connect();
+
+        const payload = {
+            runtimeGeneration: 2,
+            configGeneration: 4,
+            catalogGeneration: 7,
+            servers: [],
+        };
+        (conn as unknown as {
+            handleTauriEnvelope(eventName: string, envelope: { transportGeneration: number; data: string }): void;
+        }).handleTauriEnvelope('chat:mcp-effective-snapshot', {
+            transportGeneration: 42,
+            data: JSON.stringify(payload),
+        });
+
+        expect(handler).toHaveBeenCalledWith('chat:mcp-effective-snapshot', payload, {
+            connectionGeneration: 42,
+        });
+        await conn.disconnect();
+    });
+
     it('unwraps a revisioned terminal error as structured data', async () => {
         const conn = new SseConnection('test-tab', { current: 'session-a' });
         const handler = vi.fn();

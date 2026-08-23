@@ -53,7 +53,7 @@ fn default_issue_subscription_run_mode() -> SpaceIssueSubscriptionRunMode {
     SpaceIssueSubscriptionRunMode::SingleSession
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpaceGoalSubscriptionSummary {
     pub id: String,
@@ -253,14 +253,6 @@ fn value_issue_subscription_run_mode(
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
-fn first_subscription_from_data(data: &Value) -> Option<&Value> {
-    data.get("subscription").or_else(|| {
-        data.get("subscriptions")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-    })
-}
-
 fn subscription_summary_from_value(value: &Value) -> Option<SpaceGoalSubscriptionSummary> {
     Some(SpaceGoalSubscriptionSummary {
         id: optional_value_string(value, "id")?,
@@ -396,15 +388,31 @@ fn device_summary_from_cloud(
 fn local_registered_agent_public_from_cloud(
     session: &SpaceSession,
     registered: &Value,
-    subscription: Option<&Value>,
+    subscription_data: Option<&Value>,
     fallback: Option<&LocalRegisteredAgent>,
 ) -> Result<LocalRegisteredAgentPublic, String> {
     let device = device_summary_from_cloud(registered, fallback, None);
-    let state_filter = subscription
-        .and_then(|value| value_string_array(value, "stateFilter"))
-        .filter(|items| !items.is_empty())
+    let response_defines_subscriptions = subscription_data.is_some_and(|data| {
+        data.get("subscription").is_some() || data.get("subscriptions").is_some()
+    });
+    let subscriptions = if response_defines_subscriptions {
+        subscriptions_from_data(subscription_data.expect("checked subscription data"))
+    } else {
+        fallback
+            .map(|agent| agent.subscriptions.clone())
+            .unwrap_or_default()
+    };
+    let visible_subscription = subscriptions.first();
+    let state_filter = visible_subscription
+        .map(|subscription| subscription.state_filter.clone())
         .or_else(|| fallback.map(|agent| agent.state_filter.clone()))
         .unwrap_or_else(default_agent_state_filter);
+    let goal_id = visible_subscription
+        .map(|subscription| subscription.goal_id.clone())
+        .or_else(|| fallback.and_then(|agent| agent.goal_id.clone()));
+    let goal_path_label = visible_subscription
+        .and_then(|subscription| subscription.goal_path_label.clone())
+        .or_else(|| fallback.and_then(|agent| agent.goal_path_label.clone()));
     Ok(LocalRegisteredAgentPublic {
         id: required_value_string(registered, "id")?,
         base_url: session.base_url.clone(),
@@ -456,17 +464,9 @@ fn local_registered_agent_public_from_cloud(
             .filter(|value| value.is_object())
             .cloned()
             .or_else(|| fallback.and_then(|agent| agent.avatar_urls.clone())),
-        subscriptions: subscription
-            .and_then(subscription_summary_from_value)
-            .map(|item| vec![item])
-            .or_else(|| fallback.map(|agent| agent.subscriptions.clone()))
-            .unwrap_or_default(),
-        goal_id: subscription
-            .and_then(|value| optional_value_string(value, "goalId"))
-            .or_else(|| fallback.and_then(|agent| agent.goal_id.clone())),
-        goal_path_label: subscription
-            .and_then(|value| optional_value_string(value, "goalPathLabel"))
-            .or_else(|| fallback.and_then(|agent| agent.goal_path_label.clone())),
+        subscriptions,
+        goal_id,
+        goal_path_label,
         state_filter,
         goal_md: optional_value_string(registered, "goalMd")
             .or_else(|| fallback.and_then(|agent| agent.goal_md.clone())),
@@ -534,6 +534,16 @@ pub struct SpaceRegisterAgentInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SpaceRegisteredAgentSubscriptionReplacementInput {
+    #[serde(default)]
+    pub expected_subscription_id: Option<String>,
+    pub goal_id: String,
+    #[serde(default)]
+    pub state_filter: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SpaceUpdateRegisteredAgentInput {
     pub id: String,
     #[serde(default)]
@@ -549,9 +559,7 @@ pub struct SpaceUpdateRegisteredAgentInput {
     #[serde(default)]
     pub workspace_label: Option<String>,
     #[serde(default)]
-    pub goal_id: Option<String>,
-    #[serde(default)]
-    pub state_filter: Option<Vec<String>>,
+    pub subscription_replacement: Option<SpaceRegisteredAgentSubscriptionReplacementInput>,
     #[serde(default)]
     pub goal_md: Option<String>,
     #[serde(default)]
@@ -846,31 +854,37 @@ pub(super) async fn update_registered_agent(
             }
         }
     }
-    if let Some(goal_id) = input.goal_id {
-        let goal_id = goal_id.trim();
+    if let Some(replacement) = input.subscription_replacement {
+        let goal_id = replacement.goal_id.trim();
         if goal_id.is_empty() {
-            return Err("goalId is required".into());
+            return Err("subscriptionReplacement.goalId is required".into());
         }
-        if agent.as_ref().and_then(|agent| agent.goal_id.as_deref()) != Some(goal_id) {
-            if let Some(agent) = agent.as_mut() {
-                agent.goal_path_label = None;
+        let expected_subscription_id = match replacement.expected_subscription_id {
+            Some(id) if id.trim().is_empty() => {
+                return Err(
+                    "subscriptionReplacement.expectedSubscriptionId must not be empty".into(),
+                )
             }
-        }
-        if let Some(agent) = agent.as_mut() {
-            agent.goal_id = Some(goal_id.to_string());
-            agent.goal_path_label = None;
-        }
-        body.insert("goalId".to_string(), Value::String(goal_id.to_string()));
-    }
-    if let Some(state_filter) = input.state_filter {
-        let state_filter = normalize_agent_state_filter(Some(state_filter));
-        body.insert(
-            "stateFilter".to_string(),
-            Value::Array(state_filter.iter().cloned().map(Value::String).collect()),
+            Some(id) => Some(id.trim().to_string()),
+            None => None,
+        };
+        let state_filter = normalize_agent_state_filter(replacement.state_filter);
+        let mut replacement_body = serde_json::Map::new();
+        replacement_body.insert(
+            "expectedSubscriptionId".to_string(),
+            expected_subscription_id
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
-        if let Some(agent) = agent.as_mut() {
-            agent.state_filter = state_filter;
-        }
+        replacement_body.insert("goalId".to_string(), Value::String(goal_id.to_string()));
+        replacement_body.insert(
+            "stateFilter".to_string(),
+            Value::Array(state_filter.into_iter().map(Value::String).collect()),
+        );
+        body.insert(
+            "subscriptionReplacement".to_string(),
+            Value::Object(replacement_body),
+        );
     }
     if let Some(goal_md) = input.goal_md {
         let goal_md = goal_md.trim();
@@ -969,7 +983,6 @@ pub(super) async fn update_registered_agent(
     } else if let Some(agent) = agent.as_mut() {
         agent.updated_at = chrono::Utc::now().to_rfc3339();
     }
-    let subscription = first_subscription_from_data(&data);
     if let Some(agent) = agent.as_mut() {
         apply_subscriptions_to_local_agent(agent, &data);
         let merged =
@@ -980,7 +993,7 @@ pub(super) async fn update_registered_agent(
         .get("registeredAgent")
         .ok_or_else(|| "Space API response missing registeredAgent".to_string())?;
     Ok((
-        local_registered_agent_public_from_cloud(&session, registered, subscription, None)?,
+        local_registered_agent_public_from_cloud(&session, registered, Some(&data), None)?,
         false,
     ))
 }
@@ -1018,12 +1031,7 @@ pub(super) async fn update_registered_agent_avatar(
         return Ok((merged.into(), true));
     }
     Ok((
-        local_registered_agent_public_from_cloud(
-            &session,
-            registered,
-            first_subscription_from_data(&data),
-            None,
-        )?,
+        local_registered_agent_public_from_cloud(&session, registered, Some(&data), None)?,
         false,
     ))
 }
@@ -1066,7 +1074,7 @@ pub async fn cmd_space_revoke_registered_agent(
     Ok(local_registered_agent_public_from_cloud(
         &session,
         registered,
-        first_subscription_from_data(&data),
+        Some(&data),
         None,
     )?)
 }

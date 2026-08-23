@@ -1304,6 +1304,41 @@ pub(crate) fn finish_session_owner_release(
         // The exact generation remains manager-authoritative with admission
         // closed while this waits. No global manager mutex is held here.
         drain.wait();
+        let browser_host = {
+            let mut manager_guard = manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            manager_guard.global_process_binding()
+        };
+        if let Some((port, generation)) = browser_host {
+            let retirement = crate::local_http::blocking_builder()
+                .timeout(std::time::Duration::from_millis(5_500))
+                .build()
+                .and_then(|client| {
+                    client
+                        .post(format!(
+                            "http://127.0.0.1:{port}/api/browser/session/retire"
+                        ))
+                        .header("x-myagents-sidecar-generation", generation.to_string())
+                        .json(&serde_json::json!({
+                            "productSessionId": &drain.session_id,
+                        }))
+                        .send()
+                });
+            match retirement {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => ulog_warn!(
+                    "[browser-profile] action=session-retire status=rejected session={} http_status={}",
+                    drain.session_id,
+                    response.status()
+                ),
+                Err(error) => ulog_warn!(
+                    "[browser-profile] action=session-retire status=unavailable session={} error={}",
+                    drain.session_id,
+                    error
+                ),
+            }
+        }
         let retired = {
             // Owner removal already committed before the drain. Recovering a
             // poisoned lock here is required to finish that same transition;
@@ -1321,7 +1356,7 @@ pub(crate) fn finish_session_owner_release(
     Ok((removed, stopped))
 }
 
-pub fn release_session_sidecar(
+fn release_session_sidecar_blocking(
     manager: &ManagedSidecarManager,
     session_id: &str,
     owner: &SidecarOwner,
@@ -1357,6 +1392,56 @@ pub fn release_session_sidecar(
         );
         Ok(false)
     }
+}
+
+/// Blocking-thread-only owner release entrypoint.
+///
+/// This exists for lifecycle pollers that already run on a dedicated
+/// `std::thread`. Tokio/async callers must use [`release_session_sidecar`].
+pub(crate) fn release_session_sidecar_from_blocking_thread(
+    manager: &ManagedSidecarManager,
+    session_id: &str,
+    owner: &SidecarOwner,
+) -> Result<bool, String> {
+    release_session_sidecar_blocking(manager, session_id, owner)
+}
+
+/// Async-safe owner release entrypoint. The exact generation drain, Browser
+/// Host retirement request, and process drop are intentionally executed on a
+/// blocking worker; callers on Tokio must never enter reqwest's blocking
+/// client lifecycle directly.
+pub async fn release_session_sidecar(
+    manager: &ManagedSidecarManager,
+    session_id: &str,
+    owner: &SidecarOwner,
+) -> Result<bool, String> {
+    let manager = manager.clone();
+    let session_id = session_id.to_string();
+    let owner = owner.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        release_session_sidecar_blocking(&manager, &session_id, &owner)
+    })
+    .await
+    .map_err(|error| format!("Session owner release task failed: {error:?}"))?
+}
+
+/// Transfer a Drop-only release obligation to the async lifecycle owner.
+/// Ordinary control flow must await [`release_session_sidecar`] directly.
+pub fn schedule_release_session_sidecar(
+    manager: ManagedSidecarManager,
+    session_id: String,
+    owner: SidecarOwner,
+) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = release_session_sidecar(&manager, &session_id, &owner).await {
+            ulog_warn!(
+                "[sidecar] deferred owner release failed session={} owner={:?}: {}",
+                session_id,
+                owner,
+                error
+            );
+        }
+    });
 }
 
 /// Get the port for a Session's Sidecar
@@ -1440,12 +1525,7 @@ pub async fn cmd_release_session_sidecar(
         _ => return Err(format!("Invalid owner type: {}", ownerType)),
     };
 
-    let manager = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        release_session_sidecar(&manager, &sessionId, &owner)
-    })
-    .await
-    .map_err(|error| format!("Session owner release task failed: {error:?}"))?
+    release_session_sidecar(state.inner(), &sessionId, &owner).await
 }
 
 /// Get the ready port for a Session's Sidecar.

@@ -1,7 +1,7 @@
 import { AlertCircle, CheckCircle, Loader2, X } from 'lucide-react';
 import React, { memo, useCallback, useMemo, useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { Virtuoso } from 'react-virtuoso';
-import type { SizeFunction, VirtuosoHandle } from 'react-virtuoso';
+import type { ListItem, SizeFunction, VirtuosoHandle } from 'react-virtuoso';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 
@@ -16,6 +16,7 @@ import { ChatRowLayoutProvider, type RowLayoutChangeReason } from '@/context/Cha
 import type { RowLayoutContract } from '@/utils/chatRowLayout';
 import { useChatScrollDebugProbe } from '@/hooks/useChatScrollDebugProbe';
 import { resolveChatBottomSpacerPx } from '@/utils/chatBottomSpacer';
+import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
 function formatElapsedTime(totalSeconds: number, t: TFunction<'chat'>): string {
   const hours = Math.floor(totalSeconds / 3600);
@@ -41,8 +42,14 @@ interface MessageListProps {
    * if we were following before the tab went hidden.
    */
   isActive?: boolean;
-  /** Native focus projection, used to preserve blur-time follow intent and fence focus recovery. */
-  isWindowFocused?: boolean;
+  /** Native shown/not-minimized generation; focus is intentionally excluded. */
+  windowPresentation?: MainWindowPresentation;
+  /** Commits the single list-admission edge to the Chat scroll owner. */
+  onViewportAdmissionChanged?: (admitted: boolean, presentationGeneration: number) => void;
+  /** Allows an event-driven pending anchor to settle once Virtuoso mounts its row. */
+  onItemsRendered?: () => void;
+  /** Hides only a known-wrong intermediate recovery position. */
+  isViewportRecoveryFenced?: boolean;
   // Pagination: Virtuoso maintains the visible scroll position across
   // prepended items by the absolute index of data[0]. Default 0 = no pagination.
   firstItemIndex?: number;
@@ -96,6 +103,13 @@ const STREAMING_MESSAGE_COUNT = 20;
 const noopRowLayoutChanged = (_messageId: string, _reason: RowLayoutChangeReason) => {};
 const STATUS_ROW_HEIGHT_PX = 30;
 const EMPTY_MESSAGE_ID_SET: ReadonlySet<string> = new Set();
+const EMPTY_MESSAGES: readonly MessageType[] = [];
+const DEFAULT_WINDOW_PRESENTATION: MainWindowPresentation = {
+  surfaceAvailable: true,
+  generation: 0,
+};
+const noopViewportAdmissionChanged = (_admitted: boolean, _presentationGeneration: number) => {};
+const noopItemsRendered = () => {};
 
 function isLargeRowShrink(reason: RowLayoutChangeReason): boolean {
   return reason === 'process-row-collapse' || reason === 'user-message-collapse-measured';
@@ -248,7 +262,10 @@ const MessageList = memo(function MessageList({
   isLoading,
   sessionId,
   isActive = true,
-  isWindowFocused = true,
+  windowPresentation = DEFAULT_WINDOW_PRESENTATION,
+  onViewportAdmissionChanged = noopViewportAdmissionChanged,
+  onItemsRendered = noopItemsRendered,
+  isViewportRecoveryFenced = false,
   firstItemIndex,
   heightEstimateSeed,
   layoutByMessageId,
@@ -280,8 +297,45 @@ const MessageList = memo(function MessageList({
   bottomSpacerPx,
 }: MessageListProps) {
   const { t } = useTranslation('chat');
-  const committedWindowFocusedRef = useRef(isWindowFocused);
-  const isWindowFocusReturn = isWindowFocused && !committedWindowFocusedRef.current;
+  const viewportRootRef = useRef<HTMLDivElement>(null);
+  const [readyPresentationGeneration, setReadyPresentationGeneration] = useState<number | null>(
+    windowPresentation.surfaceAvailable && windowPresentation.generation === 0 ? 0 : null,
+  );
+  useLayoutEffect(() => {
+    if (
+      !isActive
+      || !windowPresentation.surfaceAvailable
+      || readyPresentationGeneration === windowPresentation.generation
+    ) return;
+    const viewport = viewportRootRef.current;
+    if (!viewport) return;
+    let disposed = false;
+    const commitIfUsable = (width: number, height: number) => {
+      if (disposed || width <= 0 || height <= 0) return;
+      setReadyPresentationGeneration(windowPresentation.generation);
+    };
+    if (typeof ResizeObserver === 'undefined') {
+      const rect = viewport.getBoundingClientRect();
+      commitIfUsable(rect.width, rect.height);
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      commitIfUsable(entry.contentRect.width, entry.contentRect.height);
+    });
+    observer.observe(viewport);
+    return () => {
+      disposed = true;
+      observer.disconnect();
+    };
+  }, [isActive, readyPresentationGeneration, windowPresentation]);
+  const canLayoutVirtualList = isActive
+    && windowPresentation.surfaceAvailable
+    && readyPresentationGeneration === windowPresentation.generation;
+  useLayoutEffect(() => {
+    onViewportAdmissionChanged(canLayoutVirtualList, windowPresentation.generation);
+  }, [canLayoutVirtualList, onViewportAdmissionChanged, windowPresentation.generation]);
   const liveHeightEstimateSeed = heightEstimateSeed?.length === messages.length ? heightEstimateSeed : undefined;
 
   const streamingStatusMessage = useMemo(
@@ -334,79 +388,17 @@ const MessageList = memo(function MessageList({
     // same cache-poisoning class as the data freeze below). If the session changed
     // while inactive, defer the pin: leaving lastScrolledSessionRef unset means this
     // effect re-fires and pins once isActive flips true.
-    if (!isActive) return;
+    if (!canLayoutVirtualList) return;
     if (!sessionId || sessionId === lastScrolledSessionRef.current) return;
     if (messages.length === 0) return;
     lastScrolledSessionRef.current = sessionId;
     scrollToBottom('auto');
-  }, [isActive, sessionId, messages.length, scrollToBottom]);
+  }, [canLayoutVirtualList, sessionId, messages.length, scrollToBottom]);
 
-  // Tab inactive ↔ active follow-state preservation.
-  //
-  // While inactive, the host wraps us in `content-visibility: hidden`. WebKit
-  // skips descendant layout, so Virtuoso's ResizeObserver and internal bottom-
-  // detection math can fire with zero/stale geometry. The `guardedAtBottomChange`
-  // below catches the common case (atBottom callback fired while !isActive), but
-  // there are timing windows around the inactive↔active transition itself where a
-  // queued callback can race with the React re-render and slip through with the
-  // wrong closure. Once `followEnabledRef` flips to `false`, the previous "skip
-  // recovery if not following" guard would silently drop us out of follow mode
-  // permanently for this stream — exactly the user-reported bug.
-  //
-  // Pit-of-success fix: snapshot the live follow state at the precise moment the
-  // tab goes inactive (when measurements are still trustworthy and the user's
-  // intent is unambiguous), then on re-activation restore the snapshot and re-pin
-  // to bottom if the snapshot says we were following. This makes recovery
-  // independent of whatever happens to `followEnabledRef` during the hidden
-  // window — even if a stale observer flips it, the snapshot is authoritative.
-  // 'force' is normalized to `true` because force is a transient programmatic
-  // state; restoring it would re-enter `force` with no scrollToBottom call to
-  // back it up, defeating the auto-degrade timer.
-  const inactiveSnapshotRef = useRef<boolean | 'force' | null>(null);
-  // Session the snapshot belongs to. A session switch while hidden invalidates the
-  // snapshot: the old session's follow intent must not carry into the new session.
-  const inactiveSnapshotSessionRef = useRef<string | null | undefined>(null);
-  useLayoutEffect(() => {
-    if (!isActive) {
-      if (inactiveSnapshotRef.current === null) {
-        const cur = followEnabledRef.current;
-        inactiveSnapshotRef.current = cur === 'force' ? true : cur;
-        inactiveSnapshotSessionRef.current = sessionId;
-      }
-      return;
-    }
-    const snap = inactiveSnapshotRef.current;
-    const snapSession = inactiveSnapshotSessionRef.current;
-    if (snap === null) return; // initial mount or no inactive transition recorded
-    inactiveSnapshotRef.current = null;
-    // Session changed while hidden → the old snapshot is stale. Drop it and let the
-    // session-switch pin effect own scroll + follow for the new session (it defaults
-    // a fresh session to bottom, and scrollToBottom's 'force' degrades to follow=true).
-    // Without this, restoring a stale `snap === false` here would leave the freshly
-    // switched-to session pinned at bottom but with auto-follow silently disabled.
-    if (snapSession !== sessionId) return;
-    // Restore from snapshot regardless of branch — both directions need to overwrite
-    // whatever the live ref currently says. If `snap === false` we restore `false`
-    // explicitly: a stale atBottom(true) callback during the hidden window could
-    // have flipped the live ref to `true`, which would silently re-engage follow
-    // mode against the user's actual intent (they had scrolled up before leaving).
-    followEnabledRef.current = snap;
-    // User had scrolled up before switching away — respect that, leave scroll alone.
-    if (snap === false) return;
-    // User was at bottom before switching away. Re-pin to actual scroll bottom.
-    // scrollToBottom() flips the ref to 'force' + arms grace/auto-degrade timer.
-    if (messages.length > 0) {
-      scrollToBottom('auto');
-    }
-  }, [isActive, messages.length, scrollToBottom, sessionId, followEnabledRef]);
-
-  // Keep the follow intent captured at blur authoritative until focus returns.
-  // Layout-driven atBottom changes may still arrive while the visible window is
-  // unfocused; rendering stays live, but those callbacks are not user intent.
   const guardedAtBottomChange = useCallback((atBottom: boolean) => {
-    if (!isActive || !isWindowFocused || (isWindowFocusReturn && !committedWindowFocusedRef.current)) return;
+    if (!canLayoutVirtualList) return;
     handleAtBottomChange(atBottom);
-  }, [isActive, isWindowFocused, isWindowFocusReturn, handleAtBottomChange]);
+  }, [canLayoutVirtualList, handleAtBottomChange]);
 
   // ── Auto-scroll during streaming — keep the view pinned to the bottom as the
   // streaming item grows taller. `followOutput` only fires on item-COUNT change,
@@ -424,18 +416,21 @@ const MessageList = memo(function MessageList({
   // Gated on `isLoading` (actual streaming), not merely `!!streamingMessage`: a
   // stale streaming message from the loadSession-REST / live-SSE mid-turn race
   // must NOT keep auto-scroll alive once the turn has completed.
+  const wasViewportRecoveryFencedRef = useRef(isViewportRecoveryFenced);
   useLayoutEffect(() => {
+    const justFinishedRecovery = wasViewportRecoveryFencedRef.current && !isViewportRecoveryFenced;
+    wasViewportRecoveryFencedRef.current = isViewportRecoveryFenced;
     if (!streamingMessage || !isLoading || !followEnabledRef.current) return;
     // Skip while the internal Tab is hidden — scrolling against a
     // content-visibility:hidden scroller
     // can compute against stale geometry. The re-pin layout effect above restores
     // position on re-activation.
-    if (!isActive) return;
-    // Window-focus recovery belongs to ChatScrollController. A focus-only
-    // geometry transition must not create a second LAST/end command here.
-    if (isWindowFocusReturn) return;
+    if (!canLayoutVirtualList || isViewportRecoveryFenced) return;
+    // The controller already issued the one authoritative recovery command.
+    // Fence settlement alone is not new streaming output and must not replay it.
+    if (justFinishedRecovery) return;
     virtuosoRef.current?.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' });
-  }, [streamingMessage, isLoading, isActive, isWindowFocusReturn, followEnabledRef, virtuosoRef]);
+  }, [streamingMessage, isLoading, canLayoutVirtualList, isViewportRecoveryFenced, followEnabledRef, virtuosoRef]);
 
   // ── Terminal pin — pin to bottom once when a turn ends ──
   // At turn end the data-layer reveal drains the remaining text and the message moves to
@@ -447,17 +442,10 @@ const MessageList = memo(function MessageList({
   useLayoutEffect(() => {
     const was = prevIsLoadingRef.current;
     prevIsLoadingRef.current = isLoading;
-    if (was && !isLoading && isActive && !isWindowFocusReturn && followEnabledRef.current) {
+    if (was && !isLoading && canLayoutVirtualList && !isViewportRecoveryFenced && followEnabledRef.current) {
       scrollToBottom('auto');
     }
-  }, [isLoading, isActive, isWindowFocusReturn, followEnabledRef, scrollToBottom]);
-
-  // Mark the focus commit trustworthy only after Virtuoso's child layout
-  // effects have run. During that commit callbacks and local pins stay gated;
-  // the parent ChatScrollController then executes the sole recovery intent.
-  useLayoutEffect(() => {
-    committedWindowFocusedRef.current = isWindowFocused;
-  }, [isWindowFocused]);
+  }, [isLoading, canLayoutVirtualList, isViewportRecoveryFenced, followEnabledRef, scrollToBottom]);
 
   // ── Refs for stable callbacks — avoid recreating itemContent/Footer on every render ──
   const streamingMessageRef = useRef(streamingMessage);
@@ -474,15 +462,20 @@ const MessageList = memo(function MessageList({
   layoutByMessageIdRef.current = layoutByMessageId;
   const onRowLayoutChangedRef = useRef(onRowLayoutChanged ?? noopRowLayoutChanged);
   onRowLayoutChangedRef.current = onRowLayoutChanged ?? noopRowLayoutChanged;
-  const isItemMeasurementActiveRef = useRef(isActive);
-  isItemMeasurementActiveRef.current = isActive;
+  const isItemMeasurementActiveRef = useRef(canLayoutVirtualList);
+  isItemMeasurementActiveRef.current = canLayoutVirtualList;
   const measureVisibleItemSize = useCallback<SizeFunction>((element, field) => {
+    const knownSize = Number(element.dataset.knownSize);
     if (!isItemMeasurementActiveRef.current) {
-      const knownSize = Number(element.dataset.knownSize);
-      if (Number.isFinite(knownSize)) return knownSize;
+      if (Number.isFinite(knownSize) && knownSize > 0) return knownSize;
     }
     const rectField = field === 'offsetWidth' ? 'width' : 'height';
-    return Math.round(element.getBoundingClientRect()[rectField]);
+    const measuredSize = Math.round(element.getBoundingClientRect()[rectField]);
+    // A mounted row always has positive layout size. Some WebViews can briefly report
+    // zero while updating a long virtualized list; feeding that transient geometry into
+    // Virtuoso corrupts its size model and can move the viewport far from the anchor.
+    if (measuredSize <= 0 && Number.isFinite(knownSize) && knownSize > 0) return knownSize;
+    return measuredSize;
   }, []);
   const [isLargeRowShrinking, setIsLargeRowShrinking] = useState(false);
   const collapseMeasureFrameRef = useRef<number | null>(null);
@@ -523,42 +516,40 @@ const MessageList = memo(function MessageList({
     onRowLayoutChangedRef.current(messageId, reason);
   }, [cancelPendingLargeRowShrink]);
   useLayoutEffect(() => {
-    if (isActive) return;
+    if (canLayoutVirtualList) return;
     // A delayed ResizeObserver callback may already be queued when the host hides
     // this Tab with content-visibility. Cancel our transaction before the next
     // frame; measureVisibleItemSize also fences any already-queued Virtuoso callback
     // to its last known size so hidden geometry cannot poison the size cache.
     cancelPendingLargeRowShrink();
     setIsLargeRowShrinking(false);
-  }, [cancelPendingLargeRowShrink, isActive]);
+  }, [cancelPendingLargeRowShrink, canLayoutVirtualList]);
   useEffect(() => cancelPendingLargeRowShrink, [cancelPendingLargeRowShrink]);
-  // followOutput / startReached capture `isActive` DIRECTLY (not via a ref). Under
-  // React 19's child-before-parent layout-effect ordering, a ref updated in our parent
-  // layout effect could still read a stale value when Virtuoso's child effects fire
-  // these callbacks first on the active→hidden commit. Capturing the prop means the
-  // callback Virtuoso holds always matches the committed render. These recreate only on
-  // a tab active⇄inactive flip (rare — no per-stream churn) and are not itemContent, so
-  // a new identity never remounts rows.
+  // Capture the committed admission state directly (not via a ref). Under React
+  // 19's child-before-parent layout-effect ordering, a ref updated in our parent
+  // layout effect could still be stale when Virtuoso's child effects fire during
+  // an admitted→suspended commit. These callbacks are not row identities, so
+  // recreating them at a rare lifecycle edge cannot remount message rows.
   const handleFollowOutput = useMemo(
     () => (isAtBottom: boolean) => {
       // Hidden tab (content-visibility:hidden): never drive follow-scroll against
       // skipped/stale geometry (same cache-poisoning class as the data freeze below).
-      if (!isActive || (isWindowFocusReturn && !committedWindowFocusedRef.current)) return false;
+      if (!canLayoutVirtualList || isViewportRecoveryFenced) return false;
       const mode = followEnabledRef.current;
       if (!mode) return false;
       if (mode === 'force') return 'smooth' as const;
       return isAtBottom ? 'smooth' as const : false;
     },
-    [followEnabledRef, isActive, isWindowFocusReturn]
+    [followEnabledRef, canLayoutVirtualList, isViewportRecoveryFenced]
   );
 
   // Pagination guard: don't load an older page off stale range math while hidden —
   // Virtuoso can fire startReached from corrupted offsets when our subtree's layout
   // was skipped (content-visibility:hidden), and a prepend in that state compounds the desync.
   const guardedLoadOlder = useCallback(() => {
-    if (!isActive || (isWindowFocusReturn && !committedWindowFocusedRef.current)) return;
+    if (!canLayoutVirtualList || isViewportRecoveryFenced) return;
     onLoadOlder?.();
-  }, [onLoadOlder, isActive, isWindowFocusReturn]);
+  }, [onLoadOlder, canLayoutVirtualList, isViewportRecoveryFenced]);
 
   const [debugScroller, setDebugScroller] = useState<HTMLElement | null>(null);
   const handleScrollerRef = useCallback((el: HTMLElement | Window | null) => {
@@ -670,14 +661,14 @@ const MessageList = memo(function MessageList({
     components: typeof components;
     messageActionContext: MessageActionContext;
   }>({
-    data: messages,
-    firstItemIndex,
-    heightEstimateSeed: liveHeightEstimateSeed,
+    data: canLayoutVirtualList ? messages : EMPTY_MESSAGES,
+    firstItemIndex: canLayoutVirtualList ? firstItemIndex : undefined,
+    heightEstimateSeed: canLayoutVirtualList ? liveHeightEstimateSeed : undefined,
     components,
     messageActionContext,
   });
   useLayoutEffect(() => {
-    if (isActive) {
+    if (canLayoutVirtualList) {
       frozenDataRef.current = {
         data: messages,
         firstItemIndex,
@@ -686,12 +677,12 @@ const MessageList = memo(function MessageList({
         messageActionContext,
       };
     }
-  }, [isActive, messages, firstItemIndex, liveHeightEstimateSeed, components, messageActionContext]);
-  const virtuosoData = isActive ? messages : frozenDataRef.current.data;
-  const virtuosoFirstItemIndex = isActive ? firstItemIndex : frozenDataRef.current.firstItemIndex;
-  const virtuosoHeightEstimateSeed = isActive ? liveHeightEstimateSeed : frozenDataRef.current.heightEstimateSeed;
-  const virtuosoComponents = isActive ? components : frozenDataRef.current.components;
-  const virtuosoMessageActionContext = isActive
+  }, [canLayoutVirtualList, messages, firstItemIndex, liveHeightEstimateSeed, components, messageActionContext]);
+  const virtuosoData = canLayoutVirtualList ? messages : frozenDataRef.current.data;
+  const virtuosoFirstItemIndex = canLayoutVirtualList ? firstItemIndex : frozenDataRef.current.firstItemIndex;
+  const virtuosoHeightEstimateSeed = canLayoutVirtualList ? liveHeightEstimateSeed : frozenDataRef.current.heightEstimateSeed;
+  const virtuosoComponents = canLayoutVirtualList ? components : frozenDataRef.current.components;
+  const virtuosoMessageActionContext = canLayoutVirtualList
     ? messageActionContext
     : frozenDataRef.current.messageActionContext;
   const debugProbe = useChatScrollDebugProbe({
@@ -700,11 +691,20 @@ const MessageList = memo(function MessageList({
     data: virtuosoData,
     heightEstimateSeed: virtuosoHeightEstimateSeed,
   });
+  const handleItemsRendered = useCallback((items: ListItem<MessageType>[]) => {
+    debugProbe?.handleItemsRendered(items);
+    onItemsRendered();
+  }, [debugProbe, onItemsRendered]);
 
   return (
     <div
+      ref={viewportRootRef}
       className="relative flex-1"
       data-streaming={isStreaming || undefined}
+      data-viewport-phase={isViewportRecoveryFenced ? 'recovering' : (canLayoutVirtualList ? 'renderable' : 'suspended')}
+      style={isViewportRecoveryFenced && windowPresentation.surfaceAvailable
+        ? { visibility: 'hidden' }
+        : undefined}
     >
       {/*
         Virtuoso stays mounted across session switches. Previously `key={sessionId}`
@@ -746,13 +746,13 @@ const MessageList = memo(function MessageList({
         followOutput={handleFollowOutput}
         atBottomStateChange={guardedAtBottomChange}
         rangeChanged={debugProbe?.handleRangeChanged}
-        itemsRendered={debugProbe?.handleItemsRendered}
+        itemsRendered={handleItemsRendered}
         atBottomThreshold={50}
         itemSize={measureVisibleItemSize}
         defaultItemHeight={480}
         increaseViewportBy={{ top: 1600, bottom: 800 }}
         minOverscanItemCount={{ top: 3, bottom: 1 }}
-        skipAnimationFrameInResizeObserver={!isActive || !isLargeRowShrinking}
+        skipAnimationFrameInResizeObserver={!canLayoutVirtualList || !isLargeRowShrinking}
         className="h-full"
         style={{ overscrollBehavior: 'none', scrollbarGutter: 'stable', overflowAnchor: 'none' }}
         components={virtuosoComponents}

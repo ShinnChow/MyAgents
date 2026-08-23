@@ -21,7 +21,7 @@
 
 import { resolve as resolvePath, isAbsolute } from 'path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import type { ResolvedSkillSource } from '../skills/url-resolver';
+import type { RemoteSkillSource } from '../skills/url-resolver';
 
 export type ResolvedPluginSource =
   | {
@@ -29,7 +29,7 @@ export type ResolvedPluginSource =
       /** Display name for UI / errors */
       displayName: string;
       /** Reusable skills-fetcher source — fetcher.ts hands this to fetchSkillZip */
-      tarball: ResolvedSkillSource;
+      tarball: RemoteSkillSource;
       /** Optional subdirectory inside the tree that contains .claude-plugin/plugin.json */
       subPath?: string;
       /** Original user input (kept for AppConfig.plugins.sourceUrl) */

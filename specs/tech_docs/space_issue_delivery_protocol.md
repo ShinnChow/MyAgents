@@ -815,6 +815,8 @@ Cloud Production 是 migration-first。PRD 0.3.2 定义的 backward-compatible e
 
 任何 Prompt 标签、字段、kind、reason、visible copy 或 CLI discovery 变化，都必须先更新本文与对应测试，再合并实现。
 
+本地 Task Comment 不属于 IssueDelivery。Attached Task 可以同时有本地 Comment 时间线，但只有 Cloud 下发的 query 使用本文 `myagents-space-issue` instruction 并回复 Cloud Issue；从本地时间线注入的 query 使用独立 `TASK_COMMENT` reminder 与 `myagents task comment`。Task 类型、workspace 或 Session identity 都不能替代当前 query 来源，Desktop 不镜像、不代理、不双写两边评论。
+
 ## 21. 非目标
 
 - 不新增 Registered Agent role enum 或固定 handling mode；

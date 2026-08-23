@@ -1,11 +1,13 @@
-// Focused behavior tests for App's content slots. Restored persisted Sessions
+// Presentation behavior tests for App's content slots. Restored persisted Sessions
 // always mount TabProvider, while the heavy Chat child may stay deferred until
 // the active shell has painted.
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
+import type { PendingAppRoute } from '@/../shared/appRoute';
 import type { Tab } from '@/types/tab';
+import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
 // TabProvider is the ONLY branch that triggers sidecar/SSE side effects — a
 // spy marker lets us assert whether it was mounted.
@@ -19,9 +21,10 @@ vi.mock('@/context/TabProvider', () => ({
 
 // Stub the heavy page subtrees so importing App stays cheap and side-effect free.
 const chatRenderSpy = vi.hoisted(() => vi.fn());
+const taskCenterRenderSpy = vi.hoisted(() => vi.fn());
 vi.mock('@/pages/Chat', () => ({
-  default: ({ isWindowFocused }: { isWindowFocused: boolean }) => {
-    chatRenderSpy(isWindowFocused);
+  default: ({ windowPresentation }: { windowPresentation: MainWindowPresentation }) => {
+    chatRenderSpy(windowPresentation);
     return <div data-testid="chat" />;
   },
 }));
@@ -38,7 +41,12 @@ vi.mock('@/pages/Settings', () => ({
     );
   },
 }));
-vi.mock('@/pages/TaskCenter', () => ({ default: () => <div data-testid="taskcenter" /> }));
+vi.mock('@/pages/TaskCenter', () => ({
+  default: ({ pendingRoute }: { pendingRoute?: PendingAppRoute | null }) => {
+    taskCenterRenderSpy(pendingRoute ?? null);
+    return <div data-testid="taskcenter" />;
+  },
+}));
 vi.mock('@/components/ChatBootOverlay', () => ({
   default: () => <div data-testid="chat-boot-overlay" />,
 }));
@@ -57,8 +65,11 @@ function restoredTab(over: Partial<Tab> = {}): Tab {
   };
 }
 
+const AVAILABLE_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 0 };
+const SUSPENDED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: false, generation: 1 };
+
 const noopProps = {
-  isWindowFocused: true,
+  windowPresentation: AVAILABLE_PRESENTATION,
   isLoading: false,
   error: null,
   isDeferredMount: false,
@@ -72,6 +83,7 @@ const noopProps = {
   onLaunchProject: vi.fn(),
   onOpenHistorySession: vi.fn(async () => {}),
   onNewSession: vi.fn(async () => true),
+  onLaunchRuntimeBackedProviderSession: vi.fn(async () => null),
   onUpdateGenerating: vi.fn(),
   onUpdateTitle: vi.fn(),
   onUpdateUnread: vi.fn(),
@@ -159,7 +171,7 @@ describe('restored live chat tab', () => {
     expect(screen.getByTestId('tab-provider').parentElement).toHaveClass('invisible');
   });
 
-  it('projects desktop focus only through the active Chat slot', async () => {
+  it('projects native presentation only through the active Chat slot', async () => {
     chatRenderSpy.mockClear();
     const liveTab = restoredTab();
     const view = render(
@@ -173,7 +185,7 @@ describe('restored live chat tab', () => {
         tab={liveTab}
         isActive={false}
         {...noopProps}
-        isWindowFocused={false}
+        windowPresentation={SUSPENDED_PRESENTATION}
       />,
     );
     expect(chatRenderSpy).toHaveBeenCalledTimes(inactiveRenderCount);
@@ -183,10 +195,10 @@ describe('restored live chat tab', () => {
         tab={liveTab}
         isActive
         {...noopProps}
-        isWindowFocused={false}
+        windowPresentation={SUSPENDED_PRESENTATION}
       />,
     );
-    await waitFor(() => expect(chatRenderSpy).toHaveBeenLastCalledWith(false));
+    await waitFor(() => expect(chatRenderSpy).toHaveBeenLastCalledWith(SUSPENDED_PRESENTATION));
   });
 
   it('keeps Settings and Capabilities UI state in their own mounted Tab slots', async () => {
@@ -213,5 +225,56 @@ describe('restored live chat tab', () => {
     view.rerender(contents('settings'));
     expect(screen.getByTestId('settings-draft')).toHaveValue('provider draft');
     expect(screen.getByTestId('capabilities-draft')).toHaveValue('mcp draft');
+  });
+
+  it('projects every new Task route while the singleton Task Center stays active', async () => {
+    taskCenterRenderSpy.mockClear();
+    const taskCenterTab = restoredTab({
+      id: 'task-center-tab',
+      agentDir: null,
+      sessionId: null,
+      view: 'taskcenter',
+      title: 'Task Center',
+    });
+    const route = (generation: number): PendingAppRoute => ({
+      generation,
+      route: {
+        version: 1,
+        name: 'task.comment',
+        params: { taskId: 'task-1', commentId: 'comment-1' },
+      },
+    });
+    const view = render(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        taskPendingRoute={null}
+      />,
+    );
+
+    view.rerender(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        taskPendingRoute={route(1)}
+      />,
+    );
+    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ generation: 1 }),
+    ));
+
+    view.rerender(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        taskPendingRoute={route(2)}
+      />,
+    );
+    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+      expect.objectContaining({ generation: 2 }),
+    ));
   });
 });

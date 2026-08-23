@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { McpServerDefinition } from './config-types';
 import {
+  applyMcpServerConfigAdditions,
   promoteAgentMcpJsonToGlobal,
   removeMcpServerFromAppConfig,
   type McpConfigContainer,
@@ -19,6 +20,34 @@ function remote(id: string): McpServerDefinition {
 }
 
 describe('MCP config helpers', () => {
+  it('defaults only absent standard Playwright args to isolated mode', () => {
+    const playwright: McpServerDefinition = {
+      id: 'playwright',
+      name: 'Playwright',
+      type: 'stdio',
+      command: 'npx',
+      args: ['@playwright/mcp@0.0.68'],
+      isBuiltin: true,
+    };
+
+    expect(applyMcpServerConfigAdditions([playwright], {})[0].args).toEqual([
+      '@playwright/mcp@0.0.68',
+      '--isolated',
+    ]);
+    expect(applyMcpServerConfigAdditions([playwright], {
+      mcpServerArgs: { playwright: [] },
+    })[0].args).toEqual(['@playwright/mcp@0.0.68']);
+    expect(applyMcpServerConfigAdditions([playwright], {
+      mcpServerArgs: {
+        playwright: ['--browser=firefox', '--user-data-dir=/tmp/profile'],
+      },
+    })[0].args).toEqual([
+      '@playwright/mcp@0.0.68',
+      '--browser=firefox',
+      '--user-data-dir=/tmp/profile',
+    ]);
+  });
+
   it('promotes selected Agent-only HTTP definitions into the global catalogue', () => {
     const server = remote('remote-http');
     const config: McpConfigContainer = {

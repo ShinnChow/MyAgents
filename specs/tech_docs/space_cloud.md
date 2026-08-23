@@ -43,7 +43,7 @@ Phase 2 为本地验证和自动化测试新增了显式 mock mode：
 
 - debug/test build 中运行时设置 `MYAGENTS_SPACE_MOCK_DATA=true` 时，`space_build_capability()` 返回可用能力，baseUrl 为 `https://space.mock.myagents.local`。release build 中该环境变量被忽略。
 - mock mode 仍然由 Rust Space 边界拥有：renderer 继续只调用 `src/renderer/api/spaceCloud.ts`，Tauri command/CLI helper 继续进入 `src-tauri/src/space_cloud.rs` facade 或其明确 owner module，不会在 React 组件里塞假数据。
-- mock mode 使用进程内 deterministic 数据集，覆盖 Goals、Issues、评论、附件、Skills、Skill 文件、Registered Agents、IssueDelivery 与 claim。mutation 会更新同一份 in-memory state，便于验证创建/评论/状态/claim/complete 等交互。
+- mock mode 使用进程内 deterministic 数据集，覆盖 Goals、Issues、评论、附件、Skills、Skill 文件、Tools、Tool revisions、Registered Agents、IssueDelivery 与 claim。mutation 会更新同一份 in-memory state，便于验证创建/评论/状态/claim/complete、Tool 发布/更新/回滚/删除/恢复等交互。
 - mock mode 不读写真实 `~/.myagents/space/session.json`，不访问 `space.myagents.io`，不作为发布能力写入 CHANGELOG 或 Release notes。
 - mock mode 只用于 dev/test。生产构建仍以 `MYAGENTS_SPACE_ENABLED` / `MYAGENTS_SPACE_BASE_URL` / public client id 的 build-time capability 为准。
 
@@ -52,13 +52,22 @@ Phase 2 为本地验证和自动化测试新增了显式 mock mode：
 | 层           | 文件                                                          | 职责                                                                                                                                                                                                                                                                                                                               |
 | ------------ | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Rust core    | `src-tauri/src/space_cloud.rs`                                | facade；account context + user credential authority、统一 Cloud response/auth policy、HTTP transport、session persistence，以及 Agent mutation→Connector wake、Attachment 下载 credential 选择等跨域编排                                                                                                                         |
-| Rust domains | `src-tauri/src/space_cloud/{registered_agents,delivery,cli,skills,attachments}.rs` | Registered Agent model/store/management、Connector + IssueDelivery、CLI actor/context、Skill package/install、Issue attachment IO；领域模块复用根 auth/client 与既有文件安全 helper，不建立平行 authority                                                                                                                          |
+| Rust domains | `src-tauri/src/space_cloud/{registered_agents,delivery,cli,skills,tools,attachments,notifications}.rs` | Registered Agent model/store/management、Connector + IssueDelivery、CLI actor/context、Skill package/install、Tool 图标 multipart transport、Issue attachment IO，以及进程级 optional-auth Cloud notification sync；领域模块复用根 auth/client 与既有文件安全 helper，不建立平行 authority                                                                                                                          |
 | Rust tests   | `src-tauri/src/space_cloud/tests.rs`                          | account/session/auth、跨模块持久化、Prompt、Connector、CLI、Agent selector 与 Attachment 的契约回归；模块私有实现优先就近测试                                                                                                                                                                                                     |
 | Renderer API | `src/renderer/api/spaceCloud.ts`                              | Tauri invoke typed wrapper与结构化错误投影；不直接 `fetch` Space 服务、不裁决 credential validity                                                                                                                                                                                                                                  |
-| Renderer UI  | `src/renderer/pages/Space.tsx` + `src/renderer/pages/space/*` | Space shell 与 Issues / Skills / Agents 三个 workspace，登录轮询、创建/评论/Goal 订阅、Skill 安装、本地缓存                                                                                                                                                                                                                        |
+| Renderer UI  | `src/renderer/pages/Space.tsx` + `src/renderer/pages/space/*` | Space shell 与 Issues / Skills / Tools / Agents workspace，登录轮询、创建/评论/Goal 订阅、Skill/Tool 安装、本地缓存                                                                                                                                                                                                                        |
 | CLI          | `src/cli/myagents.ts` + Sidecar Admin API + Rust Management API | 每个业务命令显式 `--space <slug>`；Sidecar 从当前 project 补 stable workspace id，Rust 单点解析 User/Registered Agent actor 和 token。支持 list/whoami/Goal/assignee discovery、Issue create/read/metadata update/comment/claim/complete、top attachment add/download；CLI 不接受显式 actor/token |
 
 Rust 领域依赖固定为 `delivery → registered_agents`、`cli → registered_agents + attachments`，其余领域彼此独立并共同指向根 auth/client。`registered_agents` 不调用 `delivery`，`attachments` 也不选择 Registered Agent；需要同时修改 Agent 状态与 Connector schedule，或先裁决 User/Agent credential 再执行 Attachment 下载的 Tauri command，由根 facade 完成跨域编排。这些不是兼容 wrapper，而是显式的跨 owner 协调点。
+
+### Cloud notification sync
+
+- `space_cloud::notifications` 承载 App 进程级全局通知协调器，不依赖 Team Space Tab、Session Sidecar 或 Registered Agent connector。Cloud source 继续复用根模块的 build capability、optional user session、HTTP/client-context header 与 401 reauth transition，只调用一个 `/api/notifications` feed；TaskStore 另提供本地 Agent Comment locator source。两者只在 snapshot 投影层合并，不改变各自 authority。
+- 匿名身份只投影公开公告，并用本机有界 receipt/cutoff 归一已读；账号身份额外投影私有评论通知，Cloud `hasUnread` 是账号红点权威。通知协调器把全部 receipt 写入应用全局 `~/.myagents/notification-state.json`：`localTasks` 不带 Space 环境 scope，Cloud 元数据按规范化 base URL hash 的 origin bucket、再按账号 hash 隔离。文件只保存 pending read/read-all/anonymous merge 元数据，绝不保存私有 feed 内容或 target。
+- 前台 1 分钟、失焦/隐藏/托盘 5 分钟，由一个 loop + sync gate 串行；登录、登出、聚焦、网络恢复只 wake。首次进程/身份成功同步只建立 baseline；之后失焦时的新 ID 逐条发系统通知，同一进程每个 ID 至多一次。
+- 账号切换、登出与 credential 401 在网络补拉前同步清空内存 projection。点击 feed item 或系统通知才写 read；read mutation 先落本地 pending，再异步向 Cloud 幂等收敛。
+- 公告 target 只允许 Rust 二次校验后的绝对 HTTP/HTTPS URL；Issue comment target 是 typed `AppRoute`，由 App Shell 和 Space store 完成精确 Space/Issue 导航。
+- 本地 Task Comment 不进入 Cloud feed、账号 ACK 或 private projection，也不跟随 Space prod/dev 环境切换。TaskStore 从 durable `comments.jsonl` 异步重建并增量维护有界 index；通知协调器只在应用全局状态中保存有界 read receipt、做统一排序/分页/红点/OS toast，并以 typed `task.comment` route 打开 Task detail 的 exact Comment。Cloud 不可用或用户未登录时，本地 source 仍可展示、分页和已读。
 
 ### CLI Goal discovery 与 Issue 元数据更新
 
@@ -154,9 +163,16 @@ Space 切换属于 Renderer 导航状态，不是 Cloud mutation。点击已加�
 
 Space 头像是产品/组织身份，所有尺寸统一使用 APP icon 式圆角矩形；User 与 Registered Agent 是主体身份，继续使用圆形头像。两类形态不得混用。
 
-Space 侧栏中的多个 Space 是同级导航实体，必须按服务端列表顺序渲染为一级手风琴项；每项都可在本地展开 Issues / Goals / Skills，以及按该 Space membership 权限展示的 Settings，且同时最多展开一个。展开/折叠只修改 Renderer UI 状态，不请求接口，也不改变当前 Space；只有点击某个子导航时才原子切换到对应 Space 与页面。其它 Space 不得嵌入当前 Space 的展开容器伪装成子级。
+Space 侧栏中的多个 Space 是同级导航实体，必须按服务端列表顺序渲染为一级手风琴项；每项都可在本地展开 Issues / Goals / Skills / Tools，以及按该 Space membership 权限展示的 Settings，且同时最多展开一个。展开/折叠只修改 Renderer UI 状态，不请求接口，也不改变当前 Space；只有点击某个子导航时才原子切换到对应 Space 与页面。其它 Space 不得嵌入当前 Space 的展开容器伪装成子级。
 
-Space 页面各 workspace 的数据加载必须显式以 active Space identity 为依赖，不能依赖 boot loading→ready 的视觉状态跃迁来间接触发；静默切换保持页面可见时，目标 Space 的 Issues / Goals / Skills / Settings 仍必须主动加载并收口自己的 loading 状态。各 collection 的 freshness 必须由该 collection 在当前 active Space 投影内独立持有；不得复用 session/bootstrap 的刷新时间，否则切换时清空 collection 后会被旧 owner 的 boot freshness 错误拦截。
+Space 页面各 workspace 的数据加载必须显式以 active Space identity 为依赖，不能依赖 boot loading→ready 的视觉状态跃迁来间接触发；静默切换保持页面可见时，目标 Space 的 Issues / Goals / Skills / Tools / Settings 仍必须主动加载并收口自己的 loading 状态。各 collection 的 freshness 必须由该 collection 在当前 active Space 投影内独立持有；不得复用 session/bootstrap 的刷新时间，否则切换时清空 collection 后会被旧 owner 的 boot freshness 错误拦截。
+
+### Space Tool 本地安装边界
+
+- Cloud 是 Tool 元数据、revision、权限、配额与图标对象的 authority；Desktop `spaceStore` 仅缓存列表、详情和历史，并通过 Space event cursor 失效刷新。
+- `mcp` revision 只携带版本化 `portableMcpManifest`。Desktop 发布前使用 `src/shared/spaceToolManifest.ts` 脱敏和校验；现有 stdio / HTTP / SSE 都由 schema v1 的同一 JSON 表示，管理员编辑 Cloud revision 时复用同一 validator。`serverId` 允许 Unicode 字母/数字及 `._-`，但作为 `(space_id, serverId)` 稳定 identity 不可通过 revision 改名。安装时由 Renderer 在 `atomicModifyConfig` 锁内合并最新 `config.json`，新装和替换都默认禁用，同 ID 不同定义必须用户明确确认。Rust Space facade 不写 MCP 配置，也不修改 Agent、workspace 或 OAuth 引用。
+- `custom_install_prompt` 不是新的 Runtime Tool 类型，而是安装协议。详情页把版本化指令放进无语言标签、长度安全的 Markdown fence，复用小助理 launch 链路新建会话，并要求 bundled helper 的 `/tool-install` Skill 执行安全检查和验证；完成状态只在对话中自然收口。
+- 两类 Tool 的自定义图标选择都经过 Rust `tools.rs`：只接受绝对路径普通文件，拒绝 symlink，输入最大 5 MiB，归一为最长边 256 px 的 lossless WebP，归一结果最大 512 KiB，再由统一 authorized multipart client 上传。
 
 Space 侧栏的加入方式副标题必须通过 i18n 显式映射领域值：`open_join` 显示“开放加入”，`approval_required` 显示“需审核加入”；未知值显示本地化兜底文案，禁止把原始技术 token 转空格后直接暴露给用户。
 
@@ -271,5 +287,7 @@ Space Issue 的用户可见编号由云端拥有，不从 opaque `issue.id` 推�
 - 登记与编辑弹窗使用同一套 viewport-safe 三段布局：外框不超过可视区并保留安全边距，header/footer 始终可见，只有中间表单区滚动；不得让整个 overlay 随字段数量越过屏幕边界。
 - “目标与指令”正常态只展示字段名与 placeholder，不重复显示说明文字；校验错误和旧 Agent 缺少 Instruction 的兼容提醒仍显示在输入框下方。
 - Cloud 数据模型与 create/delete API 继续允许一个 Registered Agent 拥有多条 Subscription；Desktop 登记/编辑弹窗暂时只提供一条可编辑订阅，不提供添加多条、逐条删除或重新评估入口。编辑时只替换 UI 当前呈现的一条规则，不得静默删除由其它客户端/API 创建的额外规则。
+- 编辑已登记 Agent 时，Renderer 只提交一次 `cmd_space_update_registered_agent`：同时携带 Instruction revision CAS 与 `subscriptionReplacement { expectedSubscriptionId, goalId, stateFilter }`。Cloud 在同一 D1 mutation 中更新 Agent settings 并精确替换 UI 呈现的 Subscription；目标已存在时采用该行，目标冲突或 expected 已变化时整体返回 `409`，不得先 create/delete 再靠客户端补偿。
+- Cloud 成功响应返回该 Agent 的完整权威 Subscription 集合，并把本次编辑的目标规则置于首位；Rust 在文件锁内以这份集合覆盖 `registered_agents.json` 的本地投影，再把同一快照交给 Renderer。客户端不能根据请求参数乐观拼接 Subscription，也不能用单条响应覆盖或删除隐藏规则。
 - “订阅执行策略”选项固定按“新开对话 → 连续对话”排列，新登记 Agent 默认 `new_session`；编辑已有 Agent 必须保留其权威值，旧数据缺字段仍按历史 `single_session` 回退。
 - `clientId` 是 OAuth public client/build 配置，不是设备标识，不应出现在卡片关键位。

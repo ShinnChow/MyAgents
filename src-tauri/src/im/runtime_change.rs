@@ -660,7 +660,7 @@ pub async fn freeze_and_rotate_for_runtime_change(
             // the user gets to keep using the old session as a regular
             // historical session backed by the snapshot we just wrote.
             let owner = SidecarOwner::Agent(key.clone());
-            let _ = release_session_sidecar(sidecar_manager, &old_session_id, &owner);
+            let _ = release_session_sidecar(sidecar_manager, &old_session_id, &owner).await;
 
             // ----- 4. Queue one notification per actual adapter delivery
             // target. A channel can temporarily contain stale duplicate

@@ -86,8 +86,8 @@ describe('Runtime diagnostics log projection', () => {
           {
             component: 'host_tools',
             state: 'unsupported',
-            code: 'host_tools_catalog_immutable',
-            message: 'Start a new Product Session.',
+            code: 'host_tools_connect_failed',
+            message: 'Host tool bridge failed to start.',
             requiresUserAction: true,
           },
         ],
@@ -101,7 +101,7 @@ describe('Runtime diagnostics log projection', () => {
     });
     expect(entries[1]).toMatchObject({
       level: 'warn',
-      message: expect.stringContaining('host_tools (host_tools_catalog_immutable'),
+      message: expect.stringContaining('host_tools (host_tools_connect_failed'),
     });
     expect(entries.map(entry => entry.message).join('\n')).not.toContain('workspace:valid-skill');
   });

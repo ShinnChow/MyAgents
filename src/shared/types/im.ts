@@ -5,6 +5,9 @@
  */
 export type ImPlatform = 'telegram' | 'feishu' | 'dingtalk' | `openclaw:${string}`;
 
+/** Provider that can create bot credentials through the Channel setup QR flow. */
+export type CredentialQrProvider = 'wecom' | 'feishu';
+
 /**
  * Message source identifier
  */

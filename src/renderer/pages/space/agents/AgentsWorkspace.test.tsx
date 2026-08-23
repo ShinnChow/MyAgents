@@ -186,6 +186,11 @@ describe("AgentsWorkspace", () => {
         displayName: "Build Agent",
         instruction: "Assess each Issue and implement it when ready.",
         expectedInstructionRevision: 1,
+        subscriptionReplacement: {
+          expectedSubscriptionId: "subscription-1",
+          goalId: "goal-1",
+          stateFilter: ["todo"],
+        },
         issueSubscriptionRunMode: "single_session",
       }),
     );
@@ -242,18 +247,8 @@ describe("AgentsWorkspace", () => {
       subscriptions: [...testAgent.subscriptions, hiddenSubscription],
     };
     const updateRegisteredAgent = vi.fn().mockResolvedValue(testAgent);
-    const deleteRegisteredAgentSubscription = vi
-      .fn()
-      .mockResolvedValue(undefined);
-    const createRegisteredAgentSubscription = vi.fn().mockResolvedValue({
-      ...testAgent.subscriptions[0],
-      id: "subscription-2",
-      stateFilter: ["todo", "open"],
-    });
     renderWorkspace(undefined, [agentWithHiddenSubscription], true, {
       updateRegisteredAgent,
-      deleteRegisteredAgentSubscription,
-      createRegisteredAgentSubscription,
     });
 
     fireEvent.click(
@@ -275,14 +270,15 @@ describe("AgentsWorkspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
-      expect(deleteRegisteredAgentSubscription).toHaveBeenCalledWith(
-        "subscription-1",
-      );
-      expect(deleteRegisteredAgentSubscription).toHaveBeenCalledTimes(1);
-      expect(createRegisteredAgentSubscription).toHaveBeenCalledWith({
-        registeredAgentId: "rag-1",
-        goalId: "goal-1",
-        stateFilter: ["todo", "open"],
+      expect(updateRegisteredAgent).toHaveBeenCalledWith({
+        id: "rag-1",
+        displayName: "Build Agent",
+        subscriptionReplacement: {
+          expectedSubscriptionId: "subscription-1",
+          goalId: "goal-1",
+          stateFilter: ["todo", "open"],
+        },
+        issueSubscriptionRunMode: "single_session",
       });
     });
   });

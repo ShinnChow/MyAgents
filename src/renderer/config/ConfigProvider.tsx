@@ -439,7 +439,7 @@ export function ConfigProvider({ children }: { children: React.ReactNode }) {
             const { invoke } = await import('@tauri-apps/api/core');
             const results = await Promise.allSettled([
                 invoke('cmd_sync_admin_agent'),
-                // System skills (task-alignment / task-implement) —
+                // Product-owned system Skills —
                 // independent version gate (SYSTEM_SKILLS_VERSION in
                 // commands.rs). Force-overwrites user copies so the
                 // skill contracts always match the shipped CLI.

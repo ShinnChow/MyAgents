@@ -77,6 +77,17 @@ pub(crate) struct FrontendSidecarBinding {
     generation: u64,
 }
 
+/// Server-authoritative identity used when a live Session Sidecar asks Rust
+/// for an application Browser Host capability. The requesting process may
+/// prove its immutable birth identity, but it may not choose a different
+/// logical Session or filesystem root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrowserCapabilitySource {
+    pub(crate) product_session_id: String,
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) interactive: bool,
+}
+
 impl FrontendSidecarBinding {
     pub(crate) fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
@@ -361,6 +372,72 @@ impl SidecarManager {
         session_process_is_live || global_process_is_live
     }
 
+    /// Resolve the logical Session and workspace owned by one exact live
+    /// Session Sidecar process generation. This follows pending -> real Session
+    /// rekeys because `management_id` is immutable while `session_id` is the
+    /// manager-owned current identity.
+    pub(crate) fn resolve_browser_capability_source(
+        &self,
+        management_id: &str,
+        generation: u64,
+    ) -> Option<BrowserCapabilitySource> {
+        self.sidecars
+            .iter()
+            .find(|(session_id, sidecar)| {
+                sidecar.management_id == management_id
+                    && self.sidecar_generations.get(*session_id).copied() == Some(generation)
+            })
+            .map(|(_, sidecar)| BrowserCapabilitySource {
+                product_session_id: sidecar.session_id.clone(),
+                workspace_path: std::fs::canonicalize(&sidecar.workspace_path)
+                    .unwrap_or_else(|_| sidecar.workspace_path.clone()),
+                interactive: sidecar.owners.iter().any(|owner| {
+                    matches!(owner, SidecarOwner::Tab(_) | SidecarOwner::Companion(_))
+                }),
+            })
+    }
+
+    /// Validate a future Runtime identity for Browser capability projection.
+    /// This deliberately does not rekey the Sidecar: only the renderer-owned
+    /// materialization transaction may commit pending -> real Session state.
+    pub(crate) fn validate_browser_product_session_projection(
+        &self,
+        management_id: &str,
+        generation: u64,
+        product_session_id: &str,
+    ) -> Option<String> {
+        let current = self.sidecars.iter().find_map(|(session_id, sidecar)| {
+            (sidecar.management_id == management_id
+                && self.sidecar_generations.get(session_id).copied() == Some(generation))
+            .then(|| session_id.clone())
+        });
+        let Some(current) = current else {
+            return None;
+        };
+        if current == product_session_id {
+            return Some(current);
+        }
+        if !current.starts_with("pending-")
+            || self.sidecars.contains_key(product_session_id)
+            || self.recovering_sidecars.contains_key(product_session_id)
+        {
+            return None;
+        }
+        Some(current)
+    }
+
+    /// Resolve the current ready Global Sidecar execution Host. Browser MCP
+    /// capabilities bind to this exact `(port, generation)` pair so a crash,
+    /// restart, or port reuse invalidates every credential from the retired
+    /// Host before it can create a BrowserContext.
+    pub fn global_process_binding(&mut self) -> Option<(u16, u64)> {
+        let instance = self.instances.get_mut(GLOBAL_SIDECAR_ID)?;
+        if !instance.healthy || !instance.is_process_alive() {
+            return None;
+        }
+        Some((instance.port, instance.generation))
+    }
+
     /// Allocate the next instance ID and stash it as this session's current
     /// generation. The ID comes from the process-global atomic counter, so
     /// it is unique for the whole process lifetime — repeated sidecars under
@@ -618,10 +695,11 @@ impl SidecarManager {
         if !self.instance_matches_replacement(tab_id, replacement) {
             return Err(candidate);
         }
-        Ok(self
+        let retired = self
             .instances
             .insert(tab_id.to_string(), candidate)
-            .expect("replacement target remains present while manager is locked"))
+            .expect("replacement target remains present while manager is locked");
+        Ok(retired)
     }
 
     pub(super) fn abandon_instance_replacement(
@@ -696,6 +774,38 @@ impl SidecarManager {
         ports.sort();
         ports.dedup();
         ports
+    }
+
+    /// Stop all instances (session sidecars and global sidecar)
+    pub(crate) fn prepare_stop_all(&mut self) -> SidecarShutdownPreparation {
+        let mut drains = Vec::with_capacity(
+            self.sidecars.len() + self.recovering_sidecars.len() + self.instances.len(),
+        );
+        drains.extend(
+            self.sidecars
+                .values()
+                .map(|sidecar| DispatchGate::close(&sidecar.dispatch_gate)),
+        );
+        drains.extend(
+            self.recovering_sidecars
+                .values()
+                .map(|recovery| DispatchGate::close(&recovery.dispatch_gate)),
+        );
+        drains.extend(
+            self.instances
+                .values()
+                .map(|instance| DispatchGate::close(&instance.dispatch_gate)),
+        );
+        let globals = self
+            .instances
+            .values()
+            .filter(|instance| instance.is_global && instance.healthy && instance.process.is_some())
+            .map(|instance| GlobalShutdownTarget {
+                port: instance.port,
+                generation: instance.generation,
+            })
+            .collect();
+        SidecarShutdownPreparation { drains, globals }
     }
 
     /// Stop all instances (session sidecars and global sidecar)
@@ -2230,6 +2340,82 @@ mod completion_claim_tests {
         assert!(manager
             .claim_frontend_session_completion(&binding, "session-real", "turn-1")
             .is_some());
+    }
+
+    #[test]
+    fn browser_capability_source_is_manager_owned_and_follows_rekey() {
+        let mut manager = SidecarManager::new();
+        manager.insert_test_ready_frontend_sidecar(
+            "pending-tab-a",
+            32001,
+            SidecarOwner::Tab("tab-a".to_string()),
+        );
+        let generation = manager
+            .generation_for("pending-tab-a")
+            .expect("current generation");
+        let management_id = manager
+            .sidecars
+            .get("pending-tab-a")
+            .expect("sidecar")
+            .management_id
+            .clone();
+
+        assert_eq!(
+            manager
+                .resolve_browser_capability_source(&management_id, generation)
+                .expect("pending binding")
+                .product_session_id,
+            "pending-tab-a",
+        );
+        assert!(manager.upgrade_session_id_for_tab("pending-tab-a", "session-real", "tab-a",));
+        assert_eq!(
+            manager
+                .resolve_browser_capability_source(&management_id, generation)
+                .expect("rekeyed binding")
+                .product_session_id,
+            "session-real",
+        );
+        assert!(manager
+            .resolve_browser_capability_source(&management_id, generation + 1)
+            .is_none());
+        assert!(manager
+            .resolve_browser_capability_source("another-process", generation)
+            .is_none());
+    }
+
+    #[test]
+    fn browser_projection_validates_exact_pending_process_without_rekeying_it() {
+        let mut manager = SidecarManager::new();
+        manager.insert_test_ready_frontend_sidecar(
+            "pending-tab-a",
+            32001,
+            SidecarOwner::Tab("tab-a".to_string()),
+        );
+        let generation = manager.generation_for("pending-tab-a").unwrap();
+        let management_id = manager
+            .sidecars
+            .get("pending-tab-a")
+            .unwrap()
+            .management_id
+            .clone();
+
+        assert!(manager
+            .validate_browser_product_session_projection(
+                "another-process",
+                generation,
+                "session-real",
+            )
+            .is_none());
+        assert_eq!(
+            manager.validate_browser_product_session_projection(
+                &management_id,
+                generation,
+                "session-real",
+            ),
+            Some("pending-tab-a".to_string()),
+        );
+        assert!(manager.sidecars.contains_key("pending-tab-a"));
+        assert!(!manager.sidecars.contains_key("session-real"));
     }
 
     #[test]

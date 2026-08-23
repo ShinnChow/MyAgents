@@ -38,6 +38,12 @@
     "toolsEmptyPrefix": "Enable tools in",
     "toolsEmptyExternal": "Enable official CLI tools in Settings to use them with this runtime.",
     "toolsEmptyBuiltin": "Install and enable MCP tools to use browser automation and more.",
+    "mcpStatus": {
+      "readyTools": "{{count}} tools ready",
+      "needsAuth": "Authentication required",
+      "unavailable": "Unavailable",
+      "starting": "Starting…"
+    },
     "pluginsHeader": "Plugins",
     "pluginLoadsMcpTitle": "Enabling this plugin automatically loads these MCP servers: {{names}}",
     "pluginLoadsMcp": "{{count}} MCP: {{names}}",

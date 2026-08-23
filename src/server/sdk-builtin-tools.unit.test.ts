@@ -4,21 +4,24 @@ import { describe, expect, it } from 'vitest';
 import { SDK_BUILTIN_TOOLS, SDK_EXCLUDED_BUILTIN_TOOLS } from './sdk-builtin-tools';
 
 describe('Claude Agent SDK builtin catalog', () => {
-  it('keeps the product-owned 26-tool catalog exact and duplicate-free', () => {
+  it('keeps the product-owned 29-tool catalog exact and duplicate-free', () => {
     expect(SDK_BUILTIN_TOOLS).toEqual([
       'Read',
       'Write',
       'Edit',
+      'MultiEdit',
       'NotebookEdit',
       'Glob',
       'Grep',
       'Bash',
+      'PowerShell',
       'WebFetch',
       'WebSearch',
       'AskUserQuestion',
       'EnterPlanMode',
       'ExitPlanMode',
       'Skill',
+      'Agent',
       'Task',
       'TaskStop',
       'SendMessage',
@@ -33,7 +36,7 @@ describe('Claude Agent SDK builtin catalog', () => {
       'EnterWorktree',
       'ExitWorktree',
     ]);
-    expect(new Set(SDK_BUILTIN_TOOLS).size).toBe(26);
+    expect(new Set(SDK_BUILTIN_TOOLS).size).toBe(29);
     expect(SDK_BUILTIN_TOOLS).not.toContain('TaskOutput');
   });
 

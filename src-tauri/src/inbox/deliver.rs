@@ -235,7 +235,7 @@ pub async fn start_fresh_session(
     let port = match ensure {
         Ok(result) => result.port,
         Err(error) => {
-            release_transient_owner(manager, &session_id, &transient_owner);
+            release_transient_owner(manager, &session_id, &transient_owner).await;
             return outcome(
                 "delivery_failed",
                 Some(format!("sidecar start failed: {error}")),
@@ -285,7 +285,7 @@ pub async fn start_fresh_session(
     };
     // BackgroundCompletion, when attached, now owns the ordinary lifecycle.
     // No fresh-start-specific durable token or recovery state is introduced.
-    release_transient_owner(manager, &session_id, &transient_owner);
+    release_transient_owner(manager, &session_id, &transient_owner).await;
     drop(lifecycle);
     result
 }
@@ -302,11 +302,77 @@ pub async fn deliver_with_resume(
     message: PendingInboxMessage,
     resume_workspace_path: Option<std::path::PathBuf>,
 ) -> DeliverOutcome {
+    deliver_with_resume_policy(
+        app_handle,
+        manager,
+        message,
+        resume_workspace_path,
+        SessionBirthPolicy::AllowBirth,
+        |_| true,
+    )
+    .await
+}
+
+/// Deliver to an already-durable Product Session. A frozen routing reference
+/// (for example a local Task comment reply) is not authority to recreate a
+/// Session that the user has deleted.
+pub async fn deliver_existing_session_with_resume(
+    app_handle: &AppHandle,
+    manager: &ManagedSidecarManager,
+    message: PendingInboxMessage,
+    resume_workspace_path: Option<std::path::PathBuf>,
+) -> DeliverOutcome {
+    deliver_with_resume_policy(
+        app_handle,
+        manager,
+        message,
+        resume_workspace_path,
+        SessionBirthPolicy::ExistingOnly,
+        |session_id| {
+            crate::sidecar::runtime_identity::resolve_session_runtime_identity_full(session_id)
+                .is_some()
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBirthPolicy {
+    AllowBirth,
+    ExistingOnly,
+}
+
+fn session_target_is_eligible(
+    policy: SessionBirthPolicy,
+    metadata_exists: impl FnOnce() -> bool,
+) -> bool {
+    policy == SessionBirthPolicy::AllowBirth || metadata_exists()
+}
+
+async fn deliver_with_resume_policy<F>(
+    app_handle: &AppHandle,
+    manager: &ManagedSidecarManager,
+    message: PendingInboxMessage,
+    resume_workspace_path: Option<std::path::PathBuf>,
+    birth_policy: SessionBirthPolicy,
+    session_metadata_exists: F,
+) -> DeliverOutcome
+where
+    F: FnOnce(&str) -> bool,
+{
     let to_sid = message.to_session_id.clone();
     let owner_id = format!("inbox-deliver-{}", uuid::Uuid::new_v4());
     let transient_owner = SidecarOwner::Agent(owner_id.clone());
     let lifecycle =
         std::sync::Arc::new(crate::sidecar::acquire_session_lifecycle(&[&to_sid]).await);
+
+    if !session_target_is_eligible(birth_policy, || session_metadata_exists(&to_sid)) {
+        ulog_warn!(
+            "[inbox] target {} no longer exists — refusing to recreate it for delivery",
+            to_sid
+        );
+        return DeliverOutcome::SessionNotFound;
+    }
 
     ulog_info!(
         "[inbox] delivering kind={:?} from={} to={} reply_back={} msg_id={} transient_owner={}",
@@ -359,7 +425,7 @@ pub async fn deliver_with_resume(
             }
             Err(e) => {
                 ulog_error!("[inbox] resume failed for {}: {}", to_sid, e);
-                release_transient_owner(manager, &to_sid, &transient_owner);
+                release_transient_owner(manager, &to_sid, &transient_owner).await;
                 return DeliverOutcome::DeliveryFailed {
                     reason: format!("resume failed: {}", e),
                 };
@@ -369,7 +435,7 @@ pub async fn deliver_with_resume(
 
     let outcome = http_post_drain(port, &message).await;
     start_headless_completion_if_delivered(app_handle, manager, &to_sid, &outcome);
-    release_transient_owner(manager, &to_sid, &transient_owner);
+    release_transient_owner(manager, &to_sid, &transient_owner).await;
     outcome
 }
 
@@ -412,12 +478,12 @@ fn start_headless_completion(
 
 /// Release the transient inbox-delivery owner. Idempotent — no-op if the
 /// sidecar was already torn down or the owner was never inserted.
-fn release_transient_owner(
+async fn release_transient_owner(
     manager: &ManagedSidecarManager,
     session_id: &str,
     owner: &SidecarOwner,
 ) {
-    match crate::sidecar::release_session_sidecar(manager, session_id, owner) {
+    match crate::sidecar::release_session_sidecar(manager, session_id, owner).await {
         Ok(stopped) => {
             ulog_info!(
                 "[inbox] released transient owner for {}; sidecar_stopped={}",
@@ -509,5 +575,27 @@ mod tests {
             parsed.reason.as_deref(),
             Some("termination could not be confirmed")
         );
+    }
+
+    #[test]
+    fn existing_only_delivery_never_turns_a_missing_session_into_birth_authority() {
+        assert!(!session_target_is_eligible(
+            SessionBirthPolicy::ExistingOnly,
+            || false
+        ));
+        assert!(session_target_is_eligible(
+            SessionBirthPolicy::ExistingOnly,
+            || true
+        ));
+
+        let birth_probe_called = std::cell::Cell::new(false);
+        assert!(session_target_is_eligible(
+            SessionBirthPolicy::AllowBirth,
+            || {
+                birth_probe_called.set(true);
+                false
+            }
+        ));
+        assert!(!birth_probe_called.get());
     }
 }

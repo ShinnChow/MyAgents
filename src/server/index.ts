@@ -1,4 +1,4 @@
-import { appendFileSync, cpSync, existsSync, lstatSync, readdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeFileSync , rmSync, renameSync } from 'fs';
+import { appendFileSync, cpSync, existsSync, lstatSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync , rmSync, renameSync } from 'fs';
 import { copyFile as copyFileAsync, readdir as readdirAsync, rm, stat } from 'fs/promises';
 import { spawn as subprocessSpawn } from './utils/subprocess';
 import { fileResponse, sniffMime } from './utils/file-response';
@@ -94,12 +94,24 @@ import {
 } from '../shared/slashCommands';
 import { sanitizeFolderName, isWindowsReservedName } from '../shared/utils';
 import {
+  assertKnownProductSystemSkillRequirement,
   isRequiredSystemSkill,
+  type ProductSystemSkillRequirement,
   withoutRequiredSystemSkills,
 } from '../shared/systemSkills';
 import { resolveSkillUrl, type ResolvedSkillSource } from './skills/url-resolver';
 import { fetchSkillZip, TarballFetchError } from './skills/tarball-fetcher';
-import { analyseTree, buildInstallPayload, writeSkillFiles, type SkillCandidate } from './skills/installer';
+import { loadSkillTree, SkillSourceLoadError } from './skills/source-loader';
+import {
+  analyseTree,
+  buildInstallPayload,
+  buildInstallPayloadForCandidate,
+  pathEntryExistsNoFollow,
+  publishSkillInstallPlan,
+  SkillInstallError,
+  skillTargetCollisionKey,
+  type SkillCandidate,
+} from './skills/installer';
 import {
   installPlugin,
   uninstallPlugin,
@@ -170,7 +182,7 @@ function buildSkillSourceMeta(
   }
   return {
     type: src.kind === 'raw-zip' ? 'raw_zip' : 'url',
-    url: src.rawZipUrl ?? tree.sourceUrl,
+    url: src.kind === 'raw-zip' ? src.rawZipUrl : tree.sourceUrl,
     resolvedUrl: tree.sourceUrl,
     rootPath: cand.rootPath || null,
     skillName: cand.suggestedFolderName,
@@ -239,6 +251,7 @@ async function schedulePluginRestartLazy(): Promise<void> {
 }
 import type { SessionSource, TurnAnalyticsSource } from './types/session';
 import { isPendingSessionId } from '../shared/constants';
+import { MANAGED_BROWSER_MCP_ID } from '../shared/browserTools';
 import { parseAgentFrontmatter, parseFullAgentContent, serializeAgentContent } from '../shared/agentCommands';
 import { scanAgents, readWorkspaceConfig, writeWorkspaceConfig, loadEnabledAgents, readAgentMeta, writeAgentMeta, findAgent } from './agents/agent-loader';
 import type { AgentFrontmatter, AgentMeta, AgentWorkspaceConfig } from '../shared/agentTypes';
@@ -265,7 +278,7 @@ let _adminApi: Promise<AdminApiModule> | null = null;
 const getAdminApi = (): Promise<AdminApiModule> => (_adminApi ??= import('./admin-api'));
 import { setImMediaContext } from './tools/im-media-tool';
 import { ensureImBridgeToolSurface } from './tools/im-bridge-tools';
-import { normalizeHostInteractionCapability } from './host-interaction';
+import { normalizeHostInteractionCapability, resolveImGroupToolsDeny } from './host-interaction';
 import { getBuiltinMcpInstance } from './tools/builtin-mcp-registry';
 // NOTE: builtin MCP META is auto-registered when agent-session.ts side-effect-imports
 // './tools/builtin-mcp-meta'. No duplicate import needed here.
@@ -397,18 +410,56 @@ process.on('unhandledRejection', (reason) => {
   }
 });
 
-process.on('SIGTERM', () => {
-  if (!stdioBroken) {
-    try { console.log('[process] SIGTERM received, shutting down...'); } catch { /* ignore */ }
+let gracefulShutdownHook: (() => Promise<void>) | null = null;
+let gracefulShutdownPromise: Promise<void> | null = null;
+let processShutdownStarted = false;
+
+async function shutdownOwnedResources(): Promise<void> {
+  if (!gracefulShutdownPromise) {
+    gracefulShutdownPromise = (async () => {
+      if (!gracefulShutdownHook) return;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          gracefulShutdownHook(),
+          new Promise<void>((_resolve, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error('Owned resource shutdown timed out')),
+              5_000,
+            );
+            timeout.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    })();
   }
-  process.exit(0);  // Trigger SDK's process.on('exit') handler → SIGTERM CLI subprocess
+  await gracefulShutdownPromise;
+}
+
+async function shutdownProcess(signal: 'SIGTERM' | 'SIGINT'): Promise<void> {
+  if (processShutdownStarted) return;
+  processShutdownStarted = true;
+  if (!stdioBroken) {
+    try { console.log(`[process] ${signal} received, shutting down...`); } catch { /* ignore */ }
+  }
+  try {
+    await shutdownOwnedResources();
+  } catch (error) {
+    if (!stdioBroken) {
+      try { console.error('[process] graceful resource shutdown failed:', error); } catch { /* ignore */ }
+    }
+  }
+  process.exit(0);  // Trigger SDK's process.on('exit') handler → terminate CLI subprocess
+}
+
+process.on('SIGTERM', () => {
+  void shutdownProcess('SIGTERM');
 });
 
 process.on('SIGINT', () => {
-  if (!stdioBroken) {
-    try { console.log('[process] SIGINT received, shutting down...'); } catch { /* ignore */ }
-  }
-  process.exit(0);
+  void shutdownProcess('SIGINT');
 });
 
 // ============= END CRASH DIAGNOSTICS =============
@@ -613,6 +664,8 @@ type SendMessagePayload = {
   analyticsSource?: TurnAnalyticsSource;
   /** Stable session birth origin, present only when this desktop send creates/materializes a session. */
   birthOrigin?: unknown;
+  /** Product workflow admission; validated against the compiled contract. */
+  requiredSystemSkill?: unknown;
   // 'subscription' = explicit switch to Anthropic subscription (from desktop)
   // undefined/missing = "keep current provider" (safe default for IM/Task callers)
   // object = use this specific third-party provider
@@ -922,8 +975,7 @@ function resolveBundledSkillsDir(): string | null {
  * genuine user skill named identically.
  */
 const SYSTEM_SKILLS: readonly string[] = [
-  'task-alignment',
-  'task-implement',
+  'myagents-task-alignment',
   // v10: ultra-research removed — not generic enough.
   'download-anything',
   // v9: myagents-cli — global skill that exposes the entire `myagents`
@@ -1097,69 +1149,6 @@ function ensurePluginsDirs(): void {
     ensureDirSync(dataRoot);
   } catch (err) {
     console.warn('[plugins] ensurePluginsDirs failed (non-fatal):', err);
-  }
-}
-
-/**
- * Clean up stale Playwright MCP profile lock files left by a crashed Chromium.
- *
- * Chromium leaves SingletonLock / SingletonSocket / SingletonCookie files in
- * the user-data-dir when the process crashes (or the OS kills it on app exit
- * without a clean shutdown). Subsequent Chromium launches with the same
- * user-data-dir refuse to start with "ProfileInUse" until the locks clear.
- *
- * Playwright's own startup mostly handles this, but the legacy
- * `~/.playwright-mcp-profile/` directory pre-dates Playwright MCP's improved
- * recovery paths and we've seen real "Chromium hangs forever" reports tied to
- * stale locks here. Cheap idempotent cleanup at sidecar boot.
- */
-function cleanupStalePlaywrightProfile(): void {
-  try {
-    const homeDir = getHomeDirOrNull();
-    if (!homeDir) return;
-
-    const profileDir = join(homeDir, '.playwright-mcp-profile');
-    const lockPath = join(profileDir, 'SingletonLock');
-
-    if (!existsSync(lockPath)) return;
-
-    // SingletonLock content: "hostname-pid" (POSIX symlink target on macOS/Linux,
-    // regular file content on Windows).
-    let linkTarget: string;
-    try {
-      linkTarget = readlinkSync(lockPath);
-    } catch {
-      try {
-        linkTarget = readFileSync(lockPath, 'utf-8').trim();
-      } catch {
-        return; // Can't read — bail
-      }
-    }
-
-    const pidMatch = linkTarget.match(/-(\d+)$/);
-    if (!pidMatch) return;
-    const pid = parseInt(pidMatch[1], 10);
-
-    // Probe pid liveness; if the process is alive, leave its locks alone.
-    try {
-      process.kill(pid, 0);
-      return;
-    } catch {
-      // Process is dead → safe to clean up
-    }
-
-    for (const file of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-      const filePath = join(profileDir, file);
-      try {
-        if (existsSync(filePath)) {
-          unlinkSync(filePath);
-        }
-      } catch { /* best effort */ }
-    }
-
-    console.log(`[startup] Cleaned up stale Playwright MCP profile lock (pid ${pid} dead)`);
-  } catch (err) {
-    console.warn('[startup] Playwright profile cleanup failed:', err);
   }
 }
 
@@ -1418,8 +1407,9 @@ async function routeAdminApi(
   // Task Center — thoughts + tasks (v0.1.69)
   if (route === 'task/list') return await api.handleTaskList(payload as Parameters<typeof api.handleTaskList>[0]);
   if (route === 'task/get') return await api.handleTaskGet(payload as Parameters<typeof api.handleTaskGet>[0]);
+  if (route === 'task/comments') return await api.handleTaskComments(payload as Parameters<typeof api.handleTaskComments>[0]);
+  if (route === 'task/comment') return await api.handleTaskComment(payload as Parameters<typeof api.handleTaskComment>[0]);
   if (route === 'task/create-direct') return await api.handleTaskCreateDirect(payload);
-  if (route === 'task/create-from-alignment') return await api.handleTaskCreateFromAlignment(payload);
   if (route === 'task/create-attached') return await api.handleTaskCreateAttached(payload);
   if (route === 'task/run') return await api.handleTaskRun(payload as Parameters<typeof api.handleTaskRun>[0]);
   if (route === 'task/run-now') return await api.handleTaskRunNow(payload as Parameters<typeof api.handleTaskRunNow>[0]);
@@ -1800,6 +1790,20 @@ async function main() {
   console.log(`[startup] HTTP server binding to 127.0.0.1:${port}...`);
 
   const dispatchRequest = composeSidecarRequestHandler(sidecarComposition, handleRequest);
+  let browserHostPromise: Promise<import('./browser-host').PlaywrightBrowserHost> | null = null;
+  const ensureBrowserHost = async (): Promise<import('./browser-host').PlaywrightBrowserHost> => {
+    if (!browserHostPromise) {
+      browserHostPromise = import('./browser-host').then(({ PlaywrightBrowserHost }) => (
+        new PlaywrightBrowserHost(port)
+      ));
+    }
+    return browserHostPromise;
+  };
+  gracefulShutdownHook = async () => {
+    if (!browserHostPromise) return;
+    const browserHost = await browserHostPromise;
+    await browserHost.shutdown();
+  };
 
   honoServe({
     // Explicit 127.0.0.1 for Rust proxy compatibility (IPv4).
@@ -1923,6 +1927,47 @@ async function main() {
         const { status, body } = buildReadyResponseBody();
         return jsonResponse(body, status);
       }
+      // Rust owns process-tree retirement. This bounded handshake lets the
+      // Global Sidecar checkpoint Browser identity before Windows closes its
+      // Job Object; the generation header prevents a stale retirement from
+      // shutting down a replacement process that reused the same port.
+      if (pathname === '/api/process/graceful-shutdown' && request.method === 'POST') {
+        const expectedGeneration = process.env.MYAGENTS_SIDECAR_GENERATION?.trim();
+        const requestedGeneration = request.headers.get('x-myagents-sidecar-generation')?.trim();
+        if (!expectedGeneration || requestedGeneration !== expectedGeneration) {
+          return jsonResponse({ success: false, error: 'stale sidecar generation' }, 409);
+        }
+        try {
+          await shutdownOwnedResources();
+          return jsonResponse({ success: true });
+        } catch (error) {
+          return jsonResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          }, 500);
+        }
+      }
+      if (pathname === '/api/browser/session/retire' && request.method === 'POST') {
+        const expectedGeneration = process.env.MYAGENTS_SIDECAR_GENERATION?.trim();
+        const requestedGeneration = request.headers.get('x-myagents-sidecar-generation')?.trim();
+        if (!expectedGeneration || requestedGeneration !== expectedGeneration) {
+          return jsonResponse({ success: false, error: 'stale sidecar generation' }, 409);
+        }
+        const body = await request.json().catch(() => null) as { productSessionId?: unknown } | null;
+        if (typeof body?.productSessionId !== 'string' || !body.productSessionId.trim()) {
+          return jsonResponse({ success: false, error: 'productSessionId is required' }, 400);
+        }
+        try {
+          const browserHost = await ensureBrowserHost();
+          await browserHost.retireProductSession(body.productSessionId.trim());
+          return jsonResponse({ success: true });
+        } catch (error) {
+          return jsonResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          }, 500);
+        }
+      }
       // (removed) `POST /health/ready/retry` — pre-0.2.0 endpoint that reset
       // DeferredInitState to `pending` and returned 202 promising a re-run,
       // but no in-process re-runner exists (the deferred init block is a
@@ -1978,6 +2023,15 @@ async function main() {
         return fr;
       }
 
+      // Runtime-only Streamable HTTP MCP data plane. The role gate admits
+      // this endpoint only on the Global Sidecar, and the Host validates a
+      // Rust-issued Session capability before creating any MCP connection or
+      // BrowserContext. It must be usable while Session runtimes are warming,
+      // so it intentionally precedes the deferred agent-state gate.
+      if (pathname === '/mcp/playwright') {
+        const browserHost = await ensureBrowserHost();
+        return browserHost.handleRequest(request);
+      }
       // ── Deferred init gate ────────────────────────────────────────────────
       // All other routes depend on agent state (currentAgentDir, MCP servers,
       // session metadata, bridge handler). Pattern 4: instead of awaiting
@@ -2071,7 +2125,7 @@ async function main() {
       }
 
       // Browser dev-mode fallback for attachment files.
-      // Production uses the Tauri `myagents://attachment/<path>` custom protocol
+      // Production uses the Tauri `myagents-resource://attachment/<path>` custom protocol
       // (`src-tauri/src/attachment_protocol.rs`) which serves bytes directly
       // through WebKit without round-tripping JSON. In dev (vite + browser) the
       // custom scheme isn't registered, so this route serves the same bytes
@@ -2197,6 +2251,19 @@ async function main() {
           scenarioType: interactionScenario.type,
           desktopSurface: interactionScenario.surface,
         });
+        let requiredSystemSkill: ProductSystemSkillRequirement | undefined;
+        if (payload.requiredSystemSkill !== undefined) {
+          try {
+            requiredSystemSkill = assertKnownProductSystemSkillRequirement(
+              payload.requiredSystemSkill,
+            );
+          } catch (error) {
+            return jsonResponse({
+              success: false,
+              error: error instanceof Error ? error.message : String(error),
+            }, 400);
+          }
+        }
 
         // Allow sending with just images or just text
         if (!text && images.length === 0) {
@@ -2228,6 +2295,7 @@ async function main() {
             analyticsSource,
             analyticsOrigin,
             birthOrigin,
+            requiredSystemSkill,
           });
           if (result.error) {
             return jsonResponse({ success: false, error: result.error }, result.status ?? 500);
@@ -3680,7 +3748,9 @@ async function main() {
           // user-facing error surfaces.
           const displayCommand = server.command === '__builtin__'
             ? '(builtin)'
-            : server.command === '__bundled_cuse__' ? 'cuse' : server.command;
+            : server.command === '__bundled_cuse__'
+              ? 'cuse'
+              : server.command === '__browser_host__' ? '(browser-host)' : server.command;
           console.log(`[api/mcp/enable] Enabling MCP: ${server.id}, type: ${server.type}, command: ${displayCommand}`);
 
           // Built-in MCP (in-process) — delegate validation to registry.
@@ -3698,6 +3768,11 @@ async function main() {
               }
             }
             console.log(`[api/mcp/enable] Built-in MCP: ${server.id} — enabled`);
+            return jsonResponse({ success: true });
+          }
+
+          if (server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__') {
+            console.log('[api/mcp/enable] Browser uses the application Browser Host');
             return jsonResponse({ success: true });
           }
 
@@ -5696,6 +5771,12 @@ async function main() {
           }
 
           let tree;
+          if (resolved.kind === 'local') {
+            return jsonResponse(
+              { success: false, error: '本地 Skill 来源只支持安装，不能直接作为 Space 发布来源' },
+              400,
+            );
+          }
           try {
             tree = await fetchSkillZip(resolved);
           } catch (err) {
@@ -5814,7 +5895,7 @@ async function main() {
         }
       }
 
-      // POST /api/skill/install-from-url - Install skill(s) from a GitHub repo / raw zip URL
+      // POST /api/skill/install-from-url - Install from GitHub, HTTPS zip, or a local source.
       // Two-step flow: first call analyses and may return a preview for the user to confirm;
       // second call (with confirmedSelection) re-fetches and writes the chosen skills.
       if (pathname === '/api/skill/install-from-url' && request.method === 'POST') {
@@ -5822,6 +5903,8 @@ async function main() {
           const payload = await request.json() as {
             url: string;
             scope: 'user' | 'project';
+            /** Analyse only. Never publish even for an unambiguous single Skill. */
+            previewOnly?: boolean;
             confirmedSelection?: {
               pluginName?: string;
               folderNames?: string[];
@@ -5850,14 +5933,14 @@ async function main() {
             );
           }
 
-          // 2. Download + extract in memory
+          // 2. Read/download + extract into the same immutable in-memory tree
           let tree;
           try {
-            tree = await fetchSkillZip(resolved);
+            tree = await loadSkillTree(resolved);
           } catch (err) {
-            const statusCode = err instanceof TarballFetchError ? err.statusCode : 500;
+            const statusCode = err instanceof SkillSourceLoadError ? err.statusCode : 500;
             return jsonResponse(
-              { success: false, error: err instanceof Error ? err.message : '下载失败' },
+              { success: false, error: err instanceof Error ? err.message : '读取 Skill 来源失败' },
               statusCode,
             );
           }
@@ -5869,12 +5952,19 @@ async function main() {
             return jsonResponse({ success: false, error: analysis.reason }, 422);
           }
 
+          if (payload.previewOnly && payload.confirmedSelection) {
+            return jsonResponse(
+              { success: false, error: 'previewOnly 不能与 confirmedSelection 同时使用' },
+              400,
+            );
+          }
+
           // 4. Compute existing folder conflicts for a given candidate list
           const checkConflicts = (candidates: SkillCandidate[]) => {
             const conflicts: Array<{ suggestedFolderName: string; name: string }> = [];
             for (const cand of candidates) {
               const folder = sanitizeFolderName(cand.suggestedFolderName);
-              if (existsSync(join(baseDir, folder))) {
+              if (pathEntryExistsNoFollow(join(baseDir, folder))) {
                 conflicts.push({ suggestedFolderName: folder, name: cand.name });
               }
             }
@@ -5883,7 +5973,9 @@ async function main() {
 
           // ---------- Step B: confirmedSelection provided — write to disk ----------
           if (payload.confirmedSelection) {
-            const overwrite = new Set(payload.confirmedSelection.overwrite ?? []);
+            const overwrite = new Set(
+              (payload.confirmedSelection.overwrite ?? []).map(name => sanitizeFolderName(name)),
+            );
             const renames = payload.confirmedSelection.renames ?? {};
 
             // Determine which candidates were chosen
@@ -5919,18 +6011,18 @@ async function main() {
             //   (1) duplicates within the chosen set (two skills collapsing to
             //       the same folder name — usually via frontmatter.name collision)
             //   (2) existing folders that aren't in overwrite
-            //   (3) rename targets that collide with existing folders
-            // All of these MUST fail before we write anything, otherwise a
-            // partial install leaks. Pre-validation gives atomic-ish semantics
-            // without a temp-dir dance.
-            const plan: Array<{ cand: SkillCandidate; folderName: string; originalName: string }> = [];
+            //   (3) rename targets that collide with existing folders.
+            // The publisher repeats conflict checks under the cross-process
+            // lock; this pass exists for precise request-level diagnostics.
+            const plan: Array<{ cand: SkillCandidate; folderName: string; overwrite: boolean }> = [];
             const seenTargets = new Set<string>();
             for (const cand of chosen) {
               const originalName = sanitizeFolderName(cand.suggestedFolderName);
               const renameTo = renames[originalName] ?? renames[cand.suggestedFolderName];
               const folderName = renameTo ? sanitizeFolderName(renameTo) : originalName;
 
-              if (seenTargets.has(folderName)) {
+              const collisionKey = skillTargetCollisionKey(folderName);
+              if (seenTargets.has(collisionKey)) {
                 return jsonResponse(
                   {
                     success: false,
@@ -5941,12 +6033,12 @@ async function main() {
                   409,
                 );
               }
-              seenTargets.add(folderName);
+              seenTargets.add(collisionKey);
 
               // If renamed, the rename target must not already exist on disk
               // (the user's original `overwrite` set was keyed on the original
               // name, not the rename target).
-              if (renameTo && existsSync(join(baseDir, folderName))) {
+              if (renameTo && pathEntryExistsNoFollow(join(baseDir, folderName))) {
                 return jsonResponse(
                   {
                     success: false,
@@ -5959,7 +6051,11 @@ async function main() {
               }
 
               // Non-renamed conflict must be covered by `overwrite`
-              if (!renameTo && existsSync(join(baseDir, folderName)) && !overwrite.has(folderName)) {
+              if (
+                !renameTo
+                && pathEntryExistsNoFollow(join(baseDir, folderName))
+                && !overwrite.has(folderName)
+              ) {
                 return jsonResponse(
                   {
                     success: false,
@@ -5971,31 +6067,20 @@ async function main() {
                 );
               }
 
-              plan.push({ cand, folderName, originalName });
+              plan.push({ cand, folderName, overwrite: !renameTo && overwrite.has(folderName) });
             }
 
-            // ---------- Write phase (all validations have passed) ----------
-            const payloadMap = buildInstallPayload(tree, chosen);
-            const installed: Array<{ folderName: string; path: string; name: string; description: string }> = [];
-
-            for (const { cand, folderName } of plan) {
-              const files = payloadMap.get(cand.suggestedFolderName);
-              if (!files) continue;
-
-              const skillDir = join(baseDir, folderName);
-              if (existsSync(skillDir) && overwrite.has(folderName)) {
-                rmSync(skillDir, { recursive: true, force: true });
-              }
-
-              writeSkillFiles(skillDir, files);
-
-              installed.push({
+            // ---------- Publish phase: stage complete dirs, then lock + rename ----------
+            const installed = await publishSkillInstallPlan(
+              baseDir,
+              plan.map(({ cand, folderName, overwrite: shouldOverwrite }) => ({
                 folderName,
-                path: skillDir,
+                files: buildInstallPayloadForCandidate(tree, cand),
                 name: cand.name,
                 description: cand.description,
-              });
-            }
+                overwrite: shouldOverwrite,
+              })),
+            );
 
             if (installed.length === 0) {
               return jsonResponse({ success: false, error: '没有任何 skill 被安装' }, 500);
@@ -6031,7 +6116,7 @@ async function main() {
                     name: s.name,
                     description: s.description,
                     hasDangerousTools: s.hasDangerousTools,
-                    conflict: existsSync(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
+                    conflict: pathEntryExistsNoFollow(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
                   })),
                 })),
               },
@@ -6051,7 +6136,7 @@ async function main() {
                   description: s.description,
                   hasDangerousTools: s.hasDangerousTools,
                   rootPath: s.rootPath,
-                  conflict: existsSync(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
+                  conflict: pathEntryExistsNoFollow(join(baseDir, sanitizeFolderName(s.suggestedFolderName))),
                 })),
               },
               sourceUrl: tree.sourceUrl,
@@ -6082,14 +6167,32 @@ async function main() {
             });
           }
 
-          // Auto-install the single unambiguous skill
-          const skillDir = join(baseDir, folderName);
-          const files = buildInstallPayload(tree, [cand]).get(cand.suggestedFolderName);
-          if (!files || files.size === 0) {
-            return jsonResponse({ success: false, error: '未找到可安装的文件' }, 500);
+          if (payload.previewOnly) {
+            return jsonResponse({
+              success: true,
+              mode: 'single',
+              preview: {
+                skill: {
+                  suggestedFolderName: folderName,
+                  name: cand.name,
+                  description: cand.description,
+                  hasDangerousTools: cand.hasDangerousTools,
+                  conflict: false,
+                },
+              },
+              sourceUrl: tree.sourceUrl,
+              effectiveRef: tree.effectiveRef,
+            });
           }
 
-          writeSkillFiles(skillDir, files);
+          // Auto-install the single unambiguous skill
+          const installed = await publishSkillInstallPlan(baseDir, [{
+            folderName,
+            files: buildInstallPayloadForCandidate(tree, cand),
+            name: cand.name,
+            description: cand.description,
+            overwrite: false,
+          }]);
 
           if (scope === 'user') {
             bumpSkillsGeneration();
@@ -6099,12 +6202,7 @@ async function main() {
           return jsonResponse({
             success: true,
             mode: 'installed',
-            installed: [{
-              folderName,
-              path: skillDir,
-              name: cand.name,
-              description: cand.description,
-            }],
+            installed,
             sourceUrl: tree.sourceUrl,
             effectiveRef: tree.effectiveRef,
           });
@@ -6112,7 +6210,7 @@ async function main() {
           console.error('[api/skill/install-from-url] Error:', error);
           return jsonResponse(
             { success: false, error: error instanceof Error ? error.message : 'Install failed' },
-            500,
+            error instanceof SkillInstallError ? error.statusCode : 500,
           );
         }
       }
@@ -7587,13 +7685,7 @@ async function main() {
             finalMessage = `[引用回复]\n> ${payload.replyToBody.split('\n').join('\n> ')}\n\n${finalMessage}`;
           }
 
-          const DEFAULT_GROUP_TOOLS_DENY = ['Bash', 'Edit', 'Write'];
-          if (payload.sourceType === 'group') {
-            const denyList = payload.groupToolsDeny !== undefined ? payload.groupToolsDeny : DEFAULT_GROUP_TOOLS_DENY;
-            setGroupToolsDeny(denyList);
-          } else {
-            setGroupToolsDeny([]);
-          }
+          setGroupToolsDeny(resolveImGroupToolsDeny(payload.sourceType, payload.groupToolsDeny));
 
           const metadata = {
             source: payload.source as SessionSource,
@@ -8751,7 +8843,7 @@ description: >
             currentInitPhase = 'cleanup';
             setDeferredInitPhase(currentInitPhase);
             initPhaseStarted = nowMs();
-            // Retention, stale-profile cleanup and the one-time config scrub
+            // Retention and the one-time config scrub
             // are app-wide maintenance. Running them in every Session process
             // multiplied I/O and timers without adding authority.
             const collectActivePaths = (): ReadonlySet<string> => {
@@ -8764,8 +8856,6 @@ description: >
             };
             runLogRetentionSweep({ activeFilePaths: collectActivePaths() });
             startPeriodicSweep(collectActivePaths);
-            cleanupStalePlaywrightProfile();
-
             try {
               const { scrubStaleRuntimeConfig } = await import('./migrations/scrub-stale-runtime-config');
               const result = await scrubStaleRuntimeConfig();

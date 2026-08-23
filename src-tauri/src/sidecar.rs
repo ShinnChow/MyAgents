@@ -99,7 +99,7 @@ pub(crate) use session_lifecycle::{
     ensure_session_sidecar_with_runtime_identity_override_lifecycle,
     ensure_session_sidecar_with_runtime_identity_override_lifecycle_held,
     finish_runtime_drift_transition, finish_session_owner_release, has_persisted_session_owner,
-    SessionLifecycleGuard,
+    release_session_sidecar_from_blocking_thread, SessionLifecycleGuard,
 };
 #[allow(unused_imports)]
 pub use session_lifecycle::{
@@ -107,7 +107,7 @@ pub use session_lifecycle::{
     cmd_get_session_port, cmd_has_session_sidecar, cmd_release_session_sidecar,
     cmd_release_tab_session, cmd_session_has_persistent_owners, cmd_upgrade_session_id,
     get_session_generation, get_session_sidecar_port, has_session_sidecar, release_session_sidecar,
-    EnsureSidecarResult,
+    schedule_release_session_sidecar, EnsureSidecarResult,
 };
 pub use shutdown::{
     begin_app_exit_shutdown, begin_lifecycle_spawn_permit, begin_update_shutdown,
@@ -168,8 +168,8 @@ fn next_sidecar_port_candidate(counter: &AtomicU16) -> u16 {
     }
 }
 pub(crate) use types::{
-    DispatchDrain, DispatchGate, DispatchLease, DispatchReplacement, SessionCompletionClaim,
-    SessionGenerationDrain, SidecarRetirement,
+    DispatchDrain, DispatchGate, DispatchLease, DispatchReplacement, GlobalShutdownTarget,
+    SessionCompletionClaim, SessionGenerationDrain, SidecarRetirement, SidecarShutdownPreparation,
 };
 pub use types::{RuntimeDriftResult, SessionSidecar, SidecarInstance, SidecarOwner, SidecarState};
 

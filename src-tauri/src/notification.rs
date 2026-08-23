@@ -11,8 +11,8 @@
 // not a fresh process spawn, so single-instance and focus-changed handlers
 // never fire.
 //
-// This module owns the OS notification surface end-to-end with **two
-// platform-exclusive paths** that don't share state:
+// This module owns the OS notification surface end-to-end with three
+// platform-exclusive paths. Every path receives an exact per-toast click:
 //
 //   ┌──────────────┬─────────────────────────────────────────────────────┐
 //   │ Windows      │ `tauri-winrt-notification::Toast::on_activated`     │
@@ -20,12 +20,11 @@
 //   │              │ global queue, no focus-edge consumption. The click  │
 //   │              │ handler is in-process and deterministic.            │
 //   ├──────────────┼─────────────────────────────────────────────────────┤
-//   │ macOS/Linux  │ Three-state global latch                            │
-//   │              │ (Empty/Single/Ambiguous). `Single` is consumed when │
-//   │              │ the front-end signals window-activation; `Ambiguous`│
-//   │              │ (≥2 unconsumed notifications stacked up) raises the │
-//   │              │ window but **refuses to deep-link** — wrong-tab     │
-//   │              │ navigation is a worse UX than no-deep-link.         │
+//   │ macOS        │ UserNotifications request identifier → navigation   │
+//   │              │ registry, consumed by its native response delegate. │
+//   ├──────────────┼─────────────────────────────────────────────────────┤
+//   │ Linux        │ notify-rust DBus action callback closure-captures   │
+//   │              │ the navigation target for that exact handle.        │
 //   └──────────────┴─────────────────────────────────────────────────────┘
 //
 // What this REPLACES:
@@ -34,26 +33,23 @@
 //   - `wasHidden` closure flag in `useTrayEvents.ts` (broke when user wasn't
 //     minimized to tray — alt-tab away then click toast).
 //   - `notification:show` Tauri event hop (Rust → JS → plugin-notification);
-//     now Rust calls plugin-notification directly via builder API.
+//     Rust now owns each platform's native callback path directly.
 //
 // Why mutually exclusive paths matter (review-time finding): an earlier
-// draft populated the global latch on Windows too "as a fallback". That
-// caused a double-emit bug — the WinRT closure emitted `notification:click`
-// directly, then `onFocusChanged(true)` invoked `cmd_consume_notification_click`
-// which drained the same entry and emitted a *second* identical event. The
-// strict cfg-split below makes the bug structurally unrepresentable.
+// draft populated a focus-consumed global latch alongside Windows' native
+// callback. That caused a double-emit bug when one activation reached both.
+// There is no focus-consumed navigation state anymore, making the bug
+// structurally unrepresentable.
 
-#[cfg(not(target_os = "windows"))]
-use std::sync::Mutex;
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::sync::{LazyLock, Mutex};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
-// `NotificationExt` powers `show_via_plugin` (the macOS / Linux toast
-// path). Windows goes through `tauri_winrt_notification::Toast` directly.
-#[cfg(not(target_os = "windows"))]
-use tauri_plugin_notification::NotificationExt;
 
 use crate::notification_badge::NotificationBadgeIncrement;
 #[cfg(target_os = "windows")]
@@ -61,44 +57,209 @@ use crate::ulog_error;
 use crate::utils::bom::strip_bom;
 use crate::{ulog_debug, ulog_info, ulog_warn};
 
-/// How long an unconsumed deep-link target stays valid on macOS / Linux.
-///
-/// Only relevant for the non-Windows fallback path. Windows consumes
-/// synchronously inside the WinRT `on_activated` callback, so this constant
-/// is unused there.
-///
-/// 30 seconds bounds "user notices toast → finishes current task → clicks"
-/// without letting truly stale entries linger.
-#[cfg(not(target_os = "windows"))]
-const PENDING_CLICK_TTL: Duration = Duration::from_secs(30);
+/// Delivered macOS banners can remain in Notification Center for days. Bound
+/// ignored/dismissed routes by both age and count while retaining long-lived
+/// click behavior for banners the user opens later.
+#[cfg(target_os = "macos")]
+const MAC_ROUTE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+#[cfg(target_os = "macos")]
+const MAX_MAC_ROUTES: usize = 512;
 
-#[cfg(not(target_os = "windows"))]
-struct PendingClick {
+#[cfg(target_os = "macos")]
+struct MacNotificationRoute {
     navigation: NotificationNavigation,
-    queued_at: Instant,
+    created_at: Instant,
 }
 
-/// Three-state latch for the macOS/Linux fallback path.
-///
-/// `Ambiguous` is the load-bearing piece: when two notifications stack up
-/// without an intervening focus-regain, we can't tell *which* one the user
-/// clicked, so we refuse to deep-link. The user still gets the window raised
-/// (`notification:click` is simply not emitted), which is the no-data-loss
-/// degradation.
-#[cfg(not(target_os = "windows"))]
-enum PendingState {
-    Empty,
-    Single(PendingClick),
-    /// Two-or-more notifications stacked unconsumed. Tracked timestamp is
-    /// the *earliest* queue entry's `queued_at` so TTL still expires the
-    /// state.
-    Ambiguous {
-        queued_at: Instant,
-    },
-}
+#[cfg(target_os = "macos")]
+static MAC_NOTIFICATION_ROUTES: LazyLock<Mutex<HashMap<String, MacNotificationRoute>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[cfg(not(target_os = "windows"))]
-static PENDING_CLICK: Mutex<PendingState> = Mutex::new(PendingState::Empty);
+/// Modern macOS UserNotifications integration. The request identifier is the
+/// correlation key; the system returns that exact identifier to the single
+/// process-lifetime delegate when a banner is clicked or dismissed.
+#[cfg(target_os = "macos")]
+mod macos_notifications {
+    use core::ffi::c_void;
+
+    use objc2::ffi::{objc_setAssociatedObject, OBJC_ASSOCIATION_RETAIN_NONATOMIC};
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, Bool, ProtocolObject};
+    use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
+    use objc2_foundation::{MainThreadMarker, NSError, NSObject, NSObjectProtocol, NSString};
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent,
+        UNNotificationDefaultActionIdentifier, UNNotificationRequest, UNNotificationResponse,
+        UNNotificationSound, UNUserNotificationCenter, UNUserNotificationCenterDelegate,
+    };
+
+    use super::*;
+
+    static DELEGATE_ASSOCIATION_KEY: u8 = 0;
+
+    #[derive(Debug)]
+    struct MacNotificationDelegateIvars {
+        app: AppHandle,
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements. Apple invokes
+        // UserNotifications delegate callbacks on the main queue.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "MyAgentsUserNotificationCenterDelegate"]
+        #[ivars = MacNotificationDelegateIvars]
+        struct MacNotificationDelegate;
+
+        // SAFETY: NSObjectProtocol has no additional requirements.
+        unsafe impl NSObjectProtocol for MacNotificationDelegate {}
+
+        // SAFETY: The selector and argument types exactly match Apple's
+        // UNUserNotificationCenterDelegate response callback.
+        unsafe impl UNUserNotificationCenterDelegate for MacNotificationDelegate {
+            #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+            fn did_receive_response(
+                &self,
+                _center: &UNUserNotificationCenter,
+                response: &UNNotificationResponse,
+                completion_handler: &block2::DynBlock<dyn Fn()>,
+            ) {
+                let identifier = response.notification().request().identifier().to_string();
+                let navigation = take_route(&identifier);
+                let action = response.actionIdentifier();
+                // SAFETY: This framework constant is present on every macOS
+                // version supported by Tauri 2.
+                let default_action = unsafe { UNNotificationDefaultActionIdentifier };
+                if &*action == default_action {
+                    handle_toast_click(&self.ivars().app, navigation);
+                }
+                completion_handler.call(());
+            }
+        }
+    );
+
+    impl MacNotificationDelegate {
+        fn new(mtm: MainThreadMarker, app: AppHandle) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(MacNotificationDelegateIvars { app });
+            // SAFETY: NSObject's init signature is correct for this subclass.
+            unsafe { msg_send![super(this), init] }
+        }
+    }
+
+    pub(super) fn install(app: &AppHandle) -> Result<(), String> {
+        let mtm = MainThreadMarker::new().ok_or_else(|| {
+            "notification delegate must be installed on the main thread".to_owned()
+        })?;
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let delegate = MacNotificationDelegate::new(mtm, app.clone());
+        center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+
+        // `delegate` is a weak property. Tie its strong lifetime to the
+        // singleton center with an associated object.
+        unsafe {
+            objc_setAssociatedObject(
+                Retained::as_ptr(&center).cast_mut().cast::<AnyObject>(),
+                (&DELEGATE_ASSOCIATION_KEY as *const u8).cast::<c_void>(),
+                Retained::as_ptr(&delegate).cast_mut().cast::<AnyObject>(),
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC,
+            );
+        }
+        if read_notification_prefs().os_notifications {
+            request_authorization(&center);
+        }
+        Ok(())
+    }
+
+    pub(super) fn request_permission() {
+        request_authorization(&UNUserNotificationCenter::currentNotificationCenter());
+    }
+
+    fn request_authorization(center: &UNUserNotificationCenter) {
+        let completion = block2::RcBlock::new(|granted: Bool, error: *mut NSError| {
+            if !error.is_null() {
+                ulog_warn!("[Notification] macOS authorization request failed");
+            } else {
+                ulog_info!(
+                    "[Notification] macOS authorization granted={}",
+                    granted.as_bool()
+                );
+            }
+        });
+        center.requestAuthorizationWithOptions_completionHandler(
+            UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound,
+            &completion,
+        );
+    }
+
+    pub(super) fn show(
+        title: &str,
+        body: &str,
+        navigation: Option<NotificationNavigation>,
+        silent: bool,
+    ) -> Result<(), String> {
+        let identifier = format!("myagents:{}", uuid::Uuid::new_v4());
+        if let Some(navigation) = navigation {
+            register_route(identifier.clone(), navigation);
+        }
+
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(title));
+        content.setBody(&NSString::from_str(body));
+        if !silent {
+            content.setSound(Some(&UNNotificationSound::defaultSound()));
+        }
+        let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+            &NSString::from_str(&identifier),
+            &content,
+            None,
+        );
+        UNUserNotificationCenter::currentNotificationCenter()
+            .addNotificationRequest_withCompletionHandler(&request, None);
+        Ok(())
+    }
+
+    fn register_route(identifier: String, navigation: NotificationNavigation) {
+        let mut routes = MAC_NOTIFICATION_ROUTES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        routes.retain(|_, route| route.created_at.elapsed() <= MAC_ROUTE_TTL);
+        if routes.len() >= MAX_MAC_ROUTES {
+            if let Some(oldest) = routes
+                .iter()
+                .min_by_key(|(_, route)| route.created_at)
+                .map(|(identifier, _)| identifier.clone())
+            {
+                routes.remove(&oldest);
+            }
+        }
+        routes.insert(
+            identifier,
+            MacNotificationRoute {
+                navigation,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    fn take_route(identifier: &str) -> Option<NotificationNavigation> {
+        MAC_NOTIFICATION_ROUTES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(identifier)
+            .map(|route| route.navigation)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_registry_round_trip() {
+        let first = NotificationNavigation::from_tab_id(Some("first".to_owned())).unwrap();
+        let second = NotificationNavigation::from_tab_id(Some("second".to_owned())).unwrap();
+        register_route("request-first".to_owned(), first.clone());
+        register_route("request-second".to_owned(), second.clone());
+        assert_eq!(take_route("request-second"), Some(second));
+        assert_eq!(take_route("request-first"), Some(first));
+        assert_eq!(take_route("request-first"), None);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +270,16 @@ pub struct NotificationNavigation {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_notification_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_target: Option<crate::space_cloud::notifications::NotificationTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_is_announcement: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_origin_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_origin_account_key: Option<String>,
 }
 
 impl NotificationNavigation {
@@ -121,6 +292,11 @@ impl NotificationNavigation {
             tab_id: clean_optional_string(tab_id),
             session_id: clean_optional_string(session_id),
             workspace_path: clean_optional_string(workspace_path),
+            cloud_notification_id: None,
+            cloud_target: None,
+            cloud_is_announcement: None,
+            cloud_origin_key: None,
+            cloud_origin_account_key: None,
         };
         if navigation.tab_id.is_none()
             && (navigation.session_id.is_none() || navigation.workspace_path.is_none())
@@ -143,10 +319,30 @@ impl NotificationNavigation {
         Self::new(tab_id, Some(session_id), Some(workspace_path))
     }
 
+    pub fn for_cloud(
+        notification_id: String,
+        target: crate::space_cloud::notifications::NotificationTarget,
+        is_announcement: bool,
+        origin_key: Option<String>,
+        origin_account_key: Option<String>,
+    ) -> Option<Self> {
+        let notification_id = clean_optional_string(Some(notification_id))?;
+        Some(Self {
+            tab_id: None,
+            session_id: None,
+            workspace_path: None,
+            cloud_notification_id: Some(notification_id),
+            cloud_target: Some(target),
+            cloud_is_announcement: Some(is_announcement),
+            cloud_origin_key: clean_optional_string(origin_key),
+            cloud_origin_account_key: clean_optional_string(origin_account_key),
+        })
+    }
+
     fn describe(&self) -> String {
         format!(
-            "tab_id={:?} session_id={:?} workspace_path={:?}",
-            self.tab_id, self.session_id, self.workspace_path
+            "tab_id={:?} session_id={:?} workspace_path={:?} cloud_notification_id={:?}",
+            self.tab_id, self.session_id, self.workspace_path, self.cloud_notification_id
         )
     }
 }
@@ -171,6 +367,10 @@ pub struct NotificationClickPayload {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_notification_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_target: Option<crate::space_cloud::notifications::NotificationTarget>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -354,6 +554,30 @@ pub fn show_with_navigation_target<R: Runtime>(
     show_with_navigation_target_inner(app, title, body, navigation, None);
 }
 
+pub fn show_cloud_notification<R: Runtime>(
+    app: &AppHandle<R>,
+    title: &str,
+    body: &str,
+    notification_id: String,
+    target: crate::space_cloud::notifications::NotificationTarget,
+    is_announcement: bool,
+    origin_key: Option<String>,
+    origin_account_key: Option<String>,
+) {
+    show_with_navigation_target(
+        app,
+        title,
+        body,
+        NotificationNavigation::for_cloud(
+            notification_id,
+            target,
+            is_announcement,
+            origin_key,
+            origin_account_key,
+        ),
+    );
+}
+
 pub fn show_with_navigation_target_and_badge<R: Runtime>(
     app: &AppHandle<R>,
     title: &str,
@@ -407,62 +631,56 @@ fn show_with_navigation_target_inner<R: Runtime>(
         }
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
-        // Render first; only stash on success. Stashing eagerly would let
-        // failed renders pollute the latch for 30s.
-        if let Err(e) = show_via_plugin(app, title, body, silent) {
-            ulog_warn!("[Notification] plugin-notification show failed: {}", e);
-            return;
+        if let Err(error) = macos_notifications::show(title, body, navigation, silent) {
+            ulog_warn!("[Notification] UserNotifications show failed: {}", error);
         }
-        if let Some(target) = navigation {
-            queue_pending_click(target);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(error) = show_linux_toast(app, title, body, navigation, silent) {
+            ulog_warn!("[Notification] freedesktop toast failed: {}", error);
         }
     }
 }
 
-/// Render via the cross-platform `tauri-plugin-notification` builder API.
-///
-/// `plugin-notification`'s desktop backend (`notify-rust`) routes the `sound`
-/// field through to `mac-notification-sys` on macOS and the freedesktop
-/// notification spec's `sound-name` hint on Linux. Not calling `.sound()` at
-/// all on these platforms means notify-rust never sets the sound key, which
-/// produces a *silent* notification — that's why the silent path takes the
-/// no-op branch and the audible path needs an explicit name.
-#[cfg(not(target_os = "windows"))]
-fn show_via_plugin<R: Runtime>(
+/// Linux receives DBus actions on the exact returned notification handle. A
+/// dedicated waiter thread is required because desktop daemons deliver that
+/// action asynchronously and notify-rust's convenience API blocks while it
+/// listens. Each thread closure owns one navigation target, so stacked toasts
+/// cannot cross-route.
+#[cfg(target_os = "linux")]
+fn show_linux_toast<R: Runtime>(
     app: &AppHandle<R>,
     title: &str,
     body: &str,
+    navigation: Option<NotificationNavigation>,
     silent: bool,
-) -> tauri_plugin_notification::Result<()> {
-    let mut builder = app.notification().builder().title(title).body(body);
+) -> notify_rust::error::Result<()> {
+    use notify_rust::{Notification, Timeout};
+
+    let mut notification = Notification::new();
+    notification
+        .appname("MyAgents")
+        .summary(title)
+        .body(body)
+        .timeout(Timeout::Milliseconds(10_000))
+        .action("default", "Open");
     if !silent {
-        if let Some(sound_name) = default_sound_name() {
-            builder = builder.sound(sound_name);
-        }
+        notification.sound_name("message-new-instant");
     }
-    builder.show()
-}
-
-/// Per-platform default sound identifier passed to `notify-rust`.
-///
-/// macOS: `NSUserNotificationDefaultSoundName` is the documented sentinel for
-/// "play the system's default notification chime" (see Apple's
-/// NSUserNotification docs). `mac-notification-sys` recognizes any other
-/// string as a custom sound name (e.g. "Ping", "Blow") in `/System/Library/Sounds/`.
-///
-/// Linux: `message-new-instant` is part of the freedesktop sound theme spec
-/// and is supported by GNOME / KDE / XFCE / Cinnamon notification daemons.
-/// Notification daemons that don't understand it fall back to no sound.
-#[cfg(target_os = "macos")]
-fn default_sound_name() -> Option<&'static str> {
-    Some("NSUserNotificationDefaultSoundName")
-}
-
-#[cfg(target_os = "linux")]
-fn default_sound_name() -> Option<&'static str> {
-    Some("message-new-instant")
+    let handle = notification.show()?;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        handle.wait_for_action(move |action| {
+            if action == "default" {
+                handle_toast_click(&app, navigation);
+            }
+        });
+    });
+    Ok(())
 }
 
 /// User notification preferences read from `~/.myagents/config.json`.
@@ -626,12 +844,8 @@ fn resolve_windows_app_id<R: Runtime>(app: &AppHandle<R>) -> String {
     }
 }
 
-/// Toast click handler (Windows in-process Activated callback).
-///
-/// Intentionally **does not** consult the global pending-click latch — that
-/// latch is non-Windows only. The closure captures the per-toast navigation
-/// target at render time, eliminating multi-toast misroute.
-#[cfg(target_os = "windows")]
+/// Platform callback convergence point. Windows and Linux closure-capture the
+/// target; macOS resolves it from the exact UserNotifications request ID.
 fn handle_toast_click<R: Runtime>(app: &AppHandle<R>, navigation: Option<NotificationNavigation>) {
     ulog_info!(
         "[Notification] Toast clicked; navigation={:?}",
@@ -641,146 +855,47 @@ fn handle_toast_click<R: Runtime>(app: &AppHandle<R>, navigation: Option<Notific
     emit_click(app, navigation);
 }
 
-/// macOS / Linux fallback: when the user activates our app via an external
-/// trigger (single-instance second launch, focus regain after a banner
-/// click), drain the pending latch.
-///
-/// **Tradeoff (acknowledged)**: any external activation drains the latch,
-/// not strictly toast clicks — alt-tab back to MyAgents within 30s of a
-/// notification will navigate to the queued tab even though the user didn't
-/// click the toast. Mitigations:
-///   - The latch is `Ambiguous` (no-route) when ≥2 notifications stacked
-///     up unconsumed, so the worst case is a single-toast wrong-tab nudge.
-///   - The `Single`-state path is the most common notification flow (one
-///     completion, user reacts to it), where this behavior is what the user
-///     wants anyway.
-///
-/// Real fix on macOS would require an `NSUserNotificationCenterDelegate`
-/// hooked through Tauri (not currently exposed); on Linux, dbus action
-/// callbacks. Both are out of scope for this fix and tracked separately.
-#[cfg(not(target_os = "windows"))]
-pub fn on_window_activated_externally<R: Runtime>(app: &AppHandle<R>) -> bool {
-    if let Some(navigation) = take_pending_click() {
-        ulog_info!(
-            "[Notification] External activation consumed pending click {}",
-            navigation.describe()
-        );
-        emit_click(app, Some(navigation));
-        return true;
-    }
-    false
+#[cfg(target_os = "macos")]
+pub fn install_macos_notification_delegate(app: &AppHandle) -> Result<(), String> {
+    macos_notifications::install(app)
 }
 
-/// Windows variant: no global latch, so external activation has nothing to
-/// consume. Defined as a no-op so the call site in `lib.rs::single_instance`
-/// stays platform-agnostic.
-#[cfg(target_os = "windows")]
-pub fn on_window_activated_externally<R: Runtime>(_app: &AppHandle<R>) -> bool {
-    false
+#[tauri::command]
+pub fn cmd_request_notification_permission() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    macos_notifications::request_permission();
+    Ok(())
 }
 
 fn emit_click<R: Runtime>(app: &AppHandle<R>, navigation: Option<NotificationNavigation>) {
     let Some(navigation) = navigation else {
         return;
     };
+    if let (Some(notification_id), Some(target)) = (
+        navigation.cloud_notification_id.clone(),
+        navigation.cloud_target.clone(),
+    ) {
+        crate::space_cloud::notifications::activate_from_toast(
+            app.clone(),
+            notification_id,
+            target,
+            navigation.cloud_is_announcement.unwrap_or(false),
+            navigation.cloud_origin_key.clone(),
+            navigation.cloud_origin_account_key.clone(),
+        );
+        return;
+    }
     if let Err(e) = app.emit(
         "notification:click",
         NotificationClickPayload {
             tab_id: navigation.tab_id,
             session_id: navigation.session_id,
             workspace_path: navigation.workspace_path,
+            cloud_notification_id: navigation.cloud_notification_id,
+            cloud_target: navigation.cloud_target,
         },
     ) {
         ulog_warn!("[Notification] Failed to emit notification:click: {}", e);
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn queue_pending_click(navigation: NotificationNavigation) {
-    let described = navigation.describe();
-    let mut guard = match PENDING_CLICK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            ulog_warn!("[Notification] PENDING_CLICK mutex was poisoned; recovering");
-            poisoned.into_inner()
-        }
-    };
-    let now = Instant::now();
-    *guard = match std::mem::replace(&mut *guard, PendingState::Empty) {
-        // First entry — straightforward.
-        PendingState::Empty => PendingState::Single(PendingClick {
-            navigation,
-            queued_at: now,
-        }),
-        // Promote to Ambiguous: we now have ≥2 unconsumed notifications
-        // and can't tell which one the user will click. Keep the older
-        // queued_at so TTL bounds the ambiguous window correctly.
-        //
-        // Boundary fix (review-by-codex): if the old `Single` is itself
-        // already past TTL (notification fired ≥30s ago, never clicked),
-        // the user has clearly abandoned it — treat it as Empty for the
-        // promotion. Otherwise we'd build an Ambiguous state seeded with
-        // an already-expired timestamp, and `take_pending_click` doesn't
-        // apply TTL to Ambiguous → the latch stays stuck refusing routes
-        // until the next queue flushes it. v0.2.14 dogfood scenario:
-        // queue A, leave window unfocused 31s, queue B, click B → gets
-        // no deep-link forever.
-        PendingState::Single(prev) if prev.queued_at.elapsed() > PENDING_CLICK_TTL => {
-            PendingState::Single(PendingClick {
-                navigation,
-                queued_at: now,
-            })
-        }
-        PendingState::Single(prev) => PendingState::Ambiguous {
-            queued_at: prev.queued_at,
-        },
-        // Same TTL hygiene for an already-Ambiguous entry: if its anchor
-        // is past TTL when a new notification arrives, reset to Single on
-        // the fresh entry. The user's previous batch is no longer the one
-        // being clicked.
-        PendingState::Ambiguous { queued_at } if queued_at.elapsed() > PENDING_CLICK_TTL => {
-            PendingState::Single(PendingClick {
-                navigation,
-                queued_at: now,
-            })
-        }
-        PendingState::Ambiguous { queued_at } => PendingState::Ambiguous { queued_at },
-    };
-    ulog_info!("[Notification] Pending click queued {}", described);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn take_pending_click() -> Option<NotificationNavigation> {
-    let mut guard = match PENDING_CLICK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            ulog_warn!("[Notification] PENDING_CLICK mutex was poisoned; recovering");
-            poisoned.into_inner()
-        }
-    };
-    let state = std::mem::replace(&mut *guard, PendingState::Empty);
-    match state {
-        PendingState::Empty => None,
-        PendingState::Single(entry) => {
-            if entry.queued_at.elapsed() > PENDING_CLICK_TTL {
-                ulog_debug!(
-                    "[Notification] Pending click for {} expired",
-                    entry.navigation.describe()
-                );
-                None
-            } else {
-                Some(entry.navigation)
-            }
-        }
-        PendingState::Ambiguous { queued_at: _ } => {
-            // Refusing to route is the safe choice: deep-linking to the
-            // *wrong* tab is worse than leaving the user on the current
-            // tab after raising the window.
-            ulog_debug!(
-                "[Notification] Pending click was Ambiguous; raising window without deep-link"
-            );
-            None
-        }
     }
 }
 
@@ -818,130 +933,39 @@ pub fn cmd_show_notification<R: Runtime>(
     );
 }
 
-/// Front-end hook for macOS / Linux focus-regain. On Windows this is a
-/// no-op — the WinRT in-process callback already handled click routing
-/// synchronously, and consulting the (non-existent) global latch would
-/// cause a double-emit (#review-finding-1).
-#[tauri::command]
-pub fn cmd_consume_notification_click<R: Runtime>(app: AppHandle<R>) -> bool {
-    let consumed = on_window_activated_externally(&app);
-    ulog_info!(
-        "[Notification] cmd_consume_notification_click consumed={}",
-        consumed
-    );
-    consumed
-}
-
 // ============ Tests ============
 
-#[cfg(all(test, not(target_os = "windows")))]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 
-    /// All tests in this module touch the same global latch. Run them in a
-    /// single `#[test]` so they don't race when `cargo test` parallelizes.
     #[test]
-    fn pending_click_state_machine() {
-        // 0. Reset (tests share the static; reset to Empty between phases).
-        let reset = || {
-            let mut guard = PENDING_CLICK.lock().unwrap();
-            *guard = PendingState::Empty;
-        };
-        reset();
+    fn mac_registry_correlates_stacked_toasts_by_exact_identifier() {
+        macos_notifications::test_registry_round_trip();
+    }
+}
 
-        // 1. Empty → take returns None.
-        assert_eq!(take_pending_click(), None);
+#[cfg(test)]
+mod notification_navigation_tests {
+    use super::*;
 
-        // 2. queue + take returns the value once.
-        queue_pending_click(NotificationNavigation::from_tab_id(Some("tab-1".into())).unwrap());
+    #[test]
+    fn cloud_navigation_captures_origin_and_account_identity() {
+        let navigation = NotificationNavigation::for_cloud(
+            "notification-1".to_string(),
+            crate::space_cloud::notifications::NotificationTarget::ExternalUrl {
+                url: "https://example.com/notice".to_string(),
+            },
+            true,
+            Some("origin-a".to_string()),
+            Some("account-a".to_string()),
+        )
+        .expect("cloud navigation");
+
+        assert_eq!(navigation.cloud_origin_key.as_deref(), Some("origin-a"));
         assert_eq!(
-            take_pending_click(),
-            NotificationNavigation::from_tab_id(Some("tab-1".into()))
-        );
-        assert_eq!(take_pending_click(), None, "single-consumer semantics");
-
-        // 3. Two queues without a take in between → Ambiguous → take None.
-        reset();
-        queue_pending_click(NotificationNavigation::from_tab_id(Some("tab-A".into())).unwrap());
-        queue_pending_click(NotificationNavigation::from_tab_id(Some("tab-B".into())).unwrap());
-        assert_eq!(
-            take_pending_click(),
-            None,
-            "Ambiguous must refuse to deep-link"
-        );
-
-        // 4. Three queues → still Ambiguous → still None.
-        reset();
-        queue_pending_click(NotificationNavigation::from_tab_id(Some("tab-A".into())).unwrap());
-        queue_pending_click(NotificationNavigation::from_tab_id(Some("tab-B".into())).unwrap());
-        queue_pending_click(NotificationNavigation::from_tab_id(Some("tab-C".into())).unwrap());
-        assert_eq!(take_pending_click(), None);
-
-        // 5. After Ambiguous is consumed, state resets and a fresh Single
-        //    can route normally.
-        queue_pending_click(
-            NotificationNavigation::for_session(
-                None,
-                "session-fresh".into(),
-                "/tmp/workspace".into(),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            take_pending_click(),
-            NotificationNavigation::for_session(
-                None,
-                "session-fresh".into(),
-                "/tmp/workspace".into(),
-            )
-        );
-
-        // 6. TTL expiry on Single — synthesize an old entry directly.
-        {
-            let mut guard = PENDING_CLICK.lock().unwrap();
-            *guard = PendingState::Single(PendingClick {
-                navigation: NotificationNavigation::from_tab_id(Some("tab-stale".into())).unwrap(),
-                queued_at: Instant::now() - Duration::from_secs(31),
-            });
-        }
-        assert_eq!(take_pending_click(), None, "TTL must drop stale Single");
-
-        // 7. queue → wait past TTL → queue → take must route to the LATER
-        //    notification (not stick on Ambiguous-with-stale-anchor). This
-        //    is the boundary fix from the v0.2.14 codex review.
-        reset();
-        {
-            let mut guard = PENDING_CLICK.lock().unwrap();
-            *guard = PendingState::Single(PendingClick {
-                navigation: NotificationNavigation::from_tab_id(Some("tab-old".into())).unwrap(),
-                queued_at: Instant::now() - Duration::from_secs(31),
-            });
-        }
-        queue_pending_click(
-            NotificationNavigation::from_tab_id(Some("tab-fresh-after-stale".into())).unwrap(),
-        );
-        assert_eq!(
-            take_pending_click(),
-            NotificationNavigation::from_tab_id(Some("tab-fresh-after-stale".into())),
-            "stale Single must not poison the Ambiguous promotion",
-        );
-
-        // 8. Pre-existing Ambiguous past TTL + new queue → resets to Single
-        //    on the fresh entry rather than refusing forever.
-        reset();
-        {
-            let mut guard = PENDING_CLICK.lock().unwrap();
-            *guard = PendingState::Ambiguous {
-                queued_at: Instant::now() - Duration::from_secs(31),
-            };
-        }
-        queue_pending_click(
-            NotificationNavigation::from_tab_id(Some("tab-after-ambiguous".into())).unwrap(),
-        );
-        assert_eq!(
-            take_pending_click(),
-            NotificationNavigation::from_tab_id(Some("tab-after-ambiguous".into())),
-            "stale Ambiguous must not poison subsequent routes",
+            navigation.cloud_origin_account_key.as_deref(),
+            Some("account-a")
         );
     }
 }

@@ -38,6 +38,12 @@
     "toolsEmptyPrefix": "在",
     "toolsEmptyExternal": "在设置页面启用官方 CLI 工具后即可在此 runtime 使用。",
     "toolsEmptyBuiltin": "安装开启 MCP 工具，即可使用浏览器等更多功能",
+    "mcpStatus": {
+      "readyTools": "{{count}} 个工具已就绪",
+      "needsAuth": "需要登录授权",
+      "unavailable": "当前不可用",
+      "starting": "正在启动…"
+    },
     "pluginsHeader": "插件 Plugins",
     "pluginLoadsMcpTitle": "启用此插件会自动加载这些 MCP server：{{names}}",
     "pluginLoadsMcp": "{{count}} 个 MCP：{{names}}",

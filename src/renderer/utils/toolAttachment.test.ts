@@ -23,24 +23,24 @@ describe('resolveTauriToolAttachmentUrl', () => {
     setNavigatorPlatform('MacIntel');
     expect(
       resolveTauriToolAttachmentUrl('/api/attachment/tool/session-a/turn-b/image.png'),
-    ).toBe('myagents://tool-attachment/session-a/turn-b/image.png');
+    ).toBe('myagents-resource://tool-attachment/session-a/turn-b/image.png');
     expect(
       resolveTauriToolAttachmentUrl('/api/attachment/tool/session-a/turn-b/image.png', 'session-a'),
-    ).toBe('myagents://tool-attachment/session-a/turn-b/image.png');
+    ).toBe('myagents-resource://tool-attachment/session-a/turn-b/image.png');
   });
 
   it('maps sidecar tool attachment API paths to Tauri localhost on Windows', () => {
     setNavigatorPlatform('Win32', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
     expect(
       resolveTauriToolAttachmentUrl('/api/attachment/tool/session-a/turn-b/image.png', 'session-a'),
-    ).toBe('http://myagents.localhost/tool-attachment/session-a/turn-b/image.png');
+    ).toBe('http://myagents-resource.localhost/tool-attachment/session-a/turn-b/image.png');
   });
 
   it('preserves encoded path segments', () => {
     setNavigatorPlatform('MacIntel');
     expect(
       resolveTauriToolAttachmentUrl('/api/attachment/tool/session-a/turn-b/image%20one.png'),
-    ).toBe('myagents://tool-attachment/session-a/turn-b/image%20one.png');
+    ).toBe('myagents-resource://tool-attachment/session-a/turn-b/image%20one.png');
   });
 
   it('does not rewrite unrelated attachment paths', () => {

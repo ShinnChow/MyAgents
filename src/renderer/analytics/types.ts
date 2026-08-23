@@ -74,6 +74,7 @@ export type Surface =
   | 'new_chat_button'
   | 'task_center'
   | 'bug_report'
+  | 'space_tools'
   | 'agent_setup'
   | 'cmd_k'
   | 'external_link'
@@ -98,6 +99,7 @@ export type EntryIntent =
   | 'thought_alignment'
   | 'workspace_init'
   | 'support_diagnostics'
+  | 'tool_install'
   | 'new_chat'
   | 'fork'
   | 'unknown';
@@ -117,6 +119,7 @@ export type AssistantEntry =
   | 'terminal_reason'
   | 'runtime_diagnostics'
   | 'support_diagnostics'
+  | 'space_tool_install'
   | 'other';
 
 /**
@@ -202,6 +205,7 @@ export type EventName =
   | 'space_issue_mutation'
   | 'space_goal_mutation'
   | 'space_skill_mutation'
+  | 'space_tool_mutation'
   | 'space_registered_agent_mutation'
   | 'space_member_mutation'
   | 'space_settings_mutation'

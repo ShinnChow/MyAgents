@@ -1,4 +1,6 @@
 export const MCP_PREWARM_GRACE_MS = 10_000;
+/** One final bounded truth read when dispatch observation starts after grace. */
+export const MCP_STATUS_SNAPSHOT_TIMEOUT_MS = 1_000;
 
 export type McpConnectionStatus =
   | 'connected'
@@ -92,7 +94,10 @@ export function classifyMcpPrewarmStatuses(
       ...(status ? { status: status.status } : {}),
       ...(status?.error ? { error: status.error } : {}),
     };
-    if (status?.status === 'pending') pendingServers.push(detail);
+    // A newly installed server may not be present in the first SDK status
+    // snapshot yet. Treat absence as startup-in-progress until the absolute
+    // grace expires; only explicit terminal statuses may release early.
+    if (!status || status.status === 'pending') pendingServers.push(detail);
     else degradedServers.push(detail);
   }
 
@@ -119,10 +124,12 @@ function readStatusesUntil(
   owner: McpPrewarmOwner,
   now: () => number,
   signal?: AbortSignal,
+  allowExpiredSnapshot = false,
 ): Promise<StatusReadResult> {
   if (signal?.aborted) return Promise.resolve({ kind: 'cancelled' });
   const remainingMs = owner.deadlineAt - now();
-  if (remainingMs <= 0) return Promise.resolve({ kind: 'timeout' });
+  if (remainingMs <= 0 && !allowExpiredSnapshot) return Promise.resolve({ kind: 'timeout' });
+  const timeoutMs = remainingMs > 0 ? remainingMs : MCP_STATUS_SNAPSHOT_TIMEOUT_MS;
 
   return new Promise((resolve) => {
     let settled = false;
@@ -134,7 +141,7 @@ function readStatusesUntil(
       resolve(result);
     };
     const onAbort = () => settle({ kind: 'cancelled' });
-    const timer = setTimeout(() => settle({ kind: 'timeout' }), remainingMs);
+    const timer = setTimeout(() => settle({ kind: 'timeout' }), timeoutMs);
     signal?.addEventListener('abort', onAbort, { once: true });
     Promise.resolve()
       .then(() => owner.readStatuses())
@@ -195,6 +202,7 @@ export async function awaitMcpPrewarm(params: {
   const sleep = params.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
   const pollMs = Math.max(200, Math.min(500, params.pollMs ?? 250));
   let lastObserved: McpPrewarmServerDetail[] = owner.requiredServerIds.map(id => ({ id }));
+  let hasReadStatuses = false;
 
   if (owner.requiredServerIds.length === 0) {
     return { state: 'ready', elapsedMs: elapsedMs(owner, now) };
@@ -211,7 +219,7 @@ export async function awaitMcpPrewarm(params: {
         elapsedMs: elapsedMs(owner, now),
       };
     }
-    if (now() >= owner.deadlineAt) {
+    if (hasReadStatuses && now() >= owner.deadlineAt) {
       return {
         state: 'degraded',
         reason: 'timeout',
@@ -220,7 +228,8 @@ export async function awaitMcpPrewarm(params: {
       };
     }
 
-    const read = await readStatusesUntil(owner, now, params.signal);
+    const read = await readStatusesUntil(owner, now, params.signal, !hasReadStatuses);
+    hasReadStatuses = true;
     if (read.kind === 'cancelled') throw new Error('MCP pre-warm wait cancelled');
     if (!sameOwner(params.getOwner(), owner)) {
       return {

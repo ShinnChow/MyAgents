@@ -11,6 +11,7 @@ import {
   Plus,
   Settings,
   UserPlus,
+  Wrench,
 } from "lucide-react";
 
 import type { SpaceInfo, SpaceListItem, SpaceSession } from "@/api/spaceCloud";
@@ -20,7 +21,12 @@ import { currentSupportedLocale } from "@/i18n/format";
 import { SpaceAvatar, SpaceIcon, spaceDisplayName } from "./SpaceAvatar";
 import { PAPER_GRID_STYLE } from "./spaceUi";
 
-export type SpaceViewMode = "issues" | "goals" | "skills" | "settings";
+export type SpaceViewMode =
+  | "issues"
+  | "goals"
+  | "skills"
+  | "tools"
+  | "settings";
 
 function joinPolicyLabel(
   policy: string | null | undefined,
@@ -65,9 +71,7 @@ export function SpaceLogin({
 }) {
   const { t } = useTranslation("app");
   return (
-    <div
-      className="relative flex h-full items-center justify-center overflow-hidden bg-[var(--paper)] px-6"
-    >
+    <div className="relative flex h-full items-center justify-center overflow-hidden bg-[var(--paper)] px-6">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 opacity-40"
@@ -286,6 +290,7 @@ export function SpaceSidebar({
       { mode: "issues", label: t("space.sidebar.issues"), icon: MessageSquare },
       { mode: "goals", label: t("space.sidebar.goals"), icon: GitBranch },
       { mode: "skills", label: t("space.sidebar.skills"), icon: Package },
+      { mode: "tools", label: t("space.sidebar.tools"), icon: Wrench },
     ];
     if (canManage) {
       items.push({

@@ -18,15 +18,13 @@ import type { AssistantEntry } from '@/analytics';
 
 import { CUSTOM_EVENTS } from '../../shared/constants';
 
-export interface HelperRequestInput {
+interface HelperRequestBase {
     /** User's message body. Whitespace is trimmed before dispatch. */
     description: string;
     /** Optional explicit provider override; handler falls back to helper Agent. */
     providerId?: string;
     /** Optional explicit model override; handler falls back to helper Agent. */
     model?: string;
-    /** App version, surfaced in the helper conversation context. */
-    appVersion: string;
     /** Optional image attachments (data-url previews + File handles). */
     images?: ImageAttachment[];
     /**
@@ -40,18 +38,40 @@ export interface HelperRequestInput {
     assistantEntry?: AssistantEntry;
 }
 
+type SupportHelperRequest = HelperRequestBase & {
+    scenario?: 'support';
+    /** App version, surfaced in the support conversation context. */
+    appVersion: string;
+};
+
+type SpaceToolInstallHelperRequest = HelperRequestBase & {
+    scenario: 'space_tool_install';
+    appVersion?: never;
+};
+
+export type HelperRequestInput =
+    | SupportHelperRequest
+    | SpaceToolInstallHelperRequest;
+
+export type HelperRequestDetail =
+    | (Omit<SupportHelperRequest, 'scenario'> & { scenario: 'support' })
+    | SpaceToolInstallHelperRequest;
+
 export function dispatchHelperRequest(input: HelperRequestInput): void {
+    const common = {
+        description: input.description.trim(),
+        providerId: input.providerId,
+        model: input.model,
+        images: input.images,
+        resumeSessionId: input.resumeSessionId,
+        assistantEntry: input.assistantEntry,
+    };
+    const detail: HelperRequestDetail = input.scenario === 'space_tool_install'
+        ? { ...common, scenario: 'space_tool_install' }
+        : { ...common, scenario: 'support', appVersion: input.appVersion };
     window.dispatchEvent(
         new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
-            detail: {
-                description: input.description.trim(),
-                providerId: input.providerId,
-                model: input.model,
-                appVersion: input.appVersion,
-                images: input.images,
-                resumeSessionId: input.resumeSessionId,
-                assistantEntry: input.assistantEntry,
-            },
+            detail,
         }),
     );
 }

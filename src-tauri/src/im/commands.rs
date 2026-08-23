@@ -2029,7 +2029,8 @@ pub(crate) async fn reload_agent_config_from_disk<R: Runtime>(
                     .router
                     .lock()
                     .await
-                    .release_all_sidecars_preserve_bindings(sidecar_manager);
+                    .release_all_sidecars_preserve_bindings(sidecar_manager)
+                    .await;
             }
         }
         if patch.enabled.is_some() {

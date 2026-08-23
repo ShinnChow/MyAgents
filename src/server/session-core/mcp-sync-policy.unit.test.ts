@@ -96,6 +96,17 @@ describe('mcp-sync-policy', () => {
     });
   });
 
+  it('restarts when product-owned Runtime settings revision changes', () => {
+    const previousServers = [server({ id: 'playwright', runtimeConfigRevision: 'browser-v1' })];
+    const nextServers = [server({ id: 'playwright', runtimeConfigRevision: 'browser-v2' })];
+
+    expect(decideMcpSync({
+      previousServers,
+      nextServers,
+      hasQuerySession: true,
+    })).toMatchObject({ changed: true, shouldRestart: true });
+  });
+
   it.each([
     { promotedItemInFlight: false, turnInFlight: false, sdkCommandInFlight: false, expected: false },
     { promotedItemInFlight: true, turnInFlight: false, sdkCommandInFlight: false, expected: true },

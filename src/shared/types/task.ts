@@ -158,8 +158,9 @@ export type ManagedTaskKind =
   | 'memory_auto_update_batch';
 
 /**
- * How the task was created — governs the initial prompt construction on dispatch
- * (see PRD §9.3.1) and which of the four `.task/` files are expected to exist.
+ * How the task was created. This is provenance only: every ordinary Task is
+ * dispatched from its complete task.md regardless of origin. `ai-aligned` is
+ * retained for rows created by older versions.
  */
 export type TaskDispatchOrigin = 'direct' | 'ai-aligned' | 'attached-session';
 
@@ -229,6 +230,15 @@ export interface RecurringWindow {
   timezone: string;
   start: string;
   end: string;
+}
+
+export interface TaskLastExecution {
+  at: number;
+  trigger: 'scheduled' | 'manual';
+  success: boolean;
+  durationMs: number;
+  sessionId?: string;
+  error?: string;
 }
 
 /** A Task — workspace-scoped execution unit. */
@@ -307,12 +317,16 @@ export interface Task {
   /** Timer anchor; manual run-now must not move the recurring schedule. */
   lastScheduledAt?: number;
   executionCount?: number;
+  /** Consecutive scheduled failures; a scheduled success resets this to zero. */
+  consecutiveExecutionFailures?: number;
+  /** TaskStore-owned current execution summary. Run history is audit-only. */
+  lastExecution?: TaskLastExecution;
   /** Internal durable receipt for the last admitted command-trigger event. */
   lastActivationEventId?: string;
   /** Append-only audit log of status changes. See PRD §3.2 / §10.2.1. */
   statusHistory: StatusTransition[];
   notification?: NotificationConfig;
-  /** How the task was created; governs first-message construction. See PRD §9.3.1. */
+  /** Creation provenance; never an execution-protocol switch. */
   dispatchOrigin: TaskDispatchOrigin;
   /** Optional external coordination record that caused this local Task. */
   externalSource?: TaskExternalSource;
@@ -326,7 +340,7 @@ export interface Task {
   executionError?: string;
   /** Read-time projection owned by Rust TaskStore; not persisted in tasks.jsonl. */
   triggerState?: TaskTriggerRuntimeState;
-  /** Absolute paths to the four task markdown docs. Populated by
+  /** Absolute paths to task markdown docs. Populated by
    *  `cmd_task_get` / `/api/task/get` at read time (not persisted) — the
    *  consumer (CLI, AI, UI) reads the files directly via Read/Edit/Write
    *  rather than going through dedicated read-doc / write-doc commands.
@@ -344,11 +358,11 @@ export interface TaskDocs {
   dir: string;
   /** `task.md` — always present; the task's instruction/prompt body. */
   taskMd: string;
-  /** `verify.md` — present once the AI or user has written verification rules. */
+  /** Legacy `verify.md`; new tasks keep verification inside task.md. */
   verifyMd?: string;
-  /** `progress.md` — present once the AI has started recording execution progress. */
+  /** Legacy `progress.md`; preserved for compatibility. */
   progressMd?: string;
-  /** `alignment.md` — present when the task was created via `/task-alignment`. */
+  /** Legacy `alignment.md`; preserved for compatibility. */
   alignmentMd?: string;
 }
 
@@ -395,38 +409,6 @@ export interface TaskCreateDirectInput {
   notification?: NotificationConfig;
 }
 
-/**
- * Payload for `cmd_task_create_from_alignment`.
- * `alignmentSessionId` identifies the pending directory `<workspace>/.task/<sessionId>/`.
- */
-export interface TaskCreateFromAlignmentInput {
-  name: string;
-  executor: TaskExecutor;
-  description?: string;
-  workspaceId: string;
-  workspacePath: string;
-  alignmentSessionId: string;
-  executionMode: TaskExecutionMode;
-  runMode?: TaskRunMode;
-  endConditions?: EndConditions;
-  trigger?: TaskTrigger;
-  /** Per-task model override. Omit to inherit the Agent workspace default. */
-  model?: string;
-  /** PRD 0.2.9 — Per-task provider id override. MUST be paired with `model`. */
-  providerId?: string;
-  /** Per-task permission mode override. Runtime-specific values — see `myagents runtime describe <runtime>`. */
-  permissionMode?: string;
-  /** Required materialized Session identity when `runMode` is `single-session`. */
-  preselectedSessionId?: string;
-  runtime?: RuntimeType;
-  runtimeConfig?: RuntimeConfigSnapshot;
-  /** Per-task MCP enable list override (PRD 0.2.4 §需求 4). */
-  mcpEnabledServers?: string[];
-  sourceThoughtId?: string;
-  tags?: string[];
-  notification?: NotificationConfig;
-}
-
 /** Payload for `cmd_task_create_attached` / `myagents task create-attached`. */
 export interface TaskCreateAttachedInput {
   name: string;
@@ -451,6 +433,9 @@ export interface TaskUpdateInput {
   name?: string;
   executor?: TaskExecutor;
   description?: string;
+  /** Workspace identity is an atomic pair: callers must send both fields or neither. */
+  workspaceId?: string;
+  workspacePath?: string;
   executionMode?: TaskExecutionMode;
   runMode?: TaskRunMode;
   endConditions?: EndConditions;
@@ -501,8 +486,8 @@ export interface TaskUpdateInput {
   /**
    * When provided, the new markdown body is atomically written to
    * `.task/<id>/task.md` under the same write lock that persists the JSONL
-   * row. Empty string is rejected server-side. AI-aligned tasks may not
-   * overwrite their prompt this way — they use `/task-implement` + `alignment.md`.
+   * row. Empty string is rejected server-side. This is the complete execution
+   * context for every ordinary Task, including legacy ai-aligned rows.
    */
   prompt?: string;
 }
@@ -511,9 +496,9 @@ export interface TaskUpdateInput {
 export interface TaskRunStats {
   executionCount: number;
   lastExecutedAt?: number;
-  /** `ok` flag from the most recent `cron_runs/<id>.jsonl` row. */
+  /** Success flag from `Task.lastExecution`. */
   lastSuccess?: boolean;
-  /** Duration of the most recent run (ms). */
+  /** Duration from `Task.lastExecution` (ms). */
   lastDurationMs?: number;
   /** Task scheduler status. */
   schedulerStatus?: string;

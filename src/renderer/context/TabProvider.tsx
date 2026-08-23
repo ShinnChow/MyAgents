@@ -63,8 +63,13 @@ import type { SlashCommand } from '../../shared/slashCommands';
 import type { LogEntry } from '@/types/log';
 import { applySubagentLifecycleToContent } from '@/components/tools/subagentActivity';
 import type { ProviderRoute } from '../../shared/providerRoute';
+import type { ProductSystemSkillRequirement } from '../../shared/systemSkills';
 import { stripLeadingSystemReminder } from '../../shared/systemReminder';
 import { deriveSessionTitle } from '../../shared/sessionTitle';
+import {
+    reduceMcpEffectiveSnapshot,
+    type McpEffectiveSnapshot,
+} from '../../shared/mcpEffectiveState';
 import {
     COLD_HISTORY_REPLAY_KIND,
     LIVE_USER_ECHO_REPLAY_KIND,
@@ -236,6 +241,44 @@ function applyAssistantCompletionPatch(message: Message, patch: AssistantComplet
         ...(patch.toolCount !== undefined ? { toolCount: patch.toolCount } : {}),
         ...(patch.durationMs !== undefined ? { durationMs: patch.durationMs } : {}),
         ...(patch.runtimeTurnAnchor ? { runtimeTurnAnchor: patch.runtimeTurnAnchor } : {}),
+    };
+}
+
+// Force-close incomplete thinking/tool blocks on an assistant message before it
+// moves into history. Shared by moveStreamingToHistory (turn terminal) and the
+// queue:started midTurnBreak split — a force-send interrupts the old turn, so the
+// snapshot must mark its thinking as stopped rather than leave it "in progress".
+function finalizeAssistantForHistory(msg: Message, status: 'completed' | 'stopped' | 'failed'): Message {
+    if (msg.role !== 'assistant' || !Array.isArray(msg.content)) return msg;
+    const statusFlags = status === 'stopped' ? { isStopped: true }
+        : status === 'failed' ? { isFailed: true }
+            : {};
+    const hasIncomplete = msg.content.some(b =>
+        (b.type === 'thinking' && !b.isComplete) ||
+        (b.type === 'tool_use' && b.tool?.isLoading)
+    );
+    if (!hasIncomplete) return msg;
+    return {
+        ...msg,
+        content: msg.content.map(block => {
+            if (block.type === 'thinking' && !block.isComplete) {
+                return {
+                    ...block,
+                    isComplete: true,
+                    ...statusFlags,
+                    thinkingDurationMs: block.thinkingStartedAt
+                        ? Date.now() - block.thinkingStartedAt
+                        : undefined
+                };
+            }
+            if (block.type === 'tool_use' && block.tool?.isLoading) {
+                return {
+                    ...block,
+                    tool: { ...block.tool, isLoading: false, ...statusFlags }
+                };
+            }
+            return block;
+        }),
     };
 }
 
@@ -829,6 +872,7 @@ export default function TabProvider({
     const [logs, setLogs] = useState<string[]>([]);
     const [unifiedLogs, setUnifiedLogs] = useState<LogEntry[]>([]);
     const [systemInitInfo, setSystemInitInfo] = useState<SystemInitInfo | null>(null);
+    const [mcpEffectiveSnapshot, setMcpEffectiveSnapshot] = useState<McpEffectiveSnapshot | null>(null);
     const [sdkSlashCommands, setSdkSlashCommands] = useState<SlashCommand[]>([]);
     // Issue #194 — runtime diagnostics snapshot for external runtimes (Codex
     // today; Claude Code / Gemini later). Replaces the previously-hardcoded
@@ -889,6 +933,7 @@ export default function TabProvider({
             setAgentPlanTodos(null);
             setSdkSlashCommands([]);
             setSystemInitInfo(null);
+            setMcpEffectiveSnapshot(null);
         }
     }, [sessionId]);
 
@@ -1221,6 +1266,7 @@ export default function TabProvider({
         setSessionMeta(null);
         setSessionRuntimeSource(null);
         setSystemInitInfo(null);
+        setMcpEffectiveSnapshot(null);
         // Issue #194 (Codex review #6) — clear runtime diagnostics on reset so
         // a stale Codex banner from the previous session doesn't leak into a
         // new one (or a Tab that just switched to builtin runtime).
@@ -1872,40 +1918,7 @@ export default function TabProvider({
                 return null;
             }
 
-            let finalMsg = prev;
-            if (prev.role === 'assistant' && Array.isArray(prev.content)) {
-                const statusFlags = status === 'stopped' ? { isStopped: true }
-                    : status === 'failed' ? { isFailed: true }
-                        : {};
-                const hasIncomplete = prev.content.some(b =>
-                    (b.type === 'thinking' && !b.isComplete) ||
-                    (b.type === 'tool_use' && b.tool?.isLoading)
-                );
-                if (hasIncomplete) {
-                    finalMsg = {
-                        ...prev,
-                        content: prev.content.map(block => {
-                            if (block.type === 'thinking' && !block.isComplete) {
-                                return {
-                                    ...block,
-                                    isComplete: true,
-                                    ...statusFlags,
-                                    thinkingDurationMs: block.thinkingStartedAt
-                                        ? Date.now() - block.thinkingStartedAt
-                                        : undefined
-                                };
-                            }
-                            if (block.type === 'tool_use' && block.tool?.isLoading) {
-                                return {
-                                    ...block,
-                                    tool: { ...block.tool, isLoading: false, ...statusFlags }
-                                };
-                            }
-                            return block;
-                        }),
-                    };
-                }
-            }
+            let finalMsg = finalizeAssistantForHistory(prev, status);
 
             finalMsg = finalizeMessageSubagentProjection(finalMsg, status);
 
@@ -3240,6 +3253,25 @@ export default function TabProvider({
                 break;
             }
 
+            case 'chat:mcp-effective-snapshot': {
+                const payload = data as McpEffectiveSnapshot | null;
+                const payloadSessionId = payload?.sessionId;
+                const currentId = currentSessionIdRef.current;
+                const connectedId = attachedSseSessionIdRef.current;
+                if (!payload || !shouldAcceptSessionScopedSseSnapshot({
+                    connectedSessionId: connectedId,
+                    currentSessionId: currentId,
+                    payloadSessionId,
+                    isConnectedSessionPending: connectedId ? isPendingSessionId(connectedId) : false,
+                    isCurrentSessionPending: currentId ? isPendingSessionId(currentId) : false,
+                })) {
+                    console.log(`[TabProvider ${tabId}] Ignoring MCP effective snapshot for stale session ${payloadSessionId}`);
+                    break;
+                }
+                setMcpEffectiveSnapshot(previous => reduceMcpEffectiveSnapshot(previous, payload));
+                break;
+            }
+
             case 'chat:logs': {
                 const payload = data as { lines: string[] } | null;
                 if (payload?.lines) {
@@ -3842,7 +3874,8 @@ export default function TabProvider({
                                 flushPendingTextNow();
                                 rawSetStreamingMessage(prev => {
                                     if (prev) {
-                                        setHistoryMessages(prevHistory => [...prevHistory, prev, userMsg]);
+                                        const finalizedPrev = finalizeAssistantForHistory(prev, 'stopped');
+                                        setHistoryMessages(prevHistory => [...prevHistory, finalizedPrev, userMsg]);
                                     } else {
                                         setHistoryMessages(prevHistory => [...prevHistory, userMsg]);
                                     }
@@ -3861,6 +3894,11 @@ export default function TabProvider({
                                 revealLastRef.current = 0;
                                 isStreamingRef.current = false;
                                 adoptedStreamRef.current = false;
+                                // force-surface suppresses message-stopped, so its renderer cleanup
+                                // (setSystemStatus(null) + clearRuntimePlanTodos) is owned here — the
+                                // old turn's transient status/todos must not leak into the new turn (V3c).
+                                setSystemStatus(null);
+                                clearRuntimePlanTodos();
                             } else {
                                 // Normal turn start: render immediately
                                 setHistoryMessages(prev => [...prev, userMsg]);
@@ -4240,6 +4278,7 @@ export default function TabProvider({
                 // boundary until the first envelope from the replacement marks
                 // the connection live again; Tab config hydration keys off it.
                 setIsConnected(false);
+                setMcpEffectiveSnapshot(null);
                 resetTabServerUrlCache(tabId);
                 const restore = persistedRestoreLifecycleRef.current;
                 if (isPendingSessionId(restartedSid)) return;
@@ -4276,6 +4315,7 @@ export default function TabProvider({
         // net mirroring `model` (the /api/reasoning-effort/set push is primary).
         reasoningEffort?: string,
         providerRoute?: ProviderRoute,
+        requiredSystemSkill?: ProductSystemSkillRequirement,
     ): Promise<boolean> => {
         const trimmed = text.trim();
         if (!trimmed && (!images || images.length === 0)) return false;
@@ -4363,6 +4403,7 @@ export default function TabProvider({
             model,
             reasoningEffort,
             providerRoute,
+            requiredSystemSkill,
             ...(birthOrigin ? { birthOrigin } : {}),
             ...(providerRoute ? {} : { providerEnv: providerEnv ?? 'subscription' }),
         };
@@ -5297,6 +5338,7 @@ export default function TabProvider({
         logs,
         unifiedLogs,
         systemInitInfo,
+        mcpEffectiveSnapshot,
         sdkSlashCommands,
         runtimeDiagnostics,
         agentError,
@@ -5341,7 +5383,7 @@ export default function TabProvider({
         forceExecuteQueuedMessage,
     }), [
         tabId, agentDir, currentSessionId, messages, historyMessages, streamingMessage, firstItemIndex, hasMoreBefore, isLoading, isSessionLoading, sessionRestoreError, sessionRestoreMode, sessionState, sessionRuntime, sessionRuntimeSource, sessionMeta,
-        logs, unifiedLogs, systemInitInfo, sdkSlashCommands, runtimeDiagnostics, agentError, systemStatus, systemNotice, contextUsage, agentPlanTodos, lastTerminalReason, pendingPermission, pendingAskUserQuestion, pendingExitPlanMode, pendingEnterPlanMode, toolCompleteCount, queuedMessages, isConnected,
+        logs, unifiedLogs, systemInitInfo, mcpEffectiveSnapshot, sdkSlashCommands, runtimeDiagnostics, agentError, systemStatus, systemNotice, contextUsage, agentPlanTodos, lastTerminalReason, pendingPermission, pendingAskUserQuestion, pendingExitPlanMode, pendingEnterPlanMode, toolCompleteCount, queuedMessages, isConnected,
         setMessages, appendLog, appendUnifiedLog, clearUnifiedLogs, sendMessage, stopResponse, retryCurrentSessionRestore, loadOlderMessages, resetSession, adoptMigratedSession,
         apiGetJson, postJson, apiPutJson, apiDeleteJson, respondPermission, respondAskUserQuestion, respondExitPlanMode, cancelQueuedMessage, forceExecuteQueuedMessage
     ]);

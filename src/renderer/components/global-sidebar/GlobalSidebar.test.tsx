@@ -28,6 +28,20 @@ const mocks = vi.hoisted(() => ({
   isTauri: false,
   openExternal: vi.fn(async () => undefined),
   deleteSession: vi.fn(),
+  notificationSnapshot: {
+    loadState: 'ready',
+    authState: 'signed_out',
+    items: [] as Array<Record<string, unknown>>,
+    hasUnread: false,
+    hasMore: false,
+    isLoadingMore: false,
+    feedCutoff: null,
+    lastSyncedAt: null,
+    errorCode: null,
+  },
+  notificationRefresh: vi.fn(),
+  notificationLoadMore: vi.fn(async () => undefined),
+  notificationMarkAllRead: vi.fn(async () => undefined),
   toast: {
     error: vi.fn(),
     success: vi.fn(),
@@ -98,6 +112,15 @@ vi.mock('@/components/HistorySearchOverlayContent', () => ({
 
 vi.mock('@/components/FeedbackPopover', () => ({ default: () => null }));
 
+vi.mock('@/notifications/useNotificationCenter', () => ({
+  useNotificationCenter: () => ({
+    snapshot: mocks.notificationSnapshot,
+    refresh: mocks.notificationRefresh,
+    loadMore: mocks.notificationLoadMore,
+    markAllRead: mocks.notificationMarkAllRead,
+  }),
+}));
+
 vi.mock('@/components/Toast', () => ({
   useToast: () => mocks.toast,
 }));
@@ -131,6 +154,7 @@ function sidebar(overrides: Partial<SidebarProps> = {}) {
       teamSpaceAvailable
       onNewTab={vi.fn()}
       onOpenTaskCenter={vi.fn()}
+      onCreateTask={vi.fn()}
       onOpenSpace={vi.fn()}
       onOpenCapabilities={vi.fn()}
       onOpenSettings={vi.fn()}
@@ -161,6 +185,8 @@ describe('GlobalSidebar rail flyout', () => {
     mocks.configError = null;
     mocks.forcedRail = true;
     mocks.isTauri = false;
+    mocks.notificationSnapshot.hasUnread = false;
+    mocks.notificationSnapshot.items = [];
     mocks.touchProject.mockResolvedValue(undefined);
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -187,13 +213,82 @@ describe('GlobalSidebar rail flyout', () => {
     vi.unstubAllGlobals();
   });
 
+  it('keeps the notification bell visible, distinguishes unread, and opens one fixed panel', () => {
+    mocks.notificationSnapshot.hasUnread = true;
+    renderSidebar();
+
+    const bell = screen.getByRole('button', {
+      name: String(i18n.t('app:notificationCenter.bellUnread')),
+    });
+    expect(bell.querySelector('.bg-\\[var\\(--accent-warm\\)\\]')).toBeInTheDocument();
+    fireEvent.click(bell);
+
+    expect(mocks.notificationRefresh).toHaveBeenCalledOnce();
+    expect(screen.getByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).toBeInTheDocument();
+    const shell = document.querySelector<HTMLElement>('[data-notification-center-shell]');
+    expect(shell).not.toBeNull();
+    expect(shell).toHaveClass(
+      'bg-[var(--paper-elevated)]',
+      'shadow-xl',
+      'rounded-xl',
+      'border-[var(--line)]',
+    );
+    expect(shell).not.toHaveClass('bg-[var(--global-sidebar-bg)]', 'shadow-md');
+    expect(document.querySelectorAll('[data-notification-center-shell]')).toHaveLength(1);
+  });
+
+  it('extends the helper popover anchor to the sidebar edge', () => {
+    renderSidebar();
+
+    const anchor = document.querySelector('[data-feedback-popover-anchor]');
+    expect(anchor).toHaveClass('-mr-3', 'pr-3');
+  });
+
+  it('keeps App Shell flyouts mutually exclusive in both directions', () => {
+    renderSidebar();
+    const bell = screen.getByRole('button', {
+      name: String(i18n.t('app:notificationCenter.bell')),
+    });
+    fireEvent.click(bell);
+    expect(screen.getByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', {
+      name: String(i18n.t('app:globalSidebar.helper')),
+    }));
+    expect(screen.queryByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).not.toBeInTheDocument();
+
+    fireEvent.click(bell);
+    const workspaceTrigger = screen.getByRole('button', { name: 'Agent 工作区' });
+    fireEvent.pointerEnter(workspaceTrigger);
+    act(() => vi.advanceTimersByTime(125));
+    expect(screen.queryByRole('dialog', {
+      name: String(i18n.t('app:notificationCenter.title')),
+    })).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Agent 工作区' })).toBeInTheDocument();
+  });
+
   it('opens idempotently on click even after the hover delay has elapsed', () => {
     renderSidebar();
     const trigger = screen.getByRole('button', { name: 'Agent 工作区' });
 
     fireEvent.pointerEnter(trigger);
     act(() => vi.advanceTimersByTime(125));
-    expect(screen.getByRole('region', { name: 'Agent 工作区' })).toBeInTheDocument();
+    const region = screen.getByRole('region', { name: 'Agent 工作区' });
+    expect(region).toBeInTheDocument();
+    const shell = region.closest('[data-global-sidebar-flyout]');
+    expect(shell).toHaveClass(
+      'bg-[var(--paper-elevated)]',
+      'shadow-xl',
+      'rounded-xl',
+      'border-[var(--line)]',
+    );
+    expect(shell).not.toHaveClass('bg-[var(--global-sidebar-bg)]', 'shadow-md');
 
     fireEvent.click(trigger);
     expect(screen.getByRole('region', { name: 'Agent 工作区' })).toBeInTheDocument();
@@ -370,7 +465,7 @@ describe('GlobalSidebar rail flyout', () => {
     expect(screen.queryByRole('button', { name: /Focused session/ })).not.toBeInTheDocument();
   });
 
-  it('uses the sidebar surface and invisible fixed-height placeholders in the rail flyout', () => {
+  it('uses the shared App Shell surface and invisible fixed-height placeholders in the rail flyout', () => {
     mocks.projects.push({ id: 'project-1', name: 'Project one', path: '/work/project-one' });
     mocks.taskData.workspaceSessionStates.set('/work/project-one', { isLoading: true, error: null });
     window.localStorage.setItem(GLOBAL_SIDEBAR_PREFERENCE_KEY, JSON.stringify({
@@ -386,10 +481,10 @@ describe('GlobalSidebar rail flyout', () => {
 
     const region = screen.getByRole('region', { name: 'Agent 工作区' });
     const flyout = region.closest('[data-global-sidebar-flyout]');
-    expect(flyout).toHaveClass('bg-[var(--global-sidebar-bg)]');
+    expect(flyout).toHaveClass('bg-[var(--paper-elevated)]', 'shadow-xl');
     expect(flyout).toHaveClass('fixed', 'top-32', 'bottom-28');
     expect(flyout).not.toHaveClass('absolute', 'top-12', 'bottom-3');
-    expect(flyout).not.toHaveClass('bg-[var(--paper-elevated)]');
+    expect(flyout).not.toHaveClass('bg-[var(--global-sidebar-bg)]', 'shadow-md');
     const placeholder = region.querySelector('[data-global-sidebar-session-placeholder]')!;
     expect(placeholder.children).toHaveLength(3);
     for (const row of Array.from(placeholder.children)) {
@@ -642,6 +737,30 @@ describe('GlobalSidebar rail flyout', () => {
     fireEvent.mouseLeave(taskButton.parentElement!);
     fireEvent.click(screen.getByRole('button', { name: '小助理' }));
     expect(screen.queryByRole('tooltip', { name: '小助理' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the hover Task-create tooltip trigger inside an absolute row overlay', () => {
+    mocks.forcedRail = false;
+    window.localStorage.setItem(
+      GLOBAL_SIDEBAR_PREFERENCE_KEY,
+      JSON.stringify({
+        version: 1,
+        preferredMode: 'expanded',
+        expandedWorkspaceKeys: [],
+        hasSeededDefaultExpansion: true,
+        showAutomationSessions: true,
+        sessionView: 'all',
+      }),
+    );
+    renderSidebar();
+
+    const createButton = screen.getByRole('button', { name: '创建任务' });
+    const tooltipAnchor = createButton.parentElement;
+    const rowOverlay = tooltipAnchor?.parentElement;
+    expect(tooltipAnchor).toHaveClass('relative', 'inline-flex');
+    expect(tooltipAnchor).not.toHaveClass('absolute');
+    expect(rowOverlay).toHaveClass('absolute', 'right-1', 'top-1');
+    expect(rowOverlay?.parentElement).toHaveClass('group/task-create', 'relative');
   });
 
   it('keeps the workspace surface open when Session navigation is rejected', async () => {
@@ -942,8 +1061,8 @@ describe('GlobalSidebar rail flyout', () => {
       i18n.t('app:globalSidebar.settings'),
     ]) {
       const action = screen.getByRole('button', { name: String(label) });
-      expect(action).toHaveClass('h-9');
-      expect(action).not.toHaveClass('h-10');
+      expect(action).toHaveClass('h-8');
+      expect(action).not.toHaveClass('h-9', 'h-10');
     }
 
     const activeRow = screen.getByText('Project one').closest<HTMLElement>('[data-global-sidebar-workspace-row]')!;
@@ -956,6 +1075,37 @@ describe('GlobalSidebar rail flyout', () => {
     expect(inactiveTitle).toHaveClass('font-normal');
     expect(inactiveTitle?.className).toContain('group-hover/workspace:font-medium');
     expect(inactiveTitle?.className).toContain('group-focus-within/workspace:font-medium');
+    const notificationButton = screen.getByRole('button', {
+      name: String(i18n.t('app:notificationCenter.bell')),
+    });
+    const helperButton = screen.getByRole('button', {
+      name: String(i18n.t('app:globalSidebar.helper')),
+    });
+    expect(notificationButton.querySelector('.global-sidebar-nav-label')).toBeInTheDocument();
+    expect(helperButton.querySelector('.global-sidebar-nav-label')).toBeInTheDocument();
+    const workspaceFade = document.querySelector<HTMLElement>('[data-global-sidebar-workspace-fade]');
+    expect(workspaceFade).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'bottom-0', 'h-6');
+    expect(workspaceFade?.style.background).toContain('linear-gradient(to bottom');
+    expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg-a0)');
+    expect(workspaceFade?.style.background).toContain('var(--global-sidebar-bg)');
+    expect(document.querySelector('[role="tree"]')).toHaveClass('pt-2', 'pb-6');
+    const workspaceFadeTop = document.querySelector<HTMLElement>('[data-global-sidebar-workspace-fade-top]');
+    expect(workspaceFadeTop).toHaveClass('pointer-events-none', 'absolute', 'inset-x-0', 'top-8', 'h-2');
+    expect(workspaceFadeTop?.style.background).toContain('linear-gradient(to bottom');
+    expect(workspaceFadeTop?.style.background).toContain('var(--global-sidebar-bg)');
+    expect(workspaceFadeTop?.style.background).toContain('var(--global-sidebar-bg-a0)');
+    // The top fade must consume the header row's former bottom slack: the
+    // header shrinks from h-12 to h-8 so the scroller edge (and the fade)
+    // occupy the exact pixels that used to be solid spacing below the
+    // section title, instead of stacking a fade below an unchanged gap.
+    const workspaceSectionHeader = screen.getByText(String(i18n.t('app:globalSidebar.workspaceSection'))).closest('div');
+    expect(workspaceSectionHeader).toHaveClass('h-8');
+    // The fade must consume the spacing directly above the notification entry:
+    // the expanded footer drops its top padding so the scroller edge (and the
+    // fade) reach the notification button, instead of stacking an extra
+    // gradient band on top of an unchanged gap.
+    const footerActions = document.querySelector<HTMLElement>('[data-global-sidebar-footer-actions]');
+    expect(footerActions).toHaveClass('pt-0', 'pb-2');
     const workspaceToggle = within(inactiveRow).getAllByRole('button')[0];
     const workspaceActions = inactiveRow.querySelector<HTMLElement>('[data-global-sidebar-workspace-actions]');
     expect(inactiveRow).toHaveClass('relative');

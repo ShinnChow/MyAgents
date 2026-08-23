@@ -1,8 +1,6 @@
 import type { McpServerDefinition } from '../../../../shared/config-types';
 import type { InteractionScenario } from '../../../system-prompt';
 
-export const MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION = '0.146.0';
-
 export type ManagedCodexExtensionApplyState =
   | 'unchanged'
   | 'applied'

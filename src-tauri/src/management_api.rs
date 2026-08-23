@@ -113,6 +113,36 @@ pub async fn start_management_api() -> Result<u16, String> {
             "/api/runtime/sdk-child/settle",
             post(sdk_child_settle_handler),
         )
+        .route(
+            "/api/mcp/startup/acquire",
+            post(mcp_startup_acquire_handler),
+        )
+        .route("/api/mcp/startup/cancel", post(mcp_startup_cancel_handler))
+        .route("/api/mcp/startup/settle", post(mcp_startup_settle_handler))
+        .route(
+            "/api/browser/capability/acquire",
+            post(browser_capability_acquire_handler),
+        )
+        .route(
+            "/api/browser/capability/verify",
+            post(browser_capability_verify_handler),
+        )
+        .route(
+            "/api/browser/session/adopt",
+            post(browser_session_adopt_handler),
+        )
+        .route(
+            "/api/browser/resource/resolve",
+            post(browser_resource_resolve_handler),
+        )
+        .route(
+            "/api/browser/identity/read",
+            post(browser_identity_read_handler),
+        )
+        .route(
+            "/api/browser/identity/checkpoint",
+            post(browser_identity_checkpoint_handler),
+        )
         .route("/api/cron/create", post(create_cron_handler))
         .route("/api/cron/list", get(list_cron_handler))
         .route("/api/cron/update", post(update_cron_handler))
@@ -164,10 +194,6 @@ pub async fn start_management_api() -> Result<u16, String> {
         .route("/api/task/get", get(task_get_handler))
         .route("/api/task/create-direct", post(task_create_direct_handler))
         .route(
-            "/api/task/create-from-alignment",
-            post(task_create_from_alignment_handler),
-        )
-        .route(
             "/api/task/create-attached",
             post(task_create_attached_handler),
         )
@@ -177,6 +203,9 @@ pub async fn start_management_api() -> Result<u16, String> {
             "/api/task/turn/authorize",
             post(task_turn_authorize_handler),
         )
+        .route("/api/task/turn/admitted", post(task_turn_admitted_handler))
+        .route("/api/task/comments", get(task_comments_handler))
+        .route("/api/task/comment", post(task_comment_handler))
         .route(
             "/api/task/append-session",
             post(task_append_session_handler),
@@ -454,6 +483,534 @@ async fn sdk_child_settle_handler(
         );
     }
     no_store_json(serde_json::json!({ "ok": true }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStartupAcquireRequest {
+    sidecar_id: String,
+    request_id: String,
+    executable_identity: String,
+    runtime_generation: u64,
+    config_generation: u64,
+    priority: String,
+}
+
+fn valid_mcp_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn sidecar_is_live(sidecar_id: &str, generation: u64) -> bool {
+    get_sidecar_state()
+        .and_then(|sidecars| sidecars.lock().ok())
+        .is_some_and(|manager| manager.is_live_process(sidecar_id, generation))
+}
+
+async fn mcp_startup_acquire_handler(
+    headers: HeaderMap,
+    Json(req): Json<McpStartupAcquireRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let request_id = req.request_id.trim();
+    let executable_identity = req.executable_identity.trim();
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if sidecar_id.is_empty()
+        || !valid_mcp_request_id(request_id)
+        || !is_executable_identity(executable_identity)
+        || req.runtime_generation == 0
+        || req.config_generation == 0
+    {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid MCP startup identity and generations are required",
+        }));
+    }
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let priority = match req.priority.as_str() {
+        "interactive" => crate::mcp_startup_admission::AdmissionPriority::Interactive,
+        "background" => crate::mcp_startup_admission::AdmissionPriority::Background,
+        _ => {
+            return no_store_json(serde_json::json!({
+                "ok": false,
+                "code": "invalid_request",
+                "error": "priority must be interactive or background",
+            }));
+        }
+    };
+    let request = crate::mcp_startup_admission::McpStartupRequest {
+        request_id: request_id.to_string(),
+        executable_identity: executable_identity.to_string(),
+        sidecar_id: sidecar_id.to_string(),
+        sidecar_generation: source_generation,
+        runtime_generation: req.runtime_generation,
+        config_generation: req.config_generation,
+    };
+    let admission =
+        crate::mcp_startup_admission::request_mcp_startup(request, priority, sidecar_is_live);
+    no_store_json(serde_json::json!({
+        "ok": true,
+        "admitted": admission.admitted,
+        "leaseEpoch": admission.lease_epoch,
+        "queuePosition": admission.queue_position,
+        "retryAfterMs": admission.retry_after_ms,
+        "errorCode": admission.error_code,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStartupSettleRequest {
+    sidecar_id: String,
+    request_id: String,
+    executable_identity: String,
+    runtime_generation: u64,
+    config_generation: u64,
+    lease_epoch: u64,
+    outcome: String,
+    error_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStartupCancelRequest {
+    sidecar_id: String,
+    request_id: String,
+    executable_identity: String,
+    runtime_generation: u64,
+    config_generation: u64,
+}
+
+async fn mcp_startup_cancel_handler(
+    headers: HeaderMap,
+    Json(req): Json<McpStartupCancelRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let request_id = req.request_id.trim();
+    let executable_identity = req.executable_identity.trim();
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if sidecar_id.is_empty()
+        || !valid_mcp_request_id(request_id)
+        || !is_executable_identity(executable_identity)
+        || req.runtime_generation == 0
+        || req.config_generation == 0
+    {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid MCP startup demand identity is required",
+        }));
+    }
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let request = crate::mcp_startup_admission::McpStartupRequest {
+        request_id: request_id.to_string(),
+        executable_identity: executable_identity.to_string(),
+        sidecar_id: sidecar_id.to_string(),
+        sidecar_generation: source_generation,
+        runtime_generation: req.runtime_generation,
+        config_generation: req.config_generation,
+    };
+    let cancelled = crate::mcp_startup_admission::cancel_mcp_startup(&request, sidecar_is_live);
+    no_store_json(serde_json::json!({ "ok": true, "cancelled": cancelled }))
+}
+
+async fn mcp_startup_settle_handler(
+    headers: HeaderMap,
+    Json(req): Json<McpStartupSettleRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let request_id = req.request_id.trim();
+    let executable_identity = req.executable_identity.trim();
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if sidecar_id.is_empty()
+        || !valid_mcp_request_id(request_id)
+        || !is_executable_identity(executable_identity)
+        || req.runtime_generation == 0
+        || req.config_generation == 0
+        || req.lease_epoch == 0
+    {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A valid MCP startup lease identity is required",
+        }));
+    }
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let error_code = req.error_code.as_deref();
+    let outcome = match req.outcome.as_str() {
+        "ready" => crate::runtime_launch_guard::LaunchOutcome::Ready,
+        "spawn_denied" if error_code.is_some_and(is_launch_error_code) => {
+            crate::runtime_launch_guard::LaunchOutcome::SpawnDenied
+        }
+        "released" | "failed" => crate::runtime_launch_guard::LaunchOutcome::Released,
+        _ => {
+            return no_store_json(serde_json::json!({
+                "ok": false,
+                "code": "invalid_request",
+                "error": "outcome must be ready, failed, released, or deterministic spawn_denied",
+            }));
+        }
+    };
+    let request = crate::mcp_startup_admission::McpStartupRequest {
+        request_id: request_id.to_string(),
+        executable_identity: executable_identity.to_string(),
+        sidecar_id: sidecar_id.to_string(),
+        sidecar_generation: source_generation,
+        runtime_generation: req.runtime_generation,
+        config_generation: req.config_generation,
+    };
+    let settled = crate::mcp_startup_admission::settle_mcp_startup(
+        &request,
+        req.lease_epoch,
+        outcome,
+        error_code,
+        sidecar_is_live,
+    );
+    no_store_json(serde_json::json!({ "ok": true, "settled": settled }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserCapabilityAcquireRequest {
+    sidecar_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserSessionAdoptRequest {
+    sidecar_id: String,
+    product_session_id: String,
+}
+
+fn valid_browser_product_session_id(value: &str) -> bool {
+    (1..=99).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !value.starts_with("pending-")
+}
+
+async fn browser_session_adopt_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserSessionAdoptRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let product_session_id = req.product_session_id.trim();
+    if sidecar_id.is_empty() || !valid_browser_product_session_id(product_session_id) {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "A canonical Product Session ID is required",
+        }));
+    }
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+    let Some(sidecars) = get_sidecar_state() else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    let current_session_id = sidecars.lock().ok().and_then(|manager| {
+        manager.validate_browser_product_session_projection(
+            sidecar_id,
+            source_generation,
+            product_session_id,
+        )
+    });
+    let Some(current_session_id) = current_session_id else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_source_invalid",
+            "error": "The Browser execution identity is not owned by this Session Sidecar",
+        }));
+    };
+    let adopted = crate::browser_runtime_authority::project_browser_product_session(
+        sidecar_id,
+        source_generation,
+        &current_session_id,
+        product_session_id,
+    );
+    no_store_json(serde_json::json!({ "ok": adopted, "adopted": adopted }))
+}
+
+async fn browser_capability_acquire_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserCapabilityAcquireRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    if sidecar_id.is_empty() {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "sidecarId is required",
+        }));
+    }
+    let source_generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(Json(value)) => return no_store_json(value),
+    };
+    if let Err(value) = validate_current_sidecar_request(&headers, sidecar_id) {
+        return no_store_json(value);
+    }
+
+    let Some(sidecars) = get_sidecar_state() else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    let resolved = sidecars
+        .lock()
+        .map_err(|error| error.to_string())
+        .ok()
+        .and_then(|mut manager| {
+            let source =
+                manager.resolve_browser_capability_source(sidecar_id, source_generation)?;
+            let host = manager.global_process_binding()?;
+            Some((source, host))
+        });
+    let Some((source, host_binding)) = resolved else {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_source_invalid",
+            "error": "The requesting Session Sidecar no longer owns a browser capability source",
+        }));
+    };
+    let (host_port, host_generation) = host_binding;
+
+    let token = crate::browser_runtime_authority::issue_browser_capability(
+        crate::browser_runtime_authority::BrowserCapabilityBinding {
+            product_session_id: source.product_session_id,
+            workspace_path: source.workspace_path.to_string_lossy().into_owned(),
+            source_sidecar_id: sidecar_id.to_string(),
+            source_generation,
+            host_generation,
+        },
+    );
+    no_store_json(serde_json::json!({
+        "ok": true,
+        "url": format!("http://127.0.0.1:{host_port}/mcp/playwright"),
+        "token": token,
+        "hostGeneration": host_generation,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserCapabilityVerifyRequest {
+    sidecar_id: String,
+    token: String,
+}
+
+fn verify_global_browser_capability(
+    headers: &HeaderMap,
+    sidecar_id: &str,
+    token: &str,
+) -> Result<crate::browser_runtime_authority::BrowserCapabilityBinding, serde_json::Value> {
+    if sidecar_id != crate::sidecar::GLOBAL_SIDECAR_ID || token.is_empty() {
+        return Err(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Current Global Sidecar identity and token are required",
+        }));
+    }
+    let host_generation = request_sidecar_generation(headers).map_err(|Json(value)| value)?;
+    validate_current_sidecar_request(headers, sidecar_id)?;
+    let Some(sidecars) = get_sidecar_state() else {
+        return Err(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    crate::browser_runtime_authority::verify_browser_capability(
+        token,
+        host_generation,
+        |source_sidecar_id, source_generation| {
+            sidecars
+                .lock()
+                .ok()
+                .and_then(|manager| {
+                    manager.resolve_browser_capability_source(source_sidecar_id, source_generation)
+                })
+                .map(|source| {
+                    (
+                        source.product_session_id,
+                        source.workspace_path.to_string_lossy().into_owned(),
+                    )
+                })
+        },
+    )
+    .ok_or_else(|| {
+        serde_json::json!({
+            "ok": false,
+            "code": "browser_capability_invalid",
+            "error": "Browser capability is expired or no longer current",
+        })
+    })
+}
+
+async fn browser_capability_verify_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserCapabilityVerifyRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let sidecar_id = req.sidecar_id.trim();
+    let token = req.token.trim();
+    let binding = match verify_global_browser_capability(&headers, sidecar_id, token) {
+        Ok(binding) => binding,
+        Err(value) => return no_store_json(value),
+    };
+
+    no_store_json(serde_json::json!({
+        "ok": true,
+        "productSessionId": binding.product_session_id,
+        "workspacePath": binding.workspace_path,
+        "hostGeneration": binding.host_generation,
+    }))
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserIdentityReadRequest {
+    sidecar_id: String,
+}
+
+fn validate_global_browser_owner(
+    headers: &HeaderMap,
+    sidecar_id: &str,
+) -> Result<(), serde_json::Value> {
+    if sidecar_id.trim() != crate::sidecar::GLOBAL_SIDECAR_ID {
+        return Err(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "Current Global Sidecar identity is required",
+        }));
+    }
+    validate_current_sidecar_request(headers, sidecar_id)
+}
+
+async fn browser_resource_resolve_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserIdentityReadRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    match crate::browser_resource::resolve_browser_resource() {
+        Ok(resolution) => no_store_json(serde_json::json!({
+            "ok": true,
+            "executablePath": resolution.executable_path,
+            "revision": resolution.revision,
+        })),
+        Err(status) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": status.error_code.clone().unwrap_or_else(|| {
+                if status.state == "never_installed" {
+                    "BROWSER_RESOURCE_NOT_INSTALLED".to_string()
+                } else if status.state == "unsupported" {
+                    "BROWSER_RESOURCE_UNSUPPORTED".to_string()
+                } else {
+                    "BROWSER_RESOURCE_NOT_READY".to_string()
+                }
+            }),
+            "error": "Browser resources are not ready",
+            "state": status.state,
+            "retryAfterMs": 250,
+        })),
+    }
+}
+
+async fn browser_identity_read_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserIdentityReadRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    match crate::browser_identity_store::read_identity() {
+        Ok(snapshot) => no_store_json(serde_json::json!({
+            "ok": true,
+            "revision": snapshot.revision,
+            "state": snapshot.state,
+            "recovery": snapshot.recovery,
+        })),
+        Err(error) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_identity_unavailable",
+            "error": error,
+        })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserIdentityCheckpointRequest {
+    sidecar_id: String,
+    product_session_id: String,
+    base_revision: u64,
+    base_state: serde_json::Value,
+    observed_base_state: serde_json::Value,
+    state: serde_json::Value,
+}
+
+async fn browser_identity_checkpoint_handler(
+    headers: HeaderMap,
+    Json(req): Json<BrowserIdentityCheckpointRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    if let Err(value) = validate_global_browser_owner(&headers, req.sidecar_id.trim()) {
+        return no_store_json(value);
+    }
+    if req.product_session_id.trim().is_empty() {
+        return no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "invalid_request",
+            "error": "productSessionId is required",
+        }));
+    }
+    match crate::browser_identity_store::checkpoint_identity(
+        req.base_revision,
+        &req.base_state,
+        &req.observed_base_state,
+        &req.state,
+    ) {
+        Ok(checkpoint) => no_store_json(serde_json::json!({
+            "ok": true,
+            "revision": checkpoint.revision,
+            "state": checkpoint.state,
+            "conflictCount": checkpoint.conflict_count,
+        })),
+        Err(error) => no_store_json(serde_json::json!({
+            "ok": false,
+            "code": "browser_identity_checkpoint_failed",
+            "error": error,
+        })),
+    }
 }
 
 async fn grok_bearer_handler(
@@ -2598,14 +3155,14 @@ async fn task_get_handler(Query(q): Query<TaskGetQuery>) -> Json<serde_json::Val
             "error": "task store not initialized"
         }));
     };
+    if let Err(error) = store.ensure_legacy_verify_merged(&q.id).await {
+        return Json(serde_json::json!({ "ok": false, "error": error }));
+    }
     match store.get_ordinary(&q.id).await {
         Ok(t) => {
-            // Attach task.docs (four absolute paths) so the AI / CLI
-            // reading this response knows where task.md / verify.md /
-            // progress.md / alignment.md live without having to
-            // re-derive the layout from convention. See
-            // `task::build_task_docs` for semantics of the optional
-            // fields (only existing files are surfaced).
+            // task.md is the single editable contract. Optional legacy paths
+            // remain visible for diagnostics only; verify.md has already been
+            // merged above before any CLI consumer can observe the Task.
             let docs = match task::build_task_docs(&t.id) {
                 Ok(d) => d,
                 Err(e) => {
@@ -2683,14 +3240,29 @@ struct TaskCreateDirectApiRequest {
     #[serde(flatten)]
     input: task::TaskCreateDirectInput,
     #[serde(default)]
+    task_md_file: Option<String>,
+    #[serde(default)]
     actor: Option<task::TransitionActor>,
     #[serde(default)]
     source: Option<task::TransitionSource>,
 }
 
 async fn task_create_direct_handler(
-    Json(req): Json<TaskCreateDirectApiRequest>,
+    Json(mut req): Json<TaskCreateDirectApiRequest>,
 ) -> Json<serde_json::Value> {
+    if let Some(candidate_path) = req.task_md_file.as_deref() {
+        match task::read_owned_discussion_candidate(candidate_path) {
+            Ok(Some(current_content)) => req.input.task_md_content = current_content,
+            Ok(None) => {}
+            Err(error) => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "code": "invalid_task_discussion_candidate",
+                    "error": error,
+                }));
+            }
+        }
+    }
     let application = match crate::task_application::TaskApplication::from_globals() {
         Ok(application) => application,
         Err(error) => return task_application_error_response(error),
@@ -2983,6 +3555,122 @@ async fn task_turn_authorize_handler(
         }));
     }
     Json(serde_json::json!({ "ok": true }))
+}
+
+async fn task_turn_admitted_handler(
+    headers: HeaderMap,
+    Json(req): Json<TaskTurnAuthorizeRequest>,
+) -> Json<serde_json::Value> {
+    let generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(response) => return response,
+    };
+    let Some(sidecars) = get_sidecar_state() else {
+        return Json(
+            serde_json::json!({ "ok": false, "error": "Sidecar manager is not initialized" }),
+        );
+    };
+    let live = sidecars
+        .lock()
+        .map(|manager| manager.is_live(&req.session_id, generation))
+        .unwrap_or(false);
+    if !live {
+        return Json(serde_json::json!({
+            "ok": false,
+            "code": "stale_sidecar",
+            "error": "Task admission came from a stale Sidecar",
+        }));
+    }
+    match crate::task_scheduler::get_task_scheduler()
+        .confirm_turn_admitted(&req.task_id, &req.queue_id, &req.session_id)
+        .await
+    {
+        Ok(true) => Json(serde_json::json!({ "ok": true })),
+        Ok(false) => Json(serde_json::json!({
+            "ok": false,
+            "code": "stale_execution",
+            "error": "Task admission no longer belongs to the active execution",
+        })),
+        Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskCommentsQuery {
+    id: String,
+    before: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn task_comments_handler(Query(query): Query<TaskCommentsQuery>) -> Json<serde_json::Value> {
+    let Some(store) = crate::task::get_task_store() else {
+        return Json(serde_json::json!({ "ok": false, "error": "task store not initialized" }));
+    };
+    match store
+        .list_comments(
+            &query.id,
+            query.before.as_deref(),
+            query.limit.unwrap_or(50),
+        )
+        .await
+    {
+        Ok(page) => Json(serde_json::json!({ "ok": true, "page": page })),
+        Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskAgentCommentRequest {
+    id: String,
+    body: String,
+    session_id: String,
+    reply_to_comment_id: Option<String>,
+}
+
+async fn task_comment_handler(
+    headers: HeaderMap,
+    Json(req): Json<TaskAgentCommentRequest>,
+) -> Json<serde_json::Value> {
+    let generation = match request_sidecar_generation(&headers) {
+        Ok(generation) => generation,
+        Err(response) => return response,
+    };
+    let Some(sidecars) = get_sidecar_state() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "code": "management_unavailable",
+            "error": "Sidecar manager is not initialized",
+        }));
+    };
+    let live = sidecars
+        .lock()
+        .map(|manager| manager.is_live(&req.session_id, generation))
+        .unwrap_or(false);
+    if !live {
+        return Json(serde_json::json!({
+            "ok": false,
+            "code": "stale_sidecar",
+            "error": "Task comment came from a stale Sidecar",
+        }));
+    }
+    let application = match crate::task_application::TaskApplication::from_globals() {
+        Ok(application) => application,
+        Err(error) => return task_application_error_response(error),
+    };
+    match application
+        .append_agent_comment(
+            &req.id,
+            &req.session_id,
+            &req.body,
+            req.reply_to_comment_id.as_deref(),
+        )
+        .await
+    {
+        Ok(comment) => Json(serde_json::json!({ "ok": true, "comment": comment })),
+        Err(error) => task_application_error_response(error),
+    }
 }
 
 async fn task_update_status_handler(
@@ -3402,40 +4090,6 @@ async fn space_attachment_inspect_handler(
 // Task Center execution handlers (v0.1.69)
 // ========================================================================
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TaskCreateFromAlignmentApiRequest {
-    #[serde(flatten)]
-    input: task::TaskCreateFromAlignmentInput,
-    #[serde(default)]
-    actor: Option<task::TransitionActor>,
-    #[serde(default)]
-    source: Option<task::TransitionSource>,
-}
-
-async fn task_create_from_alignment_handler(
-    Json(req): Json<TaskCreateFromAlignmentApiRequest>,
-) -> Json<serde_json::Value> {
-    let application = match crate::task_application::TaskApplication::from_globals() {
-        Ok(application) => application,
-        Err(error) => return task_application_error_response(error),
-    };
-    match application
-        .create_from_alignment_with_origin(
-            req.input,
-            req.actor.unwrap_or(task::TransitionActor::User),
-            req.source.or(Some(task::TransitionSource::Cli)),
-        )
-        .await
-    {
-        Ok(task) => Json(serde_json::json!({
-            "ok": true,
-            "task": task::project_task(task).await,
-        })),
-        Err(error) => task_application_error_response(error),
-    }
-}
-
 /// PRD §10.2.2 `POST /api/task/run` — trigger execution of an existing Task.
 ///
 /// The Task row is the sole scheduling authority. Starting persists Running,
@@ -3453,10 +4107,14 @@ async fn task_run_handler(Json(req): Json<TaskIdApiRequest>) -> Json<serde_json:
         )
         .await
     {
-        Ok(result) => Json(task_lifecycle_success_response(
-            task::project_task(result.task).await,
-            Some(result.attempt_ordinal),
-        )),
+        Ok(result) => {
+            let mut response = task_lifecycle_success_response(
+                task::project_task(result.task).await,
+                result.attempt_ordinal,
+            );
+            response["changed"] = serde_json::json!(result.changed);
+            Json(response)
+        }
         Err(error) => task_application_error_response(error),
     }
 }
@@ -3500,10 +4158,14 @@ async fn task_rerun_handler(Json(req): Json<TaskIdApiRequest>) -> Json<serde_jso
         )
         .await
     {
-        Ok(result) => Json(task_lifecycle_success_response(
-            task::project_task(result.task).await,
-            Some(result.attempt_ordinal),
-        )),
+        Ok(result) => {
+            let mut response = task_lifecycle_success_response(
+                task::project_task(result.task).await,
+                result.attempt_ordinal,
+            );
+            response["changed"] = serde_json::json!(result.changed);
+            Json(response)
+        }
         Err(error) => task_application_error_response(error),
     }
 }
@@ -3561,12 +4223,12 @@ async fn task_read_doc_handler(
 #[serde(rename_all = "camelCase")]
 struct TaskWriteDocRequest {
     id: String,
-    /// `task` | `verify` — `progress` is agent-only and rejected here.
+    /// Only `task` is writable; other documents are legacy read surfaces.
     doc: String,
     content: String,
 }
 
-/// `POST /api/task/write-doc` — write `task.md` or `verify.md` for a Task.
+/// `POST /api/task/write-doc` — write the canonical `task.md` for a Task.
 /// Delegates to `TaskStore::write_doc`, which enforces the running/verifying
 /// lock atomically with the file write (PRD §9.4). `progress.md` is
 /// explicitly rejected here — only the runtime agent appends to it.
@@ -3574,27 +4236,20 @@ async fn task_write_doc_handler(Json(req): Json<TaskWriteDocRequest>) -> Json<se
     let Some(store) = task::get_task_store() else {
         return Json(serde_json::json!({ "ok": false, "error": "task store not initialized" }));
     };
-    // Central whitelist via `task::task_doc_filename` — same contract as
-    // read-doc. Then refuse writing progress.md / alignment.md (the Tauri
-    // `cmd_task_write_doc` enforces the same rule, keeping both entry
-    // points aligned).
-    let filename = match task::task_doc_filename(&req.doc) {
-        Ok(f) => f,
-        Err(e) => return Json(serde_json::json!({ "ok": false, "error": e })),
-    };
-    if filename == "progress.md" || filename == "alignment.md" {
+    if req.doc != "task" {
+        let filename = match task::task_doc_filename(&req.doc) {
+            Ok(filename) => filename,
+            Err(error) => return Json(serde_json::json!({ "ok": false, "error": error })),
+        };
         return Json(serde_json::json!({
             "ok": false,
-            "error": format!(
-                "{} is not writable via this API (progress=agent-appended, alignment=skill-written)",
-                filename
-            ),
+            "error": format!("{} is a read-only legacy document; edit task.md instead", filename),
         }));
     }
     if let Err(error) = store.get_ordinary(&req.id).await {
         return Json(serde_json::json!({ "ok": false, "error": error }));
     }
-    match store.write_doc(&req.id, filename, &req.content).await {
+    match store.write_doc(&req.id, "task.md", &req.content).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })),
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
     }
@@ -4354,6 +5009,7 @@ mod tests {
             "workspaceId": "workspace",
             "workspacePath": "/tmp/workspace",
             "taskMdContent": "Do the work",
+            "taskMdFile": "/tmp/task-discussions/d/candidates/c/task.md",
             "executionMode": "once",
             "actor": "agent",
             "source": "cli"
@@ -4361,25 +5017,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.input.workspace_id, "workspace");
+        assert_eq!(
+            request.task_md_file.as_deref(),
+            Some("/tmp/task-discussions/d/candidates/c/task.md")
+        );
         assert_eq!(request.actor, Some(task::TransitionActor::Agent));
         assert_eq!(request.source, Some(task::TransitionSource::Cli));
     }
 
     #[test]
-    fn alignment_and_lifecycle_requests_preserve_cli_origin() {
-        let alignment: TaskCreateFromAlignmentApiRequest =
-            serde_json::from_value(serde_json::json!({
-                "name": "aligned",
-                "executor": "agent",
-                "alignmentSessionId": "alignment-1",
-                "executionMode": "once",
-                "actor": "user",
-                "source": "cli"
-            }))
-            .unwrap();
-        assert_eq!(alignment.actor, Some(task::TransitionActor::User));
-        assert_eq!(alignment.source, Some(task::TransitionSource::Cli));
-
+    fn lifecycle_requests_preserve_cli_origin() {
         let lifecycle: TaskIdApiRequest = serde_json::from_value(serde_json::json!({
             "id": "task-1",
             "actor": "agent",

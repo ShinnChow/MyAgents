@@ -874,7 +874,8 @@ pub async fn cmd_handover_session_to_channel<R: Runtime>(
                     .as_ref()
                     .map(|current| (current.session_id.as_str(), current.sidecar_port));
                 if before_identity != current_identity {
-                    let _ = release_session_sidecar(manager.inner(), &sessionId, &owner);
+                    drop(router);
+                    let _ = release_session_sidecar(manager.inner(), &sessionId, &owner).await;
                     ulog_warn!(
                         "[handover] step4b binding changed before freeze; target owner released key={}",
                         target_session_key
@@ -946,7 +947,7 @@ pub async fn cmd_handover_session_to_channel<R: Runtime>(
                     })
             };
             if let Err(e) = freeze_result {
-                let _ = release_session_sidecar(manager.inner(), &sessionId, &owner);
+                let _ = release_session_sidecar(manager.inner(), &sessionId, &owner).await;
                 ulog_warn!(
                     "[handover] step4b freeze prior session {} failed; target owner released: {}",
                     short_id(&prior.session_id),
@@ -975,7 +976,8 @@ pub async fn cmd_handover_session_to_channel<R: Runtime>(
             .as_ref()
             .map(|p| (p.session_id.as_str(), p.sidecar_port));
         if before_identity != current_identity {
-            let _ = release_session_sidecar(manager.inner(), &sessionId, &owner);
+            drop(router);
+            let _ = release_session_sidecar(manager.inner(), &sessionId, &owner).await;
             ulog_warn!(
                 "[handover] step5 binding changed while freezing; target owner released key={}",
                 target_session_key
@@ -1098,7 +1100,7 @@ pub async fn cmd_handover_session_to_channel<R: Runtime>(
                     removed.session_key
                 );
             }
-            match release_session_sidecar(manager.inner(), &removed.session_id, &removed_owner) {
+            match release_session_sidecar(manager.inner(), &removed.session_id, &removed_owner).await {
                 Ok(stopped) => ulog_info!(
                     "[handover] step5b removed stale channel binding {} from session {} (sidecar_stopped={})",
                     removed.session_key,
@@ -1161,7 +1163,7 @@ pub async fn cmd_handover_session_to_channel<R: Runtime>(
     // strip the owner we just attached.
     if let Some(prior_sid) = prior_session_id.as_deref() {
         if prior_sid != sessionId {
-            match release_session_sidecar(manager.inner(), prior_sid, &owner) {
+            match release_session_sidecar(manager.inner(), prior_sid, &owner).await {
                 Ok(stopped) => ulog_info!(
                     "[handover] step6 released prior Agent owner from {} (sidecar_stopped={})",
                     short_id(prior_sid),

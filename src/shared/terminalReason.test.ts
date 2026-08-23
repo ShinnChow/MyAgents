@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   describeTerminalReason,
+  formatApiErrorDetail,
   isAbortedTerminalReason,
   shouldOfferTerminalReasonDiagnostics,
   shouldRecordTurnForTitle,
@@ -212,5 +213,42 @@ describe('shouldTitleCompletedTurn — builtin #296 auto-title success gate', ()
     for (const reason of ['aborted_streaming', 'aborted_tools', 'max_turns', 'model_error', 'prompt_too_long']) {
       expect(shouldTitleCompletedTurn(false, reason)).toBe(false);
     }
+  });
+});
+
+describe('formatApiErrorDetail — provider error presentation', () => {
+  it('formats status + hint + raw message in the canonical order', () => {
+    expect(formatApiErrorDetail({
+      status: 429,
+      rawMessage: 'rate_limit: API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。]',
+    })).toBe('(429) 限流 / 额度受限 - rate_limit: API Error: Request rejected (429) · [1308][已达到 5 小时的使用上限。]');
+  });
+
+  it('formats status + hint with no raw message (no trailing separator)', () => {
+    expect(formatApiErrorDetail({ status: 429, rawMessage: null })).toBe('(429) 限流 / 额度受限');
+    expect(formatApiErrorDetail({ status: 429, rawMessage: '   ' })).toBe('(429) 限流 / 额度受限');
+  });
+
+  it('omits the hint segment when the status is unknown', () => {
+    expect(formatApiErrorDetail({ status: 418, rawMessage: 'teapot' })).toBe('(418) - teapot');
+    expect(formatApiErrorDetail({ status: 418 })).toBe('(418)');
+  });
+
+  it('omits the status segment entirely when status is missing (no leading separator)', () => {
+    expect(formatApiErrorDetail({ rawMessage: 'model overloaded' })).toBe('model overloaded');
+    expect(formatApiErrorDetail({})).toBe('');
+  });
+
+  it('truncates overlong raw messages to 300 chars with an ellipsis', () => {
+    const long = 'x'.repeat(400);
+    expect(formatApiErrorDetail({ status: 500, rawMessage: long }))
+      .toBe(`(500) 供应商服务器错误 - ${'x'.repeat(300)}…`);
+  });
+
+  it('treats non-finite or missing status as absent', () => {
+    expect(formatApiErrorDetail({ rawMessage: 'boom' })).toBe('boom');
+    expect(formatApiErrorDetail({ status: null, rawMessage: 'boom' })).toBe('boom');
+    expect(formatApiErrorDetail({ status: undefined, rawMessage: 'boom' })).toBe('boom');
+    expect(formatApiErrorDetail({ status: NaN, rawMessage: 'boom' })).toBe('boom');
   });
 });

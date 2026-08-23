@@ -5,15 +5,67 @@ import {
   GOAL_CONTEXT_TAG,
   GOAL_CONTINUATION_TAG,
   SPACE_ISSUE_CONTEXT_TAG,
+  TASK_DISCUSSION_TAG,
+  TASK_COMMENT_TAG,
   buildGoalContextReminder,
   buildGoalContinuationReminder,
   buildFloatingBallContextReminder,
+  buildTaskDiscussionReminder,
+  buildTaskCommentReminder,
   parseLeadingSystemReminder,
   parseSessionSendRequestDisplay,
   stripLeadingSystemReminder,
 } from './systemReminder';
 
 describe('systemReminder', () => {
+  it('builds Task discussion context while keeping only the user request visible', () => {
+    const raw = buildTaskDiscussionReminder({
+      discussionId: 'discussion-1',
+      discussionDir: '/Users/me/.myagents/task-discussions/discussion-1',
+      candidatesDir: '/Users/me/.myagents/task-discussions/discussion-1/candidates',
+      workspaceId: 'workspace-1',
+      workspacePath: '/Users/me/project<&',
+      sourceThoughtId: 'thought-1',
+      sourceThoughtTags: ['release', '<urgent>'],
+      visibleUserMessage: '每周整理一次发布记录',
+    });
+
+    const parsed = parseLeadingSystemReminder(raw);
+    expect(parsed.kind).toBe(TASK_DISCUSSION_TAG);
+    expect(parsed.body).toContain('workspacePath: /Users/me/project&lt;&amp;');
+    expect(parsed.body).toContain('- &lt;urgent&gt;');
+    expect(parsed.visibleText).toBe('每周整理一次发布记录');
+    expect(stripLeadingSystemReminder(raw)).toBe('每周整理一次发布记录');
+  });
+
+  it('builds a direct Task comment reminder with escaped exact routing context', () => {
+    const raw = buildTaskCommentReminder({
+      taskId: 'task-1',
+      taskName: 'Check <deps>',
+      taskMdPath: '/tmp/a&b/task.md',
+      commentId: 'comment-1',
+      targetSessionId: 'session-1',
+      replyContext: {
+        commentId: 'parent-1',
+        author: 'Agent <one>',
+        createdAt: '2026-08-20T10:00:00Z',
+        quote: 'quoted & bounded',
+      },
+      visibleUserMessage: '只处理第一个问题',
+    });
+
+    const parsed = parseLeadingSystemReminder(raw);
+    expect(parsed.kind).toBe(TASK_COMMENT_TAG);
+    expect(parsed.body).toContain('taskName: Check &lt;deps&gt;');
+    expect(parsed.body).toContain('taskMdPath: /tmp/a&amp;b/task.md');
+    expect(parsed.body).toContain('author: Agent &lt;one&gt;');
+    expect(parsed.body).toContain(
+      '`myagents task comment task-1 --body-file <reply-file> --reply-to comment-1 --json`',
+    );
+    expect(parsed.visibleText).toBe('只处理第一个问题');
+    expect(parsed.body).not.toContain('<myagents-session-event');
+  });
+
   it('builds floating-ball context as a plain system-reminder envelope', () => {
     const reminder = buildFloatingBallContextReminder({
       appName: 'Safari',

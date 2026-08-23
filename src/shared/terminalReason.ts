@@ -6,6 +6,10 @@
  * fallback-only behaviour. Double-sourcing was the original mistake here:
  * MyAgents hand-maintained the 12 values against SDK 0.2.107's type, which
  * works today but silently drifts when the SDK bumps.
+ *
+ * 本文件同时承载 provider 错误的展示映射（`formatApiErrorDetail` / `HTTP_STATUS_HINT`）：
+ * 终端失败携带状态码或 provisional error 时，由它产出「(状态码) 中文 hint - 原文」
+ * 的单行文案，供 server 组装 `chat:agent-error` 富文本使用。
  */
 import type { TerminalReason as SdkTerminalReason } from '@anthropic-ai/claude-agent-sdk';
 export type TerminalReason = SdkTerminalReason;
@@ -238,4 +242,61 @@ export function shouldRecordTurnForTitle(reason: unknown): boolean {
  */
 export function shouldTitleCompletedTurn(isError: boolean, terminalReason: unknown): boolean {
   return !isError && shouldRecordTurnForTitle(terminalReason);
+}
+
+/**
+ * HTTP 状态码 → 中文 hint（provider 错误展示用）。
+ *
+ * 只收录常见、可确定语义的 HTTP 状态码；未收录的状态码不产出 hint，仅保留状态码段
+ * （如 `(418)`）。provider 自己的业务错误码（如 GLM 的 1308）没有统一标准、无法穷举，
+ * 不在此表内，只随原始报错文本透出。
+ */
+const HTTP_STATUS_HINT: Record<number, string> = {
+  400: '请求参数错误',
+  401: '认证失败',
+  402: '余额或额度不足',
+  403: '权限不足',
+  404: '模型或端点不存在',
+  408: '请求超时',
+  409: '请求冲突',
+  422: '请求内容无效',
+  429: '限流 / 额度受限',
+  500: '供应商服务器错误',
+  502: '供应商网关错误',
+  503: '供应商服务不可用 / 过载',
+  504: '供应商网关超时',
+};
+
+/** 原始报错文本在展示层的截断上限；完整文本始终可在 unified log 查得。 */
+const API_ERROR_RAW_MESSAGE_MAX_LENGTH = 300;
+
+/**
+ * 把 provider 错误细节组装成单行展示文案：`(状态码) 中文 hint - 原始报错`。
+ *
+ * 各段独立可选：状态码无值则省略 `(NNN)`；hint 未命中则省略 hint；原文为空则省略
+ * ` - 原文`。返回空串表示没有任何可展示细节，调用方不应 surface 空串。
+ *
+ * 输出单行是因为 `agentError` banner 用 `<span>` 渲染、无 `whitespace-pre-wrap`，
+ * 换行会被折叠。超长原文截断到 300 字符加 `…`，完整信息仍在日志与诊断流。
+ */
+export function formatApiErrorDetail(opts: {
+  status?: number | null;
+  rawMessage?: string | null;
+}): string {
+  const status = typeof opts.status === 'number' && Number.isFinite(opts.status)
+    ? opts.status
+    : null;
+  const hint = status != null ? HTTP_STATUS_HINT[status] : undefined;
+
+  const segments: string[] = [];
+  if (status != null) segments.push(`(${status})`);
+  if (hint) segments.push(hint);
+  const head = segments.join(' ');
+
+  const body = typeof opts.rawMessage === 'string' ? opts.rawMessage.trim() : '';
+  const capped = body.length > API_ERROR_RAW_MESSAGE_MAX_LENGTH
+    ? `${body.slice(0, API_ERROR_RAW_MESSAGE_MAX_LENGTH)}…`
+    : body;
+
+  return head && capped ? `${head} - ${capped}` : (head || capped);
 }

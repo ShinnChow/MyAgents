@@ -369,8 +369,8 @@ describe('RuntimeDiagnosticsBanner diagnostics action', () => {
           {
             component: 'host_tools',
             state: 'unsupported',
-            code: 'host_tools_catalog_immutable',
-            message: 'Start a new Product Session.',
+            code: 'host_tools_connect_failed',
+            message: 'Host tool bridge failed to start.',
             requiresUserAction: true,
           },
         ],

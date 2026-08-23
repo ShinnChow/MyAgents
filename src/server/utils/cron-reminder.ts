@@ -12,6 +12,7 @@ export interface CronReminderInput {
   intervalMinutes?: number;
   executionNumber?: number;
   activationEvent?: TaskActivationPayload;
+  includeTaskCollaboration?: boolean;
 }
 
 export const MAX_ACTIVATION_HANDOFF_BYTES = 128 * 1024;
@@ -79,6 +80,17 @@ export function buildCronTaskReminder(input: CronReminderInput): string {
     ].filter((line): line is string => line !== null),
     ...activationEventLines(input.activationEvent),
   ];
+
+  if (input.includeTaskCollaboration !== false) {
+    lines.push(
+      '',
+      'Task collaboration:',
+      '- Normal assistant output is not copied into the local Task timeline automatically.',
+      '- If a result, issue, lesson, or question is worth preserving across Task Sessions, append an explicit local Task comment with:',
+      '  myagents task comment --body-file <path>',
+      '- Do not record every assistant response; use comments only for durable Task-level collaboration.',
+    );
+  }
 
   if (input.aiCanExit) {
     lines.push(

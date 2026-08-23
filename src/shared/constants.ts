@@ -84,11 +84,14 @@ export const CUSTOM_EVENTS = {
      *  任务」 tab's search icon to continue the search intent across
      *  tabs instead of forcing the user to re-click). */
     OPEN_TASK_CENTER: 'open-task-center',
+    /** Fired to open App's singleton Task creation overlay. */
+    OPEN_TASK_CREATE: 'open-task-create',
     /** Fired to open the Team Space singleton tab when the build/runtime gates allow it. */
     OPEN_SPACE: 'open-space',
     /**
-     * Fired to open a new chat tab primed with `/task-alignment` for a thought.
-     * Payload: `{ thoughtId: string; content: string; tags: string[] }`.
+     * Fired to open a new product-owned Task discussion session.
+     * Payload includes the user's text and selected workspace; a source Thought
+     * is optional provenance rather than an entry requirement.
      */
     OPEN_AI_DISCUSSION: 'open-ai-discussion',
     /** Fired when user tries to open a Session that's already active in another Tab */

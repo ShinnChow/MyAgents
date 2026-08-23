@@ -4,16 +4,9 @@
 // SECTION_GAP) with the dispatch dialog so creation and subsequent edits
 // stay pixel-aligned (PRD §7.3 — "create → edit is one continuous lifecycle").
 //
-// Document model:
-//   • task.md      — always editable. Even AI-aligned tasks (whose first
-//                    draft is synthesized from alignment.md) get this
-//                    field; the user is the source of truth here, and a
-//                    later realignment can overwrite it back if needed.
-//   • verify.md    — always editable (verification checklist authored
-//                    by the user; AI reads it during the verifying phase).
-//   • progress.md  — always read-only preview (agent-only on the backend;
-//                    `cmd_task_write_doc` rejects `progress`). Hidden when
-//                    empty so blank tasks don't show an irrelevant block.
+// Document model: task.md is the single editable task contract. Legacy
+// verify/progress/alignment files remain available from the read-only detail
+// surface, but new edits do not sustain a parallel document protocol.
 //
 // All field mutations flow into a local `draft` state; the save handler diffs
 // against the initial Task and sends only the changed fields through
@@ -24,19 +17,20 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Activity, Bell, Bot, Clock, FileText, Flag, FolderOpen, Settings2 } from 'lucide-react';
+import { Activity, Bell, Bot, Clock, FileText, FolderOpen, Settings2 } from 'lucide-react';
 
 import {
   taskOpenDocsDir,
   taskReadDoc,
   taskUpdate,
-  taskWriteDoc,
 } from '@/api/taskCenter';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import NotificationConfigEditor from '@/components/task-center/NotificationConfigEditor';
-import TaskDocBlock from '@/components/task-center/TaskDocBlock';
+import WorkspaceIcon from '@/components/launcher/WorkspaceIcon';
 import { useToast } from '@/components/Toast';
+import { isProjectActiveForUser } from '@/config/types';
 import { useConfig } from '@/hooks/useConfig';
+import { useCloseLayer } from '@/hooks/useCloseLayer';
 import { useTaskCenterData } from '@/hooks/useTaskCenterData';
 import CustomSelect from '@/components/CustomSelect';
 import { workspacePathsEqual } from '@/../shared/workspacePath';
@@ -73,7 +67,7 @@ import { extractErrorMessage } from './errors';
  *  can pass a specific target without magic strings. `null` / undefined
  *  = open at the top (basic-info section).
  */
-export type FocusDoc = 'task' | 'verify' | 'notification';
+export type FocusDoc = 'task' | 'notification';
 
 export interface TaskEditPanelProps {
   task: Task;
@@ -86,10 +80,9 @@ export interface TaskEditPanelProps {
 
 interface Draft {
   name: string;
-  description: string;
-  tagsInput: string;
+  workspaceId: string;
+  workspacePath: string;
   taskMd: string;
-  verifyMd: string;
   executionMode: TaskExecutionMode;
   runMode: TaskRunMode;
   preselectedSessionId: string;
@@ -114,7 +107,7 @@ interface Draft {
   mcpEnabledServers: string[] | undefined;
 }
 
-function taskToDraft(task: Task, taskMd: string, verifyMd: string): Draft {
+function taskToDraft(task: Task, taskMd: string): Draft {
   // End-condition mode is derived: if any constraint is present, the user
   // intended "conditional"; otherwise "forever".
   const ec = task.endConditions;
@@ -127,14 +120,22 @@ function taskToDraft(task: Task, taskMd: string, verifyMd: string): Draft {
   const atDateTime = atSource ? toLocalDateTimeString(new Date(atSource)) : '';
   return {
     name: task.name,
-    description: task.description ?? '',
-    tagsInput: task.tags.join(', '),
+    workspaceId: task.workspaceId,
+    workspacePath: task.workspacePath ?? '',
     taskMd,
-    verifyMd,
     executionMode: task.executionMode,
-    runMode: task.runMode ?? 'new-session',
-    preselectedSessionId: task.preselectedSessionId ?? '',
-    trigger: task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } },
+    runMode: task.executionMode === 'recurring'
+      ? task.runMode ?? 'new-session'
+      : task.executionMode === 'loop'
+        ? 'single-session'
+        : 'new-session',
+    preselectedSessionId:
+      task.executionMode === 'recurring' || task.executionMode === 'loop'
+        ? task.preselectedSessionId ?? ''
+        : '',
+    trigger: task.executionMode === 'recurring'
+      ? task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } }
+      : { source: { type: 'time' }, detector: { type: 'always' } },
     atDateTime,
     intervalMinutes: task.intervalMinutes ?? 30,
     cronExpression: task.cronExpression ?? '',
@@ -169,8 +170,8 @@ export function TaskEditPanel({
 }: TaskEditPanelProps) {
   const { t } = useTranslation('task');
   const { sessions } = useTaskCenterData({ isActive: true });
-  const [draft, setDraft] = useState<Draft>(() => taskToDraft(task, '', ''));
-  // Snapshot of the draft at the moment task.md / verify.md finished
+  const [draft, setDraft] = useState<Draft>(() => taskToDraft(task, ''));
+  // Snapshot of the draft at the moment task.md finished
   // loading. We diff against this for the dirty check so reads
   // populating the textareas don't count as dirty.
   const initialDraftRef = useRef<Draft | null>(null);
@@ -181,22 +182,16 @@ export function TaskEditPanel({
   // overwrite their existing task.md with an empty string (C2 review).
   const [taskMdReadState, setTaskMdReadState] =
     useState<'loading' | 'ok' | 'failed'>('loading');
-  // verify.md reads are allowed to return "" (verify is optional); we only
-  // track ok/failed so a failed read doesn't let the user save an empty
-  // body that would wipe an existing file (PRD §9.4).
-  const [verifyMdReadState, setVerifyMdReadState] =
-    useState<'loading' | 'ok' | 'failed'>('loading');
   // Discard-confirmation dialog when the draft is dirty.
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
   const toast = useToast();
-  const { providers } = useConfig();
+  const { projects, providers } = useConfig();
 
   // Refs for `focusDoc` — scroll-into-view + caret focus on open. Effect
-  // runs on mount only (focusDoc is an intent, not a live mode). For
-  // task.md / verify.md we also select so the user can start typing
-  // immediately to replace content; for notification we only scroll.
+  // runs on mount only (focusDoc is an intent, not a live mode). For task.md
+  // we also select so the user can start typing immediately; notification
+  // only scrolls into view.
   const taskMdRef = useRef<HTMLTextAreaElement | null>(null);
-  const verifyMdRef = useRef<HTMLTextAreaElement | null>(null);
   const notificationRef = useRef<HTMLDivElement | null>(null);
   // Fire-once latch: once we've scrolled + focused for a given focusDoc
   // value, don't fire again if read-state re-renders push the effect.
@@ -213,14 +208,12 @@ export function TaskEditPanel({
     // 80ms timeout, which is both flaky on slow disks and a magic
     // number. Now we wait until the textarea is enabled.
     if (focusDoc === 'task' && taskMdReadState === 'loading') return;
-    if (focusDoc === 'verify' && verifyMdReadState === 'loading') return;
     // Defer to next frame so the refs are wired and layout is settled.
     const raf = requestAnimationFrame(() => {
       const el =
         focusDoc === 'task' ? taskMdRef.current
-          : focusDoc === 'verify' ? verifyMdRef.current
-            : focusDoc === 'notification' ? notificationRef.current
-              : null;
+          : focusDoc === 'notification' ? notificationRef.current
+            : null;
       if (!el) return;
       el.scrollIntoView({ behavior: 'smooth', block: 'start' });
       if (el instanceof HTMLTextAreaElement) {
@@ -229,50 +222,25 @@ export function TaskEditPanel({
       focusAppliedRef.current = focusDoc;
     });
     return () => cancelAnimationFrame(raf);
-  }, [focusDoc, taskMdReadState, verifyMdReadState]);
+  }, [focusDoc, taskMdReadState]);
 
-  // Read the current task.md + verify.md bodies once so the user can
-  // edit both in-place.
+  // Read the canonical task.md once; the backend lazily merges any legacy
+  // verify.md into this body before returning it.
   useEffect(() => {
     let cancelled = false;
-    let taskBody = '';
-    let verifyBody = '';
-    let pending = 2;
-    const finalize = () => {
-      if (cancelled) return;
-      pending -= 1;
-      if (pending > 0) return;
-      // Both reads done — snapshot the dirty baseline so subsequent
-      // user edits are detected correctly.
-      setDraft((d) => {
-        const next = { ...d, taskMd: taskBody, verifyMd: verifyBody };
-        initialDraftRef.current = next;
-        return next;
-      });
-    };
     void taskReadDoc(task.id, 'task')
       .then((content) => {
         if (cancelled) return;
-        taskBody = content;
         setTaskMdReadState('ok');
-        finalize();
+        setDraft((current) => {
+          const next = { ...current, taskMd: content };
+          initialDraftRef.current = next;
+          return next;
+        });
       })
       .catch(() => {
         if (cancelled) return;
         setTaskMdReadState('failed');
-        finalize();
-      });
-    void taskReadDoc(task.id, 'verify')
-      .then((content) => {
-        if (cancelled) return;
-        verifyBody = content;
-        setVerifyMdReadState('ok');
-        finalize();
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setVerifyMdReadState('failed');
-        finalize();
       });
     return () => {
       cancelled = true;
@@ -303,22 +271,43 @@ export function TaskEditPanel({
   const isRecurring = draft.executionMode === 'recurring';
   const isLoop = draft.executionMode === 'loop';
   const showEndConditions = isRecurring || isLoop;
+  const visibleProjects = useMemo(
+    () => projects.filter(isProjectActiveForUser),
+    [projects],
+  );
+  const workspace = useMemo(
+    () => visibleProjects.find((project) =>
+      workspacePathsEqual(project.path, draft.workspacePath),
+    ) ?? visibleProjects.find((project) => project.id === draft.workspaceId) ?? null,
+    [draft.workspaceId, draft.workspacePath, visibleProjects],
+  );
+  const projectOptions = useMemo(
+    () => visibleProjects.map((project) => ({
+      value: project.path,
+      label:
+        project.displayName || project.name || project.path.split('/').pop() || project.path,
+      icon: <WorkspaceIcon icon={project.icon} size={16} />,
+    })),
+    [visibleProjects],
+  );
   const sessionOptions = useMemo(
     () => sessions
-      .filter((session) => task.workspacePath && workspacePathsEqual(session.agentDir, task.workspacePath))
+      .filter((session) => workspace && workspacePathsEqual(session.agentDir, workspace.path))
       .map((session, index) => ({
         value: session.id,
         label: index === 0
           ? t('trigger.sessionRecent', { title: session.title || session.id })
           : session.title || session.id,
       })),
-    [sessions, t, task.workspacePath],
+    [sessions, t, workspace],
   );
   const preservesLegacyMissingBinding =
     task.runMode === 'single-session' &&
     !task.preselectedSessionId &&
     draft.runMode === 'single-session' &&
-    !draft.preselectedSessionId;
+    !draft.preselectedSessionId &&
+    task.workspacePath !== undefined &&
+    workspacePathsEqual(task.workspacePath, draft.workspacePath);
 
   // Keep runMode aligned with PRD §9.2 defaults when user flips mode.
   const setExecutionMode = useCallback((next: TaskExecutionMode) => {
@@ -326,8 +315,16 @@ export function TaskEditPanel({
       const nextRunMode: TaskRunMode =
         next === 'loop' ? 'single-session'
           : next === 'recurring' ? 'new-session'
-            : d.runMode;
-      return { ...d, executionMode: next, runMode: nextRunMode };
+            : 'new-session';
+      return {
+        ...d,
+        executionMode: next,
+        runMode: nextRunMode,
+        preselectedSessionId: '',
+        trigger: next === 'recurring'
+          ? d.trigger
+          : { source: { type: 'time' }, detector: { type: 'always' } },
+      };
     });
   }, []);
 
@@ -338,12 +335,12 @@ export function TaskEditPanel({
       errs.push(t('edit.validation.taskReadFailed'));
     if (taskMdReadState === 'ok' && !draft.taskMd.trim())
       errs.push(t('edit.validation.taskRequired'));
-    if (verifyMdReadState === 'failed')
-      errs.push(t('edit.validation.verifyReadFailed'));
-    if (!triggerValid) errs.push(t('trigger.validation.invalid'));
+    if (!workspace) errs.push(t('dispatch.validation.workspaceRequired'));
+    if (isRecurring && !triggerValid) errs.push(t('trigger.validation.invalid'));
     if (
+      isRecurring &&
       draft.runMode === 'single-session' &&
-      !draft.preselectedSessionId &&
+      !sessionOptions.some((option) => option.value === draft.preselectedSessionId) &&
       !preservesLegacyMissingBinding
     ) {
       errs.push(t('trigger.validation.sessionRequired'));
@@ -374,7 +371,7 @@ export function TaskEditPanel({
       errs.push(t('edit.validation.endConditionRequired'));
     }
     return errs;
-  }, [draft, isScheduled, isRecurring, preservesLegacyMissingBinding, showEndConditions, taskMdReadState, triggerValid, verifyMdReadState, t]);
+  }, [draft, isScheduled, isRecurring, preservesLegacyMissingBinding, sessionOptions, showEndConditions, taskMdReadState, triggerValid, t, workspace]);
 
   const buildEndConditions = useCallback((): EndConditions | undefined => {
     if (!showEndConditions) return undefined;
@@ -408,6 +405,13 @@ export function TaskEditPanel({
     onCancel();
   }, [saving, isDirty, onCancel]);
 
+  // The edit sheet is a distinct close layer above the detail Drawer. Cmd/Ctrl+W
+  // must unwind through the dirty guard instead of closing the whole Drawer.
+  useCloseLayer(() => {
+    requestCancel();
+    return true;
+  }, 230);
+
   const confirmDiscard = useCallback(() => {
     setShowDiscardConfirm(false);
     onCancel();
@@ -415,10 +419,6 @@ export function TaskEditPanel({
 
   const handleSave = useCallback(async () => {
     if (errors.length > 0 || saving) return;
-    const tags = draft.tagsInput
-      .split(/[,，]/)
-      .map((t) => t.trim())
-      .filter((t) => t.length > 0);
 
     // Build a partial update. `Option<T>` on the Rust side means "don't
     // touch this field" for any key we omit — so we send only what the
@@ -434,10 +434,15 @@ export function TaskEditPanel({
       runtimeConfig: draft.runtimeConfig,
     });
     if (draft.name.trim() !== task.name) payload.name = draft.name.trim();
-    if (draft.description.trim() !== (task.description ?? ''))
-      payload.description = draft.description.trim();
-    const initialTags = task.tags.join(',');
-    if (tags.join(',') !== initialTags) payload.tags = tags;
+    if (
+      workspace &&
+      (workspace.id !== task.workspaceId ||
+        !task.workspacePath ||
+        !workspacePathsEqual(workspace.path, task.workspacePath))
+    ) {
+      payload.workspaceId = workspace.id;
+      payload.workspacePath = workspace.path;
+    }
 
     if (taskMdReadState === 'ok') {
       // Only persist when we actually loaded the current body — a failed
@@ -447,11 +452,22 @@ export function TaskEditPanel({
     }
 
     const modeChanged = draft.executionMode !== task.executionMode;
-    if (modeChanged) payload.executionMode = draft.executionMode;
+    // executionMode is the structural discriminator for runMode, Session and
+    // Trigger fields. Always send it from this full editor so a stale partial
+    // draft cannot merge recurring-only fields into a Task another window has
+    // already changed to Once/Scheduled.
+    payload.executionMode = draft.executionMode;
 
-    const nextRunMode: TaskRunMode = isLoop ? 'single-session' : draft.runMode;
+    const nextRunMode: TaskRunMode = isRecurring
+      ? draft.runMode
+      : isLoop
+        ? 'single-session'
+        : 'new-session';
     if (nextRunMode !== (task.runMode ?? 'new-session')) payload.runMode = nextRunMode;
-    const nextPreselected = nextRunMode === 'single-session' ? draft.preselectedSessionId : '';
+    const nextPreselected =
+      (isRecurring || isLoop) && nextRunMode === 'single-session'
+        ? draft.preselectedSessionId
+        : '';
     if (nextPreselected !== (task.preselectedSessionId ?? '')) {
       payload.preselectedSessionId = nextPreselected;
     }
@@ -463,10 +479,14 @@ export function TaskEditPanel({
       if (modeChanged || initialEc !== nextEc) payload.endConditions = ec;
     }
 
-    const initialTrigger = task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } };
-    if (JSON.stringify(initialTrigger) !== JSON.stringify(draft.trigger)) {
-      if (draft.trigger.detector.type === 'always') payload.clearTrigger = true;
-      else payload.trigger = draft.trigger;
+    if (!isRecurring) {
+      if (task.trigger) payload.clearTrigger = true;
+    } else {
+      const initialTrigger = task.trigger ?? { source: { type: 'time' }, detector: { type: 'always' } };
+      if (JSON.stringify(initialTrigger) !== JSON.stringify(draft.trigger)) {
+        if (draft.trigger.detector.type === 'always') payload.clearTrigger = true;
+        else payload.trigger = draft.trigger;
+      }
     }
 
     // Scheduling detail — only forward the field relevant to the target
@@ -565,46 +585,17 @@ export function TaskEditPanel({
     if (initialNotification !== nextNotification)
       payload.notification = draft.notification;
 
-    // verify.md is NOT part of the Task row update — it's a separate
-    // `write_doc` call. Compute change here so we know whether to
-    // short-circuit "no changes" AND whether to spend a second IPC call.
-    const baseline = initialDraftRef.current;
-    const verifyChanged =
-      verifyMdReadState === 'ok' &&
-      !!baseline &&
-      draft.verifyMd !== baseline.verifyMd;
-
     // Bail if nothing changed — stay in edit mode so the user isn't
     // thrown back to read-only with no feedback.
-    if (Object.keys(payload).length === 1 && !verifyChanged) {
+    if (Object.keys(payload).length === 1) {
       onError(t('edit.noChanges'));
       return;
     }
 
     setSaving(true);
     try {
-      // verify.md first: the TaskStore::update path re-reads the row and
-      // may bump `updated_at`, but verify.md writes go through a separate
-      // atomic write. Writing verify.md first means a mid-flight failure
-      // leaves metadata untouched (easier to reason about).
-      if (verifyChanged) {
-        await taskWriteDoc(task.id, 'verify', draft.verifyMd);
-        if (initialDraftRef.current) {
-          initialDraftRef.current = { ...initialDraftRef.current, verifyMd: draft.verifyMd };
-        }
-      }
-      // If only verify.md changed, skip the Task row update (payload
-      // would have only `id` in it and the Rust-side `update()` bumps
-      // `updated_at` even with an empty diff).
-      if (Object.keys(payload).length > 1) {
-        const updated = await taskUpdate(payload);
-        onSaved(updated);
-      } else {
-        // verify.md-only edit: refetch the task so `onSaved` hands back
-        // a row with a fresh `updated_at`. `taskWriteDoc` already bumped
-        // it on the backend.
-        onSaved({ ...task, updatedAt: Date.now() });
-      }
+      const updated = await taskUpdate(payload);
+      onSaved(updated);
     } catch (e) {
       onError(extractErrorMessage(e));
     } finally {
@@ -616,12 +607,12 @@ export function TaskEditPanel({
     saving,
     task,
     providers,
+    workspace,
     buildEndConditions,
     isScheduled,
     isRecurring,
     isLoop,
     taskMdReadState,
-    verifyMdReadState,
     onSaved,
     onError,
     t,
@@ -664,32 +655,12 @@ export function TaskEditPanel({
                 className={INPUT_CLS}
               />
             </Field>
-            <Field label={t('edit.description')} hint={t('edit.optional')}>
-              <input
-                type="text"
-                value={draft.description}
-                maxLength={200}
-                onChange={(e) => setDraft((d) => ({ ...d, description: e.target.value }))}
-                placeholder={t('edit.descriptionPlaceholder')}
-                className={INPUT_CLS}
-              />
-            </Field>
-            <Field label={t('edit.tags')} hint={t('edit.tagsHint')}>
-              <input
-                type="text"
-                value={draft.tagsInput}
-                onChange={(e) => setDraft((d) => ({ ...d, tagsInput: e.target.value }))}
-                placeholder={t('edit.tagsPlaceholder')}
-                className={INPUT_CLS}
-              />
-            </Field>
           </div>
         </FormSection>
 
         <div className={SECTION_DIVIDER} />
 
-        {/* task.md — always editable. AI-aligned tasks are seeded from
-            alignment.md but the user remains the source of truth here. */}
+        {/* task.md is the single editable semantic contract. */}
         <FormSection
           icon={FileText}
           title={t('detail.taskDocTitle')}
@@ -724,57 +695,28 @@ export function TaskEditPanel({
 
         <div className={SECTION_DIVIDER} />
 
-        {/* verify.md — always editable */}
-        <FormSection
-          icon={Flag}
-          title={t('detail.verifyDocTitle')}
-          hint={t('edit.optional')}
-          action={<OpenFolderButton onClick={() => void handleOpenDocsDir()} />}
-        >
-          <DocPathRow path={`~/.myagents/tasks/${task.id}/verify.md`} />
-          {verifyMdReadState === 'failed' ? (
-            <div className="rounded-[var(--radius-md)] border border-[var(--error)]/30 bg-[var(--error-bg)] px-3 py-2.5 text-xs text-[var(--error)]">
-              {t('edit.verifyReadFailed')}
-            </div>
-          ) : (
-            <>
-              <textarea
-                ref={verifyMdRef}
-                value={draft.verifyMd}
-                onChange={(e) => setDraft((d) => ({ ...d, verifyMd: e.target.value }))}
-                rows={6}
-                disabled={verifyMdReadState !== 'ok'}
-                placeholder={
-                  verifyMdReadState === 'ok'
-                    ? t('edit.verifyPlaceholder')
-                    : t('common.loading')
-                }
-                className={`${INPUT_CLS} resize-y font-mono text-sm`}
-              />
-              <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
-                {t('edit.verifyDescription')}
-              </p>
-            </>
-          )}
-        </FormSection>
-
-        <div className={SECTION_DIVIDER} />
-
-        {/* progress.md — read-only preview, hides when empty so blank
-            tasks don't show an irrelevant block. */}
-        <FormSection
-          icon={FileText}
-          title={t('detail.progressDocTitle')}
-          hint={t('edit.progressHint')}
-        >
-          <TaskDocBlock
-            task={task}
-            doc="progress"
-            title=""
-            emptyHint=""
-            hideWhenEmpty
-            onError={onError}
+        <FormSection icon={Bot} title={t('dispatch.workspace')}>
+          <CustomSelect
+            value={workspace?.path ?? draft.workspacePath}
+            options={projectOptions}
+            onChange={(workspacePath) => {
+              const selected = visibleProjects.find((project) =>
+                workspacePathsEqual(project.path, workspacePath),
+              );
+              if (!selected) return;
+              setDraft((current) => ({
+                ...current,
+                workspaceId: selected.id,
+                workspacePath: selected.path,
+                preselectedSessionId: '',
+              }));
+            }}
+            placeholder={t('dispatch.workspacePlaceholder')}
+            size="md"
           />
+          <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
+            {t('dispatch.workspaceHint')}
+          </p>
         </FormSection>
 
         <div className={SECTION_DIVIDER} />
@@ -782,7 +724,7 @@ export function TaskEditPanel({
         {/* 高级配置 — runtime / provider / model / permission / MCP overrides (PRD 0.2.9) */}
         <FormSection icon={Settings2} title={t('edit.advanced')}>
           <TaskAdvancedConfigEditor
-            workspacePath={task.workspacePath}
+            workspacePath={draft.workspacePath}
             runtime={draft.runtime}
             setRuntime={(v) => setDraft((d) => ({ ...d, runtime: v }))}
             providerId={draft.providerId}
@@ -817,8 +759,9 @@ export function TaskEditPanel({
             setCronExpression={(v) => setDraft((d) => ({ ...d, cronExpression: v }))}
             cronTimezone={draft.cronTimezone}
             setCronTimezone={(v) => setDraft((d) => ({ ...d, cronTimezone: v }))}
+            showSessionStrategy={isRecurring}
           />
-          {draft.runMode === 'single-session' && !isLoop && (
+          {isRecurring && draft.runMode === 'single-session' && !isLoop && (
             <div className="mt-5">
               <label className="mb-2 block text-sm font-medium text-[var(--ink-secondary)]">
                 {t('trigger.targetSession')}
@@ -833,27 +776,33 @@ export function TaskEditPanel({
                 placeholder={t('trigger.targetSessionPlaceholder')}
                 size="md"
               />
+              <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
+                {t('trigger.targetSessionHint')}
+              </p>
             </div>
           )}
         </FormSection>
 
-        <div className={SECTION_DIVIDER} />
-
-        <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
-          <TriggerEditor
-            value={draft.trigger}
-            workspacePath={task.workspacePath ?? ''}
-            ownerTaskId={task.id}
-            checkpointState={task.triggerState}
-            onChange={(trigger) => setDraft((current) => ({ ...current, trigger }))}
-            onValidityChange={setTriggerValid}
-          />
-          {task.trigger?.detector.type === 'command' && draft.trigger.detector.type === 'always' && (
-            <p className="mt-3 text-xs leading-relaxed text-[var(--ink-muted)]">
-              {t('trigger.switchAlwaysWarning')}
-            </p>
-          )}
-        </FormSection>
+        {isRecurring && (
+          <>
+            <div className={SECTION_DIVIDER} />
+            <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
+              <TriggerEditor
+                value={draft.trigger}
+                workspacePath={draft.workspacePath}
+                ownerTaskId={task.id}
+                checkpointState={task.triggerState}
+                onChange={(trigger) => setDraft((current) => ({ ...current, trigger }))}
+                onValidityChange={setTriggerValid}
+              />
+              {task.trigger?.detector.type === 'command' && draft.trigger.detector.type === 'always' && (
+                <p className="mt-3 text-xs leading-relaxed text-[var(--ink-muted)]">
+                  {t('trigger.switchAlwaysWarning')}
+                </p>
+              )}
+            </FormSection>
+          </>
+        )}
 
         {showEndConditions && (
           <>
@@ -881,7 +830,7 @@ export function TaskEditPanel({
             <NotificationConfigEditor
               value={draft.notification}
               onChange={(v) => setDraft((d) => ({ ...d, notification: v }))}
-              workspacePath={task.workspacePath}
+              workspacePath={draft.workspacePath}
             />
           </div>
         </FormSection>

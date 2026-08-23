@@ -337,7 +337,7 @@ Commands:
   model     Manage model providers
   agent     Discover stable Workspace Agents and manage proactive channels
   runtime   Inspect Agent Runtimes (list installed + describe models/modes)
-  skill     Manage skills (install from URL, list, enable/disable, sync)
+  skill     Manage skills (install from URL/local source, list, enable/disable, sync)
   cron      Legacy-compatible scheduled Task aliases
   goal      Manage the current session Goal (get/create/update)
   task      Manage Task Center and scheduled automation tasks
@@ -375,6 +375,7 @@ Examples:
   myagents skill list
   myagents skill add vercel-labs/skills --skill react-best-practices
   myagents skill add https://github.com/anthropics/skills --plugin document-skills
+  myagents skill add ./private-skill --dry-run
   myagents skill add "npx skills add foo/bar --skill baz" --force
   myagents skill remove my-skill
   myagents skill sync
@@ -395,12 +396,10 @@ Examples:
   myagents agent unarchive <agent-id>
   myagents task list --query "review" --limit 20
   myagents task get <taskId>            # returns metadata + docs paths
-                                        # (task.md / verify.md / progress.md /
-                                        #  alignment.md — read/edit them with
-                                        #  standard Read/Edit/Write tools)
-  myagents task update-status <taskId> running --message "starting work"
-  myagents task update-status <taskId> verifying
-  myagents task update-status <taskId> done --message "bundle size dropped 40%"
+                                        # (task.md is canonical; retained
+                                        #  legacy docs are listed if present)
+  myagents task comments <taskId> --limit 50
+  myagents task comment <taskId> --body-file result.md
   myagents task append-session <taskId> <sessionId>
   myagents task run <taskId>
   myagents task start <taskId>          # resume a stopped schedule
@@ -416,17 +415,11 @@ Examples:
   myagents task check-now <taskId>
   myagents task reset-checkpoint <taskId>
   myagents task create-direct --name "review PR" \\
-      --taskMdContent "Review this PR and file findings in progress.md" \\
+      --taskMdContent "Review this PR and verify the acceptance criteria" \\
       --runtime codex --model gpt-5.2 --permissionMode full-auto
     # Per-task runtime/model/permissionMode overrides — consult
     #   myagents runtime list  +  myagents runtime describe <runtime>
     # before choosing values. Omit any flag to inherit the agent workspace default.
-  myagents task create-from-alignment <alignmentSessionId> --name "新任务"
-    # Backend auto-inherits workspaceId / workspacePath / sourceThoughtId
-    # from the alignment session's metadata (set when 「AI 讨论」 launched).
-    # Pass --run to dispatch immediately in the same call.
-    # Pass --json for machine-readable output (task_id + docs_path).
-    # Same per-task override flags as create-direct apply here.
   myagents task create-attached --name "Space Issue #123" \\
       --workspaceId proj --workspacePath /path/to/proj \\
       --taskMdContent-file task.md --source space-issue --sourceIssueId iss_123
@@ -553,7 +546,8 @@ export function printResult(
     if (group === 'task' && (action === 'run' || action === 'rerun') && result.data) {
       const data = { ...(result.data as Record<string, unknown>) };
       // attemptOrdinal is an internal accepted-mutation receipt consumed by
-      // analytics. Keep the established CLI JSON response shape unchanged.
+      // analytics. The public AI contract is data.receipt; keep that semantic
+      // projection while hiding this implementation-only counter.
       delete data.attemptOrdinal;
       output = { ...result, data };
     }
@@ -947,7 +941,7 @@ export function printResult(
   // `ls -lt ~/.myagents/tasks/`. JSON mode above returns the full payload.
   // All create-* forms go through the same enriched server-side response.
   // `enrichTaskCreateResponse` server-side, so one printer covers both.
-  if (group === 'task' && (action === 'create-direct' || action === 'create-from-alignment' || action === 'create-attached')) {
+  if (group === 'task' && (action === 'create-direct' || action === 'create-attached')) {
     printTaskCreateResult(result.data as Record<string, unknown>);
     return;
   }
@@ -1035,8 +1029,8 @@ function formatDetectorOccurredAt(value: unknown): string {
  * Format output for task create-* commands.
  *
  * AI scripts need at minimum the `task_id` of the newly minted task so they
- * can either dispatch it (`create-direct` / `create-from-alignment`) or keep
- * working in the current session (`create-attached`). Also surfaces
+ * can either dispatch it (`create-direct`) or keep working in the current
+ * session (`create-attached`). Also surfaces
  * `docs_path` because the AI often wants to tell the human "I wrote the task
  * docs to X" and having that string in the CLI output saves a re-lookup.
  *
@@ -2210,17 +2204,22 @@ function printTaskDetail(task: Record<string, unknown>): void {
     console.log(`  Tags:           ${(task.tags as string[]).join(', ')}`);
   }
 
-  // Docs paths — the highlight of `task get`. AI consumers read these
-  // files with standard Read/Edit/Write tools; there are no separate
-  // `show-doc` / `write-doc` CLIs (removed v0.1.69+).
+  // task.md is the only editable Task contract. Older companion files remain
+  // visible as read-only migration evidence, never as parallel instructions.
   const docs = task.docs as Record<string, string | undefined> | undefined;
   if (docs) {
-    console.log('\nDocs (read/edit/write these directly — they are YOUR workspace):');
+    console.log('\nTask document (read/edit/write this file):');
     if (docs.dir) console.log(`  Dir:            ${docs.dir}`);
     if (docs.taskMd) console.log(`  task.md:        ${docs.taskMd}`);
-    if (docs.verifyMd) console.log(`  verify.md:      ${docs.verifyMd}`);
-    if (docs.progressMd) console.log(`  progress.md:    ${docs.progressMd}`);
-    if (docs.alignmentMd) console.log(`  alignment.md:   ${docs.alignmentMd}`);
+    const legacyDocs = [
+      ['verify.md', docs.verifyMd],
+      ['progress.md', docs.progressMd],
+      ['alignment.md', docs.alignmentMd],
+    ].filter((entry): entry is [string, string] => Boolean(entry[1]));
+    if (legacyDocs.length > 0) {
+      console.log('  Legacy read-only files (not execution inputs):');
+      for (const [name, path] of legacyDocs) console.log(`    ${name}: ${path}`);
+    }
   }
 
   // Schedule — only for scheduled / recurring / loop tasks
@@ -2651,39 +2650,6 @@ async function main(): Promise<void> {
       }
     }
 
-    // --run bundled with `task create-from-alignment`: chain immediately
-    // into /task/run using the fresh task_id. Saves the caller one round
-    // trip and removes the "which id did I just get?" parsing step.
-    // Only fires on success and only when the response actually carries
-    // a task.id (older backends without the enriched payload fall
-    // through without the run — graceful degradation).
-    if (
-      group === 'task' &&
-      action === 'create-from-alignment' &&
-      flags.run &&
-      result.success &&
-      result.data
-    ) {
-      const data = result.data as Record<string, unknown>;
-      const task = (data.task as Record<string, unknown>) ?? data;
-      const newTaskId = task?.id as string | undefined;
-      if (newTaskId) {
-        const runResult = await callApi('task/run', { id: newTaskId, ...taskCliCaller() });
-        if (!runResult.success) {
-          // Flag the failure in the top-level result so exit code reflects
-          // it, but keep the successful create payload visible so the user
-          // can manually `task run <id>` next. Stick the run error in a
-          // distinct field to avoid clobbering the create data.
-          result.success = false;
-          result.error = `created ${newTaskId} but run failed: ${String(runResult.error ?? 'unknown error')}`;
-        } else {
-          // Bundle the run result alongside create so printTaskCreateResult
-          // can show both sections (task_id + docs_path + runtime/model).
-          (result.data as Record<string, unknown>).runResult = runResult.data;
-        }
-      }
-    }
-
     printResult(group, action, result, jsonMode, flags, restArgs);
   }
 
@@ -2873,7 +2839,7 @@ const PUBLISHED_ADMIN_ROUTES = new Set([
   'cc-plugin/list', 'cc-plugin/show', 'cc-plugin/install', 'cc-plugin/uninstall', 'cc-plugin/enable', 'cc-plugin/disable',
   'skill/list', 'skill/info', 'skill/add', 'skill/remove', 'skill/enable', 'skill/disable', 'skill/sync',
   'config/get', 'config/set',
-  'task/list', 'task/get', 'task/create-direct', 'task/create-from-alignment', 'task/create-attached', 'task/run',
+  'task/list', 'task/get', 'task/comments', 'task/comment', 'task/create-direct', 'task/create-attached', 'task/run',
   'task/run-now', 'task/rerun', 'task/trigger/validate', 'task/trigger/test', 'task/check-now',
   'task/reset-checkpoint', 'task/update', 'task/update-status', 'task/append-session', 'task/archive', 'task/delete',
   'thought/list', 'thought/create',
@@ -3204,6 +3170,28 @@ function readTextFileFlag(path: string, flagName: string, exitCode = 1): string 
     console.error(`Error: failed to read --${flagName} "${path}": ${err instanceof Error ? err.message : String(err)}`);
     process.exit(exitCode);
   }
+}
+
+function resolveTaskCommentBody(flags: Record<string, unknown>): string {
+  if (flags.body !== undefined && flags.bodyFile !== undefined) {
+    console.error('Error: task comment accepts only one of --body or --body-file.');
+    process.exit(2);
+  }
+  const body = typeof flags.bodyFile === 'string'
+    ? readTextFileFlag(flags.bodyFile, 'body-file')
+    : typeof flags.body === 'string'
+      ? flags.body
+      : '';
+  if (!body.trim()) {
+    console.error('Error: task comment requires non-empty --body-file or --body.');
+    process.exit(2);
+  }
+  const bytes = Buffer.byteLength(body, 'utf8');
+  if (bytes > 64 * 1024) {
+    console.error('Error: task comment body exceeds the 65536 byte limit.');
+    process.exit(2);
+  }
+  return body;
 }
 
 function resolveCronPromptText(flags: Record<string, unknown>): string | undefined {
@@ -3986,6 +3974,40 @@ function buildAnydocRequestBody(
   return { jobId: rest[0].trim() };
 }
 
+function assertSupportedCronFlags(
+  action: 'add' | 'update',
+  flags: Record<string, unknown>,
+): void {
+  const shared = [
+    'name',
+    'prompt',
+    'message',
+    'promptFile',
+    'schedule',
+    'every',
+    'runtime',
+    'runtimeConfig',
+    'providerId',
+    'model',
+    'permissionMode',
+    'json',
+    'help',
+    'port',
+  ];
+  const allowed = new Set(action === 'add'
+    ? [...shared, 'workspace', 'dryRun']
+    : [...shared, 'id']);
+  const unsupported = Object.keys(flags).find(key => !allowed.has(key));
+  if (!unsupported) return;
+  const displayFlag = unsupported.replace(/[A-Z]/g, value => `-${value.toLowerCase()}`);
+  exitAgentCliError(flags, {
+    code: 'FLAG_UNSUPPORTED',
+    error: `myagents cron ${action} does not support --${displayFlag}.`,
+    suggestion: 'Retry with only the documented Cron fields; unsupported flags are never ignored.',
+    suggestedCommand: 'myagents cron readme',
+  });
+}
+
 export function buildRequestBody(
   group: string,
   action: string,
@@ -4703,12 +4725,18 @@ export function buildRequestBody(
   // Cron commands
   if (group === 'cron') {
     if (action === 'add') {
+      assertSupportedCronFlags(action, flags);
       return {
         name: flags.name,
         message: resolveCronPromptText(flags),
         workspacePath: flags.workspace,
         schedule: normalizeScheduleFlag(flags.schedule, { fillMissingCronTimezone: true }),
         intervalMinutes: flags.every ? Number(flags.every) : undefined,
+        runtime: flags.runtime,
+        runtimeConfig: parseRuntimeConfigFlag(flags.runtimeConfig),
+        providerId: flags.providerId,
+        model: flags.model,
+        permissionMode: flags.permissionMode,
         // Forward --dry-run so the admin handler can return a preview
         // instead of writing to the cron store. Issue #149.
         dryRun: flags.dryRun,
@@ -4724,6 +4752,7 @@ export function buildRequestBody(
       return { taskId: rest[0] || flags.id };
     }
     if (action === 'update') {
+      assertSupportedCronFlags(action, flags);
       // Map CLI flags to Rust field names expected by update_task_fields
       const patch: Record<string, unknown> = {};
       if (flags.name !== undefined) patch.name = flags.name;
@@ -4731,6 +4760,9 @@ export function buildRequestBody(
       if (updatePrompt !== undefined) patch.prompt = updatePrompt;
       if (flags.schedule !== undefined) patch.schedule = normalizeScheduleFlag(flags.schedule);
       if (flags.every !== undefined) patch.intervalMinutes = Number(flags.every);
+      if (flags.runtime !== undefined) patch.runtime = flags.runtime;
+      if (flags.runtimeConfig !== undefined) patch.runtimeConfig = parseRuntimeConfigFlag(flags.runtimeConfig);
+      if (flags.providerId !== undefined) patch.providerId = flags.providerId;
       if (flags.model !== undefined) patch.model = flags.model;
       if (flags.permissionMode !== undefined) patch.permissionMode = flags.permissionMode;
       if (Object.keys(patch).length === 0) {
@@ -4822,8 +4854,9 @@ export function buildRequestBody(
   // Skill commands
   if (group === 'skill') {
     if (action === 'add') {
+      const source = rest[0] || flags.url;
       return {
-        url: rest[0] || flags.url,
+        url: typeof source === 'string' ? normalizeSkillSourceForRequest(source) : source,
         scope: (flags.scope as string) || 'user',
         plugin: flags.plugin,
         skill: flags.skill,
@@ -4874,6 +4907,38 @@ export function buildRequestBody(
       };
     }
     if (action === 'get') return { id: requirePositional(rest[0] ?? (flags.id as string | undefined), 'task-id', 'task get', 'id') };
+    if (action === 'comments') {
+      const limit = flags.limit === undefined ? undefined : Number(flags.limit);
+      if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)) {
+        console.error('Error: task comments --limit must be an integer from 1 to 100.');
+        process.exit(2);
+      }
+      return {
+        id: requirePositional(
+          rest[0] ?? (flags.id as string | undefined),
+          'task-id',
+          'task comments',
+          'id',
+        ),
+        before: flags.before,
+        limit,
+      };
+    }
+    if (action === 'comment') {
+      const id = rest[0] ?? (flags.id as string | undefined) ?? process.env.MYAGENTS_TASK_ID;
+      if (!process.env.MYAGENTS_SESSION_ID?.trim()) {
+        console.error('Error: task comment requires MYAGENTS_SESSION_ID and must run inside an associated Task Session.');
+        process.exit(2);
+      }
+      return {
+        // The Sidecar resolves an omitted ID from the exact active Task-turn
+        // context. Outside that turn (for example, a later user-comment
+        // injection) the hidden reminder supplies the explicit Task ID.
+        id: id?.trim() || undefined,
+        body: resolveTaskCommentBody(flags),
+        replyToCommentId: flags.replyTo,
+      };
+    }
     if (action === 'update-status') {
       return {
         id: rest[0],
@@ -4985,6 +5050,7 @@ export function buildRequestBody(
       // markdown) takes precedence over `--taskMdContent` when both are
       // set. Mirrors the `cron add --prompt-file` pattern above.
       const taskMdContent = resolveTaskMdContent(flags);
+      const taskMdFile = flags.taskMdFile ?? flags.taskMdContentFile;
       const executionMode = (flags.executionMode as string | undefined) ?? 'once';
       const preselectedSessionId = resolvePreselectedSessionId(flags.preselectedSessionId, flags);
       validateTaskSessionBinding(flags.runMode, preselectedSessionId, flags);
@@ -5001,6 +5067,7 @@ export function buildRequestBody(
         workspaceId: flags.workspaceId,
         workspacePath: flags.workspacePath,
         taskMdContent,
+        taskMdFile: typeof taskMdFile === 'string' ? taskMdFile : undefined,
         executionMode,
         runMode: flags.runMode,
         ...(endConditions !== undefined ? { endConditions } : {}),
@@ -5013,9 +5080,8 @@ export function buildRequestBody(
           ? (flags.tags as string).split(',').map(s => s.trim()).filter(Boolean)
           : undefined,
         // Scheduling-detail fields the Rust TaskCreateDirectInput already
-        // accepts. Before issue #205 only the create-from-alignment path
-        // (which inherits them from the alignment session) could populate
-        // these; the CLI parser dropped them on create-direct, forcing every
+        // accepts. Before issue #205 the CLI parser dropped them on
+        // create-direct, forcing every
         // recurring task to default to 60 min and every cron / dispatchAt
         // schedule to be set via GUI afterward.
         intervalMinutes: parseIntervalMinutesFlag(flags.intervalMinutes),
@@ -5145,44 +5211,6 @@ export function buildRequestBody(
       if (notification !== undefined) body.notificationPatch = notification;
       if (promptFromTaskMd !== undefined) body.prompt = promptFromTaskMd;
       return body;
-    }
-    if (action === 'create-from-alignment') {
-      // First positional MUST be the alignmentSessionId. Use --name for the
-      // task title (to avoid ambiguity when the user writes a task name that
-      // happens to parse as a sessionId). An empty alignmentSessionId will be
-      // rejected by the Rust layer's `validate_safe_id`.
-      assertStringFlag(flags.name, 'name');
-      const preselectedSessionId = resolvePreselectedSessionId(flags.preselectedSessionId, flags);
-      validateTaskSessionBinding(flags.runMode, preselectedSessionId, flags);
-      const endConditions = buildTaskEndConditions(flags);
-      return {
-        name: flags.name,
-        executor: flags.executor ?? 'agent',
-        description: flags.description,
-        workspaceId: flags.workspaceId,
-        workspacePath: flags.workspacePath,
-        alignmentSessionId: flags.alignmentSessionId ?? rest[0],
-        executionMode: flags.executionMode ?? 'once',
-        runMode: flags.runMode,
-        ...(endConditions !== undefined ? { endConditions } : {}),
-        preselectedSessionId,
-        trigger: flags.triggerFile !== undefined
-          ? resolveTaskTriggerFile(flags.triggerFile)
-          : undefined,
-        sourceThoughtId: flags.sourceThoughtId,
-        tags: typeof flags.tags === 'string'
-          ? (flags.tags as string).split(',').map(s => s.trim()).filter(Boolean)
-          : undefined,
-        // Identical override contract to create-direct above — keep these two
-        // in lockstep.
-        runtime: flags.runtime,
-        providerId: flags.providerId,
-        model: flags.model,
-        permissionMode: flags.permissionMode,
-        runtimeConfig: parseRuntimeConfigFlag(flags.runtimeConfig),
-        mcpEnabledServers: parseMcpEnabledServersFlag(flags.mcpEnabledServers),
-        ...taskCliCaller(),
-      };
     }
     if (action === 'run' || action === 'run-now' || action === 'rerun') {
       return {
@@ -5339,6 +5367,28 @@ export function buildRequestBody(
   }
 
   return flags;
+}
+
+/**
+ * The Sidecar cannot observe the shell caller's cwd. Resolve only explicit
+ * relative path forms here; ambiguous `owner/repo` remains GitHub shorthand.
+ */
+export function normalizeSkillSourceForRequest(source: string, cwd = process.cwd()): string {
+  const trimmed = source.trim();
+  const pathMod = require('path') as typeof import('path');
+  if (/^\.\.?[\\/]/.test(trimmed)) {
+    return pathMod.resolve(cwd, trimmed);
+  }
+
+  // Preserve the established pasted-command surface while moving only its
+  // explicit local positional source across the CLI→Sidecar cwd boundary.
+  const wrapped = trimmed.match(
+    /^(npx(?:\s+-y)?\s+skills\s+(?:add|install)\s+)(\.\.?[\\/][^\s]+)([\s\S]*)$/i,
+  );
+  if (wrapped) {
+    return `${wrapped[1]}${pathMod.resolve(cwd, wrapped[2])}${wrapped[3]}`;
+  }
+  return source;
 }
 
 /** Parse KEY=VALUE pairs from --env flags */

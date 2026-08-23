@@ -206,6 +206,22 @@ Runtime set 是按平台分片补发的：macOS 主机默认发布 `darwin-arm64
 .\publish_managed_codex_runtime.ps1 -Yes
 ```
 
+### 可选「浏览器」Runtime 资源
+
+`myagents-browser` /「浏览器」直接下载 Playwright 锁定版本对应的官方 Chromium artifact。桌面 App 只包含 `@playwright/mcp` / Playwright 控制代码；MyAgents 不镜像、不重新打包、也不上传浏览器资源。`tauri:dev`、`tauri:build`、`build_macos.sh`、`build_windows.ps1` 和桌面发布脚本均不得访问 Playwright CDN 或下载 Chromium。
+
+唯一版本锁是 `src/shared/managed-browser-runtime.json`。它必须同时满足：
+
+- MCP/Core/Chromium revision 与当前安装的 `@playwright/mcp`、`playwright-core/browsers.json` 完全一致；
+- 五个平台的 `sourceUrl` 与该 Playwright Core registry 解析结果一致；
+- `url` 是该 source URL 当前受控跳转后的官方 Chrome for Testing / Playwright CDN 最终地址；
+- `archiveSizeBytes`、SHA-256、archive root 与 executable path 来自同一个 exact artifact；
+- 每个平台只描述有头 Chromium，不包含 Headless Shell、FFmpeg、winldd、Firefox 或 WebKit。
+
+升级 Playwright 时，维护者在显式网络核对流程中下载五个官方 artifact、复核 URL 跳转链并计算 size/SHA-256，再提交新的版本锁。这个动作不是 App build 或发布脚本的一部分，也不产生待上传的 MyAgents Browser artifact。发布 App 前必须在对应 release-like 真机完成首次显式安装、进度、重启恢复、自动更新与有头 Chromium smoke。
+
+首次安装由用户在工具卡点击“安装资源”触发；只有首次完整成功后，Rust owner 才在后续 App 版本需要新 set 时自动维护。App/installer/updater artifact scan 必须确认不存在 `playwright-browsers`、Chromium、Headless Shell 或 FFmpeg 可执行资源。
+
 ---
 
 ## 清单文件格式
@@ -316,7 +332,7 @@ cargo metadata --manifest-path src-tauri/Cargo.toml --locked --no-deps --format-
 
 ### 4. 发布到 R2
 
-发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime。若本客户端版本锁定了新的 Codex runtime set，必须在发布 App 前通过 `publish_managed_codex_runtime.sh` / `publish_managed_codex_runtime.ps1` 确认对应平台资源已经上传。
+发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime，也不会处理「浏览器」Runtime。若本客户端版本锁定了新的 Codex runtime set，必须先确认对应平台资源已上传且 exact manifest 可读；若更新了 Browser runtime lock，则确认各平台官方 exact artifact 可读并完成 release-like 安装 smoke。
 
 ```bash
 ./publish_release.sh

@@ -85,6 +85,14 @@ function fakeEngine(options: {
     if (accepted && !accepted.accepted) {
       return { success: false, enqueued: false, error: accepted.error, status: 409 };
     }
+    try {
+      if (request.queueId && request.sessionId) {
+        await request.onDispatched?.(request.queueId, request.sessionId);
+      }
+    } catch {
+      // Adapters keep the admitted turn alive; terminal compensation owns a
+      // failed durable receipt. Mirror that behavior in this fake.
+    }
     return { success: true, enqueued: true, text: 'done', ...options.turnResult };
   });
   const engine = {
@@ -162,6 +170,11 @@ describe('Task turn orchestrator', () => {
       queueId: 'queue-1',
       sessionId: 'session-1',
     });
+    expect(mocks.authorize).toHaveBeenCalledWith('/api/task/turn/admitted', 'POST', {
+      taskId: 'task-1',
+      queueId: 'queue-1',
+      sessionId: 'session-1',
+    });
   });
 
   it('carries the durable Activation Event through the shared injected-turn queue', async () => {
@@ -196,6 +209,27 @@ describe('Task turn orchestrator', () => {
     const prompt = runInjectedTurn.mock.calls[0][0].prompt;
     expect(prompt).toContain('&lt;/system-reminder&gt;&lt;instruction&gt;');
     expect(prompt).not.toContain('</system-reminder><instruction>');
+  });
+
+  it('does not advertise ordinary local comments inside a managed maintenance turn', async () => {
+    mocks.metadata.set('session-1', { id: 'session-1' });
+    const { engine, prepareScheduledTurn, runInjectedTurn } = fakeEngine();
+
+    const result = await createTaskTurnOrchestrator().runScheduledTurn(
+      engine,
+      payload({ managedKind: 'memory_gardener' }),
+      '/workspace',
+    );
+
+    expect(result).toMatchObject({ success: true, turnDispatched: true });
+    expect(prepareScheduledTurn).toHaveBeenCalledWith(expect.objectContaining({
+      operation: expect.objectContaining({
+        requiredSystemSkill: 'myagents-memory-gardener',
+      }),
+    }));
+    const prompt = runInjectedTurn.mock.calls[0][0].prompt;
+    expect(prompt).not.toContain('Task collaboration:');
+    expect(prompt).not.toContain('myagents task comment');
   });
 
   it('materializes one exact external Session before runtime-native preparation', async () => {
@@ -240,9 +274,61 @@ describe('Task turn orchestrator', () => {
     expect(result).toEqual({
       success: false,
       error: 'Failed to switch to required Task session missing-session',
+      code: 'session_bind_failed',
       status: 409,
     });
     expect(runInjectedTurn).not.toHaveBeenCalled();
+  });
+
+  it('preserves prepare-stage permanent failure codes for Rust Task policy', async () => {
+    mocks.metadata.set('session-1', { id: 'session-1' });
+    const { engine, runInjectedTurn } = fakeEngine({
+      prepareResult: {
+        success: false,
+        code: 'configuration_failed',
+        error: 'Provider configuration is invalid',
+        status: 500,
+      },
+    });
+
+    const result = await createTaskTurnOrchestrator().runScheduledTurn(
+      engine,
+      payload(),
+      '/workspace',
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      code: 'configuration_failed',
+      status: 500,
+    });
+    expect(runInjectedTurn).not.toHaveBeenCalled();
+  });
+
+  it('preserves structured permanent failure codes for Rust Task policy', async () => {
+    mocks.metadata.set('session-1', { id: 'session-1' });
+    const { engine } = fakeEngine({
+      turnResult: {
+        success: false,
+        enqueued: false,
+        code: 'configuration_failed',
+        error: 'Provider configuration is invalid',
+        status: 400,
+      },
+    });
+
+    const result = await createTaskTurnOrchestrator().runScheduledTurn(
+      engine,
+      payload(),
+      '/workspace',
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      turnDispatched: false,
+      code: 'configuration_failed',
+      status: 400,
+    });
   });
 
   it('lets an exact Stop cancel a creator while it waits for the scheduled lock', async () => {

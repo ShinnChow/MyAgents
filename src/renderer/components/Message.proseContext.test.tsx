@@ -41,6 +41,7 @@ import { renderWithTheme } from '@/test/renderWithTheme';
 import type { Message as MessageType } from '@/types/chat';
 import {
     SPACE_ISSUE_CONTEXT_TAG,
+    TASK_COMMENT_TAG,
     buildGoalContextReminder,
     buildGoalContinuationReminder,
 } from '../../shared/systemReminder';
@@ -84,6 +85,27 @@ describe('assistant 正文 prose 上下文接线（ai-message-content）', () =>
         const prose = container.querySelector('.ai-message-content');
         expect(prose).not.toBeNull();
         expect(prose!.textContent).toContain('块模式下的 AI 回复文本');
+    });
+});
+
+describe('Task comment system-reminder user bubble', () => {
+    it('shows only the visible human comment with the Task comment badge', () => {
+        const content = [
+            '<system-reminder>',
+            `<${TASK_COMMENT_TAG}>`,
+            '<instruction>hidden local Task reply protocol</instruction>',
+            '<task>hidden task path and identifiers</task>',
+            `</${TASK_COMMENT_TAG}>`,
+            '</system-reminder>',
+            '先不要升级数据库驱动，只修另外一个。',
+        ].join('\n');
+
+        const { container } = render(<Message message={userMessage(content)} />);
+
+        expect(container).toHaveTextContent(/Task 评论|Task comment/);
+        expect(container).toHaveTextContent('先不要升级数据库驱动，只修另外一个。');
+        expect(container).not.toHaveTextContent('hidden local Task reply protocol');
+        expect(container).not.toHaveTextContent('hidden task path and identifiers');
     });
 });
 

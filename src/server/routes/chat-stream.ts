@@ -47,6 +47,10 @@ export async function handleChatStreamRoute(
     client.send('chat:system-init', snapshot.systemInitPayload);
   }
 
+  if (snapshot.mcpEffectiveSnapshot) {
+    client.send('chat:mcp-effective-snapshot', snapshot.mcpEffectiveSnapshot);
+  }
+
   for (const pending of snapshot.pendingInteractiveRequests) {
     client.send(pending.type, pending.data);
   }

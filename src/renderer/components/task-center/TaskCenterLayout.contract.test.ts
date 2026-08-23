@@ -8,7 +8,7 @@ function source(relativePath: string): string {
   return readFileSync(resolve(root, relativePath), 'utf8');
 }
 
-describe('Task Center responsive layout contract', () => {
+describe('Task Center layout contract', () => {
   it('keeps the thought panel fixed while allowing the task panel to shrink', () => {
     const taskCenter = source('src/renderer/pages/TaskCenter.tsx');
 
@@ -47,6 +47,30 @@ describe('Task Center responsive layout contract', () => {
 
     expect(panel).toContain(
       'grid grid-cols-1 gap-3 @[560px]:grid-cols-2 @[900px]:grid-cols-3',
+    );
+  });
+
+  it('keeps Task Center thought prose compact without shrinking the Launcher composer', () => {
+    const input = source('src/renderer/components/task-center/ThoughtInput.tsx');
+    const card = source('src/renderer/components/task-center/ThoughtCard.tsx');
+    const compactVariant = input.slice(
+      input.indexOf('compact: {'),
+      input.indexOf('launcher: {'),
+    );
+    const launcherVariant = input.slice(input.indexOf('launcher: {'));
+
+    expect(compactVariant).toContain('pxPerLine: 23');
+    expect(compactVariant).toContain("textareaClass: 'text-sm leading-relaxed'");
+    expect(launcherVariant).toContain('pxPerLine: 26');
+    expect(launcherVariant).toContain("textareaClass: 'text-base leading-relaxed'");
+    expect(card).toContain(
+      'bg-transparent text-sm leading-relaxed text-[var(--ink)]',
+    );
+    expect(card).toContain(
+      'break-words text-sm leading-relaxed text-[var(--ink-secondary)]',
+    );
+    expect(card).toContain(
+      'bg-[var(--accent-warm-subtle)] px-1 text-xs text-[var(--accent-warm)]',
     );
   });
 });

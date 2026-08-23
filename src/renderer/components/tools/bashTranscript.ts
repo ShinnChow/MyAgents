@@ -31,6 +31,7 @@ export interface BashTranscriptStream {
 
 export interface BashTranscriptModel {
   shell?: string;
+  commandLanguage?: 'bash' | 'powershell';
   command: BashTranscriptCommand | null;
   /** Command content exists beyond the bounded commandActions projection. */
   hasHiddenCommandContent: boolean;
@@ -148,6 +149,7 @@ export function resolveBashTranscriptModel(tool: ToolUseSimple): BashTranscriptM
 
   return {
     shell: detectShellWrapper(rawCommand),
+    commandLanguage: tool.name === 'PowerShell' ? 'powershell' : 'bash',
     command: commandText
       ? {
           raw: commandText,

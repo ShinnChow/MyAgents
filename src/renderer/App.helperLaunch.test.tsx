@@ -7,9 +7,13 @@ import { CUSTOM_EVENTS } from '../shared/constants';
 import { SessionDeletionContext } from '@/context/SessionDeletionContext';
 import { useTabStateOptional } from '@/context/TabContext';
 
-vi.mock('@tauri-apps/api/core', () => ({
-  invoke: vi.fn(async () => undefined),
+const tauriCoreMocks = vi.hoisted(() => ({
+  invoke: vi.fn<(command: string, args?: Record<string, unknown>) => Promise<unknown>>(
+    async () => undefined,
+  ),
 }));
+
+vi.mock('@tauri-apps/api/core', () => tauriCoreMocks);
 
 const mocks = vi.hoisted(() => {
   const project = {
@@ -100,6 +104,13 @@ const mocks = vi.hoisted(() => {
     sidebarProps: [] as Array<Record<string, unknown>>,
     tabbarProps: [] as Array<Record<string, unknown>>,
     settingsProps: [] as Array<Record<string, unknown>>,
+    toast: {
+      error: vi.fn(),
+      success: vi.fn(),
+      warning: vi.fn(),
+      info: vi.fn(),
+    },
+    selfAwarenessProject: project as typeof project | null,
   };
 });
 
@@ -303,12 +314,7 @@ vi.mock('@/pages/TaskCenter', () => ({
 }));
 
 vi.mock('@/components/Toast', () => ({
-  useToast: () => ({
-    error: vi.fn(),
-    success: vi.fn(),
-    warning: vi.fn(),
-    info: vi.fn(),
-  }),
+  useToast: () => mocks.toast,
 }));
 
 vi.mock('@/hooks/useUpdater', () => ({
@@ -433,7 +439,7 @@ vi.mock('@/utils/tauriListen', () => ({
 }));
 
 vi.mock('@/config/configService', () => ({
-  ensureSelfAwarenessWorkspace: vi.fn(async () => mocks.project),
+  ensureSelfAwarenessWorkspace: vi.fn(async () => mocks.selfAwarenessProject),
   resolveBuiltinSelection: mocks.resolveBuiltinSelection,
   pairBuiltinSelection: vi.fn((_provider, model) => ({ providerId: mocks.provider.id, model })),
   isProviderAvailable: vi.fn(() => true),
@@ -457,6 +463,7 @@ describe('App helper launch', () => {
     mocks.sidebarProps.length = 0;
     mocks.tabbarProps.length = 0;
     mocks.settingsProps.length = 0;
+    mocks.selfAwarenessProject = mocks.project;
     mocks.deleteTargetSessionId = null;
     mocks.deleteResults.length = 0;
     mocks.durableTabs = null;
@@ -464,6 +471,7 @@ describe('App helper launch', () => {
     mocks.useRealTabProvider = false;
     mocks.tauriEnvironment = false;
     mocks.listeners.clear();
+    tauriCoreMocks.invoke.mockImplementation(async () => undefined);
     mocks.sessionSidecarFetch.mockReset();
     mocks.agent.runtime = 'builtin';
     mocks.agent.providerId = undefined;
@@ -508,7 +516,32 @@ describe('App helper launch', () => {
         initialMessage?: unknown,
         analyticsContext?: unknown,
         sessionBirthHint?: unknown,
-      ) => void;
+      ) => Promise<boolean>;
+    };
+  }
+
+  function latestChatProps() {
+    const props = mocks.chatProps.at(-1);
+    if (!props) throw new Error('Chat props were not captured');
+    return props as {
+      onLaunchRuntimeBackedProviderSession: (
+        project: typeof mocks.project,
+        sessionBirthHint: {
+          providerExecutionIdentity: {
+            kind: 'runtime-backed-provider';
+            providerId: string;
+            runtime: 'codex';
+            runtimeSource: 'managed-provider';
+            model: string;
+          };
+          permissionMode?: string;
+          reasoningEffort?: string;
+          mcpEnabledServers?: string[];
+          enabledPluginIds?: string[];
+          origin?: { kind: 'desktop'; surface: 'session_fork' };
+        },
+        title: string,
+      ) => Promise<string | null>;
     };
   }
 
@@ -731,6 +764,84 @@ describe('App helper launch', () => {
         }),
       );
     });
+  });
+
+  it('opens a provider-switched Managed Codex session through the prepared App launch path', async () => {
+    const providerExecutionIdentity = {
+      kind: 'runtime-backed-provider' as const,
+      providerId: CODEX_SUBSCRIPTION_PROVIDER_ID,
+      runtime: 'codex' as const,
+      runtimeSource: 'managed-provider' as const,
+      model: 'gpt-5.5',
+    };
+
+    render(<App />);
+    await act(async () => {
+      await latestLauncherProps().onLaunchProject(mocks.project);
+    });
+    await waitFor(() => expect(mocks.chatProps.length).toBeGreaterThan(0));
+    const sourceTab = latestTabbarProps().tabs.find(
+      (tab) => tab.id === latestTabbarProps().activeTabId,
+    );
+    expect(sourceTab?.view).toBe('chat');
+
+    mocks.createSession.mockClear();
+    mocks.ensureSessionSidecar.mockClear();
+    mocks.reconcileSessionTabActivation.mockClear();
+
+    let openedSessionId: string | null = null;
+    await act(async () => {
+      openedSessionId = await latestChatProps().onLaunchRuntimeBackedProviderSession(
+        mocks.project,
+        {
+          providerExecutionIdentity,
+          permissionMode: 'fullAgency',
+          reasoningEffort: 'xhigh',
+          mcpEnabledServers: ['filesystem'],
+          enabledPluginIds: ['plugin-a'],
+          origin: { kind: 'desktop', surface: 'session_fork' },
+        },
+        'Codex Subscription 会话',
+      );
+    });
+
+    expect(openedSessionId).toBe('prepared-managed-session');
+    expect(mocks.createSession).toHaveBeenCalledWith(
+      mocks.project.path,
+      'codex',
+      expect.objectContaining({
+        runtimeSource: 'managed-provider',
+        providerExecutionIdentity,
+        providerId: CODEX_SUBSCRIPTION_PROVIDER_ID,
+        model: 'gpt-5.5',
+        permissionMode: 'no-restrictions',
+        reasoningEffort: 'xhigh',
+        mcpEnabledServers: ['filesystem'],
+        enabledPluginIds: ['plugin-a'],
+        origin: { kind: 'desktop', surface: 'session_fork' },
+        prepareForFirstUserMessage: true,
+        materializationSourceSessionId: expect.stringMatching(/^pending-/),
+      }),
+    );
+    const active = latestTabbarProps().tabs.find(
+      (tab) => tab.id === latestTabbarProps().activeTabId,
+    );
+    expect(latestTabbarProps().tabs).toHaveLength(2);
+    expect(active?.id).not.toBe(sourceTab?.id);
+    expect(active?.sessionId).toBe('prepared-managed-session');
+    expect(active?.view).toBe('chat');
+    expect(active?.title).toBe('Codex Subscription 会话');
+    expect(mocks.ensureSessionSidecar).toHaveBeenCalledWith(
+      'prepared-managed-session',
+      mocks.project.path,
+      'tab',
+      active?.id,
+    );
+    expect(mocks.reconcileSessionTabActivation).toHaveBeenCalledWith(
+      'prepared-managed-session',
+      active?.id,
+    );
+    expect(latestTabbarProps().tabs.find((tab) => tab.id === sourceTab?.id)).toEqual(sourceTab);
   });
 
   it('opens a sidebar Session from a no-workspace functional Tab and reconciles the exact same Tab owner on reopen', async () => {
@@ -1780,6 +1891,47 @@ describe('App helper launch', () => {
     );
   });
 
+  it('starts Task discussion with the workspace external Runtime without requiring a builtin provider', async () => {
+    mocks.tauriEnvironment = true;
+    mocks.multiAgentRuntime = true;
+    mocks.agent.runtime = 'codex';
+    mocks.resolveBuiltinSelection.mockReturnValue(undefined);
+    tauriCoreMocks.invoke.mockImplementation(async (command) => {
+      if (command === 'cmd_task_prepare_discussion') {
+        return {
+          discussionId: 'discussion-external',
+          discussionDir: '/tmp/task-discussions/discussion-external',
+          candidatesDir: '/tmp/task-discussions/discussion-external/candidates',
+        };
+      }
+      return undefined;
+    });
+
+    render(<App />);
+    act(() => {
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
+        detail: {
+          content: '梳理并创建一个周期任务',
+          workspaceId: mocks.project.id,
+          tags: [],
+        },
+      }));
+    });
+
+    await waitFor(() => expect(mocks.ensureSessionSidecar).toHaveBeenCalled());
+    expect(mocks.resolveBuiltinSelection).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.ensureSessionSidecar).toHaveBeenCalledWith(
+      expect.stringMatching(/^pending-tab-/),
+      mocks.project.path,
+      'tab',
+      expect.stringMatching(/^tab-/),
+    );
+    expect(mocks.toast.error).not.toHaveBeenCalledWith(
+      expect.stringContaining('provider'),
+    );
+  });
+
   it('commits the helper tab before launching so the active tab is renderable', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
@@ -1815,6 +1967,140 @@ describe('App helper launch', () => {
       }));
     } finally {
       logSpy.mockRestore();
+    }
+  });
+
+  it('launches Space Tool installation without the support prompt wrapper', async () => {
+    const prompt = [
+      '## 工具安装请求',
+      '',
+      '**工具**：FFmpeg',
+      '',
+      '```',
+      'brew install ffmpeg',
+      '```',
+    ].join('\n');
+    render(<App />);
+
+    await act(async () => {
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+        detail: {
+          scenario: 'space_tool_install',
+          description: prompt,
+          images: [],
+        },
+      }));
+    });
+
+    await waitFor(() => expect(mocks.ensureSessionSidecar).toHaveBeenCalled());
+    const helperChat = [...mocks.chatProps].reverse().find((props) =>
+      Boolean(props.initialMessage),
+    ) as { initialMessage?: { text?: string } } | undefined;
+    expect(helperChat?.initialMessage?.text).toBe(prompt);
+    expect(helperChat?.initialMessage?.text).not.toContain('用户反馈');
+    await waitFor(() => {
+      expect(mocks.track).toHaveBeenCalledWith(
+        'space_tool_mutation',
+        expect.objectContaining({
+          space_surface: 'tools',
+          operation: 'helper_launch',
+          tool_kind: 'custom_install_prompt',
+          result: 'success',
+        }),
+      );
+    });
+    expect(latestTabbarProps().tabs).toContainEqual(
+      expect.objectContaining({ title: '安装工具' }),
+    );
+  });
+
+  it('reports Space Tool helper launch failure when the tab limit is reached', async () => {
+    render(<App />);
+    for (let index = 0; index < 30; index += 1) {
+      act(() => latestTabbarProps().onNewTab());
+    }
+    mocks.track.mockClear();
+    mocks.toast.error.mockClear();
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+        detail: {
+          scenario: 'space_tool_install',
+          description: 'Install safely',
+          images: [],
+        },
+      }));
+    });
+
+    await waitFor(() => expect(mocks.track).toHaveBeenCalledWith(
+      'space_tool_mutation',
+      expect.objectContaining({
+        operation: 'helper_launch',
+        result: 'failure',
+      }),
+    ));
+    expect(mocks.toast.error).toHaveBeenCalledWith(
+      '已达到最大标签页数量，请关闭其他标签页后重试',
+    );
+  });
+
+  it('reports Space Tool helper launch failure when its workspace is unavailable', async () => {
+    mocks.selfAwarenessProject = null;
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      render(<App />);
+      act(() => {
+        window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+          detail: {
+            scenario: 'space_tool_install',
+            description: 'Install safely',
+            images: [],
+          },
+        }));
+      });
+
+      await waitFor(() => expect(mocks.track).toHaveBeenCalledWith(
+        'space_tool_mutation',
+        expect.objectContaining({
+          operation: 'helper_launch',
+          result: 'failure',
+        }),
+      ));
+      expect(mocks.toast.error).toHaveBeenCalledWith(
+        '无法启动工具安装小助手，请重试。',
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('reports Space Tool helper launch failure when Session startup rejects', async () => {
+    mocks.ensureSessionSidecar.mockRejectedValueOnce(new Error('startup failed'));
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      render(<App />);
+      act(() => {
+        window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.LAUNCH_BUG_REPORT, {
+          detail: {
+            scenario: 'space_tool_install',
+            description: 'Install safely',
+            images: [],
+          },
+        }));
+      });
+
+      await waitFor(() => expect(mocks.track).toHaveBeenCalledWith(
+        'space_tool_mutation',
+        expect.objectContaining({
+          operation: 'helper_launch',
+          result: 'failure',
+        }),
+      ));
+      expect(mocks.toast.error).toHaveBeenCalledWith(
+        '无法启动工具安装小助手，请重试。',
+      );
+    } finally {
+      errorSpy.mockRestore();
     }
   });
 

@@ -1,6 +1,7 @@
 import type { Project } from "@/config/types";
 import { i18n } from "@/i18n";
 import { workspacePathsEqual } from "@/../shared/workspacePath";
+import type { PortableMcpManifestV1 } from "@/../shared/spaceToolManifest";
 
 export const DEFAULT_SPACE_ID = "official";
 
@@ -85,6 +86,7 @@ export interface SpacePlanLimits {
   joinedMembersMax: number | null;
   openIssuesMax: number | null;
   hostedSkillsMax: number | null;
+  hostedToolsMax: number | null;
   registeredAgentsMax: number | null;
   storageBytesMax: number | null;
 }
@@ -101,6 +103,7 @@ export interface SpaceUsage {
   memberSeats: number;
   openIssues: number;
   hostedSkills: number;
+  hostedTools: number;
   registeredAgents: number;
   storageBytes: number;
 }
@@ -233,6 +236,12 @@ export interface SpaceGoalSubscription {
   createdAt: string;
 }
 
+export interface SpaceRegisteredAgentSubscriptionReplacement {
+  expectedSubscriptionId: string | null;
+  goalId: string;
+  stateFilter: string[];
+}
+
 export interface SpaceIssue {
   id: string;
   number?: number | null;
@@ -264,7 +273,9 @@ export interface SpaceIssue {
 
 export interface SpaceIssueComment {
   id: string;
-  author: SpaceIdentitySummary & { type: "user" | "registered_agent" | "system" };
+  author: SpaceIdentitySummary & {
+    type: "user" | "registered_agent" | "system";
+  };
   body: string;
   attachments: SpaceAttachment[];
   createdAt: string;
@@ -333,7 +344,9 @@ export interface SpaceIssueDetail {
   claim?: SpaceIssueClaim | null;
 }
 
-function normalizeSpaceIssueComment(comment: SpaceIssueComment): SpaceIssueComment {
+function normalizeSpaceIssueComment(
+  comment: SpaceIssueComment,
+): SpaceIssueComment {
   return {
     ...comment,
     attachments: Array.isArray(comment.attachments) ? comment.attachments : [],
@@ -413,6 +426,63 @@ export interface SpaceSkillRevisionHistory {
     latestRevision: number;
   };
   items: SpaceSkillRevision[];
+}
+
+export type SpaceToolKind = "mcp" | "custom_install_prompt";
+
+export interface SpaceTool {
+  id: string;
+  kind: SpaceToolKind;
+  mcpServerId?: string | null;
+  name: string;
+  description: string;
+  iconUrl?: string | null;
+  latestRevision: number;
+  currentRevision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SpaceToolRevision {
+  id: string;
+  toolId: string;
+  revision: number;
+  name: string;
+  description: string;
+  portableMcpManifest?: PortableMcpManifestV1 | null;
+  customInstallInstruction?: string | null;
+  iconUrl?: string | null;
+  isCurrent?: boolean;
+  uploader?: SpaceUserSummary | null;
+  createdAt: string;
+}
+
+export interface SpaceToolDetail {
+  tool: SpaceTool;
+  revision: SpaceToolRevision;
+}
+
+export interface SpaceToolRevisionHistory {
+  tool: {
+    id: string;
+    latestRevision: number;
+    currentRevision: number;
+  };
+  items: SpaceToolRevision[];
+  hasMore: boolean;
+  nextCursor?: string | null;
+}
+
+export interface SpaceToolPage {
+  items: SpaceTool[];
+  hasMore: boolean;
+  nextCursor?: string | null;
+}
+
+export interface SpaceToolMutationResult extends SpaceToolDetail {
+  created?: boolean;
+  restored?: boolean;
+  noOp?: boolean;
 }
 
 export interface SpaceLocalSkill {
@@ -593,7 +663,10 @@ export interface SpaceDeliveryItem {
     registeredAgentId: string;
     subscriptionId: string | null;
     deliveryKind: "subscription" | "assignment" | "claim_followup";
-    deliveryReason: "issue_update" | "subscription_backfill" | "scope_reevaluation";
+    deliveryReason:
+      | "issue_update"
+      | "subscription_backfill"
+      | "scope_reevaluation";
     claimId: string | null;
     targetSessionId: string | null;
     sourceIssueUpdateId: string;
@@ -1026,6 +1099,10 @@ export function isSpaceErrorCode(error: unknown, code: string): boolean {
   return spaceErrorCode(error) === code;
 }
 
+export function isSpaceErrorRetryable(error: unknown): boolean {
+  return spaceErrorDetails(error).retryable === true;
+}
+
 async function spaceApi<T>(
   method: string,
   path: string,
@@ -1047,7 +1124,10 @@ async function spaceApi<T>(
       path,
       error: normalized.debugMessage,
     });
-    throw spaceUserFacingError(normalized.userMessage, spaceErrorDetails(error));
+    throw spaceUserFacingError(
+      normalized.userMessage,
+      spaceErrorDetails(error),
+    );
   }
   if (!result.success) {
     const normalized = normalizeSpaceError(
@@ -1081,7 +1161,10 @@ async function spaceMutationInvoke<T>(
       command,
       error: normalized.debugMessage,
     });
-    throw spaceUserFacingError(normalized.userMessage, spaceErrorDetails(error));
+    throw spaceUserFacingError(
+      normalized.userMessage,
+      spaceErrorDetails(error),
+    );
   }
 }
 
@@ -1363,7 +1446,10 @@ export function spaceCreateIssue(
   },
   spaceId = DEFAULT_SPACE_ID,
 ) {
-  return spaceMutationInvoke<{ issue: SpaceIssue; attachments?: SpaceAttachment[] }>(
+  return spaceMutationInvoke<{
+    issue: SpaceIssue;
+    attachments?: SpaceAttachment[];
+  }>(
     "cmd_space_create_issue_with_attachments",
     { ...input, spaceId, filePaths: input.filePaths ?? [] },
     { method: "POST", path: `/api/spaces/${spacePath(spaceId)}/issues` },
@@ -1419,7 +1505,11 @@ export async function spaceListIssueComments(
   };
 }
 
-export async function spaceCommentIssue(id: string, body: string, filePaths: string[] = []) {
+export async function spaceCommentIssue(
+  id: string,
+  body: string,
+  filePaths: string[] = [],
+) {
   const result = await spaceMutationInvoke<{ comment: SpaceIssueComment }>(
     "cmd_space_comment_issue_with_attachments",
     { issueId: id, body, filePaths },
@@ -1605,6 +1695,153 @@ export function spaceDeleteSkill(skillId: string) {
   );
 }
 
+export async function spaceListTools(
+  input: {
+    spaceId?: string;
+    cursor?: string | null;
+    limit?: number;
+  } = {},
+) {
+  const search = new URLSearchParams();
+  if (input.cursor) search.set("cursor", input.cursor);
+  if (input.limit) search.set("limit", String(input.limit));
+  const query = search.size ? `?${search.toString()}` : "";
+  try {
+    return await spaceApi<SpaceToolPage>(
+      "GET",
+      `/api/spaces/${spacePath(input.spaceId ?? DEFAULT_SPACE_ID)}/tools${query}`,
+    );
+  } catch (error) {
+    const code = spaceErrorCode(error);
+    const status = spaceErrorDetails(error).httpStatus;
+    if (
+      status === 404 ||
+      code === "NOT_FOUND" ||
+      code === "ROUTE_NOT_FOUND" ||
+      code === "SPACE_ROUTE_NOT_FOUND"
+    ) {
+      throw spaceUserFacingError(spaceText("toolsUnavailable"), {
+        code: "SPACE_TOOLS_UNAVAILABLE",
+        httpStatus: 404,
+        retryable: true,
+      });
+    }
+    throw error;
+  }
+}
+
+export function spaceGetTool(toolId: string) {
+  return spaceApi<SpaceToolDetail>(
+    "GET",
+    `/api/tools/${encodeURIComponent(toolId)}`,
+  );
+}
+
+export function spaceListToolRevisions(input: {
+  toolId: string;
+  cursor?: string | null;
+  limit?: number;
+}) {
+  const search = new URLSearchParams();
+  if (input.cursor) search.set("cursor", input.cursor);
+  if (input.limit) search.set("limit", String(input.limit));
+  const query = search.size ? `?${search.toString()}` : "";
+  return spaceApi<SpaceToolRevisionHistory>(
+    "GET",
+    `/api/tools/${encodeURIComponent(input.toolId)}/revisions${query}`,
+  );
+}
+
+export function spacePublishMcpTool(input: {
+  spaceId: string;
+  name: string;
+  description?: string;
+  portableMcpManifest: PortableMcpManifestV1;
+  iconFilePath?: string | null;
+}) {
+  return spaceMutationInvoke<SpaceToolMutationResult>(
+    "cmd_space_publish_tool",
+    {
+      ...input,
+      kind: "mcp",
+      description: input.description ?? "",
+    },
+    { operation: "publish MCP Tool" },
+  );
+}
+
+export function spaceUpdateMcpTool(input: {
+  toolId: string;
+  name: string;
+  description?: string;
+  portableMcpManifest: PortableMcpManifestV1;
+  expectedLatestRevision: number;
+  iconFilePath?: string | null;
+  resetIcon?: boolean;
+}) {
+  return spaceMutationInvoke<SpaceToolMutationResult>(
+    "cmd_space_update_tool",
+    {
+      ...input,
+      kind: "mcp",
+      description: input.description ?? "",
+    },
+    { operation: "update MCP Tool" },
+  );
+}
+
+export function spacePublishCustomTool(input: {
+  spaceId: string;
+  name: string;
+  description: string;
+  customInstallInstruction: string;
+  iconFilePath?: string | null;
+}) {
+  return spaceMutationInvoke<SpaceToolMutationResult>(
+    "cmd_space_publish_tool",
+    { ...input, kind: "custom_install_prompt" },
+    { operation: "publish custom Tool" },
+  );
+}
+
+export function spaceUpdateCustomTool(input: {
+  toolId: string;
+  name: string;
+  description: string;
+  customInstallInstruction: string;
+  expectedLatestRevision: number;
+  iconFilePath?: string | null;
+  resetIcon?: boolean;
+}) {
+  return spaceMutationInvoke<SpaceToolMutationResult>(
+    "cmd_space_update_tool",
+    { ...input, kind: "custom_install_prompt" },
+    { operation: "update custom Tool" },
+  );
+}
+
+export function spaceRollbackTool(input: {
+  toolId: string;
+  revision: number;
+  expectedCurrentRevision: number;
+}) {
+  return spaceApi<SpaceToolMutationResult>(
+    "POST",
+    `/api/tools/${encodeURIComponent(input.toolId)}/rollback`,
+    {
+      revision: input.revision,
+      expectedCurrentRevision: input.expectedCurrentRevision,
+    },
+  );
+}
+
+export function spaceDeleteTool(toolId: string) {
+  return spaceApi<{ deleted: boolean }>(
+    "DELETE",
+    `/api/tools/${encodeURIComponent(toolId)}`,
+  );
+}
+
 export function spaceUploadIssueAttachments(input: {
   issueId: string;
   filePaths: string[];
@@ -1648,8 +1885,7 @@ export function spaceUpdateRegisteredAgent(input: {
   workspaceId?: string;
   workspacePath?: string;
   workspaceLabel?: string;
-  goalId?: string;
-  stateFilter?: string[];
+  subscriptionReplacement?: SpaceRegisteredAgentSubscriptionReplacement;
   status?: "active" | "disabled";
   issueSubscriptionRunMode?: SpaceIssueSubscriptionRunMode;
 }) {
@@ -1678,31 +1914,6 @@ export function spaceListRegisteredAgents(spaceId = DEFAULT_SPACE_ID) {
   return spaceApi<{ items: SpaceRegisteredAgent[] }>(
     "GET",
     `/api/spaces/${spacePath(spaceId)}/registered-agents`,
-  );
-}
-
-export function spaceCreateRegisteredAgentSubscription(input: {
-  spaceId: string;
-  registeredAgentId: string;
-  goalId: string;
-  stateFilter: string[];
-}) {
-  return spaceApi<{ subscription: SpaceGoalSubscription }>(
-    "POST",
-    `/api/spaces/${spacePath(input.spaceId)}/subscriptions`,
-    {
-      actorType: "registered_agent",
-      actorId: input.registeredAgentId,
-      goalId: input.goalId,
-      stateFilter: input.stateFilter,
-    },
-  );
-}
-
-export function spaceDeleteRegisteredAgentSubscription(subscriptionId: string) {
-  return spaceApi<{ deleted: boolean }>(
-    "DELETE",
-    `/api/subscriptions/${encodeURIComponent(subscriptionId)}`,
   );
 }
 

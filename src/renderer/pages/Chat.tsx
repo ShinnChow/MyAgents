@@ -37,6 +37,7 @@ import {
 import QueryNavigator from '@/components/chat/QueryNavigator';
 import ChatSearchPanel from '@/components/ChatSearchPanel';
 import { useChatSearch, isHighlightApiSupported } from '@/hooks/useChatSearch';
+import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
 import SelectionCommentMenu from '@/components/SelectionCommentMenu';
 import TerminalReasonBanner from '@/components/TerminalReasonBanner';
 import RuntimeDiagnosticsBanner from '@/components/RuntimeDiagnosticsBanner';
@@ -84,7 +85,7 @@ import { runtimeModelCatalogPath } from '@/utils/runtimeModelCatalog';
 import { launchSupportDiagnostics } from '@/utils/supportDiagnostics';
 import { createDefaultSessionGoalDraftConfig } from '@/utils/sessionGoalDraft';
 import { MANAGED_CODEX_COMPACT_SLASH_COMMAND } from '@/utils/slashActions';
-import { CODEX_SUBSCRIPTION_PROVIDER_ID, type PermissionMode, type McpServerDefinition, type Provider, getEffectiveModelAliases } from '@/config/types';
+import { CODEX_SUBSCRIPTION_PROVIDER_ID, type PermissionMode, type McpServerDefinition, type Project, type Provider, getEffectiveModelAliases } from '@/config/types';
 import { syncMcpServerNames } from '@/components/tools/toolBadgeConfig';
 import {
   getAllMcpServers,
@@ -98,6 +99,10 @@ import { BrowserPanelContext } from '@/context/BrowserPanelContext';
 import { BROWSER_BLANK_URL } from '@/components/browserConstants';
 import { CUSTOM_EVENTS, isPendingSessionId } from '../../shared/constants';
 import {
+  applyBuiltinBrowserExecutionToolToggle,
+  MANAGED_BROWSER_MCP_ID,
+} from '../../shared/browserTools';
+import {
   IMAGE_UNDERSTANDING_TOOL_ID,
   OFFICIAL_TOOLS,
   normalizeOfficialToolIds,
@@ -105,6 +110,7 @@ import {
 } from '../../shared/official-tools';
 import { isSupportedLocale } from '../../shared/i18n';
 import { workspacePathsEqual } from '../../shared/workspacePath';
+import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 import { supportsCodexConversationBranch } from '../../shared/codex-conversation-capability';
 import { coerceReasoningEffortForRuntime, reasoningEffortChoices } from '../../shared/reasoningEffort';
 import type { ProviderHistoryEnv } from '../../shared/providerHistory';
@@ -133,7 +139,7 @@ import {
   projectPermissionModeForRuntime,
 } from '../../shared/types/runtime';
 import type { RuntimeType, RuntimeDetections, RuntimeConfig, RuntimeDiagnostics, RuntimeExtensionDiagnostics } from '../../shared/types/runtime';
-import type { FilePreviewIntent, InitialMessage, SidecarConfigDisposition } from '@/types/tab';
+import type { FilePreviewIntent, InitialMessage, LaunchSessionBirthHint, SidecarConfigDisposition } from '@/types/tab';
 import type { FilePreviewFocusTarget } from '@/types/filePreview';
 import { shouldAutoSendInitialMessage } from '@/utils/initialMessageAutoSend';
 import {
@@ -447,8 +453,8 @@ const SessionTitleEditor = forwardRef<
 });
 
 interface ChatProps {
-  /** Native desktop-window focus projection; independent from internal Tab activity. */
-  isWindowFocused: boolean;
+  /** Native shown/not-minimized lifecycle; focus is intentionally independent. */
+  windowPresentation: MainWindowPresentation;
   /** Called when user starts a new session. Returns true if handled externally (background completion started). */
   onNewSession?: () => Promise<boolean>;
   /** Opens a persisted Session through App's canonical new/jump/revive path. */
@@ -472,6 +478,12 @@ interface ChatProps {
   onRenameSession?: (newTitle: string) => void;
   /** Called when user forks session at a specific assistant message — App creates new tab */
   onForkSession?: (newSessionId: string, agentDir: string, title: string, initialMessage?: string) => Promise<boolean>;
+  /** App-owned fresh-session launch for a runtime-backed provider switch. */
+  onLaunchRuntimeBackedProviderSession?: (
+    project: Project,
+    sessionBirthHint: LaunchSessionBirthHint & { providerExecutionIdentity: RuntimeBackedProviderIdentity },
+    title: string,
+  ) => Promise<string | null>;
   /** Runtime-only request from App/floating-ball to open a file preview once. */
   pendingFilePreview?: FilePreviewIntent;
   onFilePreviewIntentConsumed?: (intentId: string) => void;
@@ -482,7 +494,7 @@ function isCurrentSessionGoal(goal: SessionGoal | null | undefined): goal is Ses
   return Boolean(goal);
 }
 
-export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
+export default function Chat({ windowPresentation, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
   // Get state from TabContext (required - Chat must be inside TabProvider)
   const {
     tabId,
@@ -504,6 +516,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     setSessionMeta,
     unifiedLogs,
     systemInitInfo,
+    mcpEffectiveSnapshot,
     sdkSlashCommands,
     runtimeDiagnostics,
     agentError,
@@ -540,7 +553,9 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
   const isActive = useTabActive();
   const toast = useToast();
   const { t } = useTranslation('chat');
+  const { t: tSettings } = useTranslation('settings');
   const { t: tTask, i18n } = useTranslation('task');
+  const managedBrowserReady = useBrowserResourceReady();
   const taskLocale = isSupportedLocale(i18n.language) ? i18n.language : 'zh-CN';
   const tRef = useRef(t);
   tRef.current = t;
@@ -1739,7 +1754,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     // (PRD 0.2.7 §4.5) can reference them when restoring the launcher draft.
     const builtinSel = launchMessage.builtinSelection;
     // #244 (cross-review W2): when the initialMessage carries no explicit
-    // permissionMode (internal producers — task-alignment / support / fork —
+    // permissionMode (internal producers — Task discussion / support / fork —
     // unlike the launcher, don't set it), derive the builtin mode from config
     // rather than the raw `permissionMode` state, which is still the mount-time
     // 'auto' default if useConfig() hasn't resolved yet. projectSynced:false
@@ -1933,6 +1948,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
             // message must already carry the launcher's choice.
             isExternalRuntime ? undefined : (launchMessage.reasoningEffort ?? reasoningEffort),
             isExternalRuntime ? undefined : providerRoute,
+            launchMessage.requiredSystemSkill,
           );
         }
 
@@ -2263,10 +2279,11 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     currentAgent?.mcpEnabledServers ?? currentProject?.mcpEnabledServers ?? []
   );
   const runtimeMcpTools = useMemo(
-    () => isExternalRuntime
-      ? (systemInitInfo?.tools ?? []).filter(tool => tool.startsWith('mcp__'))
-      : [],
-    [isExternalRuntime, systemInitInfo?.tools],
+    () => mcpEffectiveSnapshot?.tools
+      ?? (isExternalRuntime
+        ? (systemInitInfo?.tools ?? []).filter(tool => tool.startsWith('mcp__'))
+        : []),
+    [isExternalRuntime, mcpEffectiveSnapshot?.tools, systemInitInfo?.tools],
   );
 
   // PRD 0.2.17 — Claude plugin per-workspace enable state. Init from Agent
@@ -2776,9 +2793,16 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
   //     the live-follow source, so the single write covers both roles.
   const handleWorkspaceMcpToggle = useCallback(async (serverId: string, enabled: boolean) => {
     if (guardCronConfigMutation()) return;
-    const newEnabled = enabled
-      ? [...workspaceMcpEnabled, serverId]
-      : workspaceMcpEnabled.filter(id => id !== serverId);
+    if (serverId === MANAGED_BROWSER_MCP_ID && enabled && !managedBrowserReady) {
+      toastRef.current.warning(tSettings('toolbox.browserResource.installFirst'));
+      return;
+    }
+    const newEnabled = applyBuiltinBrowserExecutionToolToggle(
+      workspaceMcpEnabled,
+      serverId,
+      enabled,
+      managedBrowserReady,
+    );
 
     setWorkspaceMcpEnabled(newEnabled);
 
@@ -2791,7 +2815,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     if (!persisted) {
       setWorkspaceMcpEnabled(workspaceMcpEnabled);
     }
-  }, [workspaceMcpEnabled, persistTabConfigChange, guardCronConfigMutation]);
+  }, [workspaceMcpEnabled, persistTabConfigChange, guardCronConfigMutation, managedBrowserReady, tSettings]);
 
   // PRD 0.2.17 — Claude plugin per-workspace toggle. Mirrors MCP exactly:
   // optimistic local update + dual-write via persistTabConfigChange (which
@@ -3252,7 +3276,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
   const chatScrollController = useChatScrollController({
     messages: chatScrollModel.data,
     isActive,
-    isWindowFocused,
+    windowPresentation,
     sessionId,
     rootRef: chatContentRef,
   });
@@ -3264,6 +3288,9 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     pauseAutoScroll,
     handleAtBottomChange,
     attachScroller,
+    onViewportAdmissionChanged,
+    onItemsRendered,
+    isViewportRecoveryFenced,
     scrollToMessage,
     scrollToTool,
     captureAnchor,
@@ -4133,7 +4160,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     }
     const pending = pendingProviderSwitch;
     setPendingProviderSwitch(null);
-    if (!pending || !agentDir || !onForkSession) return;
+    if (!pending || !agentDir) return;
     const boundChannel = channelSurfaceRef.current;
 
     let forkTabOpened = false;
@@ -4147,30 +4174,57 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
     }
 
     try {
-      const { createSession } = await import('@/api/sessionClient');
-      const birth = buildProviderSwitchSessionBirth({
-        targetIntent,
-        providerId: pending.providerId,
-        model: targetModel,
-        permissionMode: inputChromePermissionMode,
-        reasoningEffort,
-        mcpEnabledServers: workspaceMcpEnabled,
-        enabledPluginIds: workspaceEnabledPlugins,
-        enabledOfficialToolIds: workspaceOfficialToolEnabled,
-      });
-      const session = await createSession(
-        agentDir,
-        birth.runtime,
-        { ...birth.opts, origin: DESKTOP_SESSION_FORK_ORIGIN },
-      );
-      const opened = await onForkSession(
-        session.id,
-        agentDir,
-        `${newProvider?.name ?? 'Claude'} 会话`,
-      );
-      if (!opened) {
-        await deleteUnopenedForkSession(session.id);
-        throw new Error('Fork tab failed to open');
+      const sessionTitle = `${newProvider.name} 会话`;
+      let openedSessionId: string;
+      if (targetIntent.kind === 'runtime-backed-provider') {
+        if (!currentProject || !onLaunchRuntimeBackedProviderSession) {
+          throw new Error('App runtime-backed provider launch owner is unavailable');
+        }
+        const launchedSessionId = await onLaunchRuntimeBackedProviderSession(
+          currentProject,
+          {
+            providerExecutionIdentity: targetIntent,
+            // LaunchSessionBirthHint carries product-facing values. App is the
+            // sole birth owner and converts them to runtime vocabulary once.
+            permissionMode: inputChromePermissionMode,
+            reasoningEffort,
+            mcpEnabledServers: workspaceMcpEnabled,
+            enabledPluginIds: workspaceEnabledPlugins,
+            enabledOfficialToolIds: workspaceOfficialToolEnabled,
+            origin: DESKTOP_SESSION_FORK_ORIGIN,
+          },
+          sessionTitle,
+        );
+        if (!launchedSessionId) {
+          throw new Error('App failed to open runtime-backed provider Session');
+        }
+        openedSessionId = launchedSessionId;
+      } else {
+        if (!onForkSession) {
+          throw new Error('App fork owner is unavailable');
+        }
+        const birth = buildProviderSwitchSessionBirth({
+          targetIntent,
+          providerId: pending.providerId,
+          model: targetModel,
+          permissionMode: inputChromePermissionMode,
+          reasoningEffort,
+          mcpEnabledServers: workspaceMcpEnabled,
+          enabledPluginIds: workspaceEnabledPlugins,
+          enabledOfficialToolIds: workspaceOfficialToolEnabled,
+        });
+        const { createSession } = await import('@/api/sessionClient');
+        const session = await createSession(
+          agentDir,
+          birth.runtime,
+          { ...birth.opts, origin: DESKTOP_SESSION_FORK_ORIGIN },
+        );
+        const opened = await onForkSession(session.id, agentDir, sessionTitle);
+        if (!opened) {
+          await deleteUnopenedForkSession(session.id);
+          throw new Error('Fork tab failed to open');
+        }
+        openedSessionId = session.id;
       }
       forkTabOpened = true;
       if (currentProject) {
@@ -4202,7 +4256,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
         }
       }
       if (boundChannel) {
-        await transferBindingToForkedSession(boundChannel, session.id);
+        await transferBindingToForkedSession(boundChannel, openedSessionId);
       }
     } catch (err) {
       console.error('[chat] Failed to create cross-provider session:', err);
@@ -4212,7 +4266,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
           : t('shell.toasts.createNewSessionFailed'),
       );
     }
-  }, [pendingProviderSwitch, agentDir, onForkSession, providers, transferBindingToForkedSession, deleteUnopenedForkSession, inputChromePermissionMode, reasoningEffort, workspaceMcpEnabled, workspaceEnabledPlugins, workspaceOfficialToolEnabled, currentProject, currentAgent, patchProject, refreshConfig, guardCronConfigMutation, t]);
+  }, [pendingProviderSwitch, agentDir, onForkSession, onLaunchRuntimeBackedProviderSession, providers, transferBindingToForkedSession, deleteUnopenedForkSession, inputChromePermissionMode, reasoningEffort, workspaceMcpEnabled, workspaceEnabledPlugins, workspaceOfficialToolEnabled, currentProject, currentAgent, patchProject, refreshConfig, guardCronConfigMutation, t]);
 
   // Cross-runtime confirm: create new session in new tab and send the pending message
   const confirmCrossRuntimeSend = useCallback(async () => {
@@ -5365,7 +5419,10 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
               isLoading={isLoading}
               sessionId={sessionId}
               isActive={isActive}
-              isWindowFocused={isWindowFocused}
+              windowPresentation={windowPresentation}
+              onViewportAdmissionChanged={onViewportAdmissionChanged}
+              onItemsRendered={onItemsRendered}
+              isViewportRecoveryFenced={isViewportRecoveryFenced}
               virtuosoRef={virtuosoRef}
               onScrollerRef={attachScroller}
               followEnabledRef={followEnabledRef}
@@ -5487,6 +5544,7 @@ export default function Chat({ isWindowFocused, onNewSession, onOpenSession, onO
             globalMcpEnabled={globalMcpEnabled}
             mcpServers={mcpServers}
             runtimeMcpTools={runtimeMcpTools}
+            mcpEffectiveSnapshot={mcpEffectiveSnapshot}
             onWorkspaceMcpToggle={handleWorkspaceMcpToggle}
             officialTools={OFFICIAL_TOOLS}
             workspaceOfficialToolEnabled={workspaceOfficialToolEnabled}

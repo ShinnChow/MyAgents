@@ -44,10 +44,9 @@ export interface ThoughtInputHandle {
 // Visual variants. Both variants share the outer card frame (radius,
 // shadow, border) so the Task Center input and the Launcher 想法 input
 // read as the same affordance. They diverge only on inner metrics —
-// both use 16px prose text（想法正文 = prose 档，PRD 0.2.34 Part 2 升档）；
-// `compact` (Task Center) keeps tighter padding so it sits quietly above
-// the thought stream; `launcher` uses roomier padding to match
-// SimpleChatInput's launcher-mode card byte-for-byte.
+// `compact` (Task Center) uses the 14px UI tier so short notes stay dense
+// beside the Task list; `launcher` keeps 16px prose text and roomier padding
+// to match SimpleChatInput's launcher-mode card byte-for-byte.
 type ThoughtInputVariant = 'compact' | 'launcher';
 
 const VARIANTS: Record<ThoughtInputVariant, {
@@ -77,9 +76,9 @@ const VARIANTS: Record<ThoughtInputVariant, {
   toolbarButtonPaddingClass: string;
 }> = {
   compact: {
-    pxPerLine: 26,           // text-base 16px × leading-relaxed 1.625 = 26（与 launcher variant 同源；改字号必同步此几何常量）
+    pxPerLine: 23,           // text-sm 14px × leading-relaxed 1.625 ≈ 22.75px（改字号必同步此几何常量）
     verticalPaddingPx: 12,
-    textareaClass: 'text-base leading-relaxed',
+    textareaClass: 'text-sm leading-relaxed',
     // Resting `shadow-xs` so the input reads as quietly elevated above
     // the thought stream below; lifts to `shadow-sm` on hover / focus to
     // signal the active write surface. Same idiom as SettingsHelperInbox.

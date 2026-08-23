@@ -1,4 +1,5 @@
 import type { McpServerDefinition } from './config-types';
+import { DEFAULT_STANDARD_PLAYWRIGHT_ARGS, STANDARD_PLAYWRIGHT_MCP_ID } from './browserTools';
 
 type AgentMcpConfig = {
   mcpEnabledServers?: unknown;
@@ -36,7 +37,10 @@ export function applyMcpServerConfigAdditions(
   const envByServer = asRecord(config.mcpServerEnv);
 
   return servers.map((server) => {
-    const extraArgs = argsByServer[server.id];
+    const configuredArgs = argsByServer[server.id];
+    const extraArgs = configuredArgs === undefined && server.id === STANDARD_PLAYWRIGHT_MCP_ID
+      ? [...DEFAULT_STANDARD_PLAYWRIGHT_ARGS]
+      : configuredArgs;
     const extraEnv = envByServer[server.id];
     const hasArgs = Array.isArray(extraArgs);
     const hasEnv = !!extraEnv && typeof extraEnv === 'object' && !Array.isArray(extraEnv);

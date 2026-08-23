@@ -10,6 +10,7 @@ use reqwest::header::{ACCEPT_LANGUAGE, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tauri::Manager;
 
 use crate::device_identity::{current_device_identity, DeviceIdentity};
 use crate::workspace_files::path_safety::open_regular_file_no_follow;
@@ -18,8 +19,10 @@ use crate::{ulog_info, ulog_warn};
 pub(crate) mod attachments;
 pub(crate) mod cli;
 pub(crate) mod delivery;
+pub(crate) mod notifications;
 pub(crate) mod registered_agents;
 pub(crate) mod skills;
+pub(crate) mod tools;
 
 pub use attachments::{
     SpaceAttachmentDraftMetadata, SpaceCommentIssueWithAttachmentsInput,
@@ -54,6 +57,7 @@ pub use skills::{
     SpaceSkillInstallTarget, SpaceSkillSourceInspection, SpaceSkillSourceMetaInput,
     SpaceUploadSkillInput,
 };
+pub use tools::{SpacePublishToolInput, SpaceUpdateToolInput};
 
 const SPACE_ENABLED_ENV: Option<&str> = option_env!("MYAGENTS_SPACE_ENABLED");
 const SPACE_BASE_URL_ENV: Option<&str> = option_env!("MYAGENTS_SPACE_BASE_URL");
@@ -70,6 +74,7 @@ const SESSION_FILE: &str = "session.json";
 const MAX_PROFILE_AVATAR_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_SPACE_AVATAR_BYTES: u64 = MAX_PROFILE_AVATAR_BYTES;
 const NORMALIZED_AVATAR_MAX_EDGE: u32 = 256;
+const NORMALIZED_AVATAR_MAX_BYTES: usize = 512 * 1024;
 const MAX_CLOUD_ISSUE_INSTRUCTION_CHARS: usize = 20_000;
 #[derive(Debug)]
 struct SpaceClientDeviceContext {
@@ -684,7 +689,10 @@ pub async fn cmd_space_auth_start() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn cmd_space_auth_poll(input: SpaceAuthPollInput) -> Result<Value, String> {
+pub async fn cmd_space_auth_poll(
+    app: tauri::AppHandle,
+    input: SpaceAuthPollInput,
+) -> Result<Value, String> {
     let capability = ensure_space_available()?;
     let base_url = capability_base_url(&capability)?;
     let client = http_client()?;
@@ -738,6 +746,11 @@ pub async fn cmd_space_auth_poll(input: SpaceAuthPollInput) -> Result<Value, Str
                 AuthenticatedSpaceSession::from_account(session, session_path)?,
                 identity,
             );
+            notifications::auth_boundary_changed(
+                &app,
+                app.state::<notifications::ManagedNotificationCenter>()
+                    .inner(),
+            );
         }
         if let Some(map) = data.as_object_mut() {
             map.remove("sessionToken");
@@ -764,9 +777,14 @@ pub async fn cmd_space_auth_ack(input: SpaceAuthPollInput) -> Result<(), String>
 }
 
 #[tauri::command]
-pub async fn cmd_space_logout() -> Result<(), String> {
+pub async fn cmd_space_logout(app: tauri::AppHandle) -> Result<(), String> {
     if crate::space_cloud_mock::is_enabled() {
         crate::space_cloud_mock::reset();
+        notifications::auth_boundary_changed(
+            &app,
+            app.state::<notifications::ManagedNotificationCenter>()
+                .inner(),
+        );
         return Ok(());
     }
     let capability = space_build_capability();
@@ -775,6 +793,11 @@ pub async fn cmd_space_logout() -> Result<(), String> {
         tauri::async_runtime::spawn_blocking(move || take_session_for_logout(&path))
             .await
             .map_err(|error| format!("remove Space session task failed: {error:?}"))??;
+    notifications::auth_boundary_changed(
+        &app,
+        app.state::<notifications::ManagedNotificationCenter>()
+            .inner(),
+    );
     let session_to_revoke = capability
         .available
         .then(|| capability_base_url(&capability).ok())
@@ -1386,7 +1409,7 @@ fn space_form(input: SpaceUpdateSpaceInput) -> Result<reqwest::multipart::Form, 
     Ok(form.part("avatar", part))
 }
 
-fn normalized_avatar_upload_part(
+pub(super) fn normalized_avatar_upload_part(
     file_path: &Path,
     max_bytes: u64,
 ) -> Result<reqwest::multipart::Part, String> {
@@ -1407,6 +1430,12 @@ fn normalized_avatar_upload_part(
     validate_avatar_file_extension(file_path)?;
     let bytes = read_avatar_file_bytes(file_path, &metadata, max_bytes)?;
     let normalized = normalize_avatar_bytes_to_webp(&bytes)?;
+    if normalized.len() > NORMALIZED_AVATAR_MAX_BYTES {
+        return Err(format!(
+            "Normalized avatar image exceeds {} bytes",
+            NORMALIZED_AVATAR_MAX_BYTES
+        ));
+    }
     reqwest::multipart::Part::bytes(normalized)
         .file_name("avatar.webp")
         .mime_str("image/webp")
@@ -1570,6 +1599,7 @@ async fn parse_authorized_cloud_data(
                     "[space] user session moved to reauth_required: sessionBindingId={}",
                     session.session_binding_id()
                 );
+                notifications::user_session_invalidated();
             }
             Ok(false) => {
                 ulog_info!(

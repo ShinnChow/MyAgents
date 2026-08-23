@@ -1,7 +1,7 @@
 # MyAgents Design Guide
 
-> **Version**: 2.8.51
-> **Last Updated**: 2026-08-15
+> **Version**: 2.8.63
+> **Last Updated**: 2026-08-23
 > **Status**: Active
 > **Platform**: macOS / Windows Desktop Client
 
@@ -256,6 +256,8 @@ meta（v2.5——11px 中文在 Windows 低分屏雅黑下偏虚，且 11/12/13 
 **\*立档例外与禁令边界**：
 - 聊天输入框 textarea（SimpleChatInput）行高为 26px 整数常量（≈1.625）——自适应高度
   计算依赖整数像素，不随 prose 档 1.7 配对行高，属字号同档、行高立档例外。
+- Task Center 左栏是高密度想法流：compact 输入正文、卡片阅读态与编辑态统一使用
+  `text-sm` 14px / `leading-relaxed`；Launcher 想法输入仍与聊天输入保持 `text-base` 16px / 26px 行高。
 - eslint 只封禁 **px 字面量**；rem/em 相对值（Theme brand title `2.5/3.5rem`、行内代码 `0.9em`）
   与 `style={{fontSize}}` API 配置项（Monaco/xterm/语法高亮等）不在射程内——新增此类
   用法需对照本表自证档位。
@@ -536,6 +538,8 @@ Item 选中: 文字 var(--accent-warm)
 ```
 
 所有新 Overlay 必须复用 `src/renderer/components/OverlayBackdrop.tsx`，不要手写裸 backdrop。组件封装了正确的 pointer dismissal 语义；`className` 只补 z-index、padding、overflow 等布局差异，图片预览用 `variant="dark"`。可关闭 Overlay 还必须用 `useCloseLayer(handler, zIndex)` 注册关闭层，且 z-index 与视觉层级一致，避免 Cmd+W 跳过 Overlay 直接关闭 Tab。
+
+如果 Overlay 由页面内部声明、但产品语义要求覆盖全局侧栏和完整 App Shell，必须使用 `OverlayBackdrop portal` 将稳定 backdrop 挂到 `document.body`；不能只提高页面局部 stacking context 的 z-index。Space Tool / Skill 详情和发布表单属于这一类。
 
 内嵌 `BrowserPanel` 是全表面例外：它承载浮于 React DOM 之上的原生 child Webview，窄布局时必须让同一个 Chat / Tab-owned host 原位铺满 Chat，不能通过 `OverlayBackdrop` 重挂载或重建 Webview。其全屏关闭层 z-index 必须与视觉层级一致，并与分屏、工具栏、Browser Tab × 复用同一个关闭 callback；只有当前 active Browser view 可以消费该关闭层。
 
@@ -1068,9 +1072,9 @@ PRD 0.2.34 P0-1 定为 14px；v2.5 起 ui 档即 14，dense 专用档已合并�
 滚动: 自动滚动到底部（用户手动滚动时暂停）
 ```
 
-- 切到其他桌面应用不暂停 AI、SSE、消息保存或当前 active Chat 的可见刷新；窗口仍在双屏/分屏中展示时，即使失焦也继续实时渲染。只有 MyAgents 内部未展示、由 host 设为 `content-visibility:hidden` 的 inactive Tab 冻结虚拟列表输入。
-- 若切走前仍在自动跟随，失焦期间继续显示当前最新输出并自动跟随；回到 MyAgents 时只允许一次无动画位置校正。
-- 若切走前已主动上滑阅读历史，回到 MyAgents 时应保持同一消息及其相对视口位置；新输出只续在下方，不抢回底部。
+- 切到其他桌面应用不暂停 AI、SSE、消息保存或当前 active Chat 的可见刷新；窗口仍在双屏/分屏中展示时，即使失焦也继续实时渲染，并允许鼠标悬停滚动、触控板滚动与滚动条拖拽。失焦和重新聚焦本身不得发出任何滚动命令，首次点击只改变输入 attention，不能改变用户刚刚停留的位置。
+- 只有 MyAgents 内部未展示、由 host 设为 `content-visibility:hidden` 的 inactive Tab，或原生窗口最小化/隐藏、恢复后容器尚未证明非零几何时，才冻结虚拟列表输入；消息与任务执行继续在数据层推进。
+- 从最小化/隐藏恢复时，原先自动跟随的用户只无动画落到一次最新底部；原先阅读历史的用户恢复同一 messageId 与行内相对视口位置。未挂载目标可暂时被遮蔽并等待虚拟列表挂载后精确结算，不得让长回复首句、列表顶部或底部的中间位置闪给用户，也不得用固定延时反复抢滚动。
 
 #### 已有 Session 恢复
 
@@ -1298,7 +1302,11 @@ MyAgents 使用“双层注意力导航”：全局侧边栏回答“产品能�
 
 ### 15.2 全局侧边栏
 
-展开态从上到下依次为：原生窗口 chrome 与固定收起控制、独立产品身份行、新对话/搜索/任务/团队/技能与工具的连续主导航、Agent 工作区树、底部小助理/设置；其中团队入口仅在 Team Space 实验室开关开启且当前构建能力可用时出现，关闭后展开态与 rail 均不保留失效入口。主导航项与底部入口使用 36px 命中高度且不添加行间距；从主导航到 Agent 工作区、再到底部入口均不使用横分割线，主要层级只依靠 8–12px 组间留白、工作区标题和选中面，不将每组包成卡片。
+展开态从上到下依次为：原生窗口 chrome 与固定收起控制、独立产品身份行、新对话/搜索/任务/团队/技能与工具的连续主导航、Agent 工作区树、底部小助理/设置；其中团队入口仅在 Team Space 实验室开关开启且当前构建能力可用时出现，关闭后展开态与 rail 均不保留失效入口。主导航项与底部入口使用 32px 命中高度且不添加行间距；从主导航到 Agent 工作区、再到底部入口均不使用横分割线，主要层级只依靠 8–12px 组间留白、工作区标题和选中面，不将每组包成卡片。
+
+通知 Bell 是 App Shell 的常驻底部入口，不受登录态或 Team Space UI 偏好隐藏；有未读时只在 16px Bell 右上角显示 6px `--accent-warm` 圆点，不显示数字。rail 工作区 flyout、消息中心与小助理 popover 共用 `--paper-elevated`、`shadow-xl` 和 12px 圆角材质，三者只保留各自的尺寸、位置与内容结构差异。消息中心是 fixed 非模态面板，展开/rail 时都从当前侧栏右侧起，宽度上限 380px、高度 440px，并与工作区 flyout、小助理 popover 和其它 close-layer 互斥；外部点击、Escape、Cmd+W 关闭并按入口恢复焦点。小助理 popover 的锚点延伸到当前侧栏外边界，从边界右侧 8px 处出现，不覆盖侧栏。消息中心 header 只保留“消息中心”主标题与“全部已读”，不显示“官方公告”等 scope 副标题；列表项不显示来源图标或未读红点，只用未读深色 / 已读灰色的标题与正文区分状态，正文最多三行后省略；正文独立滚动，加载、空态、局部错误和加载更多不改变外壳尺寸。
+
+通知行使用 14px 标题和 12px 摘要/时间，不预留类型图标槽；未读标题为 ink 中等字重、正文为 secondary，已读标题与正文降为 muted，不使用点状标记或整行高饱和底色。行 hover 复用 `--hover-bg`。点击是唯一 read trigger，并随后执行 target；外链失败保留面板与原 URL 复制入口，Space route 接纳后关闭面板。公告中文客户端显示中文槽，所有非中文显示“其他”并在空值时回退中文。
 
 全局侧栏根面与顶部 Tab 标题栏共同消费 Theme-owned `--global-sidebar-bg`。九套 Theme 的 light/dark 均在自身 `--paper` 与 `--paper-inset` 之间提供一个略深于页面的值，使两块 App Shell chrome 同时能与右侧 `--paper` 页面和 `--paper-elevated` 对话面形成克制分区；该色差独立承担分区，不再叠加侧栏右侧竖线或标题栏底部横线。该结构 Token 不替代通用 Paper 层级：右侧页面、卡片与弹层继续使用原有 Token，工作区/Session hover 与 active 也不随侧栏底色重算。
 
@@ -1306,14 +1314,14 @@ MyAgents 使用“双层注意力导航”：全局侧边栏回答“产品能�
 展开态 256px:
   顶部第一行: h-11；macOS 原生红绿灯 + 固定 toggle
   品牌第二行: h-10；固定 x 的 20px 圆角矩形 App Icon + Theme 产品字标 text-sm/font-medium
-  连续主导航行: h-9, px-3, text-sm, icon 16px, 行间距 0
+  连续主导航行: h-8, px-3, text-sm, icon 16px, 行间距 0
   工作区标题行: h-12, text-xs, 弱化文字
   工作区行: h-9；14px 展开箭头保留 hover 内侧安全边距，分支线穿过箭头中心；icon / text-sm 名称维持导航列位置；整行只负责展开/折叠；顶层条目额外行间距 0
   Session 行: h-9；标题 text-sm 单行 truncate，来源 tag / 右侧时间 text-xs
-  底部入口: h-9，额外行间距 0；固定且不随工作区历史滚动
+  底部入口: h-8，额外行间距 0；固定且不随工作区历史滚动
 
 rail 64px:
-  图标按钮: 40 × 36px
+  图标按钮: 40 × 32px
   按钮左缘: x=12px；16px 功能图标左缘固定 x=24px，中心线 x=32px，与展开态及 rail 中线一致
   App Icon: 20px，左缘 x=22px；40px 官网链接命中区同样固定于 x=12px
   只有工作区入口打开 320px 可交互 flyout
@@ -1330,6 +1338,8 @@ rail 64px:
 工作区标题行与每个活跃工作区行的右侧双动作采用同一优先级方向：低频“更多”在左，高频“新增工作区 / 新对话”固定在最右边缘。最右槽位不得因菜单打开状态或侧栏收展而交换，确保快速创建的屏幕边缘肌肉记忆稳定。工作区新建动作的 Tooltip 统一使用短文案“新对话”；列表首项的动作提示向下展开，避开滚动容器上边界裁切，其余条目保持向上展开。
 
 活跃工作区行的双动作是覆盖在右缘的绝对定位层，不参与工作区名称的静态宽度计算；名称常态可使用动作区下方的完整行宽，仅在动作显现时由左透明、右实色的 Theme 渐变自然遮住实际重叠部分。动作层只在 hover、focus-within 或菜单打开时显现，隐藏时不得截获鼠标命中。
+
+展开态“任务”主导航行在右端预留固定点击槽；整行 hover、focus-within 时显示「+」，Tooltip 与 accessible name 都是“创建任务”。按钮必须阻止父级导航，打开 App Shell 唯一创建 overlay；隐藏/显示不得推动文字或改变行宽。rail/触屏不增加常驻小加号，继续从 Task Center 创建。
 
 ### 15.3 工作区与 Session 树
 
@@ -1420,7 +1430,13 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 ### 15.8 任务创建面板
 
-任务中心“新建任务”与“从想法派发”共用同一创建面板。面板不展示手工标签输入，优先保留任务需求、验收清单、工作区、执行模式与通知等直接影响执行的配置；空白新建提交空标签，从想法派发仅在数据层继承来源想法已有标签。标签仍可在既有 Task 编辑与管理表面维护，不删除持久化字段或历史筛选兼容。
+侧边栏、Task Center 与 Thought 派发共用 App Shell 唯一创建面板。Header 只显示“新建任务”和“智能 / 手动”Tab，不显示副标题；Tab 支持左右键/Home/End 与 roving focus。侧边栏/Task Center 默认智能，Thought 派发默认手动，关闭后不记忆模式。
+
+智能 Tab 只包含 Agent 工作区选择器与一个大目标输入框，底栏动作为“与 AI 讨论”；启动新 Chat 失败时保留原输入。手动 Tab 只编辑一份 canonical `task.md`，不再提供独立验收输入；保留名称、工作区、执行、通知和高级配置。编辑 sheet 与手动创建使用同一字段顺序和模式显隐规则：不展示简短描述或手工标签，Agent 工作区位于高级配置之前并可重新选择。会话策略、触发前检测与结束条件只在周期触发时出现；立即执行和定时一次统一新建 Session，提交时不得携带隐藏的周期 trigger / Session 选择。历史 description / tags 继续由 TaskStore 保留供兼容读取和筛选，表单不再写回；空白新建提交空标签，从想法派发只在数据层继承 Thought provenance。
+
+创建后的详情不是同一表单 modal，而是从右侧进入的全高大 Drawer：宽窗主栏阅读完整 `task.md`，正文前只保留 home-relative（`~/.myagents/...`）文件路径，不重复显示“task.md · 执行 Prompt”标题；主栏所有 flex/Markdown/代码/表格层都必须收敛到可用栏宽，只有代码块和表格自身承担横向滚动。下方按时间正序显示线性评论，底部使用默认两行、最多约六行后内部滚动的紧凑吸底 composer，composer 不重复解释 Session 路由；评论正文使用共享 compact Markdown 排版，主身份为 14px，时间与 Session ID 为 12px，只有 Agent 身份行具有 Session 导航 hover。已加载父评论的回复引用使用左侧直角、右侧小圆角和轻量底色，占满可用的一行后由 CSS 省略；仅页外父评论的持久化摘要继续保持有界。约 360–400px 右栏展示真实状态、调度、工作区、运行配置、Session 与通知；摘要使用扁平信息组而非二次 Card，执行记录默认显示最近 5 条并以整行“展开更多 + 行尾箭头”每次追加 5 条；空间不足时属性栏成为独立 sheet。完整 status history、`progress.md` 和独立 legacy `verify.md` 不在详情展示，底层审计与兼容文件仍保留。Header 为单行，只放状态、单行截断标题、一个生命周期主动作、更多菜单和关闭；Space Issue 等来源标识放在正文区而不挤占标题。编辑位于更多菜单并打开 Drawer 内第二层表单 sheet，dirty 关闭必须确认。Task list、Bell、OS toast 与 typed deep link 都复用该 Drawer，`task.comment` 导航要滚动、focus、高亮 exact Comment 并向读屏器播报；即使 Task Center singleton 已经激活，新的 route generation 也必须重新投送。
+
+Task Center 的列表与卡片只保留执行类型 tag，生命周期状态由分组表达，精确状态在详情 Header 使用更清晰的实色徽标展示。分组固定为“进行中（running/verifying）→ 待恢复（stopped/blocked）→ 已完成（done/archived）→ 规划中（todo）”；这是只读投影，不改变 Task 状态机。列表模式的已完成区默认展示最近 10 条，“加载更多”每次追加 10 条，搜索时不得隐藏匹配项；卡片模式不分页。列表行的尾部日期槽在 hover/focus 时原位替换为“会话详情”，隐藏动作不参与静止态宽度计算，切换时不推动标题、工作区或更多菜单。列表/卡片外层不得使用包裹内部按钮的 `<button>`，需以可键盘激活的容器保证 Enter/Space 打开详情且内部动作保持独立焦点。
 
 ---
 
@@ -1428,6 +1444,19 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.64 | 2026-08-23 | **App Shell 弹层材质与位置对齐**：小助理 popover 改从当前侧栏右侧 8px 出现；rail 工作区 flyout、消息中心与小助理统一使用 elevated 背景、阴影和圆角外壳 |
+| 2.8.63 | 2026-08-23 | **Task Center 想法正文降档**：左栏 compact 输入与想法卡片查看/编辑正文由 16px prose 档收至 14px UI 档，Launcher 想法输入继续与聊天输入保持 16px |
+| 2.8.62 | 2026-08-23 | **Task 编辑与创建对齐**：编辑 sheet 移除简短描述和标签，把可持久化的 Agent 工作区选择放在高级配置之前；立即执行/定时一次隐藏并清理周期专属会话与触发状态 |
+| 2.8.61 | 2026-08-23 | **Task route 与创建表单收口**：active Task Center 重复通知仍投送新 route generation；引用改为轻量满行省略，执行记录使用整行 disclosure；手动创建移除独立验收，仅周期任务显示会话与触发策略 |
+| 2.8.60 | 2026-08-22 | **Task 列表层级收口**：列表/卡片移除重复状态 tag；按进行中、待恢复、已完成、规划中分组；列表完成项按 10 条渐进展开，搜索不截断；会话入口在 hover/focus 时复用日期槽；详情状态使用更清晰的实色底 |
+| 2.8.59 | 2026-08-22 | **Task 评论层级微调**：主身份提升至 14px；回复引用改为左侧直角、强化底色并放宽到 60 code point；移除 composer 重复的 Session 路由说明 |
+| 2.8.58 | 2026-08-22 | **消息列表视觉减法**：通知项移除来源图标和列表内未读红点，以标题/正文深浅表达未读状态；正文统一最多三行省略 |
+| 2.8.57 | 2026-08-22 | **Task 详情密度与宽度收口**：移除正文冗余标题、文档路径折叠 home 为 `~`；补齐主栏到 Markdown/代码/表格的 `min-width: 0` 约束；右栏摘要去 Card 化，执行记录统一小字号并按每次 5 条渐进展开 |
+| 2.8.56 | 2026-08-21 | **Task 详情视觉收口**：Header 合并为状态/标题/主动作/更多/关闭单行；评论使用紧凑 Markdown，Agent 身份行直达所属 Session；composer 收敛为两行起步、有限增长的吸底输入；属性栏宽窗加宽、窄窗切 Sheet，并移除 status history、progress 与独立 verify 展示 |
+| 2.8.55 | 2026-08-21 | **Chat 窗口呈现与滚动连续性**：focus 与 renderable surface 解耦，可见失焦窗口保持完整滚动交互且重新聚焦零滚动命令；最小化/隐藏按 native presentation generation 冻结 Virtuoso，并在容器非零后按 follow 或 message anchor 单次恢复 |
+| 2.8.54 | 2026-08-21 | **Task 内容与协作中枢**：全局任务行增加 hover/focus 快捷创建；唯一创建面板收敛为智能/手动 Tab；创建后使用全高双栏 Drawer 阅读 canonical task.md、查看真实属性和线性评论，Bell/OS toast/deep link 精确聚焦评论；消息中心去掉 scope 副标题并收敛为 440px 高度 |
+| 2.8.53 | 2026-08-16 | **统一通知中心**：全局侧栏底部新增常驻 Bell、6px 暖色未读点与 380×620px fixed 非模态面板；定义 scope/header、通知行字号与图标槽、click-only read、外链失败保留/复制、中文/其他文本回退和 close-layer/focus 契约 |
+| 2.8.52 | 2026-08-16 | **Space Tools 资源池**：Skills 后新增同级 Tools 导航；MCP 与自定义工具使用一致的双列卡片（32px 图标、单行名称/描述、类型 Tag），点击进入最大 800px / 80vh 的居中卡片式详情；发布按钮只展开“本地 MCP / 自定义安装提示词”两个入口，管理动作收进详情更多菜单，MCP 冲突替换必须在详情内显式确认 |
 | 2.8.51 | 2026-08-15 | **历史搜索连续展开**：Overlay 首帧保留筛选器并在右侧展示紧凑搜索框，激活后以 transform/opacity 向左展开为整行输入；Escape/X 恢复紧凑态与焦点，Suspense fallback 保持相同几何 |
 | 2.8.50 | 2026-08-15 | **统一文件资源图标**：固定 vendoring Symbols SVG，由 MyAgents typed resolver 统一负责文件名、复合扩展名、类别与未知兜底；所有具体文件/文件夹身份入口共用 `FileIcon` 的 16/20/24px 契约，动作图标和真实媒体预览保持独立 |
 | 2.8.49 | 2026-08-09 | **Managed Codex 原生智能压缩**：Managed Codex 斜杠菜单仅新增 `/compact`，与 context 用量卡片右上角「智能压缩」共用 SessionEngine 原生控制动作、忙碌与成功失败状态；其余 Claude SDK 系统指令及其他 external Runtime 继续隐藏，compact control turn 不进入对话消息流 |

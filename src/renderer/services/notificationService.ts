@@ -92,29 +92,10 @@ export function notifyPlanModeRequest(): void {
 }
 
 /**
- * Tell Rust the window has just been activated externally — flushes any
- * pending click target the front-end didn't yet receive (covers macOS / Linux
- * where the OS auto-activates the app on toast click but no in-process
- * Activated callback fires).
- */
-export async function consumePendingNotificationClick(): Promise<boolean> {
-    if (!isTauriEnvironment()) return false;
-    try {
-        return await invoke<boolean>('cmd_consume_notification_click');
-    } catch (error) {
-        console.warn('[Notification] cmd_consume_notification_click failed:', error);
-        return false;
-    }
-}
-
-/**
  * Initialize notification service.
  *
- * Permission flow is intentionally absent: desktop OS notifications under
- * `tauri-plugin-notification` and the WinRT path don't require a runtime
- * permission grant — macOS / Linux rely on system-level settings,
- * Windows uses AUMID via NSIS shortcut. Anything we'd do here would just be
- * theatre.
+ * Native setup and macOS permission ownership live in Rust. Enabling the
+ * setting later also asks through plugin-notification from SettingsPage.
  */
 export async function initNotificationService(): Promise<void> {
     // No-op kept for symmetry with existing call sites.

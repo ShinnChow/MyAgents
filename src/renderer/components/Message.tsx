@@ -27,6 +27,7 @@ import {
   GOAL_CONTINUATION_TAG,
   SESSION_EVENT_TAG,
   SPACE_ISSUE_CONTEXT_TAG,
+  TASK_COMMENT_TAG,
   parseLeadingSystemReminder,
   parseSessionSendRequestDisplay,
 } from '../../shared/systemReminder';
@@ -274,6 +275,7 @@ function systemTagLabel(kind: string, t: (key: string) => string): string | null
   if (kind === 'CRON_TASK') return t('message.systemTags.cronTask');
   if (kind === FLOATING_BALL_CONTEXT_TAG) return t('message.systemTags.floatingContext');
   if (kind === SPACE_ISSUE_CONTEXT_TAG) return t('message.systemTags.spaceIssue');
+  if (kind === TASK_COMMENT_TAG) return t('message.systemTags.taskComment');
   if (kind === GOAL_CONTINUATION_TAG || kind === GOAL_CONTEXT_TAG) return t('message.systemTags.goalMode');
   return null;
 }
@@ -388,6 +390,7 @@ const Message = memo(function Message({ message, isLoading = false, onRewind, on
       .replace(/<\/?HEARTBEAT>/g, '')
       .replace(/<\/?MEMORY_UPDATE>/g, '')
       .replace(/<\/?CRON_TASK>/g, '')
+      .replace(/<\/?TASK_COMMENT>/g, '')
       .replace(/<\/?FLOATING_BALL_CONTEXT>/g, '')
       .replace(/<\/?GOAL_CONTINUATION>/g, '')
       .replace(/<\/?GOAL_CONTEXT>/g, '')

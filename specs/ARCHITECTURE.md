@@ -224,6 +224,10 @@ Node.js SSE Server (`src/server/sse.ts`) 管理客户端连接、heartbeat、广
 
 普通 Session 的 complete/stopped/error 通知也不归 Tab：builtin/external Runtime 产生统一的 turn identity、owner 和 origin 描述；Rust SSE proxy 与 `BackgroundCompletion` 只是两个提交入口。当前 Sidecar generation 负责发放一次性完成资格，`notification.rs` 再根据业务类型、窗口焦点和通知偏好统一处理系统通知、badge 与 deep-link。Renderer 的 terminal handler 只维护消息、UI 和未读状态。
 
+Cloud 通知同样不归 Tab，但有独立的进程级 Owner：`space_cloud::notifications` 随 Tauri App 启动，通过一个 optional-auth Cloud feed 投影公开公告与当前账号的 Space Issue 评论；Renderer 只消费 normalized snapshot。通知 receipt 统一写入应用全局 `~/.myagents/notification-state.json`：本地 Task receipt 不跟随 Space 环境，Cloud 公告与 pending read 则先按规范化 base URL 的 hash、再按账号 hash 隔离；私有标题、评论摘要、actor、target 和 URL 永不落盘。登录、登出与 401 是同步清空私有内存的 identity boundary；1 / 5 分钟前后台节奏、wake、退避、分页、baseline 与 toast 去重都由同一个 sync gate/loop 裁决，不由 Window、Tab 或 Space 页面另建 interval。
+
+通知 target 进入 shared typed `AppRoute`，当前 wire 包括 `myagents://open/v1/spaces/:spaceId/issues/:issueId` 与 `myagents://open/v1/tasks/:taskId/comments/:commentId`。OS deep link 先在 Rust 严格解析并进入 latest-wins queue，App Shell 再按 route 类型创建或聚焦唯一目标 Tab 并下发 generation intent：`space.issue` 进入 Space Tab 的准确 Issue 详情，`task.comment` 进入 Task Center 的准确 Task 与评论。应用导航 scheme 与 WebView 二进制资源 scheme 分离：新资源只生成 `myagents-resource://`（Windows 为对应 localhost projection），旧 `myagents://attachment` 只在历史内容读取边界兼容，不能进入 AppRoute。
+
 ### HTTP API 调用
 
 ```
@@ -260,11 +264,13 @@ Global control request
 | 前缀 | 职责 | 调用方 |
 |------|------|--------|
 | `/api/cron/*` | Scheduled Task 兼容 CRUD + 调度控制 | CLI、`im-cron-tool.ts` |
-| `/api/task/*`（20 条） | Task Center 任务 CRUD、run/run-now/rerun、Trigger validate/test/check-now/reset-checkpoint 与 doc 读写 | CLI、`admin-api.ts` |
+| `/api/task/*` | Task Center 任务 CRUD、run/run-now/rerun、Trigger validate/test/check-now/reset-checkpoint 与 doc 读写 | CLI、`admin-api.ts` |
 | `/api/document/*`（4 条） | App-owned 本地文档 conversion job submit/status/cancel/list | `admin-api.ts` 的 AnyDoc 薄转发 |
 | `/api/mcp/remove-references` | Task 中删除 custom MCP identity 的持久引用 | `admin-api.ts` MCP remove cascade |
 | `/api/app/config-changed` | 将 disk-first AppConfig 失效信号广播到所有 WebView（空 payload，不携带 secret） | `admin-api.ts` model / MCP mutation |
 | `/api/runtime/sdk-child/{admit,settle}` | Rust-owned Claude SDK native child launch circuit；按 executable identity 限流 deterministic exec denial | Global / Session Sidecar 的 `createGuardedSdkQuery()` |
+| `/api/mcp/startup/*` | MyAgents-owned 本地 stdio MCP 的应用级启动准入；优先级、FIFO/aging、取消、过期与 stale settlement | Session Sidecar |
+| Management `/api/browser/*` | 「浏览器」Host capability、受管 Chromium resource resolution 与 Browser Identity checkpoint/CAS | Rust/Tauri；仅当前 Global/Session birth identity 可调用 |
 | `/api/thought/*`（2 条） | 想法 create / list | CLI、`admin-api.ts` |
 | `/api/im/*` + `/api/im-bridge/*` | IM Bot 唤醒 + 媒体下发 + Plugin Bridge 回调 | Node.js / 社区插件 Bridge |
 | `/api/plugin/*`（3 条） | OpenClaw 插件 CRUD | CLI |
@@ -272,7 +278,23 @@ Global control request
 
 这是项目内**唯一**的"Node → Rust"反向 HTTP 通道，规避了"Renderer / Sidecar 控制面走 Rust proxy → Node"主流向对后端间通信的不适配。所有客户端 MUST 走 `crate::local_http::builder()`（loopback，仍复用 no_proxy 保护）。
 
+应用级资源不能由某个 Session Sidecar 的内存计数代管。Rust 的 MCP startup admission 只裁决 MyAgents-owned 本地 stdio 启动突发，不接管远端 HTTP、SDK in-process 或 `system-cli` 用户自有 MCP；10 秒 dispatch grace 从 demand 被接受时起算，包含排队时间。Global Sidecar 内的「浏览器」Host 使用 Rust 签发、绑定 Product Session 与 Host generation 的 capability，具体持有 Playwright `Browser` / `BrowserContext`；Rust 分别拥有 Host generation、Chromium resource install authorization/active revision 与 Browser Identity Store revision，不复制 Node 对象状态。
+
 Rust 为 Global 与 Session 两类 Sidecar 都在 spawn 前分配 process-global 单调 generation，并注入不可变的进程管理 identity（`MYAGENTS_SIDECAR_ID`）；Session pending / reset / handover 只迁移可变的业务 `sessionId` key，Management API 仍以进程出生时的 `(sidecarId, generation)` 校验 caller，不能给 Global 伪造 Session identity。SDK native child 的 EPERM / EACCES / ENOEXEC circuit 归 Rust 应用进程持有：admission 携带 epoch，half-open lease 自动过期，旧 settlement 不能清除较新的 failure epoch。该 circuit 是 best-effort 重试保护而非 SDK 启动 authority：只有携带上述确定性系统错误的显式 circuit denial 可以阻止启动；identity 缺失、`invalid_request` / `stale_sidecar`、transport 异常或畸形响应只跳过 circuit，继续调用 SDK，生命周期清理由 Sidecar owner 收敛。
+
+### 标准 Playwright 与受管「浏览器」
+
+工具目录中存在两个独立身份，不能把它们解释成同一个工具的模式切换：
+
+- `playwright` 是标准上游 Playwright MCP preset，继续作为普通 `npx @playwright/mcp@<locked>` stdio MCP 进入各 Runtime。仅当 `mcpServerArgs.playwright` 缺失时默认附加 `--isolated`；显式空数组和所有上游参数原样保留。MyAgents 不接管它的 Browser Host、浏览器下载、Profile 或进程语义。
+- `myagents-browser`（显示名「浏览器」）是 MyAgents 受管工具。固定使用有头 Chromium，通过保留 sentinel 投影到 Global Sidecar 的认证 HTTP MCP Host；Host 使用锁定 `@playwright/mcp` 的公共 `createConnection(config, contextGetter)`，不创建另一套 MCP 协议。
+
+受管工具只把 JS 控制代码与 App 一起发布，Chromium、Chromium Headless Shell 与 FFmpeg 不进入 App bundle、installer 或 updater。`src/shared/managed-browser-runtime.json` 是随 App 签名发布的 required runtime set 与各平台官方 artifact 计划：它锁定 Playwright 官方来源解析出的最终 Chrome for Testing / Playwright CDN URL、archive size、SHA-256、归档根和 executable path。Rust App owner 从未安装时只在用户点击“安装资源”后直连该锁定官方 artifact，完成摘要校验、安全解压与原子安装；读取状态不访问网络。首次成功形成 install authorization，后续 App revision 变化自动维护且最多重试两次；没有用户卸载入口。Browser Host 只能消费 Rust 投影的精确 executable path，不回退系统 Chrome、用户 Playwright cache、`npx playwright install` 或 App resources。
+
+- 一个 App Browser generation 共享一个 Chromium Browser process；每个 Product Session 一个隔离 `BrowserContext` 和原生窗口，同一 Context 的 Pages 是 Tabs。不存在 persistent/user-data-dir/Profile lease 模式。
+- Context 从 Rust-owned Browser Identity revision 初始化，Host 在成功工具调用后防抖保存，并在 close/teardown/shutdown 前强制保存 Cookie、localStorage 与 IndexedDB；并发 checkpoint 通过 revision + key-level CAS 合并。
+- Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
+- `config.mcpEnabledServers` 只表达全局可用性，因此两个固定内置 ID 可以同时启用。真正形成执行工具集的 Session、Agent 默认、Launcher 与 Task override 选择入口才互斥：选择一个会移除另一个，取消选择不改变对方；最终 Session 工具集仍取全局可用集与该执行选择集的交集。自定义 MCP 不参与该规则。
 
 ---
 
@@ -350,7 +372,10 @@ Tab 内 MUST 用 `useTabState()` 的 `apiGet` / `apiPost`，禁止全局 `apiPos
 
 `GlobalSidebar` 挂在 `App` 的 Tab Workspace 之外，是应用级导航和资源投影，不是新的页面容器或 Session owner。顶部 Tab 仍是所有主内容页面的唯一 authority：active、关闭、恢复、拖拽、Sidecar owner token 与 pending-session birth 都继续由现有 Tab 状态机管理。
 
-- 桌面主窗口 focus 以 Tauri `onFocusChanged` 为持续事件 authority；`App` 启动时用 renderer 当前 foreground 状态播种一次，之后只持有一个布尔投影并只让 active Chat 响应。focus 只负责保存/恢复滚动意图，不能充当窗口可见性或 geometry authority：仍在展示的 active Chat 即使失焦也持续把 live 消息交给 Virtuoso。只有 App 确实以 `content-visibility:hidden` 隐藏的 internal inactive Tab 才冻结 Virtuoso 输入；TabProvider/Sidecar 生命周期始终不受两者影响。
+App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Thought 只提交创建/讨论意图，不各自挂第二个 modal；普通 Task 详情选择属于 Task Center 内部状态，`task.comment` typed route 则由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
+
+- 桌面主窗口的 renderable surface 投影由 App Shell 拥有：`useTrayEvents` 在 focus、resize、document visibility 与主动 hide 边界采样 Tauri `isVisible() && !isMinimized()`，零尺寸 resize 可先行判为 unavailable；Rust-owned 的全局快捷键 hide/show 通过 `tray::hide_main_window` / `tray::show_main_window` 在现有 Tauri event channel 同步投影同一个 surface edge，避免 WebView suspend 让异步 renderer 采样吞掉完整 hidden interval。`App` 只在 available→unavailable 时推进 presentation generation，并只把该投影交给 active Chat。focus 值仅服务通知/input attention，不拥有 Chat 滚动、窗口可见性或 geometry；仍在展示的窗口即使失焦也持续把 live 消息交给 Virtuoso，失焦/重新聚焦本身不得产生 scroll command。
+- MessageList 外层 viewport 的非零 `ResizeObserver` 结果是当前 presentation generation 的 renderer readiness authority。internal inactive Tab、native minimized/hidden surface 或尚未 ready 的恢复 generation 都冻结 Virtuoso 的 data/index/height input；消息/SSE 与 TabProvider/Sidecar 生命周期继续推进。`useChatScrollController` 是唯一 continuity owner：viewport admission 从 true→false 时保存 follow 或最近可信 message anchor，从 false→true 时只执行一个受 Session/transaction identity 保护的恢复意图；未挂载 anchor 通过 Virtuoso `itemsRendered` 事件结算，禁止 focus snapshot、固定延时、RAF 猜测或把可见的 `align:start` 当最终位置。完整不变量见 [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md)。
 - 侧栏只从既有 `ConfigProvider`、任务中心 store、Session 索引与当前 Tab 派生工作区/Session 展示；active 高亮是 projection，不持久化第二份“当前页面”。该投影保持单一持久选中面：Launcher 选择工作区时高亮工作区行，Chat 已进入具体 Session 时只高亮 Session 行，父工作区仅保留层级上下文而不同时涂底或声明 `aria-current`。工作区配置和 Session mutation 分别调用现有 Config / Task Center authority，不在侧栏另存领域状态。
 - 侧栏与顶部 Title/Tab chrome 是同一 App Shell material surface：三者只读取完整 Theme 必需的 `--global-sidebar-bg`，该 Token 由每套 Theme 的 light/dark package 拥有；页面内容与卡片/弹层继续使用既有 `--paper / --paper-elevated / --paper-inset` 语义。App Shell chrome 不再依赖与内容区的分割线，常规 leading inset 为 8px，手动 rail 的 52px 预留同时容纳固定 toggle 与其后 8px 留白；Tab active/hover 复用全局 `--hover-bg`。不能为制造分区而翻转通用 Paper 层级、在组件内混色或为 Tab Chrome 复制一套局部 palette。
 - 侧栏展开/rail 切换的布局槽一次提交最终宽度，不能给 `width` / `flex-basis` 加逐帧 transition 让 Chat、Browser、Terminal 等 resize-sensitive surface 连续重排。可见边界由固定展开宽度的独立 paint-only 材质层通过 `clip-path` 横向揭示/收回；右侧 Tab 标题栏与内容用一次布局后的 compositor transform 保持旧视觉中心，再与边界同节奏归位。Chat 右侧工作区复用镜像模式：面板材质横移，对话区在最终 flex 布局上从旧中心归位；内容只做 opacity/translate/clip 编排，且必须提供 `prefers-reduced-motion` 立即切换路径。
@@ -387,7 +412,7 @@ MyAgents 产品级 append 由 `buildSystemPromptAppend()` 统一组装：
 |----|------|---------|
 | **L1** 基础身份 | 告诉 AI 运行在 MyAgents 产品中 | 始终 |
 | **L2** 交互方式 | 桌面客户端 / IM Bot / Agent Channel | 互斥选一 |
-| **L3** 场景与产品交互 | Task / IM 心跳 / Registered Agent / 浮球 / Widget / Session 协作 / Browser Storage | 按需叠加 |
+| **L3** 场景与产品交互 | Task / IM 心跳 / Registered Agent / 浮球 / Widget / Session 协作                   | 按需叠加 |
 | **L4** CLI 能力发现 | Task / Goal / Thought / IM 媒体 / Vision / 用户注册工具 | 按场景与能力开关叠加 |
 
 当前 `InteractionScenario` 包含 desktop、im、agent-channel、cron 和 registeredAgent；
@@ -564,9 +589,11 @@ Product Session identity 与 builtin SDK execution identity 是两个 lifecycle�
 
 Session transcript 的普通写入只接受 `SessionStore.loadSessionTranscript()` 签发的进程内 `TranscriptWriteCursor` 与新 tail；cursor 封装 durable file identity 和公开的 `persistedMessageCount`，Runtime 不另存 index/cache。短 live projection、stale cursor 或未知 append 结果不能触发 full rewrite；owner 必须重载 durable transcript并拒绝当前操作。rewind、retry、SDK retraction 与 admission rollback 通过 `mutateSessionTranscript()` 的命名 intent，在既有 per-Session lock 内从 durable rows 派生 target 后 temp+rename；SDK retraction 以 durable `sdkUuid` 为选择器，仅可额外删除明确传入的 open streaming tail id。legacy JSON 首次加载先原子发布 JSONL，失败保留 legacy source 并向调用方报错。Fork 只可写入空 target transcript，已有 target 一律冲突退出。Builtin Rewind 若同时更换 SDK binding，则由 `commitBuiltinConversationRewind()` 复用同一 per-Session lock 与 metadata 中 bounded `pendingConversationMutation`，只接受 source/target 两个 message count 完成崩溃恢复；Codex 对应使用 `commitCodexConversationRewind()`。这两个显式 composite command 不扩展成通用事务层。
 
-**Builtin MCP soft pre-warm：** `Query.initializationResult()` 与 streamed `system_init` 都不代表 MCP 已连接。初始 Query 或成功安装新 MCP map 时，`lifecycle.ts` 以 Query identity + generation + 单调 installed-map revision + runtime fingerprint 建立一次性 owner，并在 owner 上记录 `startedAt + deadlineAt`；默认预算只由 `session-core/mcp-prewarm-policy.ts::MCP_PREWARM_GRACE_MS` 定义（当前 10 秒）。Desktop、IM 与 Cron / Goal / Heartbeat / Memory Update 等 injected turn 全部在 `messageGenerator()` promotion 后、live mutation fence 之后消费该 owner 的**剩余**预算。只有 `pending` 会继续等待；`failed`、`needs-auth`、`disabled`、missing、status read error 或 deadline 到期都把当前 generation 标为 degraded 并继续 AI turn。ready / degraded 都是 terminal one-shot，后续 turn 不再读 status、不开新 timer。用户取消仍立即取消 promotion；Query/map owner replacement 则 requeue 给 replacement generator，不能让旧 control response放行旧 Query。
+**Builtin MCP dispatch grace 与 live capability：** `Query.initializationResult()` 与 streamed `system_init` 都不代表 MCP 已连接。初始 Query 或成功安装新 MCP map 时，`lifecycle.ts` 以 Query identity + generation + 单调 installed-map revision + runtime fingerprint 建立 owner，并记录 `startedAt + deadlineAt`；默认 dispatch grace 仍由 `session-core/mcp-prewarm-policy.ts::MCP_PREWARM_GRACE_MS` 定义（当前 10 秒）。Desktop、IM 与 Cron / Goal / Heartbeat / Memory Update 等 injected turn 全部在 `messageGenerator()` promotion 后、live mutation fence 之后消费该 owner 的**剩余**预算；首次观察即使已过 deadline 也至少做一次有界真实 status read。grace 到期只把 dispatch 标为 released，基础 AI turn 继续，不把当前 generation 永久判为无工具。用户取消仍立即取消 exact promotion；Query/map owner replacement 则 requeue 给 replacement generator，不能让旧 control response 放行旧 Query。
 
-`runInjectedTurn()` 不再拥有 MCP precheck、第二道 fence 或 408/503 MCP 映射，只保留 Goal/Task 等 domain `beforeDispatch` 与真实 turn timeout。Live MCP 更新仍由同一个 Query-generation mutation owner 串行化：mutation claim 与 promotion 通过同一事件循环内的同步 owner 顺序互斥；先 promotion 就推迟重建，先 claim 就由 promotion 等待同一 promise。真实 `setMcpServers()` 失败/30 秒 mutation timeout 仍表示 transport map 不确定，必须 requeue + replacement Query；这是配置切换正确性 fence，不属于 soft startup readiness。`mcpServerStatus()` 控制请求在一次 pre-warm observation 内单飞；status timeout 只结算当前 generation degraded，不再触发按 turn 重启循环。
+同一 Query generation 继续由低频 observer 读取 `mcpServerStatus()` 并发布 Runtime-neutral effective snapshot；server 可从 queued/starting 迟到变为 ready/failed/needs-auth，工具目录与 UI 由 catalog generation 更新。dispatch settlement 是 one-shot fast path，live capability observation 不是。MyAgents-owned 本地 stdio server 在真正启动前还要取得 Rust application admission；排队不会重置 10 秒 grace，名额迟到可用时仍由当前 Runtime owner 继续安装或在安全 idle boundary replacement，绝不自动重放已放行 turn。
+
+`runInjectedTurn()` 不再拥有 MCP precheck、第二道 fence 或 408/503 MCP 映射，只保留 Goal/Task 等 domain `beforeDispatch` 与真实 turn timeout。Live MCP 更新仍由同一个 Query-generation mutation owner 串行化：mutation claim 与 promotion 通过同一事件循环内的同步 owner 顺序互斥；先 promotion 就推迟重建，先 claim 就由 promotion 等待同一 promise。真实 `setMcpServers()` 失败/30 秒 mutation timeout 仍表示 transport map 不确定，必须 requeue + replacement Query；这是配置切换正确性 fence，不属于 soft startup readiness。`mcpServerStatus()` 在每次 observer tick 内单飞，observer 有固定低频间隔且随 exact owner abort，不形成 per-turn 热循环。
 
 SDK `task_started` 创建的后台 Agent/Bash 仍属于产生它的同一个 Query；foreground result 不代表整个 Query 已空闲。`lifecycle.ts` 按 Query object identity 保存 active task，现有 `applyDeferredRestartIfNeeded()` 与 pre-warm timer 在 registry 非空时保留 deferred reasons、不得 close Query；最后一个既有 terminal 事件再次触发 drain。显式 Stop/Reset/Switch 与真实 teardown 仍可立即终止，finalizer 从 exact registry `take` 残留项并合成 `stopped`。该契约不引入独立 Sidecar、等待 scheduler 或后台任务的第二份产品状态。
 
@@ -580,7 +607,7 @@ SDK `task_started` 创建的后台 Agent/Bash 仍属于产生它的同一个 Que
 | `codex.ts` | Codex Runtime：JSON-RPC 2.0 over stdio，`app-server` 持久进程 |
 | `gemini.ts` | Gemini Runtime：ACP JSON-RPC 2.0 over stdio，`gemini --acp` |
 | `external-session.ts` | 外部 runtime public facade：start/send/prewarm/stop、UnifiedEvent shell、SessionEngine-facing exports |
-| `external-session/*` | 外部 runtime owner modules：lifecycle、runtime config、operation queue、turn lifecycle、content blocks、transcript persistence、interactive requests；`extensions.ts` 额外拥有 Managed Codex 的 Session-local MCP/Plugin 选择、desired/effective generation、replacement latch 与 Host catalog generation |
+| `external-session/*` | 外部 runtime owner modules：lifecycle、runtime config、operation queue、turn lifecycle、content blocks、transcript persistence、interactive requests；`extensions.ts` 额外拥有 Managed Codex 的 Session-local MCP/Plugin 选择、desired/effective generation 与 replacement latch |
 | `managed-codex/extensions/*` | `runtimeSource:'managed-provider'` 的 Product Extension compiler 与 runtime-neutral Host tool dispatcher；把 MyAgents 权威配置投影成 Codex 原生 Skill/Agent/MCP/dynamic-tool 能力，不持久化第二份产品状态 |
 
 `external-session.ts` 不再是 external runtime 的 state owner。真实 mutable state 归 `src/server/runtimes/external-session/`：
@@ -597,7 +624,7 @@ SDK `task_started` 创建的后台 Agent/Bash 仍属于产生它的同一个 Que
 
 Codex 对话回溯与分支仍走现有 `/chat/rewind`、`/sessions/fork` → `SessionEngine` → external adapter 路径，不建立 Codex 专用 route 或第二套 Session。`codex.ts` 独占 `thread/read(includeTurns:true)`、`thread/fork(lastTurnId)`、`thread/unsubscribe` 与 root `turn/start` admission；`external-session.ts` 在既有 operation serialization 边界内编排 native branch、进程切换和产品 Session；`SessionStore` 独占 transcript/metadata 的可恢复提交。成功 root terminal assistant 才持久化 `{turnId, rootUserMessageId}` 锚点。Rewind 只改变对话上下文，不恢复工作区文件；有 replacement native thread 时在 durable rebind 和 mutation lease 释放后异步复用既有 prewarm，失败只影响下一次 send 的启动延迟；第一 native Turn 之前继续用“无 runtimeSessionId”表示，不预热空 thread，下一次发送复用既有 fresh-start。Claude Code / Gemini 继续明确不支持该能力。
 
-Managed Codex 的产品扩展也必须沿同一条链路进入：route 只调用 `SessionEngine` config 方法，external adapter 交给 `external-session` 从服务端权威配置编译一份 immutable Session Extension Snapshot，并在 idle/terminal 边界 replacement process。Codex 进程启动且 MCP startup barrier 完成 terminal/timeout 观察后，desired revision 提升为该 process generation 的 effective revision；单个 Skill、MCP、Agent 或 Plugin 的失败只降级对应组件并进入 Logs，不阻断 Runtime generation。Codex adapter 只拥有 app-server 协议投影；外部 MCP 使用启动配置，Agent 使用原生 role config，合并后的有效 Workspace/全局/Plugin Skill 通过临时 extra-root 精确投影，SDK in-process MCP 与 IM Bridge 通过 runtime-neutral Host dispatcher 暴露为 `thread/start.dynamicTools`。Codex 0.146.0 的 dynamic-tool catalog 不能在 native thread resume 时更换，因此 Session metadata 只持久化协议版本与非敏感 catalog fingerprint：catalog 未变可 resume，变化或 legacy 未证明一致时必须新建 Product Session；历史 Session 的 desired/legacy catalog 都为空时允许 resume。不能偷偷恢复旧目录或建立第二套 bridge。`system-cli` Codex 不进入这套 MyAgents-owned 投影。
+Managed Codex 的产品扩展也必须沿同一条链路进入：route 只调用 `SessionEngine` config 方法，external adapter 交给 `external-session` 从服务端权威配置编译一份 immutable Session Extension Snapshot，并在 idle/terminal 边界 replacement process。Codex 进程启动且 MCP startup barrier 完成 terminal/timeout 观察后，desired revision 提升为该 process generation 的 effective revision；单个 Skill、MCP、Agent 或 Plugin 的失败只降级对应组件并进入 Logs，不阻断 Runtime generation。Codex adapter 只拥有 app-server 协议投影；外部 MCP 使用启动配置，Agent 使用原生 role config，合并后的有效 Workspace/全局/Plugin Skill 通过临时 extra-root 精确投影，SDK in-process MCP 与 IM Bridge 通过 runtime-neutral Host dispatcher 暴露为 `thread/start.dynamicTools`。Codex 0.149.0 仍在 native thread birth 固定 dynamic-tool 可见目录，resume 不提供替换目录的字段；Product Session 不持久化协议版本或 Host catalog fingerprint，也不因目录变化拒绝历史 Session。恢复时始终挂载当前 Host dispatcher：线程出生时已知且语义稳定的工具按当前 descriptor、schema、权限与 generation 执行，已移除、未知或参数无效只失败当前调用；新增工具在下一条新 native thread 可见。不能偷偷恢复旧目录或建立第二套 bridge。`system-cli` Codex 不进入这套 MyAgents-owned 投影。
 
 Managed Codex 子 Agent 的原生 child turn lifecycle 只由 `codex.ts` 在既有 turn-local ancestry / activity correlation 内归一；`external-session/content-blocks.ts` 拥有父级 `CollabAgent` 的单调内容投影、成功 turn 持久化和 root terminal fail-closed 收口。状态沿现有 `UnifiedEvent → session SSE → Renderer` 控制面传递，Renderer 只派生工具卡、Agent Status Panel 与 Companion 展示，不维护 thread registry、轮询器或第二份执行 authority。没有真实 child turn 的 control-only activity 不获得 lifecycle；builtin `Task` / `Agent` 继续走 SDK 自有状态。
 
@@ -619,7 +646,7 @@ Managed Codex 子 Agent 的原生 child turn lifecycle 只由 `codex.ts` 在既�
 | 目标 Tab 存在但 Sidecar 不活跃 | 复用该 Tab，由 Rust lifecycle revive 目标 Sidecar |
 | 目标 Session 尚无 Tab | 新建从首帧即绑定目标 Session 的 Tab，再 ensure 目标 Sidecar |
 
-**导航 owner**：Global Sidebar、Search Overlay、通知 / Task deep-link 与开发者模式 Chat History 都必须进入 `App.handleOpenTargetSession()`，由 `planSessionOpen()` 只决定 open / jump；目标 Tab 的 live create / reuse 统一进入 App 的 existing-Session materialization，并由 `reconcileExistingSessionTabOwner()` 取得 exact Tab owner。顶部“恢复上次对话”是同一能力的批量入口：候选先按既有恢复校验过滤，再一次提交最终 live Chat Tabs 与 active correlation；所有 surviving Tab 从首帧挂载正常 `TabProvider`，并各自独立进入同一个 materialization / reconcile，单目标失败只回收该 Tab。这里“正常 `TabProvider`”只承诺 Session identity、SSE、history lifecycle 与 exact owner 立即成立，不要求一次同步提交挂载全部重型 `Chat` 子树：批量恢复先绘制 provider-owned `ChatBootOverlay`，随后只 reveal active Chat；未访问的 inactive Chat 在首次选中并完成轻量帧后 reveal，已 reveal 的 Chat 继续保持挂载。不得恢复一排尚无 owner、依赖首次切换才打开的 placeholder Tab，也不得复制 Sidecar owner、port 或 workspace 状态。Chat 与 `TabProvider` 不得自行把当前真实 Session A hot-swap 为 B；历史恢复也不得修改 Node runtime binding。旧 `POST /sessions/switch` 与 `SessionEngine.switchToExistingSession` 已删除。新对话、pending→real、desktop reset 与已确认 surface migration 继续走各自既有 identity handover，不属于历史导航。
+**导航 owner**：Global Sidebar、Search Overlay、Session-targeting 通知 / Task execution 链接与开发者模式 Chat History 都必须进入 `App.handleOpenTargetSession()`，由 `planSessionOpen()` 只决定 open / jump；`space.issue`、`task.comment` 等 feature AppRoute 则由 `App.handleOpenAppRoute()` 分发到对应页面，不创建或恢复 Session。目标 Session Tab 的 live create / reuse 统一进入 App 的 existing-Session materialization，并由 `reconcileExistingSessionTabOwner()` 取得 exact Tab owner。顶部“恢复上次对话”是同一能力的批量入口：候选先按既有恢复校验过滤，再一次提交最终 live Chat Tabs 与 active correlation；所有 surviving Tab 从首帧挂载正常 `TabProvider`，并各自独立进入同一个 materialization / reconcile，单目标失败只回收该 Tab。这里“正常 `TabProvider`”只承诺 Session identity、SSE、history lifecycle 与 exact owner 立即成立，不要求一次同步提交挂载全部重型 `Chat` 子树：批量恢复先绘制 provider-owned `ChatBootOverlay`，随后只 reveal active Chat；未访问的 inactive Chat 在首次选中并完成轻量帧后 reveal，已 reveal 的 Chat 继续保持挂载。不得恢复一排尚无 owner、依赖首次切换才打开的 placeholder Tab，也不得复制 Sidecar owner、port 或 workspace 状态。Chat 与 `TabProvider` 不得自行把当前真实 Session A hot-swap 为 B；历史恢复也不得修改 Node runtime binding。旧 `POST /sessions/switch` 与 `SessionEngine.switchToExistingSession` 已删除。新对话、pending→real、desktop reset 与已确认 surface migration 继续走各自既有 identity handover，不属于历史导航。
 
 **Sidecar owner**：目标 Tab 的 Session identity 在 mount 前已经确定；App 的 `reconcileExistingSessionTabOwner()` 串起 exact Tab owner 的 ensure 与废弃请求清理。Rust manager 在同一把锁内确认当前 generation 仍包含该 Tab owner，并释放临时 `BackgroundCompletion` 交接 owner；并发 Task owner 不受影响。pending→real adoption 按 Tab 串行，Rust 只接受 exact Tab owner 的 source 或已迁移 target。配置 push / adopt 只服从锁内返回的 `result.isNew`。
 
@@ -702,42 +729,49 @@ Cmd+W 层级关闭：Overlay → 分屏面板 → Tab，高 z-index 优先。
 
 详见 `tech_docs/search_architecture.md`。
 
-### 15. Skill URL 安装 (`src/server/skills/`)
+### 15. Skill 来源安装 (`src/server/skills/`)
 
-支持从 GitHub 链接、`npx skills add` 命令或直连 zip 一键把社区 skill 装到 `~/.myagents/skills/`（或当前工作区 `.claude/skills/`）。
+支持从 GitHub 链接、`npx skills add` 命令、HTTPS zip、本地目录或本地 `.zip/.skill` 包，把 skill 物化安装到 `~/.myagents/skills/`（或当前工作区 `.claude/skills/`）。`owner/repo` 固定表示 GitHub；CLI 只把显式 `./` / `../` 相对路径按调用者 cwd 解析为绝对路径。
 
-**三段流水线：**
+**四段流水线：**
 ```
 url-resolver.ts      — 宽容解析 → ResolvedSkillSource
     ▼
-tarball-fetcher.ts   — codeload.github.com 下载 zip → 内存解包 + 安全限额
+source-loader.ts     — 远程下载或本地 no-follow 快照 → ExtractedTree
     ▼
-installer.ts         — 扫描 SKILL.md / marketplace.json → InstallAnalysis
+tarball-fetcher.ts / local-tree-reader.ts — 统一安全限额与无 symlink 树
+    ▼
+installer.ts         — analyseTree → staging → 文件锁内复核/rename 发布/失败回滚
 ```
 
-**安全限额：** tarball ≤ 50MB、单文件 ≤ 5MB、文件总数 ≤ 2000、超时 60s、Zip-Slip 防御。直连压缩包必须使用 HTTPS；下载前后每个 redirect hop 都拒绝 loopback/RFC1918/link-local/IPv6 ULA，并把 fetch 钉死到已校验 DNS 结果，防 SSRF / DNS rebinding。
+**安全限额：** 下载包与来源树总量 ≤ 50MB、单文件 ≤ 5MB、文件总数 ≤ 2000、下载超时 5 分钟；压缩包拒绝 Zip-Slip、绝对路径和 symlink，本地目录拒绝 source root / 内部 symlink 或 junction。直连压缩包必须使用 HTTPS；每个 redirect hop 都拒绝 loopback/RFC1918/link-local/IPv6 ULA，并把 fetch 钉死到已校验 DNS 结果，防 SSRF / DNS rebinding。安装永远复制为 managed root 下的普通物理目录，不保留对来源的链接。
 
-**MVP 明确不支持：** GitLab、私有仓库、git SSH URL、搜索集成、市场订阅持久化、`skill update`、跨 IDE symlink 同步、npm spec 形态。
+**明确不支持：** `.tar.gz/.tgz`、GitLab、私有仓库、git SSH URL、搜索集成、市场订阅持久化、`skill update`、跨 IDE symlink 同步、npm spec 形态。来源 URL / commit 不持久化。
 
 详见 `guides/skill_marketplace.md`。
 
 ### 16. 任务中心 (`src-tauri/src/task.rs` + `src-tauri/src/thought.rs` + `src/renderer/components/task-center/`)
 
-把"想法速记 → 对齐 → 派发 → 执行 → 验收 → 审计"的完整工作流一等公民化。
+把“想法/粗略目标 → 讨论或创建 → 调度 → Session 执行 → 本地协作 → 审计”的工作流一等公民化。
 
 **两个持久化 Store：**
 - `ThoughtStore` —— `~/.myagents/thoughts/<YYYY-MM>/<id>.md`
-- `TaskStore` —— `~/.myagents/tasks.jsonl` + `~/.myagents/tasks/<id>/{task.md, verify.md, progress.md, alignment/}`
+- `TaskStore` —— `~/.myagents/tasks.jsonl` + canonical `~/.myagents/tasks/<id>/task.md` + 可选 `comments.jsonl`；旧 `verify.md/progress.md/alignment.md` 仅兼容读取
 
 **关键设计：**
 - Task 状态机 + 审计链（每次状态变更原子写入 `statusHistory`）
 - TaskStore 是 schedule/status/config 唯一权威；TaskScheduler 直接触发并在每次 tick 动态读取 `task.md`
+- 普通 Task 的执行 prompt 永远读取完整 `task.md`，`dispatchOrigin` 只保留来源，不选择 executor Skill；旧 `verify.md` 在首次读取/编辑/执行前按字面 `# verify.md` 章节一次性并入 `task.md`
+- Task Comment 先由 TaskStore 持久化，再由 TaskApplication 冻结至多一个 exact Session 并复用既有 Inbox/FIFO 接纳；首轮 Task query 真正 admission 后才追加 Session relation 并 flush pending comments
+- Agent 只有显式 `myagents task comment` 才写回本地时间线；普通 assistant 输出不自动归档。Attached Task 的 Cloud Issue 与本地评论由本轮 reminder 决定回复通道，不镜像或双写
 - 每个 Task 最多一个 time Activation Trigger；缺失等价 `always`。command Trigger 配置写 Task row，高频 checkpoint/health/pending event 写 `tasks/<id>/trigger-state.json`，两者都只由 TaskStore 读写
 - command Detector 的合法业务结果只有 `quiet | activate`；只有 durable `activate` 才建立 Session/Sidecar/Runtime 工作，failure 在 harness 内诊断、退避或阻塞
 - `TaskApplication` 统一编排 Task 的创建、状态、删除和 run/rerun；current-session Task 只在真实 Session 创建完成后才持久化，通知字段在 TaskStore 写锁内合并，成功的 run/rerun 由同一操作返回从 1 开始计数的 `attemptOrdinal`，供 GUI/CLI 上报 analytics
 - Task/Session identity protection 由 per-Session lifecycle guard 串行化：任何 durable mutation（含 legacy migration）只要让 Task 进入受保护状态或新增受保护 Session binding，都与 Session 删除遵循 `lifecycle → TaskStore` 锁序；scheduler active execution 覆盖 Session id 已 claim、Sidecar `Task` owner 尚未附着的窗口，birth guard 只保留到权威 Session metadata 出现（不持满整轮），shared-session joiner 不得提前 adopt。metadata creator 由该 reservation 决定，不绑定 Sidecar `isNew`；被删除的 fixed Session 换新 UUID，不复活旧 identity
 - 同一 Task 的 status、timer、execution claim 与 stop side effect 由 keyed Task-control lifecycle 串行化；stop 使用现有 `queueId` 精确停止当前 Turn。持久 `Running/Stopped` 只表达 scheduler intent，具体 Turn 以非持久 `running/stopping/stop_failed` 投影；stop 未确认时禁止 rerun。Attached Space Task 的终态不能 generic rerun，必须由新的 claim/reopen 创建新 Attached Task
-- AI 讨论路径：想法卡 →「AI 讨论」打开新 Tab + 注入 `task-alignment` Skill → 完成后 `myagents task create-from-alignment`
+- Runtime terminal 先由 TaskStore 在一笔原子提交中结算 counter/time/`lastExecution`/连续失败/可选终态，再写 `cron_runs` 审计、通知和释放 Session owner；外围 cleanup 没有 Task 状态写权限。recurring 可重试失败第 5 次才 Blocked，成功清零；永久失败、一次性任务失败或 termination 未确认立即 Blocked，manual run-now 不改 durable status
+- AI 讨论路径：智能创建或 Thought「AI 讨论」→ 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`
+- Agent comment 的本地有界 locator index 由 TaskStore 从 `comments.jsonl` 异步重建并增量维护；App 级通知投影与 Cloud source 合并排序、source-aware 已读和 typed route，但不复制评论正文 authority
 - 状态变更广播 Tauri event `task:status-changed`（非 SSE），所有打开的任务中心 Tab 实时同步
 
 详见 `tech_docs/task_center.md`。
@@ -854,7 +888,7 @@ Cloud Space 把官方/团队空间接入桌面端。0.3.0 起作为实验室能�
 **核心边界：**
 
 - Space 不是 AI Runtime / Session Sidecar。云端登录、HTTP 请求、附件/Skill IO、registered-agent IssueDelivery poll/process 都由 Rust Tauri command 拥有。
-- Rust 内部以 `space_cloud.rs` 为 facade 与 account/session、统一 authorized Cloud client owner；`space_cloud/{registered_agents,delivery,cli,skills,attachments}.rs` 分别拥有现有领域状态与操作，`tests.rs` 承载跨模块契约。依赖只能从领域模块指向根 auth/client，且 `delivery → registered_agents`、`cli → registered_agents + attachments`；Agent mutation 后唤醒 connector、Attachment 下载的 User/Agent credential 选择由根 facade 编排，禁止 `registered_agents → delivery`、`attachments → registered_agents`、平行 HTTP/auth helper 或第二套状态。
+- Rust 内部以 `space_cloud.rs` 为 facade 与 account/session、统一 authorized Cloud client owner；`space_cloud/{registered_agents,delivery,cli,skills,tools,attachments}.rs` 分别拥有现有领域状态与操作，`tests.rs` 承载跨模块契约。Tool 模块只负责自定义 Tool 图标的本地文件校验、归一化和 multipart transport；MCP 安装写入仍由 Renderer 的 `atomicModifyConfig` 进入 `config.json` authority。依赖只能从领域模块指向根 auth/client，且 `delivery → registered_agents`、`cli → registered_agents + attachments`；Agent mutation 后唤醒 connector、Attachment 下载的 User/Agent credential 选择由根 facade 编排，禁止 `registered_agents → delivery`、`attachments → registered_agents`、平行 HTTP/auth helper 或第二套状态。
 - Renderer 只通过 `src/renderer/api/spaceCloud.ts` 调 Tauri invoke，不直连 Space 服务，也不持有 session token。
 - build-time capability 由 `src-tauri/build.rs` 注入 `MYAGENTS_SPACE_*`，`cmd_space_get_capability` 只裁决构建能力与当前 build-time origin；实验室入口还受 `config.teamSpaceEnabled` 默认关闭门控。debug 构建可烘焙 `MYAGENTS_SPACE_DEV_BASE_URL`，release profile 机制性丢弃 Dev origin。
 - `config.spaceEnvironment` 只在烘焙的 `production` / `dev` origin 之间二选一，Renderer 不提供自由 URL 输入。旧配置值 `staging` 仅在 debug 构建包含 Dev origin 时读取为 `dev`；新写入永远使用 `dev`，release 构建一律回落 Production。
@@ -1127,6 +1161,7 @@ Windows 无自带 git/bash，NSIS 静默安装 Git for Windows（`src-tauri/nsis
 - [设计系统](./DESIGN.md) — Token / 组件 / 页面规范
 - [Theme System](./tech_docs/theme_system.md) — Theme/Appearance 状态、注册契约、Token/adapter owner、bootstrap 与跨窗口同步
 - [React 稳定性规范](./tech_docs/react_stability_rules.md) — Context / useEffect / memo 5 条规则
+- [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md) — native surface、container readiness、Virtuoso admission 与 continuity transaction
 - [UI 国际化架构](./tech_docs/i18n_architecture.md) — `uiLanguage`、i18next resources、native tray language mirror、增加新语言流程
 
 ### CLI

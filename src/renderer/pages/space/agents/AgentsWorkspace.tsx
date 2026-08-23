@@ -70,66 +70,6 @@ function instructionLength(value: string): number {
   return Array.from(value).length;
 }
 
-function stateFiltersEqual(left: string[], right: string[]): boolean {
-  return (
-    normalizeAgentStateFilter(left).join("\u0000") ===
-    normalizeAgentStateFilter(right).join("\u0000")
-  );
-}
-
-async function replaceVisibleAgentSubscription(
-  actions: SpaceActions,
-  registeredAgentId: string,
-  current: SpaceGoalSubscription | null,
-  goalId: string,
-  stateFilter: string[],
-): Promise<SpaceGoalSubscription> {
-  const normalizedStateFilter = normalizeAgentStateFilter(stateFilter);
-  if (
-    current &&
-    current.goalId === goalId &&
-    stateFiltersEqual(current.stateFilter, normalizedStateFilter)
-  ) {
-    return current;
-  }
-
-  const create = () =>
-    actions.createRegisteredAgentSubscription({
-      registeredAgentId,
-      goalId,
-      stateFilter: normalizedStateFilter,
-    });
-
-  if (!current) return create();
-
-  if (current.goalId !== goalId) {
-    const replacement = await create();
-    try {
-      await actions.deleteRegisteredAgentSubscription(current.id);
-      return replacement;
-    } catch (error) {
-      await actions
-        .deleteRegisteredAgentSubscription(replacement.id)
-        .catch(() => undefined);
-      throw error;
-    }
-  }
-
-  await actions.deleteRegisteredAgentSubscription(current.id);
-  try {
-    return await create();
-  } catch (error) {
-    await actions
-      .createRegisteredAgentSubscription({
-        registeredAgentId,
-        goalId: current.goalId,
-        stateFilter: current.stateFilter,
-      })
-      .catch(() => undefined);
-    throw error;
-  }
-}
-
 function AgentInstructionField({
   value,
   onChange,
@@ -580,8 +520,9 @@ function EditAgentDialog({
   const [workspaceId, setWorkspaceId] = useState(
     currentProject?.id ?? currentWorkspaceId,
   );
-  const [visibleSubscription, setVisibleSubscription] =
-    useState<SpaceGoalSubscription | null>(agent.subscriptions[0] ?? null);
+  const [visibleSubscription] = useState<SpaceGoalSubscription | null>(
+    agent.subscriptions[0] ?? null,
+  );
   const visibleGoalId = visibleSubscription?.goalId ?? agent.goalId ?? "";
   const [goalId, setGoalId] = useState(visibleGoalId || goals[0]?.id || "");
   const [stateFilter, setStateFilter] = useState<string[]>(() =>
@@ -684,16 +625,6 @@ function EditAgentDialog({
     if ((visibleSubscription || goalOptions.length > 0) && !goalId) return;
     setBusy(true);
     try {
-      if (goalId) {
-        const nextSubscription = await replaceVisibleAgentSubscription(
-          actions,
-          agent.id,
-          visibleSubscription,
-          goalId,
-          stateFilter,
-        );
-        setVisibleSubscription(nextSubscription);
-      }
       await actions.updateRegisteredAgent({
         id: agent.id,
         displayName: displayName.trim(),
@@ -702,6 +633,15 @@ function EditAgentDialog({
           ? {
               instruction: normalizedInstruction,
               expectedInstructionRevision: agent.instructionRevision,
+            }
+          : {}),
+        ...(goalId
+          ? {
+              subscriptionReplacement: {
+                expectedSubscriptionId: visibleSubscription?.id ?? null,
+                goalId,
+                stateFilter: normalizeAgentStateFilter(stateFilter),
+              },
             }
           : {}),
         ...nextWorkspace,

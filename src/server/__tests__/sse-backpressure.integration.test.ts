@@ -259,6 +259,7 @@ describe('SSE event priority registration', () => {
     expect(SSE_EVENT_PRIORITIES['chat:message-chunk']).toBe('coalescible');
     expect(SSE_EVENT_PRIORITIES['chat:tool-result-delta']).toBe('coalescible');
     expect(SSE_EVENT_PRIORITIES['chat:runtime-tool-catalog']).toBe('coalescible');
+    expect(SSE_EVENT_PRIORITIES['chat:mcp-effective-snapshot']).toBe('coalescible');
   });
 
   it('classifies error / completion / init events as critical', () => {

@@ -265,6 +265,7 @@ export function SpaceSettingsWorkspace({
     String(session.space.limits?.joinedMembersMax),
     String(session.space.limits?.openIssuesMax),
     String(session.space.limits?.hostedSkillsMax),
+    String(session.space.limits?.hostedToolsMax),
     String(session.space.limits?.registeredAgentsMax),
     String(session.space.limits?.storageBytesMax),
   ].join(":");
@@ -755,11 +756,11 @@ export function SpaceSettingsWorkspace({
     ? session.space.entitlement.expiresAt
     : session.space.planExpiresAt;
   const planSummary = planExpiresAt
-      ? t("space.settings.planValidUntil", {
-          plan,
-          date: formatDate(planExpiresAt),
-        })
-      : plan;
+    ? t("space.settings.planValidUntil", {
+        plan,
+        date: formatDate(planExpiresAt),
+      })
+    : plan;
   const unlimitedLabel = t("space.settings.unlimited");
   const resourcePlan =
     session.space.entitlement?.source === "space_override"
@@ -966,6 +967,19 @@ export function SpaceSettingsWorkspace({
                 overLimit={quotaExceeded(
                   overviewUsage?.hostedSkills,
                   overviewLimits?.hostedSkillsMax,
+                )}
+              />
+              <ResourceMetric
+                label={t("space.settings.quotaTools")}
+                value={formatQuotaValue(
+                  overviewUsage?.hostedTools,
+                  overviewLimits?.hostedToolsMax,
+                  unlimitedLabel,
+                  i18n.resolvedLanguage,
+                )}
+                overLimit={quotaExceeded(
+                  overviewUsage?.hostedTools,
+                  overviewLimits?.hostedToolsMax,
                 )}
               />
               <ResourceMetric

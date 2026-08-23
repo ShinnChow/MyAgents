@@ -5,8 +5,9 @@ import type { RuntimeModelInfo, RuntimeSource, RuntimeType } from './types/runti
 import type { UiLanguage } from './i18n';
 import type { OfficialToolId, OfficialToolSettings } from './official-tools';
 import type { SubscriptionVerifyFailureKind } from './subscription';
-import { PLAYWRIGHT_MCP_PACKAGE_SPEC } from './mcpPackages';
 import managedCodexRuntimeLock from './managed-codex-runtime.json';
+import { MANAGED_BROWSER_MCP_ID, STANDARD_PLAYWRIGHT_MCP_ID } from './browserTools';
+import { PLAYWRIGHT_MCP_PACKAGE_SPEC } from './mcpPackages';
 import {
   DEFAULT_APPEARANCE_MODE,
   DEFAULT_THEME_ID,
@@ -1742,6 +1743,13 @@ export interface McpServerDefinition {
   description?: string;    // Feature description
   type: McpServerType;
 
+  /**
+   * Opaque, non-secret revision of product-owned runtime settings that are not
+   * represented as MCP argv/env. It participates in Runtime generation
+   * fingerprints but is never executed or persisted as user-authored config.
+   */
+  runtimeConfigRevision?: string;
+
   // stdio configuration
   command?: string;        // Command to run (e.g., 'npx')
   args?: string[];         // Command arguments
@@ -1794,12 +1802,24 @@ export interface McpEnableError {
  */
 export const PRESET_MCP_SERVERS: McpServerDefinition[] = [
   {
-    id: 'playwright',
+    id: STANDARD_PLAYWRIGHT_MCP_ID,
     name: 'Playwright 浏览器',
-    description: '浏览器自动化能力，支持网页浏览、截图、表单填写等',
+    description: '标准 Playwright MCP，支持自定义浏览器与运行参数',
     type: 'stdio',
     command: 'npx',
     args: [PLAYWRIGHT_MCP_PACKAGE_SPEC],
+    isBuiltin: true,
+    isFree: true,
+  },
+  {
+    id: MANAGED_BROWSER_MCP_ID,
+    name: '浏览器',
+    description: 'MyAgents 托管的 Chromium，支持多对话隔离与登录状态复用',
+    type: 'stdio',
+    // Product-owned sentinel. Runtime adapters project only this preset to the
+    // authenticated application Browser Host; it is never spawned as stdio.
+    command: '__browser_host__',
+    args: [],
     isBuiltin: true,
     isFree: true,
   },

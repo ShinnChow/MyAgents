@@ -391,7 +391,10 @@ impl SessionRouter {
         {
             let _lifecycle = crate::sidecar::acquire_session_lifecycle(&[&session_id]).await;
             match crate::sidecar::has_persisted_session_owner(&session_id).await {
-                Ok(false) => self.reconcile_peer_session_metadata_before_use(session_key, manager),
+                Ok(false) => {
+                    self.reconcile_peer_session_metadata_before_use(session_key, manager)
+                        .await
+                }
                 Ok(true) => {}
                 Err(error) => ulog_warn!(
                     "[im-router] Skipping Session identity reconciliation for {}: {}",
@@ -481,7 +484,7 @@ impl SessionRouter {
         })
     }
 
-    fn reconcile_peer_session_metadata_before_use(
+    async fn reconcile_peer_session_metadata_before_use(
         &mut self,
         session_key: &str,
         manager: &ManagedSidecarManager,
@@ -511,7 +514,7 @@ impl SessionRouter {
                 let old_session_id = snapshot.session_id.clone();
                 let new_session_id = uuid::Uuid::new_v4().to_string();
                 let owner = SidecarOwner::Agent(session_key.to_string());
-                if let Err(e) = release_session_sidecar(manager, &old_session_id, &owner) {
+                if let Err(e) = release_session_sidecar(manager, &old_session_id, &owner).await {
                     ulog_warn!(
                         "[im-router] Failed to release stale unindexed peer session {} for {}: {}",
                         short_id(&old_session_id),
@@ -800,14 +803,8 @@ impl SessionRouter {
             drift_result,
             RuntimeDriftResult::NoDrift | RuntimeDriftResult::DetectedKeptAlive
         ) {
-            let release_manager = manager.clone();
-            let release_session_id = session_id.clone();
             let release_owner = SidecarOwner::Agent(session_key.to_string());
-            let release = tauri::async_runtime::spawn_blocking(move || {
-                release_session_sidecar(&release_manager, &release_session_id, &release_owner)
-            })
-            .await
-            .map_err(|error| format!("Runtime drift owner release task failed: {error:?}"))?;
+            let release = release_session_sidecar(manager, &session_id, &release_owner).await;
             if let Err(error) = release {
                 ulog_warn!(
                     "[im-router] Failed to release old Agent owner during runtime drift (session_key={} session={}): {}",
@@ -930,7 +927,7 @@ impl SessionRouter {
     /// so that the stable session_id can be reused for resume on next message.
     /// Returns the list of session_keys collected so callers can cancel any
     /// associated ImEventConsumer tasks (Pattern C lifecycle hook).
-    pub fn collect_idle_sessions(&mut self, manager: &ManagedSidecarManager) -> Vec<String> {
+    pub async fn collect_idle_sessions(&mut self, manager: &ManagedSidecarManager) -> Vec<String> {
         let now = Instant::now();
         let idle_keys: Vec<String> = self
             .peer_sessions
@@ -951,7 +948,7 @@ impl SessionRouter {
                     &ps.session_id,
                 );
                 let owner = SidecarOwner::Agent(key.clone());
-                let _ = release_session_sidecar(manager, &ps.session_id, &owner);
+                let _ = release_session_sidecar(manager, &ps.session_id, &owner).await;
                 ps.sidecar_port = 0; // Sidecar released, but session preserved for resume
             }
         }
@@ -1635,7 +1632,7 @@ impl SessionRouter {
     /// incomplete teardown instead of silently losing retry evidence. For
     /// hot-reload paths that just need sidecars to restart (e.g. runtime
     /// switch), use [`Self::release_all_sidecars_preserve_bindings`] instead.
-    pub fn release_all(&mut self, manager: &ManagedSidecarManager) -> Result<usize, String> {
+    pub async fn release_all(&mut self, manager: &ManagedSidecarManager) -> Result<usize, String> {
         let count = self.peer_sessions.len();
         let keys: Vec<String> = self.peer_sessions.keys().cloned().collect();
         let mut released = 0usize;
@@ -1643,7 +1640,7 @@ impl SessionRouter {
         for key in keys {
             if let Some(ps) = self.peer_sessions.get(&key) {
                 let owner = SidecarOwner::Agent(key.clone());
-                match release_session_sidecar(manager, &ps.session_id, &owner) {
+                match release_session_sidecar(manager, &ps.session_id, &owner).await {
                     Ok(_) => {
                         self.peer_sessions.remove(&key);
                         released += 1;
@@ -1679,13 +1676,16 @@ impl SessionRouter {
     /// `prepare_ensure_sidecar` will see the existing peer_session and re-mint
     /// the Sidecar on the next dispatch, reusing the same `session_id` so the
     /// SDK conversation resumes seamlessly.
-    pub fn release_all_sidecars_preserve_bindings(&mut self, manager: &ManagedSidecarManager) {
+    pub async fn release_all_sidecars_preserve_bindings(
+        &mut self,
+        manager: &ManagedSidecarManager,
+    ) {
         let mut released = 0_usize;
         let keys: Vec<String> = self.peer_sessions.keys().cloned().collect();
         for key in keys {
             if let Some(ps) = self.peer_sessions.get_mut(&key) {
                 let owner = SidecarOwner::Agent(key.clone());
-                let _ = release_session_sidecar(manager, &ps.session_id, &owner);
+                let _ = release_session_sidecar(manager, &ps.session_id, &owner).await;
                 ps.sidecar_port = 0;
                 released += 1;
             }
@@ -2205,8 +2205,8 @@ mod tests {
         assert!(!restored_peer.metadata_indexed);
     }
 
-    #[test]
-    fn reset_path_rotates_stale_indexed_peer_before_freeze() {
+    #[tokio::test]
+    async fn reset_path_rotates_stale_indexed_peer_before_freeze() {
         let session_key = "agent:a:feishu:private:user";
         let mut router =
             SessionRouter::new_for_agent(PathBuf::from("/tmp/workspace"), "a".to_string());
@@ -2217,7 +2217,9 @@ mod tests {
         router.upsert_peer_session(stale);
         let manager = Arc::new(Mutex::new(SidecarManager::new()));
 
-        router.reconcile_peer_session_metadata_before_use(session_key, &manager);
+        router
+            .reconcile_peer_session_metadata_before_use(session_key, &manager)
+            .await;
 
         let reconciled = router
             .peer_session_snapshot(session_key)

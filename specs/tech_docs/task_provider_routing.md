@@ -43,16 +43,17 @@ TaskStore 不保存：
 
 ### Provider/runtime 不变式
 
-`validate_task_provider_routing()` 在所有 create/update/migration 入口统一守门：
+Rust `validate_task_execution_routing()` 在所有 create/update/migration 入口统一守门；Node 只做 CLI 早期提示与 dry-run parity，不能代替 merged-state authority：
 
 | 条件 | 结果 |
 |---|---|
 | `providerId` 存在但 `model` 缺失 | 拒绝 |
 | external runtime 与 builtin `providerId` 同时存在 | 拒绝 |
 | `providerId` 存在、runtime 缺失 | pin 为 `builtin` |
+| `runtimeConfig.source=managed-provider` 且 runtime 不是 `codex` | 拒绝 |
 | legacy credential env | 不复制；迁移 Task 标为 Blocked 并要求重选 |
 
-External runtime 自己拥有 provider，Task 只可保存该 runtime 支持的 model/config。
+External runtime 自己拥有 provider，Task 只可保存该 runtime 支持的 model/config。Cron compatibility 更新在同一 Task control lock 内读取最新 Task，先对 routing patch 做无写入的 merged-state 校验，再开始 Running Task 的 stop→update→restart；因此无效或与并发最新状态冲突的 routing patch 不会先把 Task 停掉。
 
 ### MCP 三态
 
@@ -77,7 +78,9 @@ TaskScheduler reads current Task
 -> task-turn-orchestrator.ts owns Task preparation and execution lifecycle
 -> SessionEngine selector chooses builtin/external adapter
 -> adapter.prepareScheduledTurn binds the Session and applies runtime-native initial config
--> runInjectedTurn enqueues one Task turn with per-turn permission
+-> runInjectedTurn enqueues the complete canonical task.md with per-turn permission
+-> adapter acceptance invokes onDispatched(queueId, sessionId) exactly once
+-> TaskApplication persists the Session relation and flushes pending Task comments
 -> wait for real terminal result
 -> persist Task outcome/history
 -> release Task owner on terminal/stop/delete
@@ -88,6 +91,8 @@ TaskScheduler reads current Task
 `routes/scheduled-turns.ts` 只处理 JSON 解析、字段校验、HTTP 状态和响应结构。Task 的 Session 准备、dispatch guard、reminder/exit 处理与终态判定属于 `task-turn-orchestrator.ts`；Builtin/External 的 Session binding、配置和 MCP 准备属于各自 adapter 的 `prepareScheduledTurn()`。Route 不直接实现 Runtime 分支。
 
 对已有 Session，Node 如果无法切换到 payload 指定的 Session，必须 fail closed；禁止退回“当前碰巧打开的 Session”继续执行。
+
+`dispatchOrigin` 只记录 provenance，不能选择不同 Prompt 或 executor Skill；手动与 AI 讨论后创建的 ordinary Task 共用这条路径。admission callback 是 queue 接纳后的回执，不替代既有 dispatch guard；回执持久化失败由 terminal settlement 幂等补偿，不能重放已经接纳的 Turn。
 
 ## 4. 新 Session 初始化
 

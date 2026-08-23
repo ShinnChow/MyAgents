@@ -12,8 +12,9 @@ import feishuIcon from './assets/feishu.jpeg';
 import feishuStep1Img from './assets/feishu_step1.png';
 import weixinIcon from './assets/weixin.png';
 import wecomIcon from './assets/wecom.jpeg';
+import type { CredentialQrProvider } from '../../../shared/types/im';
 
-export interface PromotedPlugin {
+interface PromotedPluginBase {
     /** Plugin ID — must match InstalledPlugin.pluginId after installation */
     pluginId: string;
     /** npm package spec for auto-install */
@@ -39,16 +40,6 @@ export interface PromotedPlugin {
     requiredFields?: string[];
     /** Default config values merged into pluginConfig when creating a new channel */
     defaultConfig?: Record<string, unknown>;
-    /**
-     * Authentication type:
-     * - 'config' (default): user fills config fields (appId, appSecret, etc.)
-     * - 'qrLogin': user scans QR code to login (e.g. WeChat)
-     * - 'dualConfig': user chooses QR scan OR manual config to obtain credentials (e.g. WeCom)
-     *   QR scan auto-creates a bot and retrieves credentials; manual lets user paste existing ones.
-     *   Both paths write to openclawPluginConfig and then start normally via config auth.
-     * Auto-detected for custom plugins via Bridge /capabilities supportsQrLogin.
-     */
-    authType?: 'config' | 'qrLogin' | 'dualConfig';
     /** Custom setup guidance for the wizard config step */
     setupGuide?: {
         /** Section title in config panel (e.g. "QQ Bot 应用凭证") */
@@ -73,6 +64,28 @@ export interface PromotedPlugin {
     };
 }
 
+/**
+ * Authentication type:
+ * - `config` (default): user fills config fields.
+ * - `qrLogin`: the plugin runtime logs an account in through its gateway.
+ * - `dualConfig`: QR provisioning creates credentials, with manual entry as fallback.
+ *
+ * A dualConfig preset must name its credential provider so the UI cannot
+ * silently fall back to a different platform's provisioning endpoint.
+ */
+export type PromotedPlugin = PromotedPluginBase & (
+    | {
+        authType: 'dualConfig';
+        /** Credential-provisioning backend used by dualConfig. */
+        credentialQrProvider: CredentialQrProvider;
+        requiredFields: string[];
+    }
+    | {
+        authType?: 'config' | 'qrLogin';
+        credentialQrProvider?: never;
+    }
+);
+
 export const PROMOTED_PLUGINS: PromotedPlugin[] = [
     {
         pluginId: 'openclaw-lark',
@@ -83,6 +96,8 @@ export const PROMOTED_PLUGINS: PromotedPlugin[] = [
         icon: feishuIcon,
         platformColor: '#3370FF',
         badge: 'official',
+        authType: 'dualConfig',
+        credentialQrProvider: 'feishu',
         requiredFields: ['appId', 'appSecret'],
         defaultConfig: {
             streaming: true,
@@ -140,6 +155,7 @@ export const PROMOTED_PLUGINS: PromotedPlugin[] = [
         platformColor: '#1B66F5',
         badge: 'official',
         authType: 'dualConfig',
+        credentialQrProvider: 'wecom',
         requiredFields: ['botId', 'secret'],
         defaultConfig: {
             dmPolicy: 'open',

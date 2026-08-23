@@ -283,16 +283,23 @@ export function createTaskTurnOrchestrator() {
             clearCronTaskContext(effectiveSessionId);
             if (prepared.code === 'session_bind_failed') {
               return payload.initializeSession
-                ? { success: false, error: 'Failed to create new session for execution.', status: 500 }
+                ? {
+                    success: false,
+                    error: 'Failed to create new session for execution.',
+                    code: prepared.code,
+                    status: 500,
+                  }
                 : {
                     success: false,
                     error: `Failed to switch to required Task session ${effectiveSessionId}`,
+                    code: prepared.code,
                     status: 409,
                   };
             }
             return {
               success: false,
               error: prepared.error ?? 'Failed to prepare Task session',
+              code: prepared.code,
               status: prepared.status ?? 500,
             };
           }
@@ -309,6 +316,7 @@ export function createTaskTurnOrchestrator() {
               intervalMinutes: payload.intervalMinutes ?? 15,
               executionNumber: payload.executionNumber,
               activationEvent: payload.activationEvent,
+              includeTaskCollaboration: payload.managedKind === undefined,
             });
             admissionAttempted = true;
             const turnResult = await engine.runInjectedTurn({
@@ -330,12 +338,23 @@ export function createTaskTurnOrchestrator() {
               turnOwner: { kind: 'task', id: payload.taskId },
               beforeDispatch: prepared.beforeDispatch ?? dispatchGuard,
               requiredSystemSkill: prepared.requiredSystemSkill,
+              onDispatched: async (acceptedQueueId, acceptedSessionId) => {
+                const admitted = await managementApi('/api/task/turn/admitted', 'POST', {
+                  taskId: payload.taskId,
+                  queueId: acceptedQueueId,
+                  sessionId: acceptedSessionId,
+                });
+                if (admitted.ok !== true) {
+                  throw new Error(String(admitted.error ?? 'Task admission receipt was rejected'));
+                }
+              },
             });
             if (!turnResult.success) {
               return {
                 success: false,
                 turnDispatched: turnResult.enqueued === true,
                 error: turnResult.error ?? 'Execution failed',
+                ...(turnResult.code ? { code: turnResult.code } : {}),
                 ...(turnResult.terminationUnconfirmed ? { terminationUnconfirmed: true } : {}),
                 status: turnResult.status ?? 503,
               };

@@ -151,7 +151,7 @@ describe('effective project capabilities', () => {
     })).rejects.toThrow('unique Project owner');
   });
 
-  it('keeps historical project copies of required Skills enabled as the project winner', async () => {
+  it('treats historical project task-alignment copies as ordinary optional Skills', async () => {
     const { home, workspace } = makeFixture();
     write(join(home, '.myagents', 'config.json'), JSON.stringify({
       agents: [{
@@ -176,19 +176,22 @@ describe('effective project capabilities', () => {
       expect.objectContaining({
         id: 'project:skill:task-alignment',
         source: 'project',
-        required: true,
+        required: false,
         systemOwned: false,
-        enabled: true,
+        enabled: false,
       }),
     ]);
-    await expect(setProjectCapabilityEnabled({
+    await setProjectCapabilityEnabled({
       workspacePath: workspace,
       capabilityId: 'project:skill:task-alignment',
-      enabled: false,
-    })).rejects.toThrow('Required system Skill cannot be disabled');
+      enabled: true,
+    });
+    expect(resolveEffectiveProjectCapabilities(workspace).enabledSkills).toContainEqual(
+      expect.objectContaining({ id: 'project:skill:task-alignment' }),
+    );
   });
 
-  it('uses a project alias as the winner for the same Required canonical name', () => {
+  it('keeps a project alias for retired task-alignment as an ordinary winner', () => {
     const { workspace } = makeFixture();
     write(
       join(workspace, '.claude', 'skills', 'local-alignment', 'SKILL.md'),
@@ -201,7 +204,7 @@ describe('effective project capabilities', () => {
         id: 'project:skill:local-alignment',
         source: 'project',
         sourceLocalId: 'local-alignment',
-        required: true,
+        required: false,
         systemOwned: false,
         enabled: true,
       }),
@@ -319,7 +322,7 @@ describe('effective project capabilities', () => {
     }));
   });
 
-  it('treats a project Skill symlink as the project winner by canonical name', () => {
+  it('treats a retired project Skill symlink as an ordinary winner by canonical name', () => {
     const { home, workspace } = makeFixture();
     write(join(home, '.myagents', 'skills', 'global-alignment', 'SKILL.md'), skill('task-alignment', 'global'));
     const foreign = join(home, 'foreign-project-skill');
@@ -333,7 +336,7 @@ describe('effective project capabilities', () => {
       expect.objectContaining({
         id: 'project:skill:local-alignment',
         source: 'project',
-        required: true,
+        required: false,
         enabled: true,
       }),
     ]);

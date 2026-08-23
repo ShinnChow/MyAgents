@@ -104,6 +104,7 @@ AppImage 和 deb 内部都包含：
 **不内置**：
 - `git` — 大多数发行版默认安装；缺失时 Claude Code 工具会降级
 - `bash` / 核心 POSIX 工具 — 系统自带
+- 「浏览器」的 Chromium / Headless Shell / FFmpeg — 只在用户首次点击“安装资源”后由 Rust owner 下载 signed runtime set；普通 AppImage/deb build 不下载也不打包
 
 ## 常见问题
 

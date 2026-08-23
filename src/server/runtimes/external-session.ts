@@ -80,7 +80,15 @@ import { isManagedCodexProviderReady } from '../utils/managed-codex-readiness';
 import { findProjectAgentByWorkspacePath, getEffectiveOfficialToolIdsForSession, isCliToolRegistryEnabled, loadConfig as loadAdminConfig, resolveWorkspaceConfig } from '../utils/admin-config';
 import type { AgentConfig } from '../../shared/types/agent';
 import { resolveEffectiveProjectCapabilities } from '../project-capabilities';
-import type { EffectiveProjectCapabilitySnapshot } from '../../shared/projectCapabilities';
+import {
+  assertProductSystemSkillCandidate,
+  type EffectiveProjectCapabilitySnapshot,
+} from '../../shared/projectCapabilities';
+import {
+  assertKnownProductSystemSkillRequirement,
+  isProductSystemSkillRequirement,
+  type SystemSkillAdmissionRequirement,
+} from '../../shared/systemSkills';
 import {
   createGlobalSkillInventorySnapshot,
   type GlobalSkillInventorySnapshot,
@@ -167,13 +175,8 @@ import type {
   ManagedCodexExtensionSnapshot,
   ManagedCodexExtensionUpdateResult,
 } from './managed-codex/extensions/contracts';
-import { MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION } from './managed-codex/extensions/contracts';
+import { attachManagedCodexHostTools } from './managed-codex/extensions/host-dispatcher';
 import {
-  attachManagedCodexHostTools,
-  managedCodexHostCatalogFingerprint,
-} from './managed-codex/extensions/host-dispatcher';
-import {
-  getActiveManagedCodexHostCatalog,
   getManagedCodexDesiredSnapshot,
   getManagedCodexExtensionStatus,
   getManagedCodexSessionEnabledPluginIds,
@@ -186,13 +189,10 @@ import {
   resolveManagedCodexMcpSelection,
   resetManagedCodexExtensionState,
   setManagedCodexDesiredSnapshot,
-  setActiveManagedCodexHostCatalog,
   setManagedCodexExtensionRestartPending,
   setManagedCodexSessionEnabledPluginIds,
   setManagedCodexSessionMcpServers,
   setManagedCodexRuntimeDiagnostics,
-  setPendingManagedCodexHostCatalogBirth,
-  takePendingManagedCodexHostCatalogBirth,
 } from './external-session/extensions';
 import {
   canDrainExternalOperations,
@@ -270,10 +270,12 @@ import {
   setExternalLifecycleScenario,
   setExternalLifecycleState,
   setExternalPrewarmingSession,
+  setExternalMcpEffectiveSnapshot,
   setExternalRuntimeSessionId,
   setExternalSystemInitPayload,
   updateExternalLifecycleStartingSessionId,
 } from './external-session/lifecycle';
+export { getExternalMcpEffectiveSnapshot } from './external-session/lifecycle';
 import { originAnalyticsFields, originFromTurnAttribution } from '../../shared/session-origin';
 import type { SessionOrigin } from '../../shared/session-origin';
 import type { OfficialToolId } from '../../shared/official-tools';
@@ -612,6 +614,29 @@ function applyPendingExternalProcessConfigInvalidation(
   return operation;
 }
 
+function scheduleManagedCodexAdmissionReplacementPrewarm(): void {
+  const sessionId = getExternalLifecycleSessionId();
+  const workspacePath = getExternalLifecycleWorkspacePath();
+  const scenario = getExternalLifecycleScenario();
+  if (!isManagedCodexProductRuntime() || !sessionId || !workspacePath) return;
+  const timer = setTimeout(() => {
+    if (
+      !isManagedCodexProductRuntime()
+      || getExternalLifecycleSessionId() !== sessionId
+      || getExternalLifecycleWorkspacePath() !== workspacePath
+      || isExternalSessionBusy()
+      || hasExternalRuntimeProcess()
+    ) return;
+    void prewarmExternalSession({ sessionId, workspacePath, scenario }).catch(error => {
+      console.warn(
+        '[external-session] MCP admission replacement prewarm failed:',
+        summarizeExternalRuntimeMessageForLog(error),
+      );
+    });
+  }, 0);
+  timer.unref?.();
+}
+
 function scheduleExternalQueueDrainAfterTurnBoundary(): void {
   if (pendingExternalProcessConfigRestartReasons().length === 0) {
     setTimeout(() => drainExternalQueueAfterTurn(), 0);
@@ -621,6 +646,7 @@ function scheduleExternalQueueDrainAfterTurnBoundary(): void {
 
   const finalization = applyPendingExternalProcessConfigInvalidation()
     .then(() => {
+      scheduleManagedCodexAdmissionReplacementPrewarm();
       setTimeout(() => drainExternalQueueAfterTurn(), 0);
     })
     .catch((error) => {
@@ -1425,37 +1451,15 @@ async function ensureExternalSessionMetadataForRealUserTurn(params: {
 
   const pendingBirth = pendingBirthForSession(sessionId);
   const existing = getSessionMetadata(sessionId);
-  const nativeThreadId = getExternalRuntimeSessionId();
-  const activeHostCatalog = getActiveManagedCodexHostCatalog();
-  const bornHostCatalog = activeHostCatalog?.threadId === nativeThreadId
-    ? activeHostCatalog
-    : null;
   if (existing) {
     const runtimeSessionId = pendingBirth?.runtimeSessionId;
     if (existing.materializationState === 'prepared') {
-      if (bornHostCatalog) {
-        await updateSessionMetadata(sessionId, {
-          managedCodexExtensionProtocolVersion: MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION,
-          managedCodexHostCatalogFingerprint: bornHostCatalog.fingerprint,
-        });
-      }
       clearPendingExternalSessionBirth(sessionId);
       return { preparedExisting: true, runtimeSessionId };
-    } else if (
-      (runtimeSessionId && existing.runtimeSessionId !== runtimeSessionId)
-      || (bornHostCatalog
-        && (existing.managedCodexExtensionProtocolVersion !== MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION
-          || existing.managedCodexHostCatalogFingerprint !== bornHostCatalog.fingerprint))
-    ) {
+    } else if (runtimeSessionId && existing.runtimeSessionId !== runtimeSessionId) {
       try {
         const updated = await updateSessionMetadata(sessionId, {
-          ...(runtimeSessionId ? { runtimeSessionId } : {}),
-          ...(bornHostCatalog
-            ? {
-                managedCodexExtensionProtocolVersion: MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION,
-                managedCodexHostCatalogFingerprint: bornHostCatalog.fingerprint,
-              }
-            : {}),
+          runtimeSessionId,
         });
         if (!updated) {
           console.warn(`[external-session] runtimeSessionId patch skipped for ${sessionId}: metadata disappeared during ${origin}`);
@@ -1508,10 +1512,6 @@ async function ensureExternalSessionMetadataForRealUserTurn(params: {
   });
   if (pendingBirth?.runtimeSessionId) {
     meta.runtimeSessionId = pendingBirth.runtimeSessionId;
-  }
-  if (bornHostCatalog) {
-    meta.managedCodexExtensionProtocolVersion = MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION;
-    meta.managedCodexHostCatalogFingerprint = bornHostCatalog.fingerprint;
   }
 
   await saveSessionMetadata(meta);
@@ -2649,13 +2649,37 @@ export function getManagedCodexExtensionConfigSnapshot(): {
 
 class ExternalRequiredSkillUnavailableError extends Error {
   constructor(skillName: string) {
-    super(`Managed Codex did not load required system skill ${skillName}`);
+    super(`External Runtime did not admit required system skill ${skillName}`);
     this.name = 'ExternalRequiredSkillUnavailableError';
   }
 }
 
 /** Reject only a dependent Managed Codex operation when native read-back omitted its Skill. */
-export async function requireCurrentExternalSkill(skillName: string): Promise<void> {
+export async function requireCurrentExternalSkill(
+  requirement: SystemSkillAdmissionRequirement,
+  admission?: ExternalSkillAdmission,
+): Promise<void> {
+  const skillName = isProductSystemSkillRequirement(requirement)
+    ? assertKnownProductSystemSkillRequirement(requirement).name
+    : requirement;
+  if (isProductSystemSkillRequirement(requirement)) {
+    const admitted = admission ?? buildCurrentExternalSkillAdmission(
+      getExternalLifecycleWorkspacePath() ?? '',
+    );
+    if (admitted.unavailableSkillNames.includes(skillName)) {
+      throw new ExternalRequiredSkillUnavailableError(skillName);
+    }
+    assertProductSystemSkillCandidate(admitted.capabilitySnapshot, requirement);
+    if (admitted.capabilitySnapshot.integrityRevision !== admitted.globalSkillInventory.integrityRevision) {
+      throw new Error(`external Runtime product Skill ${skillName} inventory is inconsistent`);
+    }
+    if (getExternalActiveCapabilityRevision() !== admitted.revision) {
+      throw new Error(`external Runtime inventory changed before product Skill ${skillName} dispatch`);
+    }
+  }
+  // Native loaded-Skill read-back is currently available only for managed
+  // Codex. Every external Runtime still passes the product-owned candidate,
+  // integrity, and revision admission above before a dependent turn starts.
   if (!isManagedCodexProductRuntime()) return;
   const process = getExternalActiveProcess();
   if (!process?.loadedSkillNames?.includes(skillName)) {
@@ -2896,7 +2920,7 @@ export async function startExternalSession(options: {
   messageOperation?: ExternalMessageOperation;
   /** Reuse the exact admission already built at this message boundary. */
   skillAdmission?: ExternalSkillAdmission;
-  requiredSystemSkill?: import('../../shared/systemSkills').RequiredSystemSkill;
+  requiredSystemSkill?: SystemSkillAdmissionRequirement;
 }): Promise<void> {
   // Concurrency guard — wait for any in-flight start to finish
   await awaitExternalLifecycleStarting();
@@ -2943,7 +2967,7 @@ async function _doStartExternalSession(options: {
   onDispatchAccepted?: () => void;
   messageOperation?: ExternalMessageOperation;
   skillAdmission?: ExternalSkillAdmission;
-  requiredSystemSkill?: import('../../shared/systemSkills').RequiredSystemSkill;
+  requiredSystemSkill?: SystemSkillAdmissionRequirement;
 }): Promise<void> {
 
   const runtimeType = getCurrentRuntimeType();
@@ -3066,49 +3090,11 @@ async function _doStartExternalSession(options: {
       sessionId: options.sessionId,
       workspacePath: options.workspacePath,
     });
-    const desiredHostCatalogFingerprint = managedCodexHostCatalogFingerprint(
-      managedCodexExtensionSnapshot.dynamicTools,
-    );
-    const emptyHostCatalogFingerprint = managedCodexHostCatalogFingerprint([]);
-    const resumeHostCatalogMismatch = Boolean(
-      options.resumeSessionId
-      && (
-        existingMetadataAtStart?.managedCodexExtensionProtocolVersion
-          !== MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION
-        || existingMetadataAtStart?.managedCodexHostCatalogFingerprint
-          !== desiredHostCatalogFingerprint
-      )
-      && (
-        managedCodexExtensionSnapshot.dynamicTools.length > 0
-        || (existingMetadataAtStart?.managedCodexHostCatalogFingerprint
-          && existingMetadataAtStart.managedCodexHostCatalogFingerprint
-            !== emptyHostCatalogFingerprint)
-      ),
-    );
-    if (resumeHostCatalogMismatch) {
-      managedCodexExtensionSnapshot.hostToolDispatcher?.dispose(
-        'Native thread Host tool catalog differs from the desired Session catalog',
-      );
-      managedCodexExtensionSnapshot = {
-        ...managedCodexExtensionSnapshot,
-        dynamicTools: [],
-        hostToolDispatcher: undefined,
-        components: [
-          ...managedCodexExtensionSnapshot.components.filter(result => result.component !== 'host_tools'),
-          {
-            component: 'host_tools',
-            state: 'unsupported',
-            code: 'host_tools_catalog_immutable',
-            message: 'Start a new Product Session to apply the changed Host tool catalog.',
-            requiresUserAction: true,
-          },
-        ],
-      };
-    } else if (!options.resumeSessionId) {
-      setPendingManagedCodexHostCatalogBirth({
-        fingerprint: desiredHostCatalogFingerprint,
-      });
-    }
+    // Codex fixes a dynamic-tool catalog at native thread birth. A resumed
+    // Product Session keeps that visibility, but always receives the current
+    // dispatcher: stable tools continue to work, while removed or
+    // schema-invalid tools fail only their individual call. Newly added tools
+    // become visible when a new native thread is created.
     setManagedCodexDesiredSnapshot(managedCodexExtensionSnapshot, 'no-live-process');
   }
   if (shouldTrackPendingExternalSessionBirth({
@@ -3345,11 +3331,6 @@ async function _doStartExternalSession(options: {
             sessionId: options.sessionId,
             workspacePath: options.workspacePath,
           });
-          setPendingManagedCodexHostCatalogBirth({
-            fingerprint: managedCodexHostCatalogFingerprint(
-              managedCodexExtensionSnapshot.dynamicTools,
-            ),
-          });
           setManagedCodexDesiredSnapshot(managedCodexExtensionSnapshot, 'no-live-process');
         }
         assertExternalTurnPromotionCurrent(options.dispatchPromotion ?? null);
@@ -3376,7 +3357,7 @@ async function _doStartExternalSession(options: {
       throw new ExternalTurnPromotionCanceledError();
     }
     if (options.requiredSystemSkill) {
-      await requireCurrentExternalSkill(options.requiredSystemSkill);
+      await requireCurrentExternalSkill(options.requiredSystemSkill, externalSkillAdmission);
     }
     if (deferRequiredAdmission) {
       await admitInitialMessage();
@@ -3394,7 +3375,6 @@ async function _doStartExternalSession(options: {
     }
     console.log(`[external-session] ${runtimeType} process started, pid=${process.pid}`);
   } catch (err) {
-    setPendingManagedCodexHostCatalogBirth(null);
     const failure = options.dispatchPromotion?.signal.aborted
       && !(err instanceof ExternalTurnPromotionCanceledError)
       ? new ExternalTurnPromotionCanceledError()
@@ -3913,7 +3893,7 @@ async function dispatchExternalMessageOperation(
   const admittedProcess = getExternalActiveProcess();
   if (context?.requiredSystemSkill && admittedProcess && !admittedProcess.exited) {
     try {
-      await requireCurrentExternalSkill(context.requiredSystemSkill);
+      await requireCurrentExternalSkill(context.requiredSystemSkill, skillAdmission);
     } catch (error) {
       if (dispatchPromotion) finishExternalTurnPromotion(dispatchPromotion);
       return { queued: false, error: error instanceof Error ? error.message : String(error) };
@@ -6711,15 +6691,6 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
       // CC: session_id from hook; Codex: threadId from thread/start response; Gemini: from session/new
       if (event.sessionId) {
         setExternalRuntimeSessionId(event.sessionId);
-        const bornHostCatalog = isManagedCodexProductRuntime()
-          ? takePendingManagedCodexHostCatalogBirth()
-          : null;
-        if (bornHostCatalog) {
-          setActiveManagedCodexHostCatalog({
-            threadId: event.sessionId,
-            fingerprint: bornHostCatalog.fingerprint,
-          });
-        }
         // Persist to SessionMetadata for cross-restart resume.
         // During pre-warm, metadata may not exist yet. Attempt update; if
         // metadata doesn't exist yet, store the ID in the pending birth record
@@ -6744,12 +6715,6 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
             runtime: getCurrentRuntimeType(),
             runtimeSource: getCurrentRuntimeSource(),
             runtimeSessionId: targetRuntimeId,
-            ...(bornHostCatalog
-              ? {
-                  managedCodexExtensionProtocolVersion: MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION,
-                  managedCodexHostCatalogFingerprint: bornHostCatalog.fingerprint,
-                }
-              : {}),
           })
             .then((updated) => {
               if (
@@ -6801,6 +6766,59 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
         sessionId: getExternalLifecycleSessionId(),
         tools,
       });
+      break;
+    }
+
+    case 'mcp_effective_update': {
+      const {
+        kind: _kind,
+        ...runtimeSnapshot
+      } = event;
+      const snapshot = setExternalMcpEffectiveSnapshot(
+        {
+          ...runtimeSnapshot,
+          observedAt: Date.now(),
+        },
+        getCurrentRuntimeType(),
+        getCurrentRuntimeSource(),
+      );
+      broadcast('chat:mcp-effective-snapshot', snapshot);
+      break;
+    }
+
+    case 'mcp_startup_admission_ready': {
+      if (!isManagedCodexProductRuntime()) break;
+      setManagedCodexExtensionRestartPending(true);
+      broadcastManagedCodexExtensionDiagnostics(true);
+      if (!isExternalSessionBusy()) {
+        void applyPendingExternalProcessConfigInvalidation()
+          .then(() => scheduleManagedCodexAdmissionReplacementPrewarm())
+          .catch(error => {
+            console.warn(
+              '[external-session] MCP admission idle replacement failed:',
+              summarizeExternalRuntimeMessageForLog(error),
+            );
+          });
+      }
+      break;
+    }
+
+    case 'mcp_runtime_replacement_required': {
+      if (!isManagedCodexProductRuntime()) break;
+      pendingExternalCapabilityRestart = true;
+      console.log(
+        `[external-session] ${event.serverId} transport is ready for idle-boundary replacement`,
+      );
+      if (!isExternalSessionBusy()) {
+        void applyPendingExternalProcessConfigInvalidation()
+          .then(() => scheduleManagedCodexAdmissionReplacementPrewarm())
+          .catch(error => {
+            console.warn(
+              '[external-session] MCP transport idle replacement failed:',
+              summarizeExternalRuntimeMessageForLog(error),
+            );
+          });
+      }
       break;
     }
 

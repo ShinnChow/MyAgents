@@ -1,12 +1,12 @@
 ---
 name: myagents-task-automation
 description: >-
-  让 Agent 建立 MyAgents Task 自动化的完整产品心智模型，并创建、验证和治理所有“以后再做”的工作：理解 Task 解决什么问题、与立即执行/Thought/Goal 的边界，以及何时到点直接唤醒 AI（always）、何时先用本地 command Detector 判断是否值得唤醒。用户提到定时、稍后、某个时间点、每天/每周、每隔一段时间、Cron、循环检查、持续关注/监控/盯着、等某件事发生后继续、满足条件才提醒或处理时，都应主动使用本 Skill，即使用户没有说 Task、Cron、Sensor 或感知器。普通立即执行任务、仅记录 Thought、明确要求 Goal Mode 的持续多轮工作不使用本 Skill。
+  让 Agent 建立 MyAgents Task 的完整产品心智模型，并创建、验证和治理需要持久追踪、独立 Session 或未来触发的工作：理解 Task 与立即执行/Thought/Goal 的边界，以及 once/scheduled/recurring、Session routing、结束条件和 command Detector。用户提到创建 Task、定时、稍后、周期检查、持续关注、满足条件才处理时使用；普通立即执行、仅记录 Thought 或明确要求 Goal Mode 的工作不使用。
 metadata:
   author: MyAgents
 ---
 
-# MyAgents 定时与自动化 Task
+# MyAgents Task 与自动化
 
 ## 先建立 Task 产品心智模型
 
@@ -70,7 +70,7 @@ MyAgents App 必须在线才会产生 tick 或执行检查。Task 可以在 App 
 4. **Session**：延续当前/已有上下文用 `single-session`；每次需要隔离上下文用 `new-session`。
 5. **结束**：一次性任务自然结束；循环任务根据用户意图选择最大 AI 执行次数、截止时间、允许 AI 主动退出，或持续到用户暂停。Detector 的 quiet 检查不计入 AI 执行次数。
 
-只澄清会改变这些选择的缺失信息。信息齐全后连续完成准备、验证、创建、回读和启动，不逐步索要批准；删除仍遵守 `/myagents-cli` 的确认规则。
+只澄清会改变这些选择的缺失信息。普通的明确创建请求在信息齐全后连续完成准备、验证、创建、回读和启动，不逐步索要批准；删除仍遵守 `/myagents-cli` 的确认规则。若本轮来自 `<TASK_DISCUSSION>`，则由 `myagents-task-alignment` 负责候选文档与创建前确认，必须等用户明确确认后才 mutation。
 
 ## `always`：到点直接激活
 
@@ -138,13 +138,15 @@ myagents task get <taskId> --json
 myagents task run <taskId> --json
 ```
 
-创建、`run`、`start`、`stop`、`rerun` 的 JSON 回执都应包含权威最新状态和 `nextExecutionAt`，因此正常流程不需要为了确认 schedule 再额外 `get`；需要完整配置、文档路径、Session 历史或 Detector health 时再用 `task get`。首次从 Todo 启用用 `task run`；暂停后恢复用 `task start`；终态重新派发用 `task rerun`。不要通过目录时间或猜测名称寻找刚创建的 Task。
+创建、`get`、`run`、`rerun` 的 JSON 结果都提供固定的 `data.receipt`：从这里读取 `taskId`、`status`、`statusMeaning`、`changed`、`nextExecutionAt`、瞬时 `executionState` 和 `resultAccess`，不要猜测不同命令的旧字段层级。`Running` 只表示 scheduler enabled；重复或并发 `task run` 已经 Running 的 Task 会成功返回 `changed: false`，不会创建第二次派发，也不应重试。`start`、`stop` 的既有回执仍包含权威状态与 `nextExecutionAt`。首次从 Todo 启用用 `task run`；暂停后恢复用 `task start`；终态重新派发用 `task rerun`。不要通过目录时间或猜测名称寻找刚创建的 Task。
+
+`resultAccess` 只解释现有结果通道：`single-session` 的结果留在绑定 Session；`new-session` 的结果留在各次执行 Session 和 `task runs` 历史。系统不会把执行结果自动推回创建 Task 的 Session，也不会把普通 assistant 输出自动复制为 Task 评论；需要沉淀到本地时间线时由 Agent 显式调用 `task comment`。
 
 ## 治理
 
 ```bash
 myagents task get <taskId> --json       # 权威配置、状态、Detector health/checkpoint
-myagents task runs <taskId> --limit 5   # 最近 AI 执行历史
+myagents task runs <taskId> --limit 5 --full --json # 最近 AI 执行历史与结果正文
 myagents task check-now <taskId>        # 真实 Detector 检查；提交状态，命中会激活 AI
 myagents task run-now <taskId>          # 绕过 Detector，直接执行 AI
 myagents task stop <taskId>             # 暂停 schedule，保留 checkpoint
@@ -158,6 +160,18 @@ myagents task delete <taskId>            # 确认后不可恢复地删除；不�
 `check-now` 会提交真实 MyAgents 状态；部署前不提交 MyAgents 状态的验证使用 `trigger test`（脚本自身副作用仍真实发生）。`run-now` 不改变 schedule anchor 或 Detector checkpoint。
 
 归档和删除不是同一种“软删除”：`archive` 是长期可恢复的产品状态；`delete` 会立即停止调度、移除平台 Trigger state/pending activation，并从正常产品使用中不可恢复地移除 Task。TaskStore 只保留防止旧 Cron 重新迁移所需的内部 tombstone 与审计；没有 30 天恢复承诺，也没有 undelete 命令。两者都不会越权清理工作区脚本、脚本数据库或外部状态。
+
+## 本地 Task 评论
+
+Task 可以作为跨 Session 的本地协作中枢。需要回看时间线时用 `myagents task comments <taskId> --json`。只有当结果、风险、经验或待用户决策的信息确实值得沉淀到 Task 时，Agent 才显式调用：
+
+```bash
+myagents task comment <taskId> --body-file result.md --json
+```
+
+在 Task 自身触发的执行 turn 内可省略 `<taskId>`；在用户评论注入的后续 turn 中，必须使用隐藏提醒提供的显式 Task ID。
+
+回复某条评论时增加 `--reply-to <commentId>`。长文本始终先写文件，不把多行正文拼进 shell。普通 assistant 回复不会自动登记为 Task 评论；从本地 Task 评论收到的 query 应服从该轮 `TASK_COMMENT` reminder，而从 Space Issue Delivery 收到的 query 继续使用 Cloud Issue 的回复命令，二者不得默认双写。
 
 ## 给用户的部署回执
 

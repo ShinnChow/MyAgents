@@ -12,6 +12,7 @@ import { getAllMcpServers, getEnabledMcpServerIds } from '@/config/configService
 import { patchAgentConfig, patchAgentProjectConfig } from '@/config/services/agentConfigService';
 import { isProviderAvailable } from '@/config/services/providerService';
 import { CUSTOM_EVENTS } from '@/../shared/constants';
+import { applyBuiltinBrowserExecutionToolToggle } from '@/../shared/browserTools';
 import { PERMISSION_MODES, type Project, type McpServerDefinition } from '@/config/types';
 import type { AgentConfig } from '../../../shared/types/agent';
 import { reasoningEffortChoices, REASONING_EFFORT_DESCRIPTIONS } from '@/../shared/reasoningEffort';
@@ -25,6 +26,8 @@ import { buildRuntimeChangePatch } from '../../../shared/types/runtime';
 import { agentDefaultsForRuntimeBackedProvider, agentUsesManagedCodexProvider, toProviderExecutionIntent } from '../../../shared/providerExecution';
 import { invoke } from '@tauri-apps/api/core';
 import { useToast } from '@/components/Toast';
+import { useBrowserResourceReady } from '@/hooks/useBrowserResourceReady';
+import { MANAGED_BROWSER_MCP_ID } from '@/../shared/browserTools';
 
 interface WorkspaceBasicsSectionProps {
   project: Project | undefined;
@@ -52,6 +55,7 @@ export default function WorkspaceBasicsSection({ project, agent, agentDir }: Wor
   // "available" set (see useAvailableProviders for rationale).
   const availableProviders = useAvailableProviders();
   const toast = useToast();
+  const managedBrowserReady = useBrowserResourceReady();
   // Derive canonical name from project — use as initializer key to reset input
   const canonicalName = useMemo(
     () => project?.displayName || project?.name || '',
@@ -229,11 +233,19 @@ export default function WorkspaceBasicsSection({ project, agent, agentDir }: Wor
 
   const handleMcpToggle = useCallback((serverId: string) => {
     const current = agent?.mcpEnabledServers || [];
-    const newEnabled = current.includes(serverId)
-      ? current.filter(id => id !== serverId)
-      : [...current, serverId];
+    const enabled = !current.includes(serverId);
+    if (serverId === MANAGED_BROWSER_MCP_ID && enabled && !managedBrowserReady) {
+      toast.warning(t('toolbox.browserResource.installFirst'));
+      return;
+    }
+    const newEnabled = applyBuiltinBrowserExecutionToolToggle(
+      current,
+      serverId,
+      enabled,
+      managedBrowserReady,
+    );
     void saveAgentConfig({ mcpEnabledServers: newEnabled });
-  }, [agent?.mcpEnabledServers, saveAgentConfig]);
+  }, [agent?.mcpEnabledServers, managedBrowserReady, saveAgentConfig, t, toast]);
 
   // PRD 0.2.17 — Claude plugin enable list. Same two-layer model as MCP:
   // candidate pool = AppConfig.plugins ∩ enabledPlugins (Layer 1 visibility

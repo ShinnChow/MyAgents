@@ -64,7 +64,6 @@ assembler。调用方传入：
 
 - `InteractionScenario`：当前 Session 的交互入口和场景。
 - `runtime`：用于生成准确的 Runtime 身份描述。
-- `playwrightStorageEnabled`：是否追加浏览器登录态保存约束。
 - `cliToolsEnabled`：是否追加稳定的 MyAgents CLI 能力提示；当前 Builtin 和全部
   External Runtime 路径都传 `true`。
 - `userCliToolsEnabled`：是否读取用户 CLI 工具注册表，受实验开关控制。
@@ -72,6 +71,8 @@ assembler。调用方传入：
 
 模板直接内联在 TypeScript 中，不从运行时文件系统加载。原因是打包后的 Bun
 `__dirname` 不能稳定定位模板资源；内联内容同时让生产包与源码使用同一个事实来源。
+
+受管「浏览器」的登录态保存不属于 Prompt 契约。应用级 Browser Host 会在成功工具调用和 Context teardown 边界自动 checkpoint Cookie、localStorage 与 IndexedDB；模型无需、也不应被提示主动调用存储工具来维持产品正确性。标准 `playwright` 仍遵循上游 MCP 的 argv/storage-state 语义，MyAgents 不用隐藏 Prompt 改写它。
 
 ### 场景模型
 
@@ -97,7 +98,7 @@ assembler。调用方传入：
 | ----------------- | ------------------------------------------------------------------------------ | -------------------- |
 | L1 基础身份       | MyAgents 身份、当前 Runtime、全局目录、时间判断约束                            | 始终包含             |
 | L2 交互渠道       | 桌面，或具体 IM/Agent Channel 与私聊/群聊信息                                  | 互斥选一             |
-| L3 场景与产品交互 | Task、Heartbeat、Registered Agent、浮球、Widget、Session 协作、Browser Storage | 按条件叠加           |
+| L3 场景与产品交互 | Task、Heartbeat、Registered Agent、浮球、Widget、Session 协作                  | 按条件叠加           |
 | L4 CLI 能力发现   | Task、Goal、Thought、IM 媒体、Vision、用户注册工具                             | 按场景与能力开关叠加 |
 
 ### 当前预设片段矩阵
@@ -114,7 +115,6 @@ assembler。调用方传入：
 | `myagents-floating-ball-instructions`    | 小窗回复应简短、桌面相邻上下文                          | `desktop.surface === floating-ball`                |
 | `myagents-generative-ui`                 | Widget 触发规则及按需读取设计契约                       | 全部 `desktop`，包括浮球                           |
 | `myagents-session-events`                | Agent/Session identity、start/send/watch 协作方式       | 全部场景                                           |
-| `myagents-browser-storage-instructions`  | 登录成功后保存 Playwright storage state                 | 当前仅 Builtin 且 Playwright 含 storage capability |
 | `myagents-cli-task-automation`           | “以后再做”统一使用 Task Skill/CLI，不用 OS cron         | 全部场景                                           |
 | `myagents-cli-goal`                      | Goal Mode 只在用户明确要求时创建                        | `desktop`，以及私聊 `im` / `agent-channel`         |
 | `myagents-cli-task-exit`                 | 目标完成时用 CLI 提前结束 Task                          | `cron && aiCanExit`                                |
@@ -223,6 +223,7 @@ payload，而 UI 只展示 envelope 后的 visible tail 或 badge。它适合 Tu
 当前典型使用包括：
 
 - Task/Cron 唤醒和结果转述；
+- Task discussion 首轮动态上下文与本地 Task Comment query；
 - Goal 首轮、自动 continuation 与普通 query context；
 - 浮球当前窗口、选中文本和截图上下文；
 - Space IssueDelivery；
@@ -242,6 +243,8 @@ payload，而 UI 只展示 envelope 后的 visible tail 或 badge。它适合 Tu
 安全上，`system-reminder` 只控制展示，不是 trust boundary。来自用户、群聊、Cloud、
 Plugin 或工具的数据仍需结构化标记、转义并声明为 untrusted context，不能因为被隐藏就
 当成系统指令。
+
+Task 智能讨论采用“薄动态 reminder + product-owned Skill”分工：`TASK_DISCUSSION` 只携带 discussion/workspace/可选 Thought identity 和原始 visible tail，`InitialMessage.requiredSystemSkill` 要求 app-owned `myagents-task-alignment` exact source/hash/inventory revision。澄清方法、完整 `task.md` 写作和确认协议留在 Skill；Task 参数事实由 `myagents-task-automation` 与 CLI leaf help 按需披露。不得在 App handler 再复制问卷、参数矩阵或四文档模板，也不得仅靠 slash 文本猜 Skill 已加载。
 
 ## 其它独立 Prompt
 

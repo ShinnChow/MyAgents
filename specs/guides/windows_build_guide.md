@@ -186,7 +186,7 @@ src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 6. **上传构建产物** - 上传到 R2
 7. **上传更新清单** - 上传 JSON 文件
 
-`publish_windows.ps1` 只发布 Windows 桌面 App 和自动更新清单，不上传 Managed Codex Runtime 资源。
+`publish_windows.ps1` 只发布 Windows 桌面 App 和自动更新清单，不上传 Managed Codex Runtime，也不上传「浏览器」Chromium 资源。
 
 ### publish_managed_codex_runtime.ps1
 
@@ -208,6 +208,10 @@ src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/
 | `CF_ZONE_ID` | Cloudflare Zone ID (可选，用于清除 CDN 缓存) |
 | `CF_API_TOKEN` | Cloudflare API Token (可选) |
 | `MANAGED_CODEX_WINDOWS_PUBLISHER` | 可选，Windows Authenticode publisher 断言；默认 `OpenAI OpCo, LLC` |
+
+### 「浏览器」Runtime（Windows x64）
+
+Windows 不再运行 Browser packager 或向 R2 上传 Chromium，`build_windows.ps1` / `publish_windows.ps1` 也不会下载 Chrome 或把它放进 installer。`src\shared\managed-browser-runtime.json` 的 `win32-x64` 项锁定当前 Playwright Core registry 对应的官方 Chrome for Testing URL、archive size、SHA-256、archive root 与 `chrome.exe` 路径。升级该锁后，必须用 Windows release-like App 验证首次安装、更新进度、重启恢复和真实有头窗口；官方 exact artifact 不可读、摘要不匹配或 smoke 失败时，不能发布锁定它的 App 版本。
 
 ---
 

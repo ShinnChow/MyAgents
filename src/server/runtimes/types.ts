@@ -313,6 +313,19 @@ export type UnifiedEvent =
   // one-time lifecycle event. External session state replays the latest catalog
   // through its system-init snapshot on reconnect.
   | { kind: 'runtime_tool_catalog'; tools: string[] }
+  | {
+    kind: 'mcp_effective_update';
+    configGeneration: number;
+    configFingerprint: string;
+    catalogGeneration: number;
+    browserHostGeneration?: number;
+    dispatch: import('../../shared/mcpEffectiveState').McpEffectiveSnapshot['dispatch'];
+    servers: import('../../shared/mcpEffectiveState').McpEffectiveServerSnapshot[];
+    tools: string[];
+    observationStale?: boolean;
+  }
+  | { kind: 'mcp_startup_admission_ready' }
+  | { kind: 'mcp_runtime_replacement_required'; serverId: string }
 
   // === Runtime diagnostics (issue #194) ===
   // External-runtime self-report (auth state, feature flags, MCP/apps the

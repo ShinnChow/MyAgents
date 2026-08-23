@@ -130,6 +130,7 @@ vi.mock('./session-engine', () => ({
 let scratch: string;
 let prevHome: string | undefined;
 let prevUserProfile: string | undefined;
+let prevSidecarId: string | undefined;
 
 function writeJson(path: string, value: unknown): void {
   writeFileSync(path, JSON.stringify(value, null, 2), 'utf-8');
@@ -148,10 +149,13 @@ beforeEach(() => {
   mkdirSync(join(scratch, '.myagents'), { recursive: true });
   prevHome = process.env.HOME;
   prevUserProfile = process.env.USERPROFILE;
+  prevSidecarId = process.env.MYAGENTS_SIDECAR_ID;
   process.env.HOME = scratch;
   process.env.USERPROFILE = scratch;
+  process.env.MYAGENTS_SIDECAR_ID = 'test-session-sidecar';
   vi.resetModules();
   agentSessionMocks.agentDir = undefined;
+  agentSessionMocks.getSidecarPort.mockReturnValue(0);
   agentSessionMocks.setMcpServers.mockClear();
   managementApiMocks.managementApi.mockClear();
   managementApiMocks.managementApi.mockResolvedValue({ ok: true, taskUpdated: 0, cronUpdated: 0 });
@@ -181,6 +185,8 @@ afterEach(() => {
   else process.env.HOME = prevHome;
   if (prevUserProfile === undefined) delete process.env.USERPROFILE;
   else process.env.USERPROFILE = prevUserProfile;
+  if (prevSidecarId === undefined) delete process.env.MYAGENTS_SIDECAR_ID;
+  else process.env.MYAGENTS_SIDECAR_ID = prevSidecarId;
   rmSync(scratch, { recursive: true, force: true });
 });
 
@@ -273,7 +279,6 @@ describe('admin-api help registry', () => {
       ['task', 'list'],
       ['task', 'get'],
       ['task', 'create-direct'],
-      ['task', 'create-from-alignment'],
       ['task', 'create-attached'],
       ['task', 'update'],
       ['task', 'run'],
@@ -508,6 +513,89 @@ describe('admin-api help registry', () => {
     expect(listText).toContain('--include-subtree <true|false>');
     expect(viewText).toContain('issue.goalId');
     expect(viewText).toContain('issue.goalPathLabel');
+  });
+});
+
+describe('admin-api Skill add preview contract', () => {
+  it('keeps a single-Skill dry-run to one preview-only request', async () => {
+    const cancellation = await import('./utils/cancellation');
+    const requests: Array<Record<string, unknown>> = [];
+    agentSessionMocks.getSidecarPort.mockReturnValue(32123);
+    cancellation._setGeneralFetchTransportForTests(async (_url, init) => {
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({
+        success: true,
+        mode: 'single',
+        preview: {
+          skill: { suggestedFolderName: 'private-skill', name: 'private-skill' },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    try {
+      const { handleSkillAdd } = await import('./admin-api');
+      const result = await handleSkillAdd({
+        url: '/tmp/private-skill',
+        dryRun: true,
+      });
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({
+        url: '/tmp/private-skill',
+        scope: 'user',
+        previewOnly: true,
+      });
+      expect(result).toMatchObject({
+        success: true,
+        dryRun: true,
+        preview: { action: 'install', skills: ['private-skill'] },
+      });
+    } finally {
+      cancellation._setGeneralFetchTransportForTests();
+    }
+  });
+
+  it('commits a single Skill only after a distinct preview request', async () => {
+    const cancellation = await import('./utils/cancellation');
+    const requests: Array<Record<string, unknown>> = [];
+    agentSessionMocks.getSidecarPort.mockReturnValue(32123);
+    cancellation._setGeneralFetchTransportForTests(async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      const response = requests.length === 1
+        ? {
+            success: true,
+            mode: 'single',
+            preview: {
+              skill: { suggestedFolderName: 'private-skill', name: 'private-skill' },
+            },
+          }
+        : {
+            success: true,
+            mode: 'installed',
+            installed: [{ folderName: 'private-skill' }],
+          };
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    try {
+      const { handleSkillAdd } = await import('./admin-api');
+      const result = await handleSkillAdd({ url: '/tmp/private-skill' });
+
+      expect(requests).toHaveLength(2);
+      expect(requests[0]).toMatchObject({ previewOnly: true });
+      expect(requests[1]).toMatchObject({
+        url: '/tmp/private-skill',
+        confirmedSelection: { folderNames: ['private-skill'] },
+      });
+      expect(requests[1]).not.toHaveProperty('previewOnly');
+      expect(result.success).toBe(true);
+    } finally {
+      cancellation._setGeneralFetchTransportForTests();
+    }
   });
 });
 
@@ -766,6 +854,74 @@ describe('admin-api goal', () => {
 });
 
 describe('admin-api cron create', () => {
+  it('validates and forwards explicit Codex Task routing through cron create', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      task: { id: 'cron-codex', runtime: 'codex' },
+    });
+    const { handleCronCreate } = await import('./admin-api');
+    const payload = {
+      name: 'Codex automation',
+      message: 'Review the workspace',
+      workspacePath: '/tmp/myagents-cron-codex',
+      intervalMinutes: 30,
+      runtime: 'codex',
+      runtimeConfig: { source: 'managed-provider', model: 'gpt-5.6-sol' },
+    };
+
+    const result = await handleCronCreate(payload);
+
+    expect(result.success).toBe(true);
+    expect(runtimeModelMocks.queryRuntimeModels).toHaveBeenCalledWith('codex', {
+      runtimeSource: 'managed-provider',
+    });
+    expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+      '/api/cron/create',
+      'POST',
+      payload,
+    );
+  });
+
+  it('validates runtime overrides before returning a cron dry-run preview', async () => {
+    const { handleCronCreate } = await import('./admin-api');
+
+    const result = await handleCronCreate({
+      name: 'Invalid automation',
+      message: 'Do work',
+      runtime: 'imaginary-runtime',
+      dryRun: true,
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('Invalid --runtime value');
+    expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+  });
+
+  it('rejects provider/model routing mismatches before a cron dry-run preview', async () => {
+    const { handleCronCreate } = await import('./admin-api');
+
+    const missingModel = await handleCronCreate({
+      name: 'Invalid provider pair',
+      message: 'Do work',
+      providerId: 'provider-1',
+      dryRun: true,
+    });
+    const externalProvider = await handleCronCreate({
+      name: 'Invalid external provider',
+      message: 'Do work',
+      runtime: 'codex',
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      dryRun: true,
+    });
+
+    expect(missingModel.success).toBe(false);
+    expect(missingModel.error).toContain('requires --model');
+    expect(externalProvider.success).toBe(false);
+    expect(externalProvider.error).toContain('cannot be combined with --providerId');
+    expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+  });
+
   it('leaves execution routing unset when the caller did not request a Task override', async () => {
     const workspacePath = '/tmp/myagents-managed-codex-workspace';
     writeJson(join(scratch, '.myagents', 'config.json'), {
@@ -821,7 +977,130 @@ describe('admin-api cron create', () => {
   });
 });
 
+describe('admin-api cron update', () => {
+  it('validates and forwards runtime patches after the workspace ownership guard', async () => {
+    managementApiMocks.managementApi
+      .mockResolvedValueOnce({ ok: true, tasks: [{ id: 'cron-codex' }] })
+      .mockResolvedValueOnce({
+        ok: true,
+        task: {
+          id: 'cron-codex',
+          status: 'running',
+          workspacePath: '/tmp/myagents-cron-codex',
+          runtime: 'codex',
+          runtimeConfig: { source: 'managed-provider', model: 'old-model' },
+        },
+      })
+      .mockResolvedValueOnce({ ok: true, task: { id: 'cron-codex', runtime: 'codex' } });
+    const { handleCronUpdate } = await import('./admin-api');
+    const payload = {
+      taskId: 'cron-codex',
+      patch: {
+        runtimeConfig: { source: 'managed-provider', model: 'gpt-5.6-sol' },
+      },
+    };
+
+    const result = await handleCronUpdate(payload);
+
+    expect(result.success).toBe(true);
+    expect(runtimeModelMocks.queryRuntimeModels).toHaveBeenCalledWith('codex', {
+      runtimeSource: 'managed-provider',
+    });
+    expect(managementApiMocks.managementApi).toHaveBeenLastCalledWith(
+      '/api/cron/update',
+      'POST',
+      payload,
+    );
+  });
+});
+
 describe('admin-api accepted task attempt analytics', () => {
+  it('uses the same semantic receipt path for Task create and get', async () => {
+    const workspacePath = '/tmp/myagents-task-receipt';
+    writeJson(join(scratch, '.myagents', 'config.json'), {
+      agents: [{ id: 'agent-receipt', name: 'Receipt Agent', workspacePath }],
+    });
+    writeJson(join(scratch, '.myagents', 'projects.json'), [{
+      id: 'project-receipt', path: workspacePath, agentId: 'agent-receipt',
+    }]);
+    const persistedTask = {
+      id: 'task-receipt',
+      name: 'Receipt Task',
+      status: 'todo',
+      runMode: 'new-session',
+      nextExecutionAt: null,
+    };
+    managementApiMocks.managementApi
+      .mockResolvedValueOnce({ ok: true, task: persistedTask })
+      .mockResolvedValueOnce({ ok: true, task: persistedTask });
+    const { handleTaskCreateDirect, handleTaskGet } = await import('./admin-api');
+
+    const created = await handleTaskCreateDirect({
+      name: 'Receipt Task',
+      workspaceId: 'project-receipt',
+      workspacePath,
+      taskMdContent: 'Do the work',
+    });
+    const fetched = await handleTaskGet({ id: 'task-receipt' });
+
+    expect(created).toMatchObject({
+      success: true,
+      data: {
+        receipt: {
+          operation: 'create',
+          taskId: 'task-receipt',
+          status: 'todo',
+          changed: true,
+          resultAccess: { mode: 'execution-session' },
+        },
+      },
+    });
+    expect(fetched).toMatchObject({
+      success: true,
+      data: {
+        receipt: {
+          operation: 'get',
+          taskId: 'task-receipt',
+          status: 'todo',
+          changed: false,
+        },
+      },
+    });
+  });
+
+  it('describes Attached Task results as staying in the bound Session', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      task: {
+        id: 'task-attached-receipt',
+        status: 'running',
+        dispatchOrigin: 'attached-session',
+        runMode: null,
+        sessionIds: ['space-session'],
+      },
+    });
+    const { handleTaskCreateAttached } = await import('./admin-api');
+
+    const result = await handleTaskCreateAttached({
+      name: 'Attached receipt',
+      currentSessionId: 'space-session',
+      workspacePath: '/tmp/myagents-space-attached',
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        receipt: {
+          taskId: 'task-attached-receipt',
+          resultAccess: {
+            mode: 'bound-session',
+            summary: expect.stringContaining('bound Session'),
+          },
+        },
+      },
+    });
+  });
+
   it('reports the run ordinal returned by the accepted mutation without a task prefetch', async () => {
     managementApiMocks.managementApi.mockResolvedValueOnce({
       ok: true,
@@ -835,7 +1114,7 @@ describe('admin-api accepted task attempt analytics', () => {
 
     const result = await handleTaskRun({ id: 'task-run-accepted' });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       success: true,
       data: {
         taskId: 'task-run-accepted',
@@ -843,6 +1122,20 @@ describe('admin-api accepted task attempt analytics', () => {
         nextExecutionAt: 1_780_000_000_000,
         task: { id: 'task-run-accepted', sessionIds: ['shared-session'] },
         attemptOrdinal: 4,
+        receipt: {
+          operation: 'run',
+          taskId: 'task-run-accepted',
+          status: 'running',
+          changed: true,
+          nextExecutionAt: 1_780_000_000_000,
+          statusMeaning: expect.stringContaining('scheduler is enabled'),
+          resultAccess: {
+            mode: 'execution-session',
+            inspectTaskCommand: 'myagents task get task-run-accepted --json',
+            inspectRunsCommand: 'myagents task runs task-run-accepted --limit 5 --full --json',
+            inspectCommentsCommand: 'myagents task comments task-run-accepted --limit 50 --json',
+          },
+        },
       },
     });
     expect(managementApiMocks.managementApi).toHaveBeenCalledOnce();
@@ -869,6 +1162,40 @@ describe('admin-api accepted task attempt analytics', () => {
 
     expect(result).toEqual({ success: false, code: 'invalid_state', error: 'task is busy' });
     expect(managementApiMocks.managementApi).toHaveBeenCalledOnce();
+    expect(analyticsMocks.trackServer).not.toHaveBeenCalled();
+  });
+
+  it('returns a semantic no-op receipt and skips analytics when run was already enabled', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      taskId: 'task-already-running',
+      status: 'running',
+      nextExecutionAt: 1_780_000_000_000,
+      changed: false,
+      task: {
+        id: 'task-already-running',
+        status: 'running',
+        runMode: 'single-session',
+        sessionIds: ['bound-session'],
+      },
+    });
+    const { handleTaskRun } = await import('./admin-api');
+
+    const result = await handleTaskRun({ id: 'task-already-running' });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        changed: false,
+        receipt: {
+          operation: 'run',
+          taskId: 'task-already-running',
+          status: 'running',
+          changed: false,
+          resultAccess: { mode: 'bound-session' },
+        },
+      },
+    });
     expect(analyticsMocks.trackServer).not.toHaveBeenCalled();
   });
 
@@ -1173,6 +1500,84 @@ describe('admin-api Task Agent experience', () => {
       { id: 'task-1', actor: 'agent', source: 'cli' },
     );
   });
+
+  it('resolves an omitted comment Task ID from the exact active Session context', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      comment: { id: 'comment-agent' },
+    });
+    const { setCronTaskContext } = await import('./tools/cron-tools');
+    const { handleTaskComment } = await import('./admin-api');
+    const previousSessionId = process.env.MYAGENTS_SESSION_ID;
+    process.env.MYAGENTS_SESSION_ID = 'session-active';
+    setCronTaskContext('task-active', false, 'session-active');
+
+    try {
+      expect(await handleTaskComment({
+        body: 'Completed with verification evidence.',
+      })).toMatchObject({ success: true });
+      expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+        '/api/task/comment',
+        'POST',
+        {
+          id: 'task-active',
+          body: 'Completed with verification evidence.',
+          replyToCommentId: undefined,
+          sessionId: 'session-active',
+        },
+      );
+    } finally {
+      setCronTaskContext(null, false, 'session-active');
+      if (previousSessionId === undefined) delete process.env.MYAGENTS_SESSION_ID;
+      else process.env.MYAGENTS_SESSION_ID = previousSessionId;
+    }
+  });
+
+  it('rejects an omitted comment Task ID outside an active Task turn', async () => {
+    const { handleTaskComment } = await import('./admin-api');
+    const previousSessionId = process.env.MYAGENTS_SESSION_ID;
+    process.env.MYAGENTS_SESSION_ID = 'session-idle';
+    try {
+      expect(await handleTaskComment({ body: 'Ambiguous result.' })).toMatchObject({
+        success: false,
+        error: expect.stringContaining('Task ID is required'),
+      });
+      expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+    } finally {
+      if (previousSessionId === undefined) delete process.env.MYAGENTS_SESSION_ID;
+      else process.env.MYAGENTS_SESSION_ID = previousSessionId;
+    }
+  });
+
+  it('ignores a forged client Session id and uses only the Sidecar identity', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      comment: { id: 'comment-agent' },
+    });
+    const { handleTaskComment } = await import('./admin-api');
+    const previousSessionId = process.env.MYAGENTS_SESSION_ID;
+    process.env.MYAGENTS_SESSION_ID = 'session-trusted';
+    try {
+      await handleTaskComment({
+        id: 'task-1',
+        body: 'Persist this result.',
+        sessionId: 'session-forged',
+      } as Parameters<typeof handleTaskComment>[0] & { sessionId: string });
+      expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+        '/api/task/comment',
+        'POST',
+        {
+          id: 'task-1',
+          body: 'Persist this result.',
+          replyToCommentId: undefined,
+          sessionId: 'session-trusted',
+        },
+      );
+    } finally {
+      if (previousSessionId === undefined) delete process.env.MYAGENTS_SESSION_ID;
+      else process.env.MYAGENTS_SESSION_ID = previousSessionId;
+    }
+  });
 });
 
 describe('admin-api task runtime model identity', () => {
@@ -1283,6 +1688,37 @@ describe('admin-api task runtime model identity', () => {
         id: 'task-managed-update',
         runtimeConfig: { source: 'managed-provider', model: 'gpt-5.6-sol' },
       },
+    );
+  });
+
+  it('applies clear-provider semantics before validating a Task runtime switch', async () => {
+    managementApiMocks.managementApi
+      .mockResolvedValueOnce({
+        ok: true,
+        task: {
+          id: 'task-clear-provider-switch',
+          workspacePath: '/tmp/myagents-clear-provider-switch',
+          runtime: 'builtin',
+          providerId: 'anthropic',
+          model: 'claude-sonnet-4-6',
+        },
+      })
+      .mockResolvedValueOnce({ ok: true, taskUpdated: 1, cronUpdated: 0 });
+    const { handleTaskUpdate } = await import('./admin-api');
+    const payload = {
+      id: 'task-clear-provider-switch',
+      runtime: 'codex',
+      clearProviderOverride: true,
+    };
+
+    const result = await handleTaskUpdate(payload);
+
+    expect(result.success).toBe(true);
+    expect(managementApiMocks.managementApi).toHaveBeenNthCalledWith(
+      2,
+      '/api/task/update',
+      'POST',
+      payload,
     );
   });
 
@@ -2248,6 +2684,21 @@ describe('admin-api config dry-run contract', () => {
 });
 
 describe('admin-api MCP add contract', () => {
+  it.each(['playwright', 'myagents-browser'])('rejects the reserved built-in Browser id %s', async id => {
+    const { handleMcpAdd } = await import('./admin-api');
+
+    const result = await handleMcpAdd({
+      server: { id, type: 'stdio', command: 'shadow' },
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining('reserved by a built-in Browser tool'),
+    });
+    expect(existsSync(join(scratch, '.myagents', 'config.json'))).toBe(false);
+    expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
+  });
+
   it('creates a new server and fans out app-wide config invalidation', async () => {
     const { handleMcpAdd } = await import('./admin-api');
 
@@ -2338,6 +2789,36 @@ describe('admin-api MCP add contract', () => {
 });
 
 describe('admin-api MCP connectivity test', () => {
+  it('diagnoses the managed Browser through its Session capability instead of spawning the sentinel', async () => {
+    managementApiMocks.managementApi.mockResolvedValueOnce({
+      ok: true,
+      url: 'http://127.0.0.1:31415/mcp/playwright',
+      token: 'a'.repeat(32),
+      hostGeneration: 7,
+    });
+
+    const { handleMcpTest } = await import('./admin-api');
+    const result = await handleMcpTest({ id: 'myagents-browser' });
+
+    expect(result).toMatchObject({
+      success: true,
+      data: {
+        id: 'myagents-browser',
+        type: 'application-host',
+        state: 'ready',
+        sessionScoped: true,
+        hostGeneration: 7,
+      },
+    });
+    expect(result.hint).toContain('internal projection marker');
+    expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+      '/api/browser/capability/acquire',
+      'POST',
+      { sidecarId: 'test-session-sidecar' },
+      { parentSignal: undefined },
+    );
+  });
+
   it('rejects a configured stdio command that exists but exits before MCP initialize', async () => {
     writeJson(join(scratch, '.myagents', 'config.json'), {
       mcpServers: [{

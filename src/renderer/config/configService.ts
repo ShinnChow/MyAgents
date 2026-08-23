@@ -40,6 +40,7 @@ export type { ProviderModelPair } from './services/providerService';
 export {
     getAllMcpServers,
     getEnabledMcpServerIds,
+    applyMcpServerAvailabilityToggle,
     toggleMcpServerEnabled,
     addCustomMcpServer,
     deleteCustomMcpServer,

@@ -184,13 +184,13 @@ pub struct CronTask {
     /// Last error message (if any)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    /// Last run success flag — denormalized from `cron_runs/<id>.jsonl` so
-    /// `cron list` doesn't need to crack open every jsonl on every list call.
-    /// Updated by `record_execution_result()` after each tick. PRD 0.2.5 R6.
+    /// Last run success flag. Task-backed compatibility rows project this
+    /// from TaskStore's authoritative `lastExecution`; legacy Cron rows retain
+    /// their historical denormalized value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_ok: Option<bool>,
-    /// Last run duration in milliseconds — same denormalization rationale as
-    /// `last_run_ok`. PRD 0.2.5 R6.
+    /// Last run duration in milliseconds from the same owner as
+    /// `last_run_ok`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_duration_ms: Option<u64>,
     // ===== IM Bot cron fields (v0.1.21) =====

@@ -682,7 +682,7 @@ Rust 构建 `GroupStreamContext` 后，Sidecar `/api/im/enqueue` 端点组装最
 
 #### 群工具禁用
 
-群聊默认禁用危险工具：`['Bash', 'Edit', 'Write']`。可通过 `groupToolsDeny` 配置覆盖（空数组 = 全部允许）。
+群聊的 `groupToolsDeny` 默认为空数组，即不额外隐藏 Runtime 工具。用户仍可通过非空列表为特定 Channel 增加群聊专属的工具禁用项；这不会替代群审批、Channel 权限模式、MCP 开关或工具自身的安全约束。
 
 #### ImMessage 群聊相关字段
 
@@ -745,6 +745,15 @@ per-Agent Channel 创建/编辑由 `components/AgentSettings/channels/ChannelWiz
 - `patchAgentConfig` 写入 `agent.channels[]`。
 - `invokeStartAgentChannel` 启动 channel，并查询 `cmd_agent_channel_status`。
 - QR / bind code / whitelist / group permission / heartbeat / permission mode / AI config / MCP tools 等子配置。
+
+推荐插件的 `dualConfig` 表示“扫码创建凭证 + 手动填写已有凭证”两种配置入口，不等同于 Plugin Bridge 的 runtime QR login。`promotedPlugins.ts` 中每个 `dualConfig` preset 必须同时声明 `credentialQrProvider` 和 `requiredFields`；`ChannelWizard` 默认进入扫码态，通过通用 credential provisioning runner 管理 loading / waiting / success / expired refresh / denied / error 与 owner-scoped cancellation。扫码返回的 plugin config patch 和扫码用户 `open_id` 在创建 Channel 时随同一份配置写入，切到手动模式必须清除尚未提交的扫码结果。
+
+现有 provider 映射：
+
+- 企业微信：扫码返回 `botId` / `secret`。
+- 飞书：使用官方 accounts app registration 创建 `PersonalAgent`，返回 `appId` / `appSecret` / `domain`，并把扫码用户 `open_id` 作为首个 `allowedUsers`。国际版租户由轮询响应切换到 Lark accounts host。
+
+Renderer 只通过 Tauri IPC 收发短生命周期 session handle 和状态，不直接访问三方 registration endpoint；最终配置仍由 disk-first Channel config owner 持久化。QR 创建和编辑已有 Channel 都通过 `applyAgentChannelCredentialProvisioning()` 在 disk-latest Channel 上原子创建/合并凭证，避免长时间扫码覆盖并发新增的 Channel；详情页默认展示凭证摘要，只有显式“重新扫码”才创建新机器人。
 
 ### 3.5 共享表单组件
 
@@ -908,6 +917,35 @@ Rust TelegramAdapter 收到消息
  └── 添加用户到白名单配置 → saveBotField → refreshConfig
 ```
 
+#### 5.2.1 扫码创建 Channel 凭证
+
+```
+ChannelWizard（dualConfig 默认扫码态）
+ │
+ ├── Tauri cmd_channel_credential_qr_start(provider)
+ │    ├── WeCom：复用既有 QR generate
+ │    └── Feishu：accounts.feishu.cn app registration init + begin(PersonalAgent)
+ │
+ ▼
+Renderer 将受信 verification URL 编码为二维码
+ │
+ ├── Tauri cmd_channel_credential_qr_poll(provider, session handle)
+ │    ├── pending / slow_down → 按 provider interval 继续
+ │    ├── expired → 有界生成新 session
+ │    ├── denied / cancelled / network → inline error + 用户重试/切手动
+ │    └── success → provider-neutral configValues + allowedUserId
+ │         ├── WeCom：allowedUserId 可省略
+ │         └── Feishu：必须带扫码人的非空 open_id，否则拒绝成功响应
+ │
+ ▼
+ChannelWizard 点击启动
+ │
+ └── applyAgentChannelCredentialProvisioning(disk-first atomic create/merge)
+      → Agent Channel lifecycle → Plugin Bridge
+```
+
+`src-tauri/src/im/credential_provisioning.rs` 是三方注册 endpoint、host allowlist、provider 响应归一化的 owner；它不持久化 session 或凭证。`src/renderer/components/AgentSettings/channels/credentialQrProvisioning.ts` 只拥有当前可见向导/详情页的轮询时序，UI 关闭或切换手动态后旧 run id 的结果不得提交。
+
 ### 5.3 设置页 → Bot 生命周期
 
 ```
@@ -943,6 +981,7 @@ ImBotList（读取 config.imBotConfigs + 轮询 statuses）
 | 工作区沙箱 | 操作范围不超出 workspacePath |
 | Token 重复 | 前端阻止同一 Token 添加多个 Bot |
 | QR 绑定 | 随机 UUID bind_code，仅对应 Bot 可识别 |
+| QR 创建凭证 | Renderer 不直连；Rust 固定 provider host + HTTPS allowlist；device code 有界校验；App Secret 不进入日志/埋点/错误文本 |
 
 ---
 
@@ -960,6 +999,7 @@ src-tauri/src/
 │ ├── reply_router.rs # requestId → draft/reply slot、权限卡与终态归属
 │ ├── state.rs # ManagedAgents / ManagedImBots / runtime config sync / channel state
 │ ├── config_store.rs # Agent/Bot config 读写、auto-start、missing config reporting
+│ ├── credential_provisioning.rs # 企微/飞书扫码创建凭证的 provider facade、host policy 与响应归一化
 │ ├── commands.rs # Tauri IM/Agent command glue
 │ ├── adapter.rs # ImAdapter trait 定义 + AnyAdapter enum
 │ ├── telegram.rs / feishu.rs / dingtalk.rs # 内置平台适配器
@@ -1156,7 +1196,7 @@ Agent Channel 是无人值守入口。没有 `ChannelOverrides.permissionMode` �
 - Codex → `no-restrictions`
 - Gemini → `yolo`
 
-`AgentConfig.permissionMode` 仍然是桌面/Agent 默认对话权限；它不能静默降低 IM Channel。用户显式配置 Channel permission override 时才按 override 执行。群聊的 `groupToolsDeny` 是独立安全层，默认仍可额外禁止 `Bash` / `Edit` / `Write`。
+`AgentConfig.permissionMode` 仍然是桌面/Agent 默认对话权限；它不能静默降低 IM Channel。用户显式配置 Channel permission override 时才按 override 执行。群聊的 `groupToolsDeny` 是独立的可选禁用层，默认值为空；只有用户显式配置非空列表时才额外隐藏对应工具。
 
 ### Mino 模板与 Agent 默认能力
 

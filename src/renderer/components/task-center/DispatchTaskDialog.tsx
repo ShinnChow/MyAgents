@@ -12,13 +12,11 @@
 // UI now reuses the shared NotificationConfigEditor instead of an
 // inline copy that drifted on toggle dimensions and label wording.
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Activity,
   Bell,
-  ChevronDown,
-  ChevronRight,
   Clock,
   Flag,
   Zap,
@@ -31,11 +29,11 @@ import { useConfig } from '@/hooks/useConfig';
 import { useTaskCenterData } from '@/hooks/useTaskCenterData';
 import { useToast } from '@/components/Toast';
 import { isProjectActiveForUser } from '@/config/types';
-import { taskCreateDirect, taskRun, taskWriteDoc } from '@/api/taskCenter';
+import { taskCreateDirect, taskRun } from '@/api/taskCenter';
 import NotificationConfigEditor from '@/components/task-center/NotificationConfigEditor';
 import { splitWithTagHighlights } from '@/utils/parseThoughtTags';
 import { workspacePathsEqual } from '@/../shared/workspacePath';
-import type { Thought } from '@/../shared/types/thought';
+import type { TaskCreateIntent, TaskCreateMode, TaskDiscussionRequest } from '@/../shared/taskDiscussion';
 import type {
   EndConditions,
   NotificationConfig,
@@ -70,25 +68,31 @@ const DEFAULT_EVENTS: NonNullable<NotificationConfig['events']> = [
   'blocked',
   'endCondition',
 ];
+const CREATE_MODES = ['smart', 'manual'] as const;
 
 interface Props {
   /** When provided, the task is derived from this thought; otherwise the dialog
    *  starts blank and `sourceThoughtId` is omitted. */
-  thought?: Thought;
+  thought?: TaskCreateIntent['thought'];
   /** Optional workspace hint for the 'new' flow (e.g. Launcher selection). */
   defaultWorkspacePath?: string;
   /** Canonical materialized Session from the Chat tab that opened Task Center. */
   currentSessionId?: string | null;
+  initialMode?: TaskCreateMode;
   onClose: () => void;
   onDispatched: (task: Task) => void;
+  /** Resolves true only after the discussion tab has actually opened. */
+  onDiscuss: (request: TaskDiscussionRequest) => Promise<boolean>;
 }
 
 export function DispatchTaskDialog({
   thought,
   defaultWorkspacePath,
   currentSessionId,
+  initialMode = 'smart',
   onClose,
   onDispatched,
+  onDiscuss,
 }: Props) {
   const isFromThought = !!thought;
   const { t } = useTranslation('task');
@@ -131,6 +135,8 @@ export function DispatchTaskDialog({
   // Form state. v0.1.69 scope is AI execution only — `executor` is pinned to
   // `'agent'`; the user-as-todo variant is a future extension.
   const [name, setName] = useState(defaultName);
+  const [mode, setMode] = useState<TaskCreateMode>(initialMode);
+  const [smartPrompt, setSmartPrompt] = useState(thought?.content ?? '');
   const [workspacePath, setWorkspacePath] = useState<string>(
     defaultProject?.path ?? '',
   );
@@ -143,8 +149,6 @@ export function DispatchTaskDialog({
   });
   const [triggerValid, setTriggerValid] = useState(true);
   const [taskMd, setTaskMd] = useState(thought?.content ?? '');
-  const [verifyMd, setVerifyMd] = useState('');
-  const [verifyExpanded, setVerifyExpanded] = useState(false);
 
   // Schedule-specific state (mirrors cron TaskCreateModal fields)
   const [atDateTime, setAtDateTime] = useState(() =>
@@ -223,14 +227,15 @@ export function DispatchTaskDialog({
   const isOnce = executionMode === 'once';
   const showEndConditions = isRecurring || isLoop;
 
-  const errors = useMemo(() => {
+  const manualErrors = useMemo(() => {
     const errs: string[] = [];
     if (!name.trim()) errs.push(t('dispatch.validation.nameRequired'));
     if (!workspace) errs.push(t('dispatch.validation.workspaceRequired'));
     if (!taskMd.trim()) errs.push(t('dispatch.validation.taskMdRequired'));
-    if (!triggerValid) errs.push(t('trigger.validation.invalid'));
+    if (isRecurring && !triggerValid) errs.push(t('trigger.validation.invalid'));
     if (
-      runMode === 'single-session'
+      isRecurring
+      && runMode === 'single-session'
       && !sessionOptions.some((option) => option.value === preselectedSessionId)
     ) {
       errs.push(t('trigger.validation.sessionRequired'));
@@ -249,13 +254,13 @@ export function DispatchTaskDialog({
     name,
     workspace,
     taskMd,
+    isRecurring,
     triggerValid,
     runMode,
     preselectedSessionId,
     sessionOptions,
     isScheduled,
     atDateTime,
-    isRecurring,
     intervalMinutes,
     showEndConditions,
     endConditionMode,
@@ -263,6 +268,14 @@ export function DispatchTaskDialog({
     maxExecutions,
     aiCanExit,
   ]);
+
+  const errors = useMemo(() => {
+    if (mode === 'manual') return manualErrors;
+    const smartErrors: string[] = [];
+    if (!workspace) smartErrors.push(t('dispatch.validation.workspaceRequired'));
+    if (!smartPrompt.trim()) smartErrors.push(t('dispatch.validation.discussionRequired'));
+    return smartErrors;
+  }, [manualErrors, mode, smartPrompt, t, workspace]);
 
   const buildEndConditions = useCallback((): EndConditions | undefined => {
     if (!showEndConditions) return undefined;
@@ -294,6 +307,7 @@ export function DispatchTaskDialog({
           })()
         : undefined;
       const advancedCron = cronExpression.trim();
+      const effectiveRunMode: TaskRunMode = isRecurring ? runMode : 'new-session';
       const executionOverrides = projectTaskExecutionOverrides({
         providers,
         runtime: advRuntime,
@@ -308,9 +322,9 @@ export function DispatchTaskDialog({
         workspacePath: workspace.path,
         taskMdContent: taskMd,
         executionMode,
-        runMode,
-        preselectedSessionId: runMode === 'single-session' ? preselectedSessionId : undefined,
-        trigger: trigger.detector.type === 'command' ? trigger : undefined,
+        runMode: effectiveRunMode,
+        preselectedSessionId: effectiveRunMode === 'single-session' ? preselectedSessionId : undefined,
+        trigger: isRecurring && trigger.detector.type === 'command' ? trigger : undefined,
         endConditions: ec,
         dispatchAt,
         intervalMinutes: isRecurring && !advancedCron ? intervalMinutes : undefined,
@@ -334,17 +348,6 @@ export function DispatchTaskDialog({
         tags: thought?.tags ?? [],
         notification,
       });
-      // verify.md is a separate `write_doc` call. We do this before the
-      // dispatch run so the agent's verifying phase finds the file in
-      // place. A failure here is non-fatal — surface a toast but still
-      // hand the task back to the caller.
-      if (verifyMd.trim()) {
-        try {
-          await taskWriteDoc(task.id, 'verify', verifyMd);
-        } catch (e) {
-          toast.error(t('dispatch.toast.verifyWriteFailed', { message: extractErrorMessage(e) }));
-        }
-      }
       // PRD §8.2: `once` dispatches should fire immediately — the user
       // just asked to "立即执行", they shouldn't also have to click a
       // play button in the right panel. Other modes wait for their
@@ -378,7 +381,6 @@ export function DispatchTaskDialog({
     cronTimezone,
     name,
     taskMd,
-    verifyMd,
     executionMode,
     isOnce,
     runMode,
@@ -398,31 +400,119 @@ export function DispatchTaskDialog({
     t,
   ]);
 
+  const handleDiscuss = useCallback(async () => {
+    if (mode !== 'smart' || errors.length > 0 || busy || !workspace) return;
+    setBusy(true);
+    try {
+      const opened = await onDiscuss({
+        content: smartPrompt.trim(),
+        workspaceId: workspace.id,
+        workspacePath: workspace.path,
+        sourceThoughtId: thought?.id,
+        sourceThoughtTags: thought?.tags,
+      });
+      if (!opened) setBusy(false);
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      setBusy(false);
+    }
+  }, [busy, errors.length, mode, onDiscuss, smartPrompt, thought, toast, workspace]);
+
+  const handlePrimary = mode === 'smart' ? handleDiscuss : handleSubmit;
+
+  const handleModeKeyDown = useCallback((event: KeyboardEvent<HTMLButtonElement>) => {
+    const current = CREATE_MODES.indexOf(mode);
+    let next = current;
+    if (event.key === 'ArrowLeft') next = (current - 1 + CREATE_MODES.length) % CREATE_MODES.length;
+    else if (event.key === 'ArrowRight') next = (current + 1) % CREATE_MODES.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = CREATE_MODES.length - 1;
+    else return;
+    event.preventDefault();
+    const nextMode = CREATE_MODES[next];
+    setMode(nextMode);
+    document.getElementById(`task-create-tab-${nextMode}`)?.focus();
+  }, [mode]);
+
   // Esc closes, Cmd/Ctrl+Enter submits. Disabled flag mirrors the primary
   // button so a half-filled form can't be submitted via shortcut.
   usePanelKeys({
     onClose,
-    onSubmit: handleSubmit,
+    onSubmit: handlePrimary,
     disabled: errors.length > 0 || busy,
   });
 
   return (
     <OverlayBackdrop onClose={onClose} className="z-[200]">
-      <div className="flex max-h-[85vh] w-[min(780px,92vw)] flex-col rounded-[var(--radius-2xl)] bg-[var(--paper-elevated)] shadow-2xl">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('dispatch.titleNew')}
+        className="flex max-h-[85vh] w-[min(780px,92vw)] flex-col rounded-[var(--radius-2xl)] bg-[var(--paper-elevated)] shadow-2xl"
+      >
         <PanelHeader
           icon={Zap}
-          title={isFromThought ? t('dispatch.titleFromThought') : t('dispatch.titleNew')}
-          subtitle={
-            isFromThought
-              ? t('dispatch.subtitleFromThought')
-              : t('dispatch.subtitleNew')
-          }
+          title={t('dispatch.titleNew')}
+          trailing={(
+            <div className="flex rounded-lg bg-[var(--paper-inset)] p-0.5" role="tablist" aria-label={t('dispatch.createMode')}>
+              {CREATE_MODES.map((value) => (
+                <button
+                  key={value}
+                  id={`task-create-tab-${value}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={mode === value}
+                  aria-controls="task-create-tabpanel"
+                  tabIndex={mode === value ? 0 : -1}
+                  onClick={() => setMode(value)}
+                  onKeyDown={handleModeKeyDown}
+                  className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+                    mode === value
+                      ? 'bg-[var(--paper-elevated)] text-[var(--ink)] shadow-sm'
+                      : 'text-[var(--ink-muted)] hover:text-[var(--ink)]'
+                  }`}
+                >
+                  {t(`dispatch.mode.${value}`)}
+                </button>
+              ))}
+            </div>
+          )}
           onClose={onClose}
           closeTitle={t('dispatch.closeEsc')}
         />
 
         {/* Body — generous breathing room per design review */}
-        <div className={`flex-1 overflow-y-auto px-6 py-6 ${SECTION_GAP}`}>
+        <div
+          id="task-create-tabpanel"
+          role="tabpanel"
+          aria-labelledby={`task-create-tab-${mode}`}
+          className={`flex-1 overflow-y-auto px-6 py-6 ${SECTION_GAP}`}
+        >
+          {mode === 'smart' ? (
+            <div className="space-y-5">
+              <div>
+                <label className="mb-1.5 block text-sm font-medium text-[var(--ink-secondary)]">
+                  {t('dispatch.agentWorkspace')}
+                </label>
+                <CustomSelect
+                  value={workspacePath}
+                  options={projectOptions}
+                  onChange={setWorkspacePath}
+                  placeholder={t('dispatch.workspacePlaceholder')}
+                  size="md"
+                />
+              </div>
+              <textarea
+                value={smartPrompt}
+                onChange={(event) => setSmartPrompt(event.target.value)}
+                rows={12}
+                autoFocus
+                placeholder={t('dispatch.smartPlaceholder')}
+                className={`${INPUT_CLS} min-h-[280px] resize-y text-sm leading-6`}
+              />
+            </div>
+          ) : (
+          <>
           <div className="space-y-5">
             <div>
               <label className="mb-1.5 block text-sm font-medium text-[var(--ink-secondary)]">
@@ -449,43 +539,6 @@ export function DispatchTaskDialog({
                 placeholder={t('dispatch.taskMdPlaceholder')}
                 className={`${INPUT_CLS} resize-y font-mono text-sm`}
               />
-            </div>
-
-            {/* verify.md — folded by default. The dispatch flow used to
-                force users to "create then immediately edit to add a
-                verification list", which is two steps for what should
-                be one. Showing it here matches the edit panel's
-                symmetric task.md / verify.md pair. */}
-            <div className="rounded-[var(--radius-lg)] border border-[var(--line-subtle)] bg-[var(--paper)]">
-              <button
-                type="button"
-                onClick={() => setVerifyExpanded((v) => !v)}
-                className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-medium text-[var(--ink-secondary)] hover:text-[var(--ink)]"
-              >
-                {verifyExpanded ? (
-                  <ChevronDown className="h-3.5 w-3.5" />
-                ) : (
-                  <ChevronRight className="h-3.5 w-3.5" />
-                )}
-                {t('dispatch.verifyTitle')}
-                <span className="text-xs font-normal text-[var(--ink-muted)]/80">
-                  {t('dispatch.verifyHint')}
-                </span>
-              </button>
-              {verifyExpanded && (
-                <div className="border-t border-[var(--line-subtle)] p-3">
-                  <textarea
-                    value={verifyMd}
-                    onChange={(e) => setVerifyMd(e.target.value)}
-                    rows={6}
-                    placeholder={t('dispatch.verifyPlaceholder')}
-                    className={`${INPUT_CLS} resize-y font-mono text-sm`}
-                  />
-                  <p className="mt-1.5 text-xs text-[var(--ink-muted)]">
-                    {t('dispatch.verifyDescription')}
-                  </p>
-                </div>
-              )}
             </div>
 
             <div>
@@ -546,8 +599,9 @@ export function DispatchTaskDialog({
               setCronExpression={setCronExpression}
               cronTimezone={cronTimezone}
               setCronTimezone={setCronTimezone}
+              showSessionStrategy={isRecurring}
             />
-            {runMode === 'single-session' && !isLoop && (
+            {isRecurring && runMode === 'single-session' && !isLoop && (
               <div className="mt-5">
                 <label className="mb-2 block text-sm font-medium text-[var(--ink-secondary)]">
                   {t('trigger.targetSession')}
@@ -566,16 +620,19 @@ export function DispatchTaskDialog({
             )}
           </FormSection>
 
-          <div className={SECTION_DIVIDER} />
-
-          <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
-            <TriggerEditor
-              value={trigger}
-              workspacePath={workspace?.path ?? ''}
-              onChange={setTrigger}
-              onValidityChange={setTriggerValid}
-            />
-          </FormSection>
+          {isRecurring && (
+            <>
+              <div className={SECTION_DIVIDER} />
+              <FormSection icon={Activity} title={t('trigger.sectionTitle')}>
+                <TriggerEditor
+                  value={trigger}
+                  workspacePath={workspace?.path ?? ''}
+                  onChange={setTrigger}
+                  onValidityChange={setTriggerValid}
+                />
+              </FormSection>
+            </>
+          )}
 
           {showEndConditions && (
             <>
@@ -605,18 +662,24 @@ export function DispatchTaskDialog({
               workspacePath={workspace?.path}
             />
           </FormSection>
+          </>
+          )}
         </div>
 
         <PanelFooter
           error={errors[0] ?? null}
           onCancel={onClose}
-          onSubmit={() => void handleSubmit()}
+          onSubmit={() => void handlePrimary()}
           busy={busy}
           disabled={errors.length > 0}
           submitLabel={
             busy
-              ? isFromThought ? t('dispatch.submitDispatching') : t('dispatch.submitCreating')
-              : isFromThought ? t('dispatch.submitDispatch') : t('dispatch.submitCreate')
+              ? mode === 'smart'
+                ? t('dispatch.submitDiscussing')
+                : isFromThought ? t('dispatch.submitDispatching') : t('dispatch.submitCreating')
+              : mode === 'smart'
+                ? t('dispatch.submitDiscuss')
+                : isFromThought ? t('dispatch.submitDispatch') : t('dispatch.submitCreate')
           }
         />
       </div>

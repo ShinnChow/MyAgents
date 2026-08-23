@@ -6,12 +6,11 @@ import type {
   ThoughtArchiveFilter,
   ThoughtCreateInput,
   ThoughtUpdateInput,
-} from '@/../shared/types/thought';
+} from "@/../shared/types/thought";
 import type {
   Task,
   TaskCreateAttachedInput,
   TaskCreateDirectInput,
-  TaskCreateFromAlignmentInput,
   TaskListFilter,
   TaskRunStats,
   TaskTrigger,
@@ -20,10 +19,15 @@ import type {
   TaskTriggerTestResponse,
   TaskUpdateInput,
   TaskUpdateStatusInput,
-} from '@/../shared/types/task';
+} from "@/../shared/types/task";
+import type {
+  TaskComment,
+  TaskCommentContextPage,
+  TaskCommentPage,
+} from "@/../shared/types/taskComment";
 
 function isTauri(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
 async function inv<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -32,14 +36,14 @@ async function inv<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
       `Task Center commands require Tauri runtime; ran in browser mode: ${cmd}`,
     );
   }
-  const { invoke } = await import('@tauri-apps/api/core');
+  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<T>(cmd, args);
 }
 
 // ==================== Thoughts ====================
 
 export function thoughtCreate(input: ThoughtCreateInput): Promise<Thought> {
-  return inv('cmd_thought_create', { input });
+  return inv("cmd_thought_create", { input });
 }
 
 export function thoughtList(filter?: {
@@ -53,27 +57,30 @@ export function thoughtList(filter?: {
    */
   archived?: ThoughtArchiveFilter;
 }): Promise<Thought[]> {
-  return inv('cmd_thought_list', { filter });
+  return inv("cmd_thought_list", { filter });
 }
 
 export function thoughtGet(id: string): Promise<Thought | null> {
-  return inv('cmd_thought_get', { id });
+  return inv("cmd_thought_get", { id });
 }
 
 export function thoughtUpdate(input: ThoughtUpdateInput): Promise<Thought> {
-  return inv('cmd_thought_update', { input });
+  return inv("cmd_thought_update", { input });
 }
 
 export function thoughtDelete(id: string): Promise<void> {
-  return inv('cmd_thought_delete', { id });
+  return inv("cmd_thought_delete", { id });
 }
 
 /**
  * Toggle a thought's archive flag (v0.2.16). Idempotent — re-archiving an
  * already-archived thought is a no-op. Returns the updated Thought.
  */
-export function thoughtSetArchived(id: string, archived: boolean): Promise<Thought> {
-  return inv('cmd_thought_set_archived', { id, archived });
+export function thoughtSetArchived(
+  id: string,
+  archived: boolean,
+): Promise<Thought> {
+  return inv("cmd_thought_set_archived", { id, archived });
 }
 
 /** Per-source delete failure surfaced by `thoughtMerge` — the merge itself
@@ -102,12 +109,12 @@ export interface ThoughtMergeResult {
  * already-deleted source data).
  */
 export function thoughtMerge(sourceIds: string[]): Promise<ThoughtMergeResult> {
-  return inv('cmd_thought_merge', { sourceIds });
+  return inv("cmd_thought_merge", { sourceIds });
 }
 
 /** Reveal `~/.myagents/thoughts/` in the OS file manager (Finder/Explorer). */
 export function thoughtOpenDir(): Promise<void> {
-  return inv('cmd_thought_open_dir');
+  return inv("cmd_thought_open_dir");
 }
 
 // ==================== Tasks ====================
@@ -115,37 +122,37 @@ export function thoughtOpenDir(): Promise<void> {
 export function taskCreateDirect(
   input: TaskCreateDirectInput & { taskMdContent: string },
 ): Promise<Task> {
-  return inv('cmd_task_create_direct', { input });
+  return inv("cmd_task_create_direct", { input });
 }
 
-export function taskCreateFromAlignment(
-  input: TaskCreateFromAlignmentInput & { alignmentSessionId: string },
+export function taskCreateAttached(
+  input: TaskCreateAttachedInput,
 ): Promise<Task> {
-  return inv('cmd_task_create_from_alignment', { input });
-}
-
-export function taskCreateAttached(input: TaskCreateAttachedInput): Promise<Task> {
-  return inv('cmd_task_create_attached', { input });
+  return inv("cmd_task_create_attached", { input });
 }
 
 export function taskList(filter?: TaskListFilter): Promise<Task[]> {
-  return inv('cmd_task_list', { filter });
+  return inv("cmd_task_list", { filter });
 }
 
 export function taskGet(id: string): Promise<Task | null> {
-  return inv('cmd_task_get', { id });
+  return inv("cmd_task_get", { id });
 }
 
 export function taskUpdate(input: TaskUpdateInput): Promise<Task> {
-  return inv('cmd_task_update', { input });
+  return inv("cmd_task_update", { input });
 }
 
-export function taskTriggerValidate(trigger: TaskTrigger): Promise<TaskTrigger> {
-  return inv('cmd_task_trigger_validate', { trigger });
+export function taskTriggerValidate(
+  trigger: TaskTrigger,
+): Promise<TaskTrigger> {
+  return inv("cmd_task_trigger_validate", { trigger });
 }
 
-export function taskTriggerTestTask(taskId: string): Promise<TaskTriggerTestResponse> {
-  return inv('cmd_task_trigger_test', { taskId });
+export function taskTriggerTestTask(
+  taskId: string,
+): Promise<TaskTriggerTestResponse> {
+  return inv("cmd_task_trigger_test", { taskId });
 }
 
 export function taskTriggerTestSpec(
@@ -153,11 +160,11 @@ export function taskTriggerTestSpec(
   workspacePath: string,
   checkpointState?: Pick<
     TaskTriggerRuntimeState,
-    'checkpoint' | 'checkpointRevision' | 'checkpointUpdatedAt'
+    "checkpoint" | "checkpointRevision" | "checkpointUpdatedAt"
   >,
   ownerTaskId?: string,
 ): Promise<TaskTriggerTestResponse> {
-  return inv('cmd_task_trigger_test', {
+  return inv("cmd_task_trigger_test", {
     ownerTaskId,
     trigger,
     workspacePath,
@@ -168,57 +175,91 @@ export function taskTriggerTestSpec(
 }
 
 export function taskCheckNow(id: string): Promise<TaskTriggerCheckNowResult> {
-  return inv('cmd_task_check_now', { id });
+  return inv("cmd_task_check_now", { id });
 }
 
 /** Force one AI turn through the ordinary Task queue without running Detector. */
 export function taskRunNow(id: string): Promise<string> {
-  return inv('cmd_task_run_now', { id });
+  return inv("cmd_task_run_now", { id });
 }
 
-export function taskResetCheckpoint(id: string): Promise<TaskTriggerRuntimeState> {
-  return inv('cmd_task_reset_checkpoint', { id });
+export function taskResetCheckpoint(
+  id: string,
+): Promise<TaskTriggerRuntimeState> {
+  return inv("cmd_task_reset_checkpoint", { id });
 }
 
 export function taskUpdateStatus(input: TaskUpdateStatusInput): Promise<Task> {
-  return inv('cmd_task_update_status', { input });
+  return inv("cmd_task_update_status", { input });
 }
 
 export function taskUpdateProgress(id: string, message: string): Promise<void> {
-  return inv('cmd_task_update_progress', { id, message });
+  return inv("cmd_task_update_progress", { id, message });
 }
 
-export function taskAppendSession(id: string, sessionId: string): Promise<Task> {
-  return inv('cmd_task_append_session', { id, sessionId });
+export function taskAppendSession(
+  id: string,
+  sessionId: string,
+): Promise<Task> {
+  return inv("cmd_task_append_session", { id, sessionId });
+}
+
+export function taskListComments(
+  id: string,
+  options: { before?: string; after?: string; limit?: number } = {},
+): Promise<TaskCommentPage> {
+  return inv("cmd_task_list_comments", { id, ...options });
+}
+
+export function taskGetCommentContext(
+  id: string,
+  commentId: string,
+): Promise<TaskCommentContextPage> {
+  return inv("cmd_task_get_comment_context", { id, commentId });
+}
+
+export function taskCreateUserComment(input: {
+  id: string;
+  body: string;
+  replyToCommentId?: string;
+}): Promise<TaskComment> {
+  return inv("cmd_task_create_user_comment", input);
+}
+
+export function taskRetryComment(
+  id: string,
+  commentId: string,
+): Promise<TaskComment> {
+  return inv("cmd_task_retry_comment", { id, commentId });
 }
 
 export function taskArchive(id: string, message?: string): Promise<Task> {
-  return inv('cmd_task_archive', { id, message });
+  return inv("cmd_task_archive", { id, message });
 }
 
 export function taskDelete(id: string): Promise<void> {
-  return inv('cmd_task_delete', { id });
+  return inv("cmd_task_delete", { id });
 }
 
 /** Names of the markdown documents attached to a Task. */
-export type TaskDocName = 'task' | 'verify' | 'progress';
+export type TaskDocName = "task" | "verify" | "progress";
 
-/** Read `.task/<id>/<doc>.md`. Missing files resolve to `""` (not an error). */
+/** Read canonical task.md or a retained legacy document. Missing legacy files return "". */
 export function taskReadDoc(id: string, doc: TaskDocName): Promise<string> {
-  return inv('cmd_task_read_doc', { id, doc });
+  return inv("cmd_task_read_doc", { id, doc });
 }
 
 /**
- * Write `.task/<id>/<doc>.md`. Allowed for `task` and `verify` only;
- * `progress` is agent-only (the CLI / SDK tool appends during runs).
+ * Write canonical task.md. Legacy Task documents are read-only compatibility
+ * inputs and cannot become a second editable authority.
  * Rejected while the task is running / verifying (PRD §9.4 lock).
  */
 export function taskWriteDoc(
   id: string,
-  doc: Exclude<TaskDocName, 'progress'>,
+  doc: Extract<TaskDocName, "task">,
   content: string,
 ): Promise<void> {
-  return inv('cmd_task_write_doc', { id, doc, content });
+  return inv("cmd_task_write_doc", { id, doc, content });
 }
 
 /**
@@ -227,7 +268,7 @@ export function taskWriteDoc(
  * Tauri-only (no browser fallback — the editor surface is desktop).
  */
 export function taskOpenDocsDir(id: string): Promise<void> {
-  return inv('cmd_task_open_docs_dir', { id });
+  return inv("cmd_task_open_docs_dir", { id });
 }
 
 /**
@@ -236,7 +277,7 @@ export function taskOpenDocsDir(id: string): Promise<void> {
  * history keyed by the same Task id.
  */
 export function taskGetRunStats(id: string): Promise<TaskRunStats> {
-  return inv('cmd_task_get_run_stats', { id });
+  return inv("cmd_task_get_run_stats", { id });
 }
 
 // ============================================================
@@ -273,7 +314,7 @@ export function searchThoughts(
   query: string,
   limit = 50,
 ): Promise<ThoughtSearchResult> {
-  return inv('cmd_search_thoughts', { query, limit });
+  return inv("cmd_search_thoughts", { query, limit });
 }
 
 export function searchTasks(
@@ -281,7 +322,7 @@ export function searchTasks(
   workspaceId?: string,
   limit = 50,
 ): Promise<TaskSearchResult> {
-  return inv('cmd_search_tasks', { query, workspaceId, limit });
+  return inv("cmd_search_tasks", { query, workspaceId, limit });
 }
 
 // ============================================================
@@ -310,7 +351,7 @@ async function postAdmin<T = unknown>(
   path: string,
   body: Record<string, unknown>,
 ): Promise<T> {
-  const { apiPostJson } = await import('@/api/apiFetch');
+  const { apiPostJson } = await import("@/api/apiFetch");
   const result = await apiPostJson<AdminResponse<T>>(path, body);
   if (!result.success) {
     throw new Error(result.error ?? `${path} failed`);
@@ -320,12 +361,12 @@ async function postAdmin<T = unknown>(
 
 /** Dispatch task execution (PRD §11.1 unified primitive). */
 export function taskRun(id: string): Promise<TaskRunResult> {
-  return postAdmin('/api/admin/task/run', { id });
+  return postAdmin("/api/admin/task/run", { id });
 }
 
 /** Reset status → todo, then dispatch (PRD §10.2.2 row "rerun"). */
 export function taskRerun(id: string): Promise<TaskRunResult> {
-  return postAdmin('/api/admin/task/rerun', { id });
+  return postAdmin("/api/admin/task/rerun", { id });
 }
 
 /** True if the current environment exposes Task Center commands (Tauri-only). */

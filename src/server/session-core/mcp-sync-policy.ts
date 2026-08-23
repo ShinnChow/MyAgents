@@ -29,6 +29,7 @@ export function mcpConfigFingerprint(servers: readonly McpServerDefinition[]): s
         url: s.url,
         env: stableObject(s.env),
         headers: stableObject(s.headers),
+        runtimeConfigRevision: s.runtimeConfigRevision,
       })),
   );
 }

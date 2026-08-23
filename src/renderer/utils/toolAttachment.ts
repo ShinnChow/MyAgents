@@ -7,13 +7,13 @@
  *
  * Browser dev fetches `/api/attachment/tool/<sid>/<tid>/<file>` through the
  * Vite proxy. Tauri uses the app-owned attachment protocol
- * (`myagents://tool-attachment/...` on macOS/Linux,
- * `http://myagents.localhost/tool-attachment/...` on Windows) so WebView
+ * (`myagents-resource://tool-attachment/...` on macOS/Linux,
+ * `http://myagents-resource.localhost/tool-attachment/...` on Windows) so WebView
  * subresource loading stays inside the configured img/media allow-list.
  */
 
 import { useEffect, useState } from 'react';
-import { resolveMyAgentsProtocolUrl } from '@/utils/myagentsProtocol';
+import { resolveMyAgentsResourceUrl } from '@/utils/myagentsProtocol';
 import { isTauriEnvironment } from '@/utils/browserMock';
 import type { ToolAttachment } from '../../shared/types/tool-attachment';
 
@@ -59,14 +59,14 @@ export function resolveTauriToolAttachmentUrl(refPath: string, expectedSessionId
   const parsed = parseToolAttachmentRefPath(refPath);
   if (!parsed) return null;
   if (expectedSessionId !== undefined && getToolAttachmentRefError(refPath, expectedSessionId)) return null;
-  return resolveMyAgentsProtocolUrl(`${TOOL_ATTACHMENT_PROTOCOL_PATH_PREFIX}${parsed.relativePath}`);
+  return resolveMyAgentsResourceUrl(`${TOOL_ATTACHMENT_PROTOCOL_PATH_PREFIX}${parsed.relativePath}`);
 }
 
 /**
  * Resolve a refPath to a fetchable URL for the current session.
  *
- * - Tauri: myagents://tool-attachment/<sid>/<tid>/<file> on macOS/Linux;
- *   http://myagents.localhost/tool-attachment/<sid>/<tid>/<file> on Windows
+ * - Tauri: myagents-resource://tool-attachment/<sid>/<tid>/<file> on macOS/Linux;
+ *   http://myagents-resource.localhost/tool-attachment/<sid>/<tid>/<file> on Windows
  * - Browser dev: relative refPath (vite proxy handles it)
  *
  * Returns null while resolving (caller shows a loading skeleton).

@@ -17,6 +17,7 @@ license does not automatically license them.
 | OpenClaw Plugin SDK-derived shim | MIT License; Copyright © 2026 OpenClaw Foundation |
 | Cuse binary | Apache License 2.0 |
 | OpenAI Codex runtime | Apache License 2.0 |
+| Playwright MCP, Playwright, and optional Chromium downloaded directly from the official Chrome for Testing / Playwright distribution | Apache License 2.0 for Playwright; Chromium and bundled third-party components retain the notices shipped in the official archive |
 | sharp | Apache License 2.0 |
 | libvips distributed with sharp platform packages | LGPL-3.0-or-later |
 | SheetJS `xlsx` | Apache License 2.0 |
@@ -65,6 +66,7 @@ MyAgents 包含、分发或集成第三方软件、SDK、运行时、Skills、�
 | 派生自 OpenClaw Plugin SDK 的 shim | MIT License；Copyright © 2026 OpenClaw Foundation |
 | Cuse binary | Apache License 2.0 |
 | OpenAI Codex runtime | Apache License 2.0 |
+| Playwright MCP、Playwright，以及从 Chrome for Testing / Playwright 官方分发按需下载的 Chromium | Playwright 使用 Apache License 2.0；Chromium 及其第三方组件保留官方归档随附的许可与声明 |
 | sharp | Apache License 2.0 |
 | 随 sharp 平台包分发的 libvips | LGPL-3.0-or-later |
 | SheetJS `xlsx` | Apache License 2.0 |

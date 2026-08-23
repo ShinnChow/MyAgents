@@ -40,8 +40,6 @@ let currentTurnCompactResult: 'success' | 'failed' | null = null;
 let currentTurnSawCompactBoundary = false;
 let currentTurnAssistantMessagePresent = false;
 let turnHadSubstantiveActivity = false;
-let sessionBrowserToolUsed = false;
-let sessionStorageStateSaved = false;
 let currentTurnInboxMeta: import('../inbox/types').InboxTurnMeta | undefined = undefined;
 const currentTurnTextBlocks: string[] = [];
 export type PendingOutputOwner = {
@@ -180,18 +178,6 @@ export const turnState = {
   },
   set turnHadSubstantiveActivity(value: boolean) {
     turnHadSubstantiveActivity = value;
-  },
-  get sessionBrowserToolUsed(): boolean {
-    return sessionBrowserToolUsed;
-  },
-  set sessionBrowserToolUsed(value: boolean) {
-    sessionBrowserToolUsed = value;
-  },
-  get sessionStorageStateSaved(): boolean {
-    return sessionStorageStateSaved;
-  },
-  set sessionStorageStateSaved(value: boolean) {
-    sessionStorageStateSaved = value;
   },
   get currentTurnInboxMeta(): import('../inbox/types').InboxTurnMeta | undefined {
     return currentTurnInboxMeta;
@@ -383,22 +369,6 @@ export function hasSubstantiveActivity(): boolean {
 
 export function setSubstantiveActivity(value: boolean): void {
   turnHadSubstantiveActivity = value;
-}
-
-export function wasBrowserToolUsed(): boolean {
-  return sessionBrowserToolUsed;
-}
-
-export function setBrowserToolUsed(value: boolean): void {
-  sessionBrowserToolUsed = value;
-}
-
-export function wasStorageStateSaved(): boolean {
-  return sessionStorageStateSaved;
-}
-
-export function setStorageStateSaved(value: boolean): void {
-  sessionStorageStateSaved = value;
 }
 
 export function getCurrentTurnInboxMeta(): import('../inbox/types').InboxTurnMeta | undefined {
@@ -640,8 +610,6 @@ export function snapshotTurn() {
     currentTurnSawCompactBoundary,
     currentTurnAssistantMessagePresent,
     turnHadSubstantiveActivity,
-    sessionBrowserToolUsed,
-    sessionStorageStateSaved,
     currentTurnInboxMeta,
     currentTurnTextBlocks: [...currentTurnTextBlocks],
     pendingOutputOwners: pendingOutputOwners.map(owner => ({
@@ -669,8 +637,6 @@ export function resetTurnForTest(): void {
   currentTurnSawCompactBoundary = false;
   currentTurnAssistantMessagePresent = false;
   turnHadSubstantiveActivity = false;
-  sessionBrowserToolUsed = false;
-  sessionStorageStateSaved = false;
   currentTurnInboxMeta = undefined;
   currentTurnTextBlocks.length = 0;
   pendingOutputOwners.length = 0;

@@ -16,6 +16,7 @@ import {
   spaceAuthStart,
   spaceCreateSpace,
   spaceErrorMessage,
+  isSpaceErrorRetryable,
   isSpaceErrorCode,
   spaceJoinSpace,
   spaceWakeConnector,
@@ -44,6 +45,7 @@ import {
   localAgentMatchesCurrentSpaceIdentity,
   spaceEventsRequireIssueListRefresh,
   spaceEventsRequireSessionRefresh,
+  spaceEventsRequireToolRefresh,
   type IssueQueryParams,
 } from "@/pages/space/spaceHelpers";
 import {
@@ -60,6 +62,7 @@ import { SpaceSettingsWorkspace } from "@/pages/space/settings/SpaceSettingsWork
 import { GoalsWorkspace } from "@/pages/space/goals/GoalsWorkspace";
 import { GoalPathLabel } from "@/pages/space/GoalPathLabel";
 import { SkillsWorkspace } from "@/pages/space/skills/SkillsWorkspace";
+import { ToolsWorkspace } from "@/pages/space/tools/ToolsWorkspace";
 import {
   SpaceLogin,
   SpaceSidebar,
@@ -71,12 +74,14 @@ import {
   nowForSpaceMetric,
   recordSpaceMetric,
   trackSpaceAuth,
+  trackSpaceOpen,
 } from "@/pages/space/spaceMetrics";
 import {
   PAPER_GRID_STYLE,
   SPACE_BACKGROUND_STYLE,
 } from "@/pages/space/spaceUi";
 import { spaceSlugCandidate } from "@/pages/space/spaceSlug";
+import type { PendingAppRoute } from "../../shared/appRoute";
 
 const AUTH_POLL_DELAY_MS = 3000;
 const AUTH_POLL_TIMEOUT_MS = 10 * 60 * 1000;
@@ -445,10 +450,18 @@ function registeredAgentToListItem(
   };
 }
 
-export default function Space({ isActive }: { isActive: boolean }) {
+export default function Space({
+  isActive,
+  pendingRoute,
+  onRouteConsumed,
+}: {
+  isActive: boolean;
+  pendingRoute?: PendingAppRoute | null;
+  onRouteConsumed?: (generation: number) => void;
+}) {
   const { t } = useTranslation("app");
   const toast = useToast();
-  const { projects } = useConfig();
+  const { projects, config } = useConfig();
   const spaceData = useSpaceData({ isActive });
   const { actions } = spaceData;
   const [authBusy, setAuthBusy] = useState(false);
@@ -492,8 +505,15 @@ export default function Space({ isActive }: { isActive: boolean }) {
   const [skillRemoteUpdateAvailable, setSkillRemoteUpdateAvailable] =
     useState(false);
   const [issueDetailId, setIssueDetailId] = useState<string | null>(null);
+  const [routeAttempt, setRouteAttempt] = useState(0);
+  const [routeFailure, setRouteFailure] = useState<{
+    generation: number;
+    message: string;
+    retryable: boolean;
+  } | null>(null);
   const [createIssueOpen, setCreateIssueOpen] = useState(false);
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
   const [registerOpen, setRegisterOpen] = useState(false);
   const [profileSettingsOpen, setProfileSettingsOpen] = useState(false);
   const [spaceDialogMode, setSpaceDialogMode] = useState<
@@ -583,6 +603,11 @@ export default function Space({ isActive }: { isActive: boolean }) {
     (spaceData.boot === "ready" &&
       spaceData.skills.lastFetchedAt === 0 &&
       !spaceData.skills.error);
+  const toolsLoading =
+    spaceData.tools.isLoading ||
+    (spaceData.boot === "ready" &&
+      spaceData.tools.lastFetchedAt === 0 &&
+      !spaceData.tools.error);
   const localAgents = spaceData.localAgents.items;
   const registeredAgents = spaceData.registeredAgents.items;
   const currentUserId = session?.user?.id ?? null;
@@ -743,12 +768,14 @@ export default function Space({ isActive }: { isActive: boolean }) {
 
   useEffect(() => {
     setSkillRemoteUpdateAvailable(false);
+    setSelectedToolId(null);
   }, [activeDataScopeKey]);
 
   useEffect(() => {
     if (spaceData.boot !== "ready") return;
     const reentered = previousModeRef.current !== activeMode;
     previousModeRef.current = activeMode;
+    if (reentered && activeMode === "tools") trackSpaceOpen("tools");
     if (activeMode === "issues") {
       const handle = window.setTimeout(() => {
         const refreshes: Promise<void>[] = [
@@ -787,6 +814,14 @@ export default function Space({ isActive }: { isActive: boolean }) {
         })
         .then(() => {
           if (reentered) setSkillRemoteUpdateAvailable(false);
+        })
+        .catch((error) => toast.error(spaceErrorMessage(error)));
+    }
+    if (activeMode === "tools") {
+      void actions
+        .refreshTools({
+          force: reentered,
+          maxAgeMs: SPACE_VISIBLE_REFRESH_TTL_MS,
         })
         .catch((error) => toast.error(spaceErrorMessage(error)));
     }
@@ -837,6 +872,7 @@ export default function Space({ isActive }: { isActive: boolean }) {
       });
       const issueRemoteUpdate = spaceEventsRequireIssueListRefresh(events);
       let skillRemoteUpdate = false;
+      const toolRemoteUpdate = spaceEventsRequireToolRefresh(events);
       let refreshAgents = false;
       let refreshBoot = spaceEventsRequireSessionRefresh(events);
 
@@ -904,6 +940,23 @@ export default function Space({ isActive }: { isActive: boolean }) {
           );
         }
       }
+      if (toolRemoteUpdate) {
+        jobs.push(actions.refreshTools({ force: true, silent: true }));
+        if (selectedToolId) {
+          jobs.push(
+            actions.refreshToolDetail(selectedToolId, {
+              force: true,
+              silent: true,
+            }),
+          );
+          jobs.push(
+            actions.refreshToolRevisions(selectedToolId, {
+              force: true,
+              silent: true,
+            }),
+          );
+        }
+      }
       if (refreshAgents) {
         jobs.push(actions.refreshLocalAgents({ force: true, silent: true }));
         jobs.push(
@@ -927,7 +980,7 @@ export default function Space({ isActive }: { isActive: boolean }) {
         throw error;
       }
     },
-    [actions, issueDetailId, selectedSkillId],
+    [actions, issueDetailId, selectedSkillId, selectedToolId],
   );
 
   useEffect(() => {
@@ -1094,6 +1147,9 @@ export default function Space({ isActive }: { isActive: boolean }) {
       await actions.refreshSkills({ force: true });
       setSkillRemoteUpdateAvailable(false);
     }
+    if (activeMode === "tools") {
+      await actions.refreshTools({ force: true });
+    }
     if (activeMode === "settings") {
       await Promise.all([
         actions.ensureBootstrapped({ force: true, silent: true }),
@@ -1110,6 +1166,7 @@ export default function Space({ isActive }: { isActive: boolean }) {
       const switching = actions.switchSpace(spaceId, target);
       setIssueDetailId(null);
       setSelectedSkillId(null);
+      setSelectedToolId(null);
       setSelectedGoalId("");
       setMode(nextMode);
       await switching;
@@ -1133,6 +1190,69 @@ export default function Space({ isActive }: { isActive: boolean }) {
     },
     [enterSpace, toast],
   );
+
+  useEffect(() => {
+    if (
+      !isActive
+      || !pendingRoute
+      || pendingRoute.route.name !== "space.issue"
+      || spaceData.boot !== "ready"
+      || !session
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const { spaceId, issueId } = pendingRoute.route.params;
+    const currentMatches = session.space.id === spaceId || session.space.slug === spaceId;
+    const target = session.spaces?.find(
+      (space) => space.id === spaceId || space.slug === spaceId,
+    );
+
+    void (async () => {
+      try {
+        setRouteFailure(null);
+        if (!currentMatches) {
+          await actions.switchSpace(spaceId, target);
+        }
+        if (cancelled) return;
+        setMode("issues");
+        setSelectedSkillId(null);
+        setSelectedToolId(null);
+        setIssueDetailId(issueId);
+        setRouteFailure(null);
+        onRouteConsumed?.(pendingRoute.generation);
+      } catch (error) {
+        if (cancelled) return;
+        setMode("issues");
+        setIssueDetailId(null);
+        toast.error(t("space.route.openFailed", { message: spaceErrorMessage(error) }));
+        const retainForRetry = isSpaceErrorRetryable(error)
+          || isSpaceErrorCode(error, "SPACE_REAUTH_REQUIRED");
+        setRouteFailure({
+          generation: pendingRoute.generation,
+          message: isSpaceErrorCode(error, "SPACE_NOT_FOUND")
+            || isSpaceErrorCode(error, "SPACE_MEMBERSHIP_REQUIRED")
+            ? t("space.route.spaceUnavailable")
+            : t("space.route.openFailed", { message: spaceErrorMessage(error) }),
+          retryable: retainForRetry,
+        });
+        if (!retainForRetry) onRouteConsumed?.(pendingRoute.generation);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    actions,
+    isActive,
+    onRouteConsumed,
+    pendingRoute,
+    routeAttempt,
+    session,
+    spaceData.boot,
+    t,
+    toast,
+  ]);
 
   const joinSpace = useCallback(() => {
     setSpaceDialogError(null);
@@ -1260,9 +1380,7 @@ export default function Space({ isActive }: { isActive: boolean }) {
 
   if (spaceData.boot === "idle" || spaceData.boot === "loading") {
     return (
-      <div
-        className="flex h-full items-center justify-center bg-[var(--paper)] text-sm text-[var(--ink-muted)]"
-      >
+      <div className="flex h-full items-center justify-center bg-[var(--paper)] text-sm text-[var(--ink-muted)]">
         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
         {t("space.common.loadingTeam")}
       </div>
@@ -1287,9 +1405,7 @@ export default function Space({ isActive }: { isActive: boolean }) {
 
   if (spaceData.boot === "error") {
     return (
-      <div
-        className="flex h-full items-center justify-center bg-[var(--paper)] text-sm text-[var(--ink-muted)]"
-      >
+      <div className="flex h-full items-center justify-center bg-[var(--paper)] text-sm text-[var(--ink-muted)]">
         <div className="text-center">
           <p>{spaceData.bootError ?? t("space.common.teamLoadFailed")}</p>
           <button
@@ -1316,6 +1432,29 @@ export default function Space({ isActive }: { isActive: boolean }) {
         authFlow={authFlow}
         onLogin={startLogin}
       />
+    );
+  }
+
+  if (routeFailure) {
+    const canRetry = routeFailure.retryable
+      && pendingRoute?.generation === routeFailure.generation;
+    return (
+      <div className="flex h-full items-center justify-center bg-[var(--paper)] px-6 text-sm text-[var(--ink-muted)]">
+        <div className="max-w-sm text-center">
+          <p>{routeFailure.message}</p>
+          <button
+            type="button"
+            onClick={() => {
+              setRouteFailure(null);
+              if (canRetry) setRouteAttempt((value) => value + 1);
+            }}
+            className="mt-3 inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--button-secondary-bg)] px-3 text-sm font-semibold text-[var(--button-secondary-text)] hover:bg-[var(--button-secondary-bg-hover)]"
+          >
+            {canRetry && <RefreshCw className="h-4 w-4" />}
+            {t(canRetry ? "space.common.retry" : "space.route.back")}
+          </button>
+        </div>
+      </div>
     );
   }
 
@@ -1392,6 +1531,32 @@ export default function Space({ isActive }: { isActive: boolean }) {
                 setSkillRemoteUpdateAvailable(false);
               }}
               onUploaded={(id) => setSelectedSkillId(id)}
+            />
+          )}
+          {activeMode === "tools" && (
+            <ToolsWorkspace
+              admin={admin}
+              spaceId={activeCacheSpaceId}
+              spaceName={session.space.name}
+              config={config}
+              toolsState={{
+                ...spaceData.tools,
+                isLoading: toolsLoading,
+              }}
+              selectedToolId={selectedToolId}
+              detailState={
+                selectedToolId
+                  ? spaceData.toolDetails[spaceCacheKey(selectedToolId)]
+                  : undefined
+              }
+              revisionState={
+                selectedToolId
+                  ? spaceData.toolRevisions[spaceCacheKey(selectedToolId)]
+                  : undefined
+              }
+              actions={actions}
+              onSelectTool={setSelectedToolId}
+              onRefresh={refreshCurrent}
             />
           )}
           {activeMode === "goals" && (

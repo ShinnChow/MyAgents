@@ -14,6 +14,7 @@ import {
   commandResultExitCode,
   TOP_HELP,
   normalizeScheduleFlag,
+  normalizeSkillSourceForRequest,
   parseArgs,
   parseDispatchAtValue,
   printModelList,
@@ -42,6 +43,44 @@ describe('myagents CLI port authority', () => {
     expect(resolveCliPort('32003', '32002')).toBe('32003');
     expect(resolveCliPort(undefined, '32002')).toBe('32002');
     expect(resolveCliPort(undefined, '')).toBe('');
+  });
+});
+
+describe('skill source normalization', () => {
+  it('resolves only explicit relative local paths against the CLI caller cwd', () => {
+    const cwd = join(tmpdir(), 'skill-caller');
+    expect(normalizeSkillSourceForRequest('./private-skill', cwd))
+      .toBe(join(cwd, 'private-skill'));
+    expect(normalizeSkillSourceForRequest('../private.skill', cwd))
+      .toBe(join(tmpdir(), 'private.skill'));
+  });
+
+  it('preserves GitHub shorthand, file URLs, and absolute paths', () => {
+    expect(normalizeSkillSourceForRequest('private/example', '/tmp/caller'))
+      .toBe('private/example');
+    expect(normalizeSkillSourceForRequest('file:///tmp/private.skill', '/tmp/caller'))
+      .toBe('file:///tmp/private.skill');
+    expect(normalizeSkillSourceForRequest('/tmp/private-skill', '/tmp/caller'))
+      .toBe('/tmp/private-skill');
+  });
+
+  it('normalizes an explicit relative source in the skill add request body', () => {
+    expect(buildRequestBody('skill', 'add', ['./private-skill'], { dryRun: true }))
+      .toMatchObject({
+        url: join(process.cwd(), 'private-skill'),
+        scope: 'user',
+        dryRun: true,
+      });
+  });
+
+  it('normalizes an explicit relative source inside a pasted npx command', () => {
+    const cwd = join(tmpdir(), 'skill-caller');
+    expect(normalizeSkillSourceForRequest(
+      'npx -y skills add ./private-skill --skill private',
+      cwd,
+    )).toBe(
+      `npx -y skills add ${join(cwd, 'private-skill')} --skill private`,
+    );
   });
 });
 
@@ -311,23 +350,52 @@ describe('myagents CLI Task notification updates', () => {
   });
 });
 
+describe('myagents CLI Task comments', () => {
+  it('keeps an explicit Task identity for injected follow-up turns', () => {
+    process.env.MYAGENTS_SESSION_ID = 'session-comment';
+    expect(buildRequestBody('task', 'comment', ['task-1'], {
+      body: 'Verification passed.',
+      replyTo: 'comment-user',
+    })).toEqual({
+      id: 'task-1',
+      body: 'Verification passed.',
+      replyToCommentId: 'comment-user',
+    });
+  });
+
+  it('lets the Session Sidecar resolve Task identity only for an active Task turn', () => {
+    process.env.MYAGENTS_SESSION_ID = 'session-task-turn';
+    expect(buildRequestBody('task', 'comment', [], { body: 'Work completed.' })).toEqual({
+      id: undefined,
+      body: 'Work completed.',
+      replyToCommentId: undefined,
+    });
+  });
+});
+
 describe('myagents CLI Task provider overrides', () => {
-  it('forwards providerId with model through both Task creation paths', () => {
+  it('forwards the original task.md file path so Rust can re-read app-owned discussion candidates', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'myagents-task-candidate-'));
+    const file = join(dir, 'task.md');
+    writeFileSync(file, '# Current candidate\n');
+    try {
+      expect(buildRequestBody('task', 'create-direct', ['review'], {
+        taskMdFile: file,
+      })).toMatchObject({
+        taskMdContent: '# Current candidate\n',
+        taskMdFile: file,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards providerId with model through Task creation', () => {
     expect(buildRequestBody('task', 'create-direct', ['review'], {
       providerId: 'deepseek',
       model: 'deepseek-chat',
       taskMdContent: 'Review the workspace.',
     })).toMatchObject({
-      providerId: 'deepseek',
-      model: 'deepseek-chat',
-    });
-
-    expect(buildRequestBody('task', 'create-from-alignment', ['session-1'], {
-      name: 'Aligned review',
-      providerId: 'deepseek',
-      model: 'deepseek-chat',
-    })).toMatchObject({
-      alignmentSessionId: 'session-1',
       providerId: 'deepseek',
       model: 'deepseek-chat',
     });
@@ -681,7 +749,7 @@ describe('myagents CLI Task Detector contracts', () => {
 });
 
 describe('myagents CLI Task dispatch output', () => {
-  it.each(['run', 'rerun'])('keeps the public %s JSON shape free of the analytics receipt', (action) => {
+  it.each(['run', 'rerun'])('hides only the internal %s attempt ordinal and preserves the semantic receipt', (action) => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
     try {
       printResult('task', action, {
@@ -689,6 +757,13 @@ describe('myagents CLI Task dispatch output', () => {
         data: {
           task: { id: 'task-1', status: 'running' },
           attemptOrdinal: 4,
+          receipt: {
+            operation: action,
+            taskId: 'task-1',
+            status: 'running',
+            statusMeaning: 'The Task scheduler is enabled.',
+            changed: true,
+          },
         },
       }, true);
 
@@ -696,6 +771,13 @@ describe('myagents CLI Task dispatch output', () => {
         success: true,
         data: {
           task: { id: 'task-1', status: 'running' },
+          receipt: {
+            operation: action,
+            taskId: 'task-1',
+            status: 'running',
+            statusMeaning: 'The Task scheduler is enabled.',
+            changed: true,
+          },
         },
       });
     } finally {
@@ -1858,6 +1940,66 @@ describe('myagents CLI IM contracts', () => {
 });
 
 describe('myagents CLI cron time handling', () => {
+  it('forwards every supported Task runtime override on cron add and update', () => {
+    const runtimeConfig = '{"source":"system-cli","model":"gpt-5.6-sol"}';
+    expect(buildRequestBody('cron', 'add', [], {
+      name: 'Codex automation',
+      prompt: 'Review the workspace',
+      workspace: '/tmp/codex-workspace',
+      every: '30',
+      runtime: 'codex',
+      runtimeConfig,
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      permissionMode: 'full-auto',
+    })).toMatchObject({
+      name: 'Codex automation',
+      message: 'Review the workspace',
+      workspacePath: '/tmp/codex-workspace',
+      intervalMinutes: 30,
+      runtime: 'codex',
+      runtimeConfig: { source: 'system-cli', model: 'gpt-5.6-sol' },
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      permissionMode: 'full-auto',
+    });
+    expect(buildRequestBody('cron', 'update', ['task-1'], {
+      runtime: 'codex',
+      runtimeConfig,
+      providerId: 'provider-1',
+      model: 'gpt-5.6-sol',
+      permissionMode: 'full-auto',
+    })).toEqual({
+      taskId: 'task-1',
+      patch: {
+        runtime: 'codex',
+        runtimeConfig: { source: 'system-cli', model: 'gpt-5.6-sol' },
+        providerId: 'provider-1',
+        model: 'gpt-5.6-sol',
+        permissionMode: 'full-auto',
+      },
+    });
+  });
+
+  it('rejects unsupported cron mutation flags instead of silently dropping them', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as typeof process.exit);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() => buildRequestBody('cron', 'add', [], {
+        prompt: 'Do work',
+        imaginaryRouting: 'silent-drop',
+      })).toThrow('process.exit(2)');
+      expect(error).toHaveBeenCalledWith(
+        'Error: myagents cron add does not support --imaginary-routing.',
+      );
+    } finally {
+      exit.mockRestore();
+      error.mockRestore();
+    }
+  });
+
   it('uses the same guarded prompt-file input for cron add and update', () => {
     const dir = mkdtempSync(join(tmpdir(), 'myagents-cron-prompt-file-'));
     try {

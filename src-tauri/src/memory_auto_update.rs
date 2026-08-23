@@ -57,6 +57,8 @@ async fn normalize_managed_task_session_shape(
             name: None,
             executor: None,
             description: None,
+            workspace_id: None,
+            workspace_path: None,
             execution_mode: None,
             run_mode: Some(MANAGED_AUTO_UPDATE_RUN_MODE),
             end_conditions: None,
@@ -217,15 +219,11 @@ impl Drop for MemoryUpdateSidecarOwnerGuard {
         if !self.release_on_drop {
             return;
         }
-        if let Err(error) =
-            sidecar::release_session_sidecar(&self.manager, &self.session_id, &self.owner)
-        {
-            ulog_warn!(
-                "[memory-auto-update] failed to release Sidecar owner session={}: {}",
-                self.session_id,
-                error
-            );
-        }
+        sidecar::schedule_release_session_sidecar(
+            self.manager.clone(),
+            self.session_id.clone(),
+            self.owner.clone(),
+        );
     }
 }
 
@@ -410,6 +408,8 @@ pub async fn configure_memory_auto_update_task(
                     name: Some(MANAGED_AUTO_UPDATE_NAME.to_string()),
                     executor: None,
                     description: Some("System-managed memory auto-update dispatcher.".to_string()),
+                    workspace_id: None,
+                    workspace_path: None,
                     execution_mode: Some(crate::task::TaskExecutionMode::Recurring),
                     run_mode: Some(MANAGED_AUTO_UPDATE_RUN_MODE),
                     end_conditions: Some(crate::task::TaskEndConditions::default()),
@@ -1536,6 +1536,26 @@ mod tests {
         crate::process_cmd::spawn_tree(&mut command).expect("spawn owner guard test child")
     }
 
+    async fn wait_until_session_owner_released(
+        manager: &crate::sidecar::ManagedSidecarManager,
+        session_id: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !manager
+                    .lock()
+                    .expect("sidecar manager lock")
+                    .session_has_owners(session_id)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred Drop owner release completes");
+    }
+
     fn base_config() -> MemoryAutoUpdateConfig {
         MemoryAutoUpdateConfig {
             enabled: true,
@@ -1748,8 +1768,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn memory_update_owner_keeps_ready_sidecar_alive_after_tab_detaches() {
+    #[tokio::test]
+    async fn memory_update_owner_keeps_ready_sidecar_alive_after_tab_detaches() {
         let session_id = "memory-owner-session";
         let tab_owner = SidecarOwner::Tab("tab-a".to_string());
         let memory_owner = SidecarOwner::Task("memory-task".to_string());
@@ -1793,6 +1813,7 @@ mod tests {
         }
 
         drop(owner_guard);
+        wait_until_session_owner_released(&manager, session_id).await;
         assert!(
             !manager
                 .lock()
@@ -1802,8 +1823,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unconfirmed_memory_turn_retains_task_owner_for_retry_stop() {
+    #[tokio::test]
+    async fn unconfirmed_memory_turn_retains_task_owner_for_retry_stop() {
         let session_id = "memory-owner-unconfirmed";
         let task_owner = SidecarOwner::Task("memory-task-unconfirmed".to_string());
         let manager = crate::sidecar::create_sidecar_manager();
@@ -1845,11 +1866,12 @@ mod tests {
             "an ambiguous turn must keep its Task owner until exact stop"
         );
         crate::sidecar::release_session_sidecar(&manager, session_id, &task_owner)
+            .await
             .expect("retry stop releases retained owner");
     }
 
-    #[test]
-    fn confirmed_memory_turn_releases_a_dispatch_retained_owner() {
+    #[tokio::test]
+    async fn confirmed_memory_turn_releases_a_dispatch_retained_owner() {
         let session_id = "memory-owner-confirmed";
         let task_owner = SidecarOwner::Task("memory-task-confirmed".to_string());
         let manager = crate::sidecar::create_sidecar_manager();
@@ -1883,6 +1905,7 @@ mod tests {
         owner_guard.retain_for_task_stop();
         owner_guard.confirm_turn_settled();
         drop(owner_guard);
+        wait_until_session_owner_released(&manager, session_id).await;
 
         assert!(
             !manager

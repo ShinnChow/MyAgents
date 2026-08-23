@@ -40,13 +40,13 @@ describe('resolveAttachmentUrl', () => {
     setTauriEnvironment(true);
     setNavigatorPlatform('MacIntel');
     expect(resolveAttachmentUrl({ savedPath: 'session-a/image one.png' }))
-      .toBe('myagents://attachment/session-a/image%20one.png');
+      .toBe('myagents-resource://attachment/session-a/image%20one.png');
   });
 
   it('uses Tauri localhost on Windows WebView2', () => {
     setTauriEnvironment(true);
     setNavigatorPlatform('Win32', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
     expect(resolveAttachmentUrl({ savedPath: 'session-a/image one.png' }))
-      .toBe('http://myagents.localhost/attachment/session-a/image%20one.png');
+      .toBe('http://myagents-resource.localhost/attachment/session-a/image%20one.png');
   });
 });

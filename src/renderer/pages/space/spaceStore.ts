@@ -6,12 +6,11 @@ import {
   spaceCommentIssue,
   spaceCreateGoal,
   spaceCompleteIssue,
-  spaceCreateRegisteredAgentSubscription,
   spaceCreateIssue,
   spaceCancelIssueClaim,
   spaceCancelIssueAssignee,
   spaceDeleteSkill,
-  spaceDeleteRegisteredAgentSubscription,
+  spaceDeleteTool,
   spaceDownloadIssueAttachment,
   spaceErrorCode,
   spaceErrorSessionBindingId,
@@ -22,6 +21,7 @@ import {
   spaceGetSession,
   spaceGetSkill,
   spaceGetSkillFile,
+  spaceGetTool,
   spaceInstallSkill,
   spaceListSkillRevisions,
   spaceListGoals,
@@ -31,17 +31,24 @@ import {
   spaceListLocalAgents,
   spaceListRegisteredAgents,
   spaceListSkills,
+  spaceListTools,
+  spaceListToolRevisions,
   spaceLogout,
   spaceRegisterAgent,
   spaceReevaluateRegisteredAgent,
   spaceRevokeRegisteredAgent,
   spaceRollbackSkill,
+  spaceRollbackTool,
+  spacePublishCustomTool,
+  spacePublishMcpTool,
   spaceSetActiveSpace,
   spaceSetIssueState,
   spaceSetIssueAssignee,
   spaceUpdateProfile,
   spaceUpdateGoal,
   spaceUpdateIssue,
+  spaceUpdateCustomTool,
+  spaceUpdateMcpTool,
   spaceUpdateRegisteredAgent,
   spaceUpdateRegisteredAgentAvatar,
   spaceUploadIssueAttachments,
@@ -53,19 +60,24 @@ import {
   type SpaceDownloadAttachmentResult,
   type SpaceEvent,
   type SpaceGoal,
-  type SpaceGoalSubscription,
   type SpaceIssue,
   type SpaceIdentitySummary,
   type SpaceIssueDetail,
   type SpaceIssueSubscriptionRunMode,
   type SpaceListItem,
   type SpaceRegisteredAgent,
+  type SpaceRegisteredAgentSubscriptionReplacement,
   type SpaceSession,
   type SpaceSkill,
   type SpaceSkillDetail,
   type SpaceSkillRevisionHistory,
+  type SpaceTool,
+  type SpaceToolDetail,
+  type SpaceToolMutationResult,
+  type SpaceToolRevisionHistory,
   type SpaceUserSummary,
 } from "@/api/spaceCloud";
+import type { PortableMcpManifestV1 } from "../../../shared/spaceToolManifest";
 import type { IssueQueryParams } from "./spaceHelpers";
 import {
   buildIssueQueryKey,
@@ -76,7 +88,10 @@ import {
   recordSpaceMetric,
   setSpaceAnalyticsContext,
   trackSpaceOpen,
+  trackSpaceToolListLoad,
   trackSpaceSwitch,
+  type SpaceToolMetricKind,
+  type SpaceToolMetricResult,
   withSpaceMutationMetric as recordSpaceMutationMetric,
 } from "./spaceMetrics";
 
@@ -85,6 +100,8 @@ export const SPACE_MAX_ISSUE_LIST_CACHES = 20;
 export const SPACE_MAX_ISSUE_DETAIL_CACHES = 100;
 export const SPACE_MAX_SKILL_DETAIL_CACHES = 100;
 export const SPACE_MAX_SKILL_FILE_CACHES = 50;
+export const SPACE_MAX_TOOL_DETAIL_CACHES = 100;
+export const SPACE_TOOL_PAGE_SIZE = 40;
 
 type BootState =
   | "idle"
@@ -114,6 +131,31 @@ interface SpaceSkillsState {
   items: SpaceSkill[];
   lastFetchedAt: number;
   isLoading: boolean;
+  error: string | null;
+}
+
+export interface SpaceToolsState {
+  items: SpaceTool[];
+  hasMore: boolean;
+  nextCursor?: string | null;
+  lastFetchedAt: number;
+  isLoading: boolean;
+  isLoadingMore: boolean;
+  error: string | null;
+}
+
+export interface SpaceToolDetailState {
+  detail: SpaceToolDetail | null;
+  lastFetchedAt: number;
+  isLoading: boolean;
+  error: string | null;
+}
+
+export interface SpaceToolRevisionState {
+  history: SpaceToolRevisionHistory | null;
+  lastFetchedAt: number;
+  isLoading: boolean;
+  isLoadingMore: boolean;
   error: string | null;
 }
 
@@ -188,6 +230,9 @@ interface StoreState {
   skillDetails: Record<string, SpaceSkillDetailState>;
   skillFiles: Record<string, SpaceSkillFileState>;
   skillRevisions: Record<string, SpaceSkillRevisionState>;
+  tools: SpaceToolsState;
+  toolDetails: Record<string, SpaceToolDetailState>;
+  toolRevisions: Record<string, SpaceToolRevisionState>;
   localAgents: SpaceAgentsState;
   registeredAgents: SpaceRegisteredAgentsState;
   avatarPresets: SpaceAvatarPresetsState;
@@ -232,6 +277,59 @@ export interface SpaceActions {
     skillId: string,
     options?: RefreshOptions,
   ) => Promise<void>;
+  refreshTools: (options?: RefreshOptions) => Promise<void>;
+  loadMoreTools: () => Promise<void>;
+  refreshToolDetail: (
+    toolId: string,
+    options?: RefreshOptions,
+  ) => Promise<void>;
+  refreshToolRevisions: (
+    toolId: string,
+    options?: RefreshOptions,
+  ) => Promise<void>;
+  loadMoreToolRevisions: (toolId: string) => Promise<void>;
+  publishMcpTool: (input: {
+    spaceId: string;
+    name: string;
+    description?: string;
+    portableMcpManifest: PortableMcpManifestV1;
+    iconFilePath?: string | null;
+  }) => Promise<SpaceToolMutationResult>;
+  publishCustomTool: (input: {
+    spaceId: string;
+    name: string;
+    description: string;
+    customInstallInstruction: string;
+    iconFilePath?: string | null;
+  }) => Promise<SpaceToolMutationResult>;
+  updateMcpTool: (input: {
+    toolId: string;
+    name: string;
+    description?: string;
+    portableMcpManifest: PortableMcpManifestV1;
+    expectedLatestRevision: number;
+    iconFilePath?: string | null;
+    resetIcon?: boolean;
+  }) => Promise<SpaceToolMutationResult>;
+  updateCustomTool: (input: {
+    toolId: string;
+    name: string;
+    description: string;
+    customInstallInstruction: string;
+    expectedLatestRevision: number;
+    iconFilePath?: string | null;
+    resetIcon?: boolean;
+  }) => Promise<SpaceToolMutationResult>;
+  rollbackTool: (input: {
+    toolId: string;
+    revision: number;
+    expectedCurrentRevision: number;
+    toolKind: SpaceTool["kind"];
+  }) => Promise<SpaceToolMutationResult>;
+  deleteTool: (input: {
+    toolId: string;
+    toolKind: SpaceTool["kind"];
+  }) => Promise<void>;
   refreshLocalAgents: (options?: RefreshOptions) => Promise<void>;
   refreshRegisteredAgents: (options?: RefreshOptions) => Promise<void>;
   syncEvents: (options?: RefreshOptions) => Promise<SpaceEvent[]>;
@@ -337,17 +435,10 @@ export interface SpaceActions {
     workspaceId?: string;
     workspacePath?: string;
     workspaceLabel?: string;
-    goalId?: string;
-    stateFilter?: string[];
+    subscriptionReplacement?: SpaceRegisteredAgentSubscriptionReplacement;
     status?: "active" | "disabled";
     issueSubscriptionRunMode?: SpaceIssueSubscriptionRunMode;
   }) => Promise<LocalRegisteredAgent>;
-  createRegisteredAgentSubscription: (input: {
-    registeredAgentId: string;
-    goalId: string;
-    stateFilter: string[];
-  }) => Promise<SpaceGoalSubscription>;
-  deleteRegisteredAgentSubscription: (subscriptionId: string) => Promise<void>;
   reevaluateRegisteredAgent: (id: string) => Promise<number>;
   updateRegisteredAgentAvatar: (input: {
     id: string;
@@ -388,6 +479,17 @@ const initialState = (): StoreState => ({
   skillDetails: {},
   skillFiles: {},
   skillRevisions: {},
+  tools: {
+    items: [],
+    hasMore: false,
+    nextCursor: null,
+    lastFetchedAt: 0,
+    isLoading: false,
+    isLoadingMore: false,
+    error: null,
+  },
+  toolDetails: {},
+  toolRevisions: {},
   localAgents: {
     items: [],
     lastFetchedAt: 0,
@@ -473,9 +575,13 @@ function applyReauthRequired(error: unknown): boolean {
 export async function withSpaceStoreMutationMetric<T>(
   operation: string,
   task: () => Promise<T>,
+  options: {
+    toolKind?: SpaceToolMetricKind;
+    toolResult?: SpaceToolMetricResult | (() => SpaceToolMetricResult);
+  } = {},
 ): Promise<T> {
   try {
-    return await recordSpaceMutationMetric(operation, task);
+    return await recordSpaceMutationMetric(operation, task, options);
   } catch (error) {
     applyReauthRequired(error);
     throw error;
@@ -691,8 +797,8 @@ function normalizeIssueQueryParams(params: IssueQueryParams): IssueQueryParams {
 }
 
 function compareUpdatedDesc(
-  left: Pick<SpaceIssue | SpaceSkill, "id" | "updatedAt">,
-  right: Pick<SpaceIssue | SpaceSkill, "id" | "updatedAt">,
+  left: { id: string; updatedAt: string },
+  right: { id: string; updatedAt: string },
 ): number {
   const updatedDelta = Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
   if (Number.isFinite(updatedDelta) && updatedDelta !== 0) return updatedDelta;
@@ -917,6 +1023,157 @@ function patchIssueDetail(
 
 function detailKey(id: string): string {
   return scopedKey(id);
+}
+
+function toolMutationScopeKey(): string {
+  return `${state.session?.sessionBindingId ?? ""}\n${activeSpaceId()}`;
+}
+
+function invalidateToolReadRequests(toolId: string): void {
+  const key = detailKey(toolId);
+  for (const requestKey of [
+    "tools",
+    "tools-more",
+    `tool:${key}`,
+    `tool-revisions:${key}`,
+    `tool-revisions-more:${key}`,
+  ]) {
+    startRequest(requestKey);
+    inFlightRequests.delete(requestKey);
+  }
+}
+
+function applyToolMutationResult(result: SpaceToolMutationResult): void {
+  const key = detailKey(result.tool.id);
+  const timestamp = Date.now();
+  const currentHistoryState = state.toolRevisions[key];
+  let nextToolRevisions = state.toolRevisions;
+  if (currentHistoryState) {
+    const currentHistory = currentHistoryState.history;
+    if (currentHistory) {
+      const nextHistoryItems = [
+        result.revision,
+        ...currentHistory.items.filter(
+          (revision) => revision.revision !== result.revision.revision,
+        ),
+      ]
+        .sort((left, right) => right.revision - left.revision)
+        .map((revision) => ({
+          ...revision,
+          isCurrent: revision.revision === result.tool.currentRevision,
+        }));
+      nextToolRevisions = {
+        ...state.toolRevisions,
+        [key]: {
+          ...currentHistoryState,
+          history: {
+            ...currentHistory,
+            tool: {
+              id: result.tool.id,
+              latestRevision: result.tool.latestRevision,
+              currentRevision: result.tool.currentRevision,
+            },
+            items: nextHistoryItems,
+          },
+          lastFetchedAt: timestamp,
+          isLoading: false,
+          isLoadingMore: false,
+          error: null,
+        },
+      };
+    } else {
+      nextToolRevisions = Object.fromEntries(
+        Object.entries(state.toolRevisions).filter(
+          ([cacheKey]) => cacheKey !== key,
+        ),
+      );
+    }
+  }
+
+  setState({
+    tools: {
+      ...state.tools,
+      items: [
+        result.tool,
+        ...state.tools.items.filter((tool) => tool.id !== result.tool.id),
+      ].sort(compareUpdatedDesc),
+      isLoading: false,
+      isLoadingMore: false,
+      error: null,
+    },
+    toolDetails: trimCacheRecord(
+      {
+        ...state.toolDetails,
+        [key]: {
+          detail: { tool: result.tool, revision: result.revision },
+          lastFetchedAt: timestamp,
+          isLoading: false,
+          error: null,
+        },
+      },
+      SPACE_MAX_TOOL_DETAIL_CACHES,
+    ),
+    toolRevisions: nextToolRevisions,
+  });
+}
+
+function removeToolFromCache(toolId: string): void {
+  const key = detailKey(toolId);
+  setState({
+    tools: {
+      ...state.tools,
+      items: state.tools.items.filter((tool) => tool.id !== toolId),
+      isLoading: false,
+      isLoadingMore: false,
+      error: null,
+    },
+    toolDetails: Object.fromEntries(
+      Object.entries(state.toolDetails).filter(
+        ([cacheKey]) => cacheKey !== key,
+      ),
+    ),
+    toolRevisions: Object.fromEntries(
+      Object.entries(state.toolRevisions).filter(
+        ([cacheKey]) => cacheKey !== key,
+      ),
+    ),
+  });
+}
+
+async function reconcileToolRevisionConflict(
+  toolId: string,
+  error: unknown,
+): Promise<void> {
+  if (spaceErrorCode(error) !== "TOOL_REVISION_CONFLICT") return;
+  await Promise.allSettled([
+    actions.refreshToolDetail(toolId, { force: true, silent: true }),
+    actions.refreshToolRevisions(toolId, { force: true, silent: true }),
+  ]);
+}
+
+async function runToolMutation(
+  operation: "tool.publish" | "tool.update" | "tool.rollback",
+  toolKind: SpaceTool["kind"],
+  task: () => Promise<SpaceToolMutationResult>,
+  conflictToolId?: string,
+): Promise<SpaceToolMutationResult> {
+  const mutationScope = toolMutationScopeKey();
+  try {
+    const result = await withSpaceMutationMetric(operation, task, {
+      toolKind,
+      toolResult: "success",
+    });
+    if (toolMutationScopeKey() === mutationScope) {
+      invalidateToolReadRequests(result.tool.id);
+      applyToolMutationResult(result);
+    }
+    return result;
+  } catch (error) {
+    if (conflictToolId && toolMutationScopeKey() === mutationScope) {
+      await reconcileToolRevisionConflict(conflictToolId, error);
+    }
+    throw error;
+  }
 }
 
 function skillFileKey(skillId: string, path: string): string {
@@ -1797,6 +2054,343 @@ export const actions: SpaceActions = {
     });
   },
 
+  refreshTools: async (options: RefreshOptions = {}) => {
+    if (!ensureReady()) return;
+    if (!options.force && isFresh(state.tools.lastFetchedAt, options.maxAgeMs))
+      return;
+    return runRequest("tools", options.force, async () => {
+      const startedAt = nowForSpaceMetric();
+      const requestSeq = startRequest("tools");
+      setState({
+        tools: {
+          ...state.tools,
+          isLoading: true,
+          error: options.silent ? state.tools.error : null,
+        },
+      });
+      try {
+        const result = await spaceListTools({
+          spaceId: activeSpaceId(),
+          limit: SPACE_TOOL_PAGE_SIZE,
+        });
+        if (!isLatest("tools", requestSeq)) return;
+        setState({
+          tools: {
+            items: result.items,
+            hasMore: result.hasMore,
+            nextCursor: result.nextCursor,
+            lastFetchedAt: Date.now(),
+            isLoading: false,
+            isLoadingMore: false,
+            error: null,
+          },
+        });
+        trackSpaceToolListLoad({
+          ok: true,
+          durationMs: Math.round(nowForSpaceMetric() - startedAt),
+          count: result.items.length,
+        });
+      } catch (error) {
+        if (!isLatest("tools", requestSeq)) return;
+        setState({
+          tools: {
+            ...state.tools,
+            isLoading: false,
+            isLoadingMore: false,
+            error: errMessage(error),
+          },
+        });
+        trackSpaceToolListLoad({
+          ok: false,
+          durationMs: Math.round(nowForSpaceMetric() - startedAt),
+          error,
+        });
+        throw error;
+      }
+    });
+  },
+
+  loadMoreTools: async () => {
+    if (!ensureReady() || !state.tools.hasMore || !state.tools.nextCursor)
+      return;
+    return runRequest("tools-more", false, async () => {
+      const requestSeq = startRequest("tools-more");
+      const cursor = state.tools.nextCursor;
+      setState({
+        tools: { ...state.tools, isLoadingMore: true, error: null },
+      });
+      try {
+        const result = await spaceListTools({
+          spaceId: activeSpaceId(),
+          cursor,
+          limit: SPACE_TOOL_PAGE_SIZE,
+        });
+        if (!isLatest("tools-more", requestSeq)) return;
+        const known = new Set(state.tools.items.map((tool) => tool.id));
+        setState({
+          tools: {
+            ...state.tools,
+            items: [
+              ...state.tools.items,
+              ...result.items.filter((tool) => !known.has(tool.id)),
+            ],
+            hasMore: result.hasMore,
+            nextCursor: result.nextCursor,
+            lastFetchedAt: Date.now(),
+            isLoadingMore: false,
+            error: null,
+          },
+        });
+      } catch (error) {
+        if (!isLatest("tools-more", requestSeq)) return;
+        setState({
+          tools: {
+            ...state.tools,
+            isLoadingMore: false,
+            error: errMessage(error),
+          },
+        });
+        throw error;
+      }
+    });
+  },
+
+  refreshToolDetail: async (toolId: string, options: RefreshOptions = {}) => {
+    if (!ensureReady() || !toolId) return;
+    const key = detailKey(toolId);
+    const current = state.toolDetails[key] ?? {
+      detail: null,
+      lastFetchedAt: 0,
+      isLoading: false,
+      error: null,
+    };
+    if (!options.force && isFresh(current.lastFetchedAt, options.maxAgeMs))
+      return;
+    const requestKey = `tool:${key}`;
+    return runRequest(requestKey, options.force, async () => {
+      const requestSeq = startRequest(requestKey);
+      setState({
+        toolDetails: {
+          ...state.toolDetails,
+          [key]: {
+            ...current,
+            isLoading: true,
+            error: options.silent ? current.error : null,
+          },
+        },
+      });
+      try {
+        const detail = await spaceGetTool(toolId);
+        if (!isLatest(requestKey, requestSeq)) return;
+        setState({
+          toolDetails: trimCacheRecord(
+            {
+              ...state.toolDetails,
+              [key]: {
+                detail,
+                lastFetchedAt: Date.now(),
+                isLoading: false,
+                error: null,
+              },
+            },
+            SPACE_MAX_TOOL_DETAIL_CACHES,
+          ),
+        });
+      } catch (error) {
+        if (!isLatest(requestKey, requestSeq)) return;
+        setState({
+          toolDetails: {
+            ...state.toolDetails,
+            [key]: { ...current, isLoading: false, error: errMessage(error) },
+          },
+        });
+        throw error;
+      }
+    });
+  },
+
+  refreshToolRevisions: async (
+    toolId: string,
+    options: RefreshOptions = {},
+  ) => {
+    if (!ensureReady() || !toolId) return;
+    const key = detailKey(toolId);
+    const current = state.toolRevisions[key] ?? {
+      history: null,
+      lastFetchedAt: 0,
+      isLoading: false,
+      isLoadingMore: false,
+      error: null,
+    };
+    if (!options.force && isFresh(current.lastFetchedAt, options.maxAgeMs))
+      return;
+    const requestKey = `tool-revisions:${key}`;
+    return runRequest(requestKey, options.force, async () => {
+      const requestSeq = startRequest(requestKey);
+      setState({
+        toolRevisions: {
+          ...state.toolRevisions,
+          [key]: {
+            ...current,
+            isLoading: true,
+            error: options.silent ? current.error : null,
+          },
+        },
+      });
+      try {
+        const history = await spaceListToolRevisions({
+          toolId,
+          limit: 100,
+        });
+        if (!isLatest(requestKey, requestSeq)) return;
+        setState({
+          toolRevisions: trimCacheRecord(
+            {
+              ...state.toolRevisions,
+              [key]: {
+                history,
+                lastFetchedAt: Date.now(),
+                isLoading: false,
+                isLoadingMore: false,
+                error: null,
+              },
+            },
+            SPACE_MAX_TOOL_DETAIL_CACHES,
+          ),
+        });
+      } catch (error) {
+        if (!isLatest(requestKey, requestSeq)) return;
+        setState({
+          toolRevisions: {
+            ...state.toolRevisions,
+            [key]: {
+              ...current,
+              isLoading: false,
+              isLoadingMore: false,
+              error: errMessage(error),
+            },
+          },
+        });
+        throw error;
+      }
+    });
+  },
+
+  loadMoreToolRevisions: async (toolId: string) => {
+    if (!ensureReady() || !toolId) return;
+    const key = detailKey(toolId);
+    const current = state.toolRevisions[key];
+    if (
+      !current?.history?.hasMore ||
+      !current.history.nextCursor ||
+      current.isLoadingMore
+    ) {
+      return;
+    }
+    const requestKey = `tool-revisions-more:${key}`;
+    return runRequest(requestKey, false, async () => {
+      const requestSeq = startRequest(requestKey);
+      const cursor = current.history!.nextCursor!;
+      setState({
+        toolRevisions: {
+          ...state.toolRevisions,
+          [key]: { ...current, isLoadingMore: true, error: null },
+        },
+      });
+      try {
+        const next = await spaceListToolRevisions({
+          toolId,
+          cursor,
+          limit: 100,
+        });
+        if (!isLatest(requestKey, requestSeq)) return;
+        const latest = state.toolRevisions[key] ?? current;
+        const known = new Set(
+          (latest.history?.items ?? []).map((revision) => revision.id),
+        );
+        setState({
+          toolRevisions: {
+            ...state.toolRevisions,
+            [key]: {
+              ...latest,
+              history: {
+                ...next,
+                items: [
+                  ...(latest.history?.items ?? []),
+                  ...next.items.filter((revision) => !known.has(revision.id)),
+                ],
+              },
+              lastFetchedAt: Date.now(),
+              isLoadingMore: false,
+              error: null,
+            },
+          },
+        });
+      } catch (error) {
+        if (!isLatest(requestKey, requestSeq)) return;
+        const latest = state.toolRevisions[key] ?? current;
+        setState({
+          toolRevisions: {
+            ...state.toolRevisions,
+            [key]: {
+              ...latest,
+              isLoadingMore: false,
+              error: errMessage(error),
+            },
+          },
+        });
+        throw error;
+      }
+    });
+  },
+
+  publishMcpTool: (input) =>
+    runToolMutation("tool.publish", "mcp", () => spacePublishMcpTool(input)),
+
+  publishCustomTool: (input) =>
+    runToolMutation("tool.publish", "custom_install_prompt", () =>
+      spacePublishCustomTool(input),
+    ),
+
+  updateMcpTool: (input) =>
+    runToolMutation(
+      "tool.update",
+      "mcp",
+      () => spaceUpdateMcpTool(input),
+      input.toolId,
+    ),
+
+  updateCustomTool: (input) =>
+    runToolMutation(
+      "tool.update",
+      "custom_install_prompt",
+      () => spaceUpdateCustomTool(input),
+      input.toolId,
+    ),
+
+  rollbackTool: ({ toolKind, ...input }) =>
+    runToolMutation(
+      "tool.rollback",
+      toolKind,
+      () => spaceRollbackTool(input),
+      input.toolId,
+    ),
+
+  deleteTool: ({ toolId, toolKind }) => {
+    const mutationScope = toolMutationScopeKey();
+    return withSpaceMutationMetric(
+      "tool.delete",
+      async () => {
+        await spaceDeleteTool(toolId);
+        if (toolMutationScopeKey() === mutationScope) {
+          invalidateToolReadRequests(toolId);
+          removeToolFromCache(toolId);
+        }
+      },
+      { toolKind, toolResult: "success" },
+    );
+  },
+
   refreshLocalAgents: async (options: RefreshOptions = {}) => {
     if (!ensureReady()) return;
     if (
@@ -2391,14 +2985,7 @@ export const actions: SpaceActions = {
           error: null,
           items: state.registeredAgents.items.map((item) =>
             item.id === registeredAgent.id
-              ? {
-                  ...item,
-                  ...registeredAgent,
-                  // PATCH does not mutate or project the Subscription
-                  // collection.  In particular, a remote Agent has no local
-                  // row from which the Rust bridge could reconstruct it.
-                  subscriptions: item.subscriptions ?? [],
-                }
+              ? { ...item, ...registeredAgent }
               : item,
           ),
         },
@@ -2429,79 +3016,6 @@ export const actions: SpaceActions = {
         ),
       });
       return agent;
-    }),
-
-  createRegisteredAgentSubscription: (input) =>
-    withSpaceMutationMetric("agent.subscription.create", async () => {
-      const result = await spaceCreateRegisteredAgentSubscription({
-        spaceId: activeSpaceId(),
-        registeredAgentId: input.registeredAgentId,
-        goalId: input.goalId,
-        stateFilter: input.stateFilter,
-      });
-      const subscription = result.subscription;
-      invalidateRegisteredAgentReads();
-      setState({
-        localAgents: {
-          ...state.localAgents,
-          items: state.localAgents.items.map((agent) =>
-            agent.id === input.registeredAgentId
-              ? {
-                  ...agent,
-                  subscriptions: [
-                    ...agent.subscriptions.filter(
-                      (item) => item.id !== subscription.id,
-                    ),
-                    subscription,
-                  ],
-                }
-              : agent,
-          ),
-        },
-        registeredAgents: {
-          ...state.registeredAgents,
-          items: state.registeredAgents.items.map((agent) =>
-            agent.id === input.registeredAgentId
-              ? {
-                  ...agent,
-                  subscriptions: [
-                    ...(agent.subscriptions ?? []).filter(
-                      (item) => item.id !== subscription.id,
-                    ),
-                    subscription,
-                  ],
-                }
-              : agent,
-          ),
-        },
-      });
-      return subscription;
-    }),
-
-  deleteRegisteredAgentSubscription: (subscriptionId) =>
-    withSpaceMutationMetric("agent.subscription.delete", async () => {
-      await spaceDeleteRegisteredAgentSubscription(subscriptionId);
-      invalidateRegisteredAgentReads();
-      setState({
-        localAgents: {
-          ...state.localAgents,
-          items: state.localAgents.items.map((agent) => ({
-            ...agent,
-            subscriptions: agent.subscriptions.filter(
-              (item) => item.id !== subscriptionId,
-            ),
-          })),
-        },
-        registeredAgents: {
-          ...state.registeredAgents,
-          items: state.registeredAgents.items.map((agent) => ({
-            ...agent,
-            subscriptions: (agent.subscriptions ?? []).filter(
-              (item) => item.id !== subscriptionId,
-            ),
-          })),
-        },
-      });
     }),
 
   reevaluateRegisteredAgent: (id) =>

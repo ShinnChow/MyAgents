@@ -4,7 +4,6 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { PLAYWRIGHT_MCP_PACKAGE_SPEC } from '../../shared/mcpPackages';
 import { getAllMcpServers, resolveWorkspaceConfig } from './admin-config';
 
 const scratchDirs: string[] = [];
@@ -17,7 +16,7 @@ afterEach(() => {
 });
 
 describe('server MCP catalogue merge', () => {
-  it('appends preset args instead of replacing the executable package spec', () => {
+  it('preserves explicit Playwright args on the generic stdio preset', () => {
     const servers = getAllMcpServers({
       mcpServers: [],
       mcpEnabledServers: ['playwright'],
@@ -26,10 +25,33 @@ describe('server MCP catalogue merge', () => {
       },
     });
 
-    expect(servers.find((server) => server.id === 'playwright')?.args).toEqual([
-      PLAYWRIGHT_MCP_PACKAGE_SPEC,
-      '--user-data-dir=/tmp/playwright-profile',
-    ]);
+    expect(servers.find((server) => server.id === 'playwright')).toMatchObject({
+      command: 'npx',
+      args: ['@playwright/mcp@0.0.68', '--user-data-dir=/tmp/playwright-profile'],
+    });
+    expect(servers.find((server) => server.id === 'myagents-browser')).toMatchObject({
+      command: '__browser_host__',
+      args: [],
+    });
+  });
+
+  it('does not let persisted custom collisions shadow either built-in Browser preset', () => {
+    const servers = getAllMcpServers({
+      mcpServers: [
+        { id: 'playwright', name: 'shadow', type: 'stdio', command: 'shadow', isBuiltin: false },
+        { id: 'myagents-browser', name: 'shadow', type: 'stdio', command: 'shadow', isBuiltin: false },
+      ],
+      mcpEnabledServers: [],
+    });
+
+    expect(servers.find((server) => server.id === 'playwright')).toMatchObject({
+      command: 'npx',
+      isBuiltin: true,
+    });
+    expect(servers.find((server) => server.id === 'myagents-browser')).toMatchObject({
+      command: '__browser_host__',
+      isBuiltin: true,
+    });
   });
 
   it('resolves owned Session IDs against current definitions and global enablement', () => {

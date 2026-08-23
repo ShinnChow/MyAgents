@@ -10,7 +10,8 @@ export type SessionEventType =
   | 'watch.already_idle'
   | 'watch.completed'
   | 'watch.error'
-  | 'space.issue_delivery';
+  | 'space.issue_delivery'
+  | 'task.comment';
 
 export type SourceNotification = 'auto' | 'none';
 export type SessionEventStatus = 'ok' | 'error';
@@ -79,8 +80,23 @@ export interface SpaceIssueDeliveryEvent extends SessionEventBase {
   updateSummary?: string | null;
 }
 
-export type SessionEvent = SendRequestEvent | SendResultEvent | WatchEvent | SpaceIssueDeliveryEvent;
-type RenderableSessionEvent = Exclude<SessionEvent, SpaceIssueDeliveryEvent>;
+export interface TaskCommentEvent extends SessionEventBase {
+  type: 'task.comment';
+  taskId: string;
+  taskName: string;
+  taskMdPath: string;
+  commentId: string;
+  targetSessionId: string;
+  replyContext?: {
+    commentId: string;
+    author: string;
+    createdAt: string;
+    quote: string;
+  };
+}
+
+export type SessionEvent = SendRequestEvent | SendResultEvent | WatchEvent | SpaceIssueDeliveryEvent | TaskCommentEvent;
+type RenderableSessionEvent = Exclude<SessionEvent, SpaceIssueDeliveryEvent | TaskCommentEvent>;
 
 const HTML_ESCAPE_MAP: Record<string, string> = {
   '<': '&lt;',
@@ -130,8 +146,8 @@ function attr(name: string, value: string | number | undefined | null): string |
 }
 
 function assertRenderableSessionEvent(event: SessionEvent): asserts event is RenderableSessionEvent {
-  if (event.type === 'space.issue_delivery') {
-    throw new Error('space.issue_delivery prompts are rendered by Rust and must bypass renderSessionEventPrompt');
+  if (event.type === 'space.issue_delivery' || event.type === 'task.comment') {
+    throw new Error(`${event.type} prompts must bypass renderSessionEventPrompt`);
   }
 }
 

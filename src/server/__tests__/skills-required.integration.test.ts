@@ -252,20 +252,20 @@ describe('required system skill API contract', () => {
       expect(savedSkill).not.toMatch(/^author:/m);
       expect(savedSkill).toContain('metadata:\n  author: "Standard Author"\n  version: "1.0"');
 
-      const systemDetailResponse = await fetch(`${baseUrl}/api/skill/task-implement?scope=user`);
+      const systemDetailResponse = await fetch(`${baseUrl}/api/skill/myagents-task-alignment?scope=user`);
       expect(systemDetailResponse.ok).toBe(true);
       const systemDetailBody = await systemDetailResponse.json() as {
         skill: { systemOwned: boolean; required: boolean };
       };
       expect(systemDetailBody.skill).toMatchObject({ systemOwned: true, required: true });
 
-      const systemSkillBefore = readFileSync(join(userSkills, 'task-implement', 'SKILL.md'), 'utf8');
-      const systemSaveResponse = await fetch(`${baseUrl}/api/skill/task-implement`, {
+      const systemSkillBefore = readFileSync(join(userSkills, 'myagents-task-alignment', 'SKILL.md'), 'utf8');
+      const systemSaveResponse = await fetch(`${baseUrl}/api/skill/myagents-task-alignment`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           scope: 'user',
-          frontmatter: { name: 'task-implement', description: 'changed' },
+          frontmatter: { name: 'myagents-task-alignment', description: 'changed' },
           body: 'changed',
         }),
       });
@@ -274,9 +274,9 @@ describe('required system skill API contract', () => {
         success: false,
         code: 'SYSTEM_SKILL_READ_ONLY',
       });
-      expect(readFileSync(join(userSkills, 'task-implement', 'SKILL.md'), 'utf8')).toBe(systemSkillBefore);
+      expect(readFileSync(join(userSkills, 'myagents-task-alignment', 'SKILL.md'), 'utf8')).toBe(systemSkillBefore);
 
-      const systemDeleteResponse = await fetch(`${baseUrl}/api/skill/task-implement?scope=user`, {
+      const systemDeleteResponse = await fetch(`${baseUrl}/api/skill/myagents-task-alignment?scope=user`, {
         method: 'DELETE',
       });
       expect(systemDeleteResponse.status).toBe(409);
@@ -284,14 +284,14 @@ describe('required system skill API contract', () => {
         success: false,
         code: 'SYSTEM_SKILL_READ_ONLY',
       });
-      expect(readFileSync(join(userSkills, 'task-implement', 'SKILL.md'), 'utf8')).toBe(systemSkillBefore);
+      expect(readFileSync(join(userSkills, 'myagents-task-alignment', 'SKILL.md'), 'utf8')).toBe(systemSkillBefore);
 
-      const caseVariantSystemSaveResponse = await fetch(`${baseUrl}/api/skill/TASK-IMPLEMENT`, {
+      const caseVariantSystemSaveResponse = await fetch(`${baseUrl}/api/skill/MYAGENTS-TASK-ALIGNMENT`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           scope: 'user',
-          frontmatter: { name: 'TASK-IMPLEMENT', description: 'changed' },
+          frontmatter: { name: 'MYAGENTS-TASK-ALIGNMENT', description: 'changed' },
           body: 'changed',
         }),
       });
@@ -300,7 +300,7 @@ describe('required system skill API contract', () => {
         success: false,
         code: 'SYSTEM_SKILL_READ_ONLY',
       });
-      const caseVariantSystemDeleteResponse = await fetch(`${baseUrl}/api/skill/TASK-IMPLEMENT?scope=user`, {
+      const caseVariantSystemDeleteResponse = await fetch(`${baseUrl}/api/skill/MYAGENTS-TASK-ALIGNMENT?scope=user`, {
         method: 'DELETE',
       });
       expect(caseVariantSystemDeleteResponse.status).toBe(409);
@@ -308,7 +308,7 @@ describe('required system skill API contract', () => {
         success: false,
         code: 'SYSTEM_SKILL_READ_ONLY',
       });
-      expect(readFileSync(join(userSkills, 'task-implement', 'SKILL.md'), 'utf8')).toBe(systemSkillBefore);
+      expect(readFileSync(join(userSkills, 'myagents-task-alignment', 'SKILL.md'), 'utf8')).toBe(systemSkillBefore);
 
       const optionalSystemDetailResponse = await fetch(`${baseUrl}/api/skill/${OPTIONAL_SYSTEM_SKILL}?scope=user`);
       expect(optionalSystemDetailResponse.ok).toBe(true);

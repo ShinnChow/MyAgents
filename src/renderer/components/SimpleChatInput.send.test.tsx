@@ -7,6 +7,7 @@ import { ImagePreviewProvider } from '@/context/ImagePreviewContext';
 import type { Provider } from '@/config/types';
 import { i18n } from '@/i18n';
 import { CUSTOM_EVENTS } from '../../shared/constants';
+import { MANAGED_BROWSER_MCP_ID } from '../../shared/browserTools';
 import {
   CC_PERMISSION_MODES,
   CODEX_PERMISSION_MODES,
@@ -468,7 +469,45 @@ describe('SimpleChatInput send paths', () => {
     expect(screen.queryByText('browser_click')).not.toBeInTheDocument();
   });
 
-  it('keeps workspace MCP configuration editable with Managed Codex builtin input chrome', async () => {
+  it('counts Managed Runtime MCP rows and only shows error status details', async () => {
+    await i18n.changeLanguage('en-US');
+    const user = userEvent.setup();
+    renderInput({
+      runtime: 'codex',
+      runtimeMcpTools: ['mcp__stale__old_tool'],
+      mcpServers: [
+        { id: 'playwright', name: 'Playwright' },
+        { id: 'search', name: 'Search' },
+      ],
+      mcpEffectiveSnapshot: {
+        sessionId: 'session-a',
+        runtime: 'codex',
+        runtimeSource: 'managed-provider',
+        runtimeGeneration: 2,
+        configGeneration: 4,
+        configFingerprint: 'revision-4',
+        catalogGeneration: 3,
+        revision: 8,
+        observedAt: 1,
+        dispatch: { state: 'released', releaseReason: 'timeout' },
+        servers: [
+          { id: 'playwright', desired: true, state: 'failed', toolCount: 0, errorCode: 'startup_failed', attemptGeneration: 2, updatedAt: 1 },
+          { id: 'search', desired: true, state: 'ready', toolCount: 3, attemptGeneration: 2, updatedAt: 1 },
+        ],
+        tools: ['mcp__search__one', 'mcp__search__two', 'mcp__search__three'],
+      },
+    });
+
+    const toolsButton = screen.getByTitle('Use tools');
+    expect(toolsButton).toHaveTextContent('2');
+    await user.click(toolsButton);
+    expect(screen.getByText('Playwright')).toBeInTheDocument();
+    expect(screen.getByText('Unavailable')).toBeInTheDocument();
+    expect(screen.queryByText('3 tools ready')).not.toBeInTheDocument();
+    expect(screen.queryByText('stale')).not.toBeInTheDocument();
+  });
+
+  it('counts editable MCP rows and hides healthy child-tool cardinality', async () => {
     await i18n.changeLanguage('en-US');
     const user = userEvent.setup();
     renderInput({
@@ -479,17 +518,57 @@ describe('SimpleChatInput send paths', () => {
         { id: 'configured-only', name: 'Configured only' },
       ],
       globalMcpEnabled: ['playwright', 'configured-only'],
-      workspaceMcpEnabled: ['playwright', 'configured-only'],
+      workspaceMcpEnabled: ['playwright', 'playwright', 'configured-only'],
+      mcpEffectiveSnapshot: {
+        sessionId: 'session-a',
+        runtime: 'codex',
+        runtimeSource: 'managed-provider',
+        runtimeGeneration: 2,
+        configGeneration: 4,
+        configFingerprint: 'revision-4',
+        catalogGeneration: 3,
+        revision: 8,
+        observedAt: 1,
+        dispatch: { state: 'released', releaseReason: 'ready' },
+        servers: [
+          { id: 'playwright', desired: true, state: 'ready', toolCount: 39, attemptGeneration: 2, updatedAt: 1 },
+          { id: 'configured-only', desired: true, state: 'failed', toolCount: 0, errorCode: 'startup_failed', attemptGeneration: 2, updatedAt: 1 },
+        ],
+        tools: Array.from({ length: 39 }, (_, index) => `mcp__playwright__tool_${index}`),
+      },
     });
 
     const toolsButton = screen.getByTitle('Use tools');
+    expect(toolsButton).toHaveTextContent('2');
     await user.click(toolsButton);
 
-    expect(toolsButton).toHaveTextContent('2');
     const playwrightRow = screen.getByText('Playwright').parentElement?.parentElement;
     expect(playwrightRow).not.toBeNull();
     expect(playwrightRow?.querySelector('button')).not.toBeNull();
     expect(screen.getByText('Configured only')).toBeInTheDocument();
+    expect(screen.queryByText('39 tools ready')).not.toBeInTheDocument();
+    expect(screen.getByText('Unavailable')).toBeInTheDocument();
+  });
+
+  it('does not expose generic MCP settings for the fixed managed Browser', async () => {
+    await i18n.changeLanguage('en-US');
+    const user = userEvent.setup();
+    renderInput({
+      runtime: 'builtin',
+      mcpServers: [
+        { id: MANAGED_BROWSER_MCP_ID, name: 'Managed Browser' },
+        { id: 'playwright', name: 'Playwright' },
+      ],
+      globalMcpEnabled: [MANAGED_BROWSER_MCP_ID, 'playwright'],
+      workspaceMcpEnabled: [MANAGED_BROWSER_MCP_ID],
+    });
+
+    await user.click(screen.getByTitle('Use tools'));
+
+    const managedBrowserRow = screen.getByText('Managed Browser').parentElement?.parentElement;
+    const playwrightRow = screen.getByText('Playwright').parentElement?.parentElement;
+    expect(managedBrowserRow?.querySelector('button[title="Settings"]')).toBeNull();
+    expect(playwrightRow?.querySelector('button[title="Settings"]')).not.toBeNull();
   });
 
   it('shows Goal and scheduled Task state independently', async () => {

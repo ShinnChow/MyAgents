@@ -133,6 +133,7 @@ function Probe() {
     historyMessages,
     streamingMessage,
     systemInitInfo,
+    mcpEffectiveSnapshot,
     queuedMessages,
     agentError,
     isConnected,
@@ -157,6 +158,7 @@ function Probe() {
       </output>
       <output data-testid="connected">{String(isConnected)}</output>
       <output data-testid="init-tools">{JSON.stringify(systemInitInfo?.tools ?? [])}</output>
+      <output data-testid="mcp-runtime-generation">{mcpEffectiveSnapshot?.runtimeGeneration ?? ''}</output>
       <output data-testid="streaming-content">{JSON.stringify(streamingMessage?.content ?? null)}</output>
       <output data-testid="session-loading">{String(isSessionLoading)}</output>
       <output data-testid="session-restore-error">{sessionRestoreError ?? ''}</output>
@@ -340,6 +342,20 @@ describe('TabProvider session activity ownership', () => {
     );
 
     await waitFor(() => expect(screen.getByTestId('connected')).toHaveTextContent('true'));
+    emit('chat:mcp-effective-snapshot', {
+      sessionId: 'pending-sidecar-restart',
+      runtime: 'builtin',
+      runtimeGeneration: 9,
+      configGeneration: 3,
+      configFingerprint: 'before-restart',
+      catalogGeneration: 2,
+      revision: 7,
+      observedAt: Date.now(),
+      dispatch: { state: 'settled', releaseReason: 'ready' },
+      servers: [],
+      tools: [],
+    });
+    expect(screen.getByTestId('mcp-runtime-generation')).toHaveTextContent('9');
     const restartListener = await waitFor(() => {
       const listener = tauriHarness.listeners.get('session-sidecar:restarted');
       expect(listener).toBeDefined();
@@ -352,6 +368,7 @@ describe('TabProvider session activity ownership', () => {
       });
     });
     expect(screen.getByTestId('connected')).toHaveTextContent('false');
+    expect(screen.getByTestId('mcp-runtime-generation')).toBeEmptyDOMElement();
 
     act(() => {
       sseHarness.state.generation = 2;

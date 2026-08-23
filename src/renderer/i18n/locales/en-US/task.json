@@ -107,9 +107,11 @@
     "intervalMinutes": "Every {{count}} minutes",
     "groups": {
       "active": "Active",
+      "recovery": "Needs recovery",
       "pending": "Planned",
       "finished": "Completed"
     },
+    "loadMore": "Load more",
     "actions": {
       "delete": "Delete",
       "edit": "Edit",
@@ -125,6 +127,11 @@
   "dispatch": {
     "titleFromThought": "Dispatch as task",
     "titleNew": "New task",
+    "createMode": "Creation method",
+    "mode": {
+      "smart": "Smart",
+      "manual": "Manual"
+    },
     "subtitleFromThought": "Create from the current thought and dispatch immediately",
     "subtitleNew": "Create a task from scratch",
     "closeEsc": "Close (Esc)",
@@ -132,10 +139,8 @@
     "namePlaceholder": "Example: Upgrade the OpenClaw Lark adapter to v2.4",
     "taskMd": "Task requirements Task.md",
     "taskMdPlaceholder": "Prompt the AI will execute. It defaults to the thought text; add details, goals, or constraints.",
-    "verifyTitle": "Acceptance checklist",
-    "verifyHint": "(Optional · verify.md · read by AI during verifying)",
-    "verifyPlaceholder": "Example:\n- curl /health returns 200\n- npm test passes",
-    "verifyDescription": "Leave empty to skip the verification stage. You can edit it after creation.",
+    "agentWorkspace": "Agent workspace",
+    "smartPlaceholder": "Describe the rough goal and requirements for a task you want to create or move forward. You will clarify it with AI over multiple turns; if a Task is needed, AI will create it only after you confirm the final document and parameters.",
     "workspace": "Agent workspace",
     "workspacePlaceholder": "Choose workspace",
     "workspaceHint": "Uses this Agent's runtime, model, permissions, and MCP tools by default. Override them below in Advanced config.",
@@ -146,16 +151,18 @@
     "submitCreating": "Creating...",
     "submitDispatch": "Dispatch task",
     "submitCreate": "Create task",
+    "submitDiscuss": "Discuss with AI",
+    "submitDiscussing": "Opening discussion...",
     "validation": {
       "nameRequired": "Enter a task name",
       "workspaceRequired": "Choose a workspace",
       "taskMdRequired": "task.md cannot be empty",
+      "discussionRequired": "Describe the task goal and requirements",
       "futureTimeRequired": "Execution time must be in the future",
       "intervalTooShort": "Recurring interval cannot be shorter than 5 minutes",
       "endConditionRequired": "Set at least one end condition"
     },
     "toast": {
-      "verifyWriteFailed": "Task was created, but writing verify.md failed: {{message}}",
       "dispatched": "Task \"{{name}}\" was dispatched. AI is running it.",
       "startFailed": "Task was created, but starting execution failed: {{message}}",
       "created": "Task \"{{name}}\" was created"
@@ -498,6 +505,31 @@
     "timezone": "Timezone",
     "invalidCron": "Invalid Cron expression"
   },
+  "comments": {
+    "title": "Comments",
+    "loading": "Loading comments…",
+    "loadEarlier": "Load earlier comments",
+    "loadNewer": "Load newer comments",
+    "retryLoad": "Reload",
+    "empty": "No comments yet. Add context or continue the work here.",
+    "you": "You",
+    "reply": "Reply",
+    "replyQuote": "Reply to {{author}}: {{quote}}",
+    "retry": "Retry delivery",
+    "cancelReply": "Cancel reply",
+    "placeholder": "Add context or reply to the Agent…",
+    "send": "Send comment",
+    "notificationTarget": "Comment opened from notification",
+    "taskNotFound": "This task no longer exists",
+    "commentNotFound": "This comment no longer exists; showing the latest task activity",
+    "admission": {
+      "pending_session": "Waiting for an execution session",
+      "sending": "Sending",
+      "accepted": "Accepted by session queue",
+      "failed": "Delivery failed",
+      "unknown": "Delivery status unknown"
+    }
+  },
   "detail": {
     "syncSuccess": "Synced to Agent",
     "syncFailed": "Sync failed: {{message}}",
@@ -510,6 +542,8 @@
     "deleteTitle": "Delete task",
     "deleteMessage": "Delete task \"{{name}}\"? This cannot be undone. Workspace scripts and their external state are not deleted.",
     "editing": "Editing",
+    "drawerLabel": "Task details",
+    "properties": "Properties",
     "closeTitle": "Close (Esc / Cmd+W)",
     "runNow": "Run now",
     "stop": "Stop",
@@ -518,10 +552,7 @@
     "edit": "Edit",
     "editLockedTitle": "Task is running or verifying and cannot be edited (PRD §9.4)",
     "taskDocTitle": "task.md · Execution Prompt",
-    "taskDocEmpty": "No content yet. Click Edit above to write this task's execution prompt.",
-    "verifyDocTitle": "verify.md · Acceptance Criteria",
-    "verifyDocEmpty": "No acceptance criteria yet. Click Edit above to write them; AI uses them to self-check during verifying.",
-    "progressDocTitle": "progress.md · Execution Log",
+    "taskDocEmpty": "No content yet. Use More → Edit in the top-right corner to write this task's execution prompt.",
     "markDone": "Mark done",
     "archive": "Archive",
     "syncing": "Syncing...",
@@ -552,10 +583,6 @@
     "taskReadFailed": "Failed to read task.md. Editing is locked to avoid overwriting existing content. Close and retry, or check disk permissions before reopening this task.",
     "taskPlaceholder": "Describe the task goal, constraints, and context",
     "taskDescription": "Prompt shown to AI during execution. Saving writes atomically to the path above.",
-    "verifyReadFailed": "Failed to read verify.md. Editing is locked to avoid overwriting existing content.",
-    "verifyPlaceholder": "Acceptance checklist (optional), for example: \"curl /health returns 200\" or \"npm test passes\"",
-    "verifyDescription": "AI reads this checklist during the verifying stage to decide whether the task is complete. Leave empty to skip verification.",
-    "progressHint": "Read-only · Written by AI",
     "advanced": "Advanced config",
     "openDocsDir": "Open folder",
     "openDocsDirTitle": "Open this task's document folder in the file manager",
@@ -564,7 +591,6 @@
       "nameRequired": "Enter a task name",
       "taskReadFailed": "Failed to read task.md, so saving is disabled to avoid overwriting existing content",
       "taskRequired": "task.md cannot be empty",
-      "verifyReadFailed": "Failed to read verify.md, so saving is disabled to avoid overwriting existing content",
       "futureTimeRequired": "Execution time must be in the future",
       "cronPartsRequired": "Cron expression must have 5 parts (minute hour day month weekday)",
       "intervalTooShort": "Recurring interval cannot be shorter than 5 minutes",
@@ -594,8 +620,16 @@
     "runMode": "Session strategy",
     "runModeSingle": "Continuous conversation",
     "runModeNew": "New conversation",
+    "executionOverrides": "Execution config",
+    "followAgent": "Follow Agent (no Task overrides)",
+    "providerOverride": "Provider override",
     "modelOverride": "Model override",
     "permissionOverride": "Permission override",
+    "runtimeOverride": "Runtime override",
+    "runtimeConfigOverride": "Runtime config",
+    "mcpOverride": "MCP override",
+    "noMcpServers": "Explicitly no MCP servers",
+    "explicitEmpty": "Explicitly empty",
     "scheduler": "Scheduler",
     "sessionCount": "Linked sessions"
   },
@@ -621,8 +655,7 @@
     "emptyNeverRun": "Not run yet",
     "emptyMissing": "Linked session records no longer exist",
     "openTitle": "Open this run's session ({{id}})",
-    "expandAll": "Expand all {{count}}",
-    "collapse": "Collapse"
+    "expandMore": "Show more"
   },
   "trigger": {
     "sectionTitle": "Pre-trigger detection",
@@ -737,7 +770,7 @@
       "directLabel": "Direct dispatch",
       "directTitle": "Direct dispatch: use the thought text as task.md",
       "alignedLabel": "Alignment discussion",
-      "alignedTitle": "Alignment discussion: generate the full four documents through /task-alignment"
+      "alignedTitle": "Created after an AI-assisted discussion"
     }
   }
 }

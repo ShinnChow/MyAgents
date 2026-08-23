@@ -230,9 +230,10 @@ pub(super) async fn enqueue_to_sidecar(
         if let Some(ref history) = gc.pending_history {
             body["pendingHistory"] = json!(history);
         }
-        if !gc.tools_deny.is_empty() {
-            body["groupToolsDeny"] = json!(gc.tools_deny);
-        }
+        // Empty is an authoritative value: group channels allow all runtime
+        // tools by default. Always put the array on the wire so the Sidecar
+        // cannot reinterpret omission as a legacy deny list.
+        body["groupToolsDeny"] = json!(gc.tools_deny);
     }
     if let Some(ref rtb) = msg.reply_to_body {
         if !rtb.is_empty() {
@@ -285,6 +286,8 @@ pub(super) async fn enqueue_to_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::post, Json, Router};
+    use std::sync::{Arc, Mutex};
 
     fn ask_cap(platform: ImPlatform) -> String {
         HostInteractionCapability::for_platform(&platform).ask_user_question
@@ -297,5 +300,104 @@ mod tests {
         assert_eq!(ask_cap(ImPlatform::OpenClaw("lark".to_string())), "none");
         assert_eq!(ask_cap(ImPlatform::OpenClaw("qqbot".to_string())), "none");
         assert_eq!(ask_cap(ImPlatform::Telegram), "none");
+    }
+
+    fn test_group_message() -> ImMessage {
+        ImMessage {
+            chat_id: "group-1".to_string(),
+            message_id: "message-1".to_string(),
+            text: "hello".to_string(),
+            sender_id: "user-1".to_string(),
+            sender_name: Some("User".to_string()),
+            account_id: None,
+            source_type: ImSourceType::Group,
+            platform: ImPlatform::Telegram,
+            timestamp: chrono::Utc::now(),
+            attachments: vec![],
+            media_group_id: None,
+            is_mention: true,
+            reply_to_bot: false,
+            hint_group_name: Some("Group".to_string()),
+            reply_to_body: None,
+            group_system_prompt: None,
+            request_id: "request-1".to_string(),
+            delivery_protocol: None,
+        }
+    }
+
+    fn test_group_context(tools_deny: Vec<String>) -> GroupStreamContext {
+        GroupStreamContext {
+            group_name: "Group".to_string(),
+            platform: ImPlatform::Telegram,
+            activation: GroupActivation::Mention,
+            is_first_turn: true,
+            pending_history: None,
+            tools_deny,
+            is_mention: true,
+            message_count: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn group_enqueue_sends_authoritative_empty_and_non_empty_tool_deny_lists() {
+        let captured = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = Router::new().route(
+            "/api/im/enqueue",
+            post({
+                let captured = Arc::clone(&captured);
+                move |Json(payload): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured.lock().expect("capture mutex").push(payload);
+                        Json(serde_json::json!({ "success": true, "sessionId": "session-1" }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind enqueue test server");
+        let port = listener.local_addr().expect("enqueue server addr").port();
+        let server = tauri::async_runtime::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = Client::new();
+        let message = test_group_message();
+        for context in [
+            test_group_context(vec![]),
+            test_group_context(vec!["CustomDangerousTool".to_string()]),
+        ] {
+            enqueue_to_sidecar(
+                &client,
+                port,
+                &message,
+                "fullAgency",
+                None,
+                None,
+                "builtin",
+                None,
+                None,
+                None,
+                None,
+                Some(&context),
+                false,
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("group enqueue succeeds");
+        }
+
+        let payloads = captured.lock().expect("capture mutex");
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["groupToolsDeny"], serde_json::json!([]));
+        assert_eq!(
+            payloads[1]["groupToolsDeny"],
+            serde_json::json!(["CustomDangerousTool"])
+        );
+
+        server.abort();
     }
 }

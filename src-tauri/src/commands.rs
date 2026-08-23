@@ -1070,7 +1070,7 @@ fn sync_admin_agent_blocking<R: Runtime>(app_handle: AppHandle<R>) -> Result<boo
 // matching exclusion list in src/server/index.ts::seedBundledSkills
 // MUST be kept in sync (comment there points back here).
 
-const SYSTEM_SKILLS_VERSION: &str = "50";
+const SYSTEM_SKILLS_VERSION: &str = "53";
 
 /// One process-wide transaction owner for the versioned system-skill
 /// snapshot. Startup automation and ConfigProvider may request convergence at
@@ -1082,12 +1082,16 @@ static SYSTEM_SKILLS_SYNC_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new
 /// the app's flows depend on them, users are not meant to customise.
 /// Keep in sync with the exclusion list in Bun's `seedBundledSkills()`.
 const SYSTEM_SKILLS: &[&str] = &[
-    "task-alignment",
-    "task-implement",
+    // v51: one product-owned Task discussion workflow replaces the former
+    // alignment/executor pair. Ordinary dispatch now hands task.md directly
+    // to the Runtime, so execution no longer depends on a Skill name.
+    "myagents-task-alignment",
     // v10: ultra-research removed — not generic enough to ship as system
     // skill. Existing installs retain the dir at ~/.myagents/skills/
     // ultra-research/ until the user deletes it (no orphan cleanup logic).
     "download-anything",
+    // v52: myagents-cli documents physical local directory/.zip/.skill
+    // installs and the CLI-owned explicit-relative cwd boundary.
     // v9: myagents-cli promoted from helper-bundled skill (was at
     // bundled-agents/myagents_helper/.claude/skills/self-config/) to a
     // global system skill. Every AI session inside MyAgents — Chat / IM Bot
@@ -1100,9 +1104,10 @@ const SYSTEM_SKILLS: &[&str] = &[
     // converter. It is required because every Runtime must discover the same
     // App-owned job surface without an always-on prompt section.
     "myagents-anydoc",
-    // v44: one Agent workflow owns scheduled, future and conditional Task
-    // automation. Command Detector protocol is a progressive reference, not
-    // a competing Sensor product entry.
+    // v53: Task automation documents the stable Agent-facing receipt,
+    // idempotent run semantics, and existing result channels. Command
+    // Detector protocol remains a progressive reference, not a competing
+    // Sensor product entry.
     "myagents-task-automation",
     // v35: product-use knowledge shared by every MyAgents session. It owns
     // stable user-facing concepts, feature relationships, prerequisites and
@@ -1137,7 +1142,7 @@ const SYSTEM_SKILLS: &[&str] = &[
 /// Product-owned system skills whose former independent workflow must not
 /// survive an upgrade. These directories were force-overwritten by MyAgents,
 /// so removing the exact retired names cannot delete a user-owned skill.
-const RETIRED_SYSTEM_SKILLS: &[&str] = &["myagents-sensor"];
+const RETIRED_SYSTEM_SKILLS: &[&str] = &["myagents-sensor", "task-alignment", "task-implement"];
 
 /// Force-sync every system skill from the app bundle to
 /// `~/.myagents/skills/<name>/`. Runs once per `SYSTEM_SKILLS_VERSION`
@@ -1551,8 +1556,8 @@ mod system_skills_tests {
     use super::{
         all_installed_system_skills_complete, ensure_system_skills_installation_current_at,
         remove_retired_system_skills, retired_system_skills_absent, skill_dir_is_complete,
-        sync_one_system_skill, SystemSkillSync, ADMIN_AGENT_VERSION, SYSTEM_SKILLS,
-        SYSTEM_SKILLS_VERSION,
+        sync_one_system_skill, SystemSkillSync, ADMIN_AGENT_VERSION, RETIRED_SYSTEM_SKILLS,
+        SYSTEM_SKILLS, SYSTEM_SKILLS_VERSION,
     };
     use crate::workspace_files::skills_config::REQUIRED_SYSTEM_SKILLS;
     use std::fs;
@@ -1575,8 +1580,11 @@ mod system_skills_tests {
     }
 
     #[test]
-    fn v50_keeps_task_cli_automation_and_creator_skills_aligned() {
-        assert_eq!(SYSTEM_SKILLS_VERSION, "50");
+    fn v53_keeps_task_cli_automation_and_creator_skills_aligned() {
+        assert_eq!(SYSTEM_SKILLS_VERSION, "53");
+        assert!(SYSTEM_SKILLS.contains(&"myagents-task-alignment"));
+        assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-alignment"));
+        assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-implement"));
         assert!(SYSTEM_SKILLS.contains(&"skill-creator"));
         let bundled = include_str!("../../bundled-skills/myagents-cli/SKILL.md");
         let anydoc = include_str!("../../bundled-skills/myagents-anydoc/SKILL.md");
@@ -1615,6 +1623,8 @@ mod system_skills_tests {
         assert!(automation.contains("没有 30 天恢复承诺"));
         assert!(automation.contains("myagents task readme"));
         assert!(automation.contains("--maxExecutions 1"));
+        assert!(automation.contains("`data.receipt`"));
+        assert!(automation.contains("`changed: false`"));
         assert!(SYSTEM_SKILLS.contains(&"myagents-task-automation"));
 
         let memory_update = include_str!("../../bundled-skills/myagents-memory-update/SKILL.md");
@@ -1719,12 +1729,8 @@ mod system_skills_tests {
                 include_str!("../../bundled-skills/prompt-writer/SKILL.md"),
             ),
             (
-                "task-alignment",
-                include_str!("../../bundled-skills/task-alignment/SKILL.md"),
-            ),
-            (
-                "task-implement",
-                include_str!("../../bundled-skills/task-implement/SKILL.md"),
+                "myagents-task-alignment",
+                include_str!("../../bundled-skills/myagents-task-alignment/SKILL.md"),
             ),
         ] {
             let yaml = content
@@ -2588,11 +2594,9 @@ pub async fn cmd_wecom_qr_poll(
                     secret,
                 })
             } else {
-                // Log raw response for debugging unexpected format
                 ulog_error!(
-                    "[wecom-qr] Poll #{} status=success but bot_info incomplete: {}",
-                    idx,
-                    resp
+                    "[wecom-qr] Poll #{} status=success but bot_info is incomplete",
+                    idx
                 );
                 Err("WeCom QR scan succeeded but bot_info is incomplete".into())
             }

@@ -1,6 +1,7 @@
 import {
   AlertCircle,
   Archive,
+  Bell,
   Bot,
   Check,
   CheckSquare,
@@ -51,6 +52,7 @@ import myAgentsLogo from '@/assets/runtime-icons/myagents.png';
 import type { SessionMetadata } from '@/api/sessionClient';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import FeedbackPopover from '@/components/FeedbackPopover';
+import { APP_SHELL_POPOVER_CHROME } from '@/components/global-sidebar/appShellPopoverChrome';
 import OverlayBackdrop from '@/components/OverlayBackdrop';
 import PathInputDialog from '@/components/PathInputDialog';
 import SessionStatsModal from '@/components/SessionStatsModal';
@@ -107,6 +109,9 @@ import { getFullSessionDisplayText } from '@/utils/sessionDisplay';
 import { copyPlainText } from '@/utils/clipboard';
 import { openExternal } from '@/utils/openExternal';
 import { OverflowNameTooltip } from '@/components/workspace-tree/OverflowNameTooltip';
+import NotificationCenterFlyout from '@/notifications/NotificationCenterFlyout';
+import { useNotificationCenter } from '@/notifications/useNotificationCenter';
+import type { AppRoute } from '../../../shared/appRoute';
 
 const loadHistorySearchOverlayContent = () => import('@/components/HistorySearchOverlayContent');
 const HistorySearchOverlayContent = lazy(loadHistorySearchOverlayContent);
@@ -150,7 +155,9 @@ interface GlobalSidebarProps {
   teamSpaceAvailable: boolean;
   onNewTab: () => void;
   onOpenTaskCenter: () => void;
+  onCreateTask: () => void;
   onOpenSpace: () => void;
+  onOpenAppRoute?: (route: AppRoute) => Promise<boolean> | boolean;
   onOpenCapabilities: (section?: CapabilitySection) => void;
   onOpenSettings: () => void;
   onOpenBugReport: () => void;
@@ -218,7 +225,7 @@ function SidebarNavButton({
       disabled={disabled}
       aria-current={active ? 'page' : undefined}
       aria-label={label}
-      className={`relative flex h-9 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
+      className={`relative flex h-8 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
         expanded ? 'w-full' : 'w-10'
       } ${
         active
@@ -338,7 +345,9 @@ export default memo(function GlobalSidebar({
   teamSpaceAvailable,
   onNewTab,
   onOpenTaskCenter,
+  onCreateTask,
   onOpenSpace,
+  onOpenAppRoute,
   onOpenCapabilities,
   onOpenSettings,
   onOpenBugReport,
@@ -374,6 +383,9 @@ export default memo(function GlobalSidebar({
   const [archivedExpanded, setArchivedExpanded] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [flyoutOpen, setFlyoutOpen] = useState(false);
+  const [notificationOpen, setNotificationOpen] = useState(false);
+  const notificationCenter = useNotificationCenter();
+  const refreshNotificationCenter = notificationCenter.refresh;
   const previousActiveTabIdRef = useRef(activeTab?.id ?? null);
   const activeTabIdRef = useRef(activeTab?.id ?? null);
   activeTabIdRef.current = activeTab?.id ?? null;
@@ -388,6 +400,8 @@ export default memo(function GlobalSidebar({
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showFeedback, setShowFeedback] = useState(false);
   const feedbackTriggerRef = useRef<HTMLDivElement | null>(null);
+  const notificationTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const notificationPanelRef = useRef<HTMLDivElement | null>(null);
 
   const [pathDialogOpen, setPathDialogOpen] = useState(false);
   const [pendingFolderName, setPendingFolderName] = useState('');
@@ -483,6 +497,9 @@ export default memo(function GlobalSidebar({
 
   const openFlyoutNow = useCallback(() => {
     clearFlyoutTimers();
+    setNotificationOpen(false);
+    setShowFeedback(false);
+    setSearchOpen(false);
     resourceSurfaceInteractionGenerationRef.current += 1;
     setFlyoutOpen(true);
   }, [clearFlyoutTimers]);
@@ -491,6 +508,9 @@ export default memo(function GlobalSidebar({
     if (expanded || flyoutOpen) return;
     if (closeTimerRef.current) clearTimeout(closeTimerRef.current);
     openTimerRef.current = setTimeout(() => {
+      setNotificationOpen(false);
+      setShowFeedback(false);
+      setSearchOpen(false);
       resourceSurfaceInteractionGenerationRef.current += 1;
       setFlyoutOpen(true);
     }, 125);
@@ -571,6 +591,29 @@ export default memo(function GlobalSidebar({
     if (restoreFocus) flyoutTriggerRef.current?.focus();
   }, [clearFlyoutTimers]);
 
+  const closeNotificationCenter = useCallback((restoreFocus = false) => {
+    setNotificationOpen(false);
+    if (restoreFocus) notificationTriggerRef.current?.focus();
+  }, []);
+
+  const toggleNotificationCenter = useCallback(() => {
+    closeFlyout();
+    setShowFeedback(false);
+    setSearchOpen(false);
+    setNotificationOpen((open) => {
+      const next = !open;
+      if (next) refreshNotificationCenter();
+      return next;
+    });
+  }, [closeFlyout, refreshNotificationCenter]);
+
+  const toggleFeedback = useCallback(() => {
+    closeFlyout();
+    closeNotificationCenter();
+    setSearchOpen(false);
+    setShowFeedback((value) => !value);
+  }, [closeFlyout, closeNotificationCenter]);
+
   useEffect(() => {
     const activeTabId = activeTab?.id ?? null;
     const activeTabChanged = previousActiveTabIdRef.current !== activeTabId;
@@ -578,13 +621,42 @@ export default memo(function GlobalSidebar({
     if (!activeTabChanged) return;
     setSearchOpen(false);
     closeFlyout();
-  }, [activeTab?.id, closeFlyout]);
+    closeNotificationCenter();
+  }, [activeTab?.id, closeFlyout, closeNotificationCenter]);
 
   useCloseLayer(() => {
     if (!flyoutOpen) return false;
     closeFlyout(true);
     return true;
   }, flyoutOpen ? 240 : -1);
+
+  useCloseLayer(() => {
+    if (!notificationOpen) return false;
+    closeNotificationCenter(true);
+    return true;
+  }, notificationOpen ? 245 : -1);
+
+  useEffect(() => {
+    if (!notificationOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (notificationPanelRef.current?.contains(target)) return;
+      if (notificationTriggerRef.current?.contains(target)) return;
+      closeNotificationCenter();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeNotificationCenter(true);
+    };
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [closeNotificationCenter, notificationOpen]);
 
   useEffect(() => {
     if (expanded && flyoutOpen) closeFlyout();
@@ -846,9 +918,12 @@ export default memo(function GlobalSidebar({
 
   const handleSearchOpen = useCallback(() => {
     if (!isTauriEnvironment()) return;
+    closeFlyout();
+    closeNotificationCenter();
+    setShowFeedback(false);
     resourceSurfaceInteractionGenerationRef.current += 1;
     setSearchOpen(true);
-  }, []);
+  }, [closeFlyout, closeNotificationCenter]);
 
   const handleSearchClose = useCallback(() => {
     resourceSurfaceInteractionGenerationRef.current += 1;
@@ -860,6 +935,7 @@ export default memo(function GlobalSidebar({
     && navigator.platform.toLowerCase().includes('win');
   const tree = (
     <WorkspaceTree
+      fadeBottom={expanded}
       projects={activeProjects}
       archivedProjects={archivedProjects}
       projectsLoading={projectsLoading}
@@ -983,7 +1059,7 @@ export default memo(function GlobalSidebar({
         </div>
 
         <nav
-          className={`shrink-0 ${expanded ? 'px-3 pb-2 pt-1' : 'global-sidebar-rail-stack pb-2 pt-1'}`}
+          className={`shrink-0 ${expanded ? 'px-3 pb-1 pt-0' : 'global-sidebar-rail-stack pb-1 pt-0'}`}
           data-global-sidebar-primary-nav
         >
           <SidebarNavButton
@@ -1001,13 +1077,35 @@ export default memo(function GlobalSidebar({
               onClick={handleSearchOpen}
             />
           )}
-          <SidebarNavButton
-            expanded={expanded}
-            active={activeView === 'taskcenter'}
-            icon={<CheckSquare className="h-4 w-4" />}
-            label={t('globalSidebar.tasks')}
-            onClick={handleOpenTaskCenter}
-          />
+          <div className="group/task-create relative">
+            <SidebarNavButton
+              expanded={expanded}
+              active={activeView === 'taskcenter'}
+              icon={<CheckSquare className="h-4 w-4" />}
+              label={t('globalSidebar.tasks')}
+              onClick={handleOpenTaskCenter}
+            />
+            {expanded && (
+              <span className="absolute right-1 top-1">
+                <Tip
+                  label={t('globalSidebar.createTask')}
+                  position="right"
+                >
+                  <button
+                    type="button"
+                    onClick={event => {
+                      event.stopPropagation();
+                      onCreateTask();
+                    }}
+                    aria-label={t('globalSidebar.createTask')}
+                    className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--ink-muted)] opacity-0 transition-[opacity,color,background-color] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] group-hover/task-create:opacity-100 group-focus-within/task-create:opacity-100"
+                  >
+                    <Plus className="h-3.5 w-3.5" strokeWidth={1.75} />
+                  </button>
+                </Tip>
+              </span>
+            )}
+          </div>
           {teamSpaceAvailable && (
             <SidebarNavButton
               expanded={expanded}
@@ -1079,19 +1177,68 @@ export default memo(function GlobalSidebar({
               </div>
             </div>
           )}
+          {expanded && (
+            <div
+              aria-hidden="true"
+              className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-6"
+              style={{
+                background: 'linear-gradient(to bottom, var(--global-sidebar-bg-a0), var(--global-sidebar-bg))',
+              }}
+              data-global-sidebar-workspace-fade
+            />
+          )}
         </div>
 
         <div
-          className={`shrink-0 py-3 ${expanded ? 'px-3' : 'global-sidebar-rail-stack'}`}
+          className={`shrink-0 pb-2 ${expanded ? 'px-3 pt-0' : 'global-sidebar-rail-stack pt-3'}`}
           data-global-sidebar-footer-actions
         >
-          <div ref={feedbackTriggerRef} className={expanded ? '' : 'flex justify-center'}>
+          <button
+            ref={notificationTriggerRef}
+            type="button"
+            onClick={toggleNotificationCenter}
+            aria-label={notificationCenter.snapshot.hasUnread
+              ? t('notificationCenter.bellUnread')
+              : t('notificationCenter.bell')}
+            aria-haspopup="dialog"
+            aria-expanded={notificationOpen}
+            aria-controls="global-notification-center"
+            className={`relative flex h-8 items-center rounded-lg text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] ${
+              expanded ? 'w-full' : 'w-10'
+            } ${
+              notificationOpen
+                ? 'bg-[var(--hover-bg)] text-[var(--ink)] shadow-sm'
+                : 'text-[var(--ink-muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]'
+            }`}
+            data-notification-center-trigger
+          >
+            <span className="absolute left-3 flex h-4 w-4 items-center justify-center">
+              <Bell className="h-4 w-4" />
+              {notificationCenter.snapshot.hasUnread && (
+                <span
+                  className="absolute -right-1 -top-1 h-1.5 w-1.5 rounded-full bg-[var(--accent-warm)] ring-2 ring-[var(--global-sidebar-bg)]"
+                  aria-hidden="true"
+                />
+              )}
+            </span>
+            <span
+              className="global-sidebar-copy global-sidebar-nav-label min-w-0 truncate text-left"
+              aria-hidden={!expanded}
+            >
+              {t('notificationCenter.bell')}
+            </span>
+          </button>
+          <div
+            ref={feedbackTriggerRef}
+            className={`-mr-3 pr-3 ${expanded ? '' : 'flex justify-center'}`}
+            data-feedback-popover-anchor
+          >
             <SidebarNavButton
               expanded={expanded}
               icon={<Bot className="h-4 w-4" />}
               label={t('globalSidebar.helper')}
               tooltipDisabled={showFeedback}
-              onClick={() => setShowFeedback((value) => !value)}
+              onClick={toggleFeedback}
             />
             <FeedbackPopover
               open={showFeedback}
@@ -1113,7 +1260,7 @@ export default memo(function GlobalSidebar({
       {!expanded && flyoutOpen && (
         <div
           ref={flyoutRef}
-          className="fixed bottom-28 left-[calc(var(--global-sidebar-rail-width)+var(--space-2))] top-32 z-[240] w-[var(--global-sidebar-flyout-width)] overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--global-sidebar-bg)] shadow-md"
+          className={`fixed bottom-28 left-[calc(var(--global-sidebar-rail-width)+var(--space-2))] top-32 z-[240] w-[var(--global-sidebar-flyout-width)] ${APP_SHELL_POPOVER_CHROME}`}
           data-global-sidebar-flyout
           onPointerEnter={handleFlyoutPointerEnter}
           onPointerLeave={handleFlyoutPointerLeave}
@@ -1135,6 +1282,36 @@ export default memo(function GlobalSidebar({
         >
           {tree}
         </div>
+      )}
+
+      {notificationOpen && createPortal(
+        <div
+          ref={notificationPanelRef}
+          id="global-notification-center"
+          role="dialog"
+          aria-label={t('notificationCenter.title')}
+          aria-modal="false"
+          className={`fixed z-[245] ${APP_SHELL_POPOVER_CHROME}`}
+          style={{
+            left: expanded
+              ? 'calc(var(--global-sidebar-expanded-width) + var(--space-2))'
+              : 'calc(var(--global-sidebar-rail-width) + var(--space-2))',
+            bottom: 'var(--space-5)',
+            width: 'min(380px, calc(100vw - var(--global-sidebar-rail-width) - var(--space-5)))',
+              height: 'min(440px, calc(100vh - var(--space-8)))',
+          }}
+          data-notification-center-shell
+        >
+          <NotificationCenterFlyout
+            snapshot={notificationCenter.snapshot}
+            onRefresh={notificationCenter.refresh}
+            onLoadMore={notificationCenter.loadMore}
+            onMarkAllRead={notificationCenter.markAllRead}
+            onOpenAppRoute={onOpenAppRoute ?? (() => false)}
+            onClose={() => closeNotificationCenter()}
+          />
+        </div>,
+        document.body,
       )}
 
       <PathInputDialog
@@ -1237,6 +1414,7 @@ export default memo(function GlobalSidebar({
 });
 
 interface WorkspaceTreeProps {
+  fadeBottom: boolean;
   projects: Project[];
   archivedProjects: Project[];
   projectsLoading: boolean;
@@ -1343,6 +1521,7 @@ function WorkspaceSessionBranch({
 }
 
 function WorkspaceTree({
+  fadeBottom,
   projects,
   archivedProjects,
   projectsLoading,
@@ -1433,8 +1612,8 @@ function WorkspaceTree({
   useNestedInteractionCleanup((open) => onNestedInteractionChange('view-options', open));
 
   return (
-    <section className="flex h-full min-h-0 flex-col" aria-label={t('globalSidebar.workspaces')}>
-      <div className="flex h-12 shrink-0 items-center gap-1 px-3">
+    <section className="relative flex h-full min-h-0 flex-col" aria-label={t('globalSidebar.workspaces')}>
+      <div className="flex h-8 shrink-0 items-center gap-1 px-3">
         <h2 className="min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wider text-[var(--ink-muted)]/60">
           {t('globalSidebar.workspaceSection')}
         </h2>
@@ -1485,7 +1664,16 @@ function WorkspaceTree({
       </div>
 
       <div
-        className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pb-3"
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-8 z-10 h-2"
+        style={{
+          background: 'linear-gradient(to bottom, var(--global-sidebar-bg), var(--global-sidebar-bg-a0))',
+        }}
+        data-global-sidebar-workspace-fade-top
+      />
+
+      <div
+        className={`min-h-0 flex-1 overflow-y-auto overscroll-contain px-2 pt-2 ${fadeBottom ? 'pb-6' : 'pb-3'}`}
         role="tree"
         style={{ scrollbarGutter: 'stable' }}
       >

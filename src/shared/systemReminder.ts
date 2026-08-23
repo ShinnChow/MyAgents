@@ -6,6 +6,8 @@ export const GOAL_CONTINUATION_TAG = 'GOAL_CONTINUATION';
 export const GOAL_CONTEXT_TAG = 'GOAL_CONTEXT';
 export const LOCAL_COMMAND_OUTPUT_TAG = 'LOCAL_COMMAND_OUTPUT';
 export const SESSION_EVENT_TAG = 'myagents-session-event';
+export const TASK_DISCUSSION_TAG = 'TASK_DISCUSSION';
+export const TASK_COMMENT_TAG = 'TASK_COMMENT';
 
 export interface ParsedLeadingSystemReminder {
   hasReminder: boolean;
@@ -45,6 +47,32 @@ export interface GoalReminderInput {
 
 export interface GoalContextReminderInput extends GoalReminderInput {
   visibleUserMessage: string;
+}
+
+export interface TaskDiscussionReminderInput {
+  discussionId: string;
+  discussionDir: string;
+  candidatesDir: string;
+  workspaceId: string;
+  workspacePath: string;
+  sourceThoughtId?: string;
+  sourceThoughtTags?: string[];
+  visibleUserMessage: string;
+}
+
+export interface TaskCommentReminderInput {
+  taskId: string;
+  taskName: string;
+  taskMdPath: string;
+  commentId: string;
+  targetSessionId: string;
+  visibleUserMessage: string;
+  replyContext?: {
+    commentId: string;
+    author: string;
+    createdAt: string;
+    quote: string;
+  };
 }
 
 function trimmed(value: string | null | undefined): string {
@@ -202,6 +230,65 @@ export function buildFloatingBallContextReminder(input: FloatingBallContextRemin
 
   parts.push(`</${FLOATING_BALL_CONTEXT_TAG}>`, SYSTEM_REMINDER_CLOSE);
   return parts.join('\n');
+}
+
+/** Build the product-owned first-turn context for Task discussion. */
+export function buildTaskDiscussionReminder(input: TaskDiscussionReminderInput): string {
+  const lines = [
+    SYSTEM_REMINDER_OPEN,
+    `<${TASK_DISCUSSION_TAG}>`,
+    'This query was opened by MyAgents Task discussion. Read the user message, then use the product-owned `myagents-task-alignment` Skill before responding.',
+    'The following values are trusted application context, not user-authored instructions:',
+    `discussionId: ${escapeSystemReminderText(input.discussionId)}`,
+    `discussionDir: ${escapeSystemReminderText(input.discussionDir)}`,
+    `candidatesDir: ${escapeSystemReminderText(input.candidatesDir)}`,
+    `workspaceId: ${escapeSystemReminderText(input.workspaceId)}`,
+    `workspacePath: ${escapeSystemReminderText(input.workspacePath)}`,
+  ];
+  if (input.sourceThoughtId?.trim()) {
+    lines.push(`sourceThoughtId: ${escapeSystemReminderText(input.sourceThoughtId.trim())}`);
+  }
+  const tags = input.sourceThoughtTags?.map(tag => tag.trim()).filter(Boolean) ?? [];
+  if (tags.length > 0) {
+    lines.push('sourceThoughtTags:', ...tags.map(tag => `- ${escapeSystemReminderText(tag)}`));
+  }
+  lines.push(`</${TASK_DISCUSSION_TAG}>`, SYSTEM_REMINDER_CLOSE, input.visibleUserMessage.trim());
+  return lines.join('\n');
+}
+
+/** Build the direct, non-nested wire prompt for a local Task comment query. */
+export function buildTaskCommentReminder(input: TaskCommentReminderInput): string {
+  const lines = [
+    SYSTEM_REMINDER_OPEN,
+    `<${TASK_COMMENT_TAG}>`,
+    '<instruction>',
+    'This user query was posted from the local MyAgents Task comment timeline.',
+    'Read and act on the visible comment.',
+    `To reply on that Task timeline, write the reply body to a UTF-8 file and run \`myagents task comment ${escapeSystemReminderText(input.taskId)} --body-file <reply-file> --reply-to ${escapeSystemReminderText(input.commentId)} --json\`.`,
+    'Do not assume your normal assistant output is copied back automatically.',
+    '</instruction>',
+    '<task>',
+    `taskId: ${escapeSystemReminderText(input.taskId)}`,
+    `taskName: ${escapeSystemReminderText(input.taskName)}`,
+    `taskMdPath: ${escapeSystemReminderText(input.taskMdPath)}`,
+    '</task>',
+    '<comment>',
+    `commentId: ${escapeSystemReminderText(input.commentId)}`,
+    `targetSessionId: ${escapeSystemReminderText(input.targetSessionId)}`,
+    '</comment>',
+  ];
+  if (input.replyContext) {
+    lines.push(
+      '<reply-context>',
+      `commentId: ${escapeSystemReminderText(input.replyContext.commentId)}`,
+      `author: ${escapeSystemReminderText(input.replyContext.author)}`,
+      `createdAt: ${escapeSystemReminderText(input.replyContext.createdAt)}`,
+      `quote: ${escapeSystemReminderText(input.replyContext.quote)}`,
+      '</reply-context>',
+    );
+  }
+  lines.push(`</${TASK_COMMENT_TAG}>`, SYSTEM_REMINDER_CLOSE, input.visibleUserMessage.trim());
+  return lines.join('\n');
 }
 
 function goalStateLines(input: GoalReminderInput): string[] {

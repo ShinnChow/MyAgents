@@ -467,8 +467,7 @@ async fn cli_context_requires_exact_registered_agent_identity() {
         workspace_id: Some("project-current".to_string()),
         workspace_path: Some(workspace.to_string_lossy().to_string()),
         workspace_label: None,
-        goal_id: None,
-        state_filter: None,
+        subscription_replacement: None,
         goal_md: None,
         status: None,
         issue_subscription_run_mode: None,
@@ -758,8 +757,7 @@ async fn cli_goal_list_and_issue_update_use_user_and_registered_agent_contexts()
         workspace_id: Some("project-current".to_string()),
         workspace_path: Some(workspace.to_string_lossy().to_string()),
         workspace_label: None,
-        goal_id: None,
-        state_filter: None,
+        subscription_replacement: None,
         goal_md: None,
         status: None,
         issue_subscription_run_mode: None,
@@ -1074,8 +1072,7 @@ async fn mock_remote_agent_workspace_binding_update_is_rejected() {
         workspace_id: None,
         workspace_path: None,
         workspace_label: Some("Changed Remotely".to_string()),
-        goal_id: None,
-        state_filter: None,
+        subscription_replacement: None,
         goal_md: None,
         status: None,
         issue_subscription_run_mode: None,
@@ -1565,8 +1562,7 @@ async fn mock_space_issue_comment_routes_are_mutable_and_method_guarded() {
         workspace_id: Some("project-current".to_string()),
         workspace_path: Some(cli_workspace.to_string_lossy().to_string()),
         workspace_label: None,
-        goal_id: None,
-        state_filter: None,
+        subscription_replacement: None,
         goal_md: None,
         status: None,
         issue_subscription_run_mode: None,
@@ -1755,6 +1751,57 @@ async fn mock_space_issue_comment_routes_are_mutable_and_method_guarded() {
         registered.issue_subscription_run_mode,
         SpaceIssueSubscriptionRunMode::SingleSession
     );
+    let expected_subscription_id = registered
+        .subscriptions
+        .first()
+        .expect("registered Agent subscription")
+        .id
+        .clone();
+    crate::space_cloud_mock::seed_agent_subscription_for_test(
+        &registered.id,
+        "subscription-existing-target",
+        "goal_mock_docs",
+        vec!["open".to_string(), "todo".to_string()],
+    )
+    .expect("seed exact target Subscription");
+    crate::space_cloud_mock::seed_agent_subscription_for_test(
+        &registered.id,
+        "subscription-hidden",
+        "goal_mock_root",
+        vec!["doing".to_string()],
+    )
+    .expect("seed hidden Subscription");
+    let before_conflict = crate::space_cloud_mock::agent_snapshot_for_test(&registered.id)
+        .expect("mock Agent before conflict");
+    let conflict = cmd_space_update_registered_agent(SpaceUpdateRegisteredAgentInput {
+        id: registered.id.clone(),
+        display_name: Some("Must Roll Back".to_string()),
+        instruction: Some("This conflicting mock update must not commit.".to_string()),
+        expected_instruction_revision: Some(registered.instruction_revision),
+        workspace_id: None,
+        workspace_path: None,
+        workspace_label: None,
+        subscription_replacement: Some(SpaceRegisteredAgentSubscriptionReplacementInput {
+            expected_subscription_id: Some(expected_subscription_id.clone()),
+            goal_id: "goal_mock_root".to_string(),
+            state_filter: Some(vec!["todo".to_string()]),
+        }),
+        goal_md: None,
+        status: None,
+        issue_subscription_run_mode: None,
+    })
+    .await
+    .expect_err("different hidden target must reject the whole mock update");
+    assert!(conflict.message.contains("SUBSCRIPTION_TARGET_CONFLICT"));
+    let after_conflict = crate::space_cloud_mock::agent_snapshot_for_test(&registered.id)
+        .expect("mock Agent after conflict");
+    assert_eq!(after_conflict.display_name, before_conflict.display_name);
+    assert_eq!(after_conflict.instruction, before_conflict.instruction);
+    assert_eq!(
+        after_conflict.instruction_revision,
+        before_conflict.instruction_revision
+    );
+    assert_eq!(after_conflict.subscriptions, before_conflict.subscriptions);
 
     let updated_agent = cmd_space_update_registered_agent(SpaceUpdateRegisteredAgentInput {
         id: registered.id.clone(),
@@ -1764,8 +1811,11 @@ async fn mock_space_issue_comment_routes_are_mutable_and_method_guarded() {
         workspace_id: None,
         workspace_path: None,
         workspace_label: None,
-        goal_id: None,
-        state_filter: None,
+        subscription_replacement: Some(SpaceRegisteredAgentSubscriptionReplacementInput {
+            expected_subscription_id: Some(expected_subscription_id),
+            goal_id: "goal_mock_docs".to_string(),
+            state_filter: Some(vec!["todo".to_string(), "open".to_string()]),
+        }),
         goal_md: None,
         status: Some("disabled".to_string()),
         issue_subscription_run_mode: Some(SpaceIssueSubscriptionRunMode::NewSession),
@@ -1774,6 +1824,27 @@ async fn mock_space_issue_comment_routes_are_mutable_and_method_guarded() {
     .expect("agent update should succeed");
     assert_eq!(updated_agent.display_name, "Mock Acceptance Agent 2");
     assert_eq!(updated_agent.status, "disabled");
+    assert_eq!(updated_agent.subscriptions.len(), 2);
+    assert_eq!(
+        updated_agent.subscriptions[0].id,
+        "subscription-existing-target"
+    );
+    assert_eq!(updated_agent.subscriptions[0].goal_id, "goal_mock_docs");
+    assert_eq!(
+        updated_agent.subscriptions[0].state_filter,
+        vec!["open".to_string(), "todo".to_string()]
+    );
+    assert!(updated_agent
+        .subscriptions
+        .iter()
+        .any(|subscription| subscription.id == "subscription-hidden"));
+    let persisted_agent = cmd_space_list_local_agents()
+        .await
+        .expect("updated Agent snapshot should remain readable")
+        .into_iter()
+        .find(|agent| agent.id == updated_agent.id)
+        .expect("updated Agent should remain in the local projection");
+    assert_eq!(persisted_agent.subscriptions, updated_agent.subscriptions);
     assert_eq!(
         updated_agent.issue_subscription_run_mode,
         SpaceIssueSubscriptionRunMode::NewSession

@@ -220,7 +220,7 @@ Cron 兼容面只提供 `list`，不发布 `cron get`；单条详情统一使用
 
 - `start` 提交 Task `Running` 并 arm timer，不绕过 schedule/Detector；若保留的 interval anchor 已过期，scheduler 可能把下一次 tick clamp 到约 2 秒后，调用方必须读取权威 `nextExecutionAt`。
 - `run-now` 可执行 Stopped Task，不启用 scheduler，也不移动下一次 scheduled anchor。
-- `task start/stop/run/rerun` 的成功数据统一包含 `taskId`、`status`、epoch-ms `nextExecutionAt` 与 canonical `TaskProjection` 字段 `task`；run/rerun 额外包含 `attemptOrdinal`。Task application 失败统一在 Rust Management API 边界输出顶层 `code` + `error`，不得把 TaskStore 的 `{code,message}` 再编码进 `error` 字符串。
+- `task start/stop/run/rerun` 的成功数据继续包含 `taskId`、`status`、epoch-ms `nextExecutionAt` 与 canonical `TaskProjection` 字段 `task`。create/get/run/rerun 在 Node 边界额外派生稳定的 `data.receipt`，统一给 Agent 提供 `taskId/status/statusMeaning/changed/nextExecutionAt/executionState/resultAccess`；它不持久化、不拥有状态，也不替换旧字段。run/rerun 的内部 `attemptOrdinal` 仅用于新执行 analytics，不作为 CLI 公共语义；Running Task 的重复/并发 run 返回 `changed=false`，不产生新 attempt。Task application 失败统一在 Rust Management API 边界输出顶层 `code` + `error`，不得把 TaskStore 的 `{code,message}` 再编码进 `error` 字符串。
 - `Loop` 被拒绝；持续工作使用 current-session Goal。
 - `/api/admin/cron/*` 是兼容路由名，不代表独立 Cron domain/store。
 
@@ -243,7 +243,7 @@ myagents task run-now <taskId>         # 绕过 Detector，强制执行 AI
 myagents task reset-checkpoint <taskId>
 ```
 
-`task create-direct` 与 `task list` 在 Sidecar Admin 边界复用当前 workspace 解析：正常路径省略 workspace flags，Sidecar 以当前 path 匹配 `projects.json` 并补齐 Rust 所需的 stable `workspaceId + workspacePath`；只有显式跨 workspace 时由调用方提供。`agent current --json` 只返回当前 Agent/workspace/Session 的紧凑诊断，不是创建前置步骤。`task list` 的 Agent 投影默认只在当前 workspace 内返回紧凑字段与 `sessionCount`，完整 `sessionIds`、文档和 Trigger health 仍由 `task get` 拥有。
+`task create-direct` 与 `task list` 在 Sidecar Admin 边界复用当前 workspace 解析：正常路径省略 workspace flags，Sidecar 以当前 path 匹配 `projects.json` 并补齐 Rust 所需的 stable `workspaceId + workspacePath`；只有显式跨 workspace 时由调用方提供。`agent current --json` 只返回当前 Agent/workspace/Session 的紧凑诊断，不是创建前置步骤。`task list` 的 Agent 投影默认只在当前 workspace 内返回紧凑字段与 `sessionCount`，完整 `sessionIds`、文档和 Trigger health 仍由 `task get` 拥有。兼容 `cron add/update` 必须无损转发同一组 `runtime/runtimeConfig/providerId/model/permissionMode` override，并在 dry-run 与真实写入前复用同一 validator；mutation leaf 对未知 flag fail closed，禁止静默丢字段。未显式传 override 时仍只继承目标 Agent，不增加顶层或 project runtime fallback。
 
 CLI 从自身 `MYAGENTS_SESSION_ID` 判定 `agent/cli` 或 `user/cli`，把内部 caller metadata 传到既有 Rust transition 审计；Sidecar 不用自己的 `MYAGENTS_PORT` 猜调用者。UI 继续在 Tauri command 边界权威盖章为 `user/ui`。archive 仍由状态机执行 user-only guard，delete 记录真实 CLI actor/source。
 
@@ -357,7 +357,7 @@ Admin API 注册在 Sidecar 的 `/api/admin/*` 路由下，提供与 GUI 对等�
 | `/api/admin/goal/*` | 当前 session Goal Mode：`get` / `create` / `update` |
 | `/api/admin/task/*` | 任务中心：list/get/create/update/run/rerun/run-now、trigger validate/test/check-now/reset、status/session/archive/delete/doc |
 | `/api/admin/thought/*` | 任务中心想法：list/create |
-| `/api/admin/skill/*` | Skills CRUD、URL 安装、启停、sync |
+| `/api/admin/skill/*` | Skills CRUD、远程/本地来源安装、启停、sync；显式相对路径由 CLI 按调用者 cwd 归一化 |
 | `/api/admin/tool/*` | 用户注册 CLI 工具注册表（实验室门控，默认关闭） |
 | `/api/admin/vision/*` | 官方图片理解 CLI 工具：`readme` / `analyze` |
 | `/api/admin/plugin/*` | OpenClaw 插件安装/卸载/列表 |
@@ -492,7 +492,7 @@ Agent 使用说明由 required system Skill `/myagents-anydoc` 渐进加载；`m
 
 ## Task 创建链路（关键机制）
 
-`task create-direct` / `task create-from-alignment` 是任务中心的重点命令，链路比其他命令长一层 —— create-direct 先补齐当前 workspace 与 CLI caller provenance，再在转发给 Rust 前做一次 **pre-flight 验证**：
+`task create-direct` 是 ordinary Task 的唯一通用创建命令。手动表单、产品级 Task 讨论与其它 Agent 工作流都在确认最终 `task.md` 和参数后进入它；CLI 先补齐当前 workspace 与 caller provenance，再在转发给 Rust 前做一次 **pre-flight 验证**：
 
 ```
 CLI → /api/admin/task/create-direct → resolveTaskWorkspace(payload)
@@ -518,6 +518,10 @@ CLI → /api/admin/task/create-direct → resolveTaskWorkspace(payload)
 3. `--model` — 外部 runtime 走 `queryRuntimeModels()`；builtin 不做本地校验（model 由 Provider 决定）
 
 **effective runtime 解析**：`--runtime` 显式传 → 用之；否则从 `workspacePath` / `workspaceId` 查 Agent 默认；都查不到就拒绝（避免静默 trust）。
+
+长正文使用 `--taskMdFile <path>`，读取的是 mutation 当下的文件内容；`create-from-alignment` 已退休，候选目录不是 Task row，也没有四文档 mint policy。创建成功后是否调用 `task run/start` 必须来自用户已经确认的动作，不能由来源类型隐式决定。
+
+`task comments <taskId>` 与 `task comment [taskId] --body-file ... [--reply-to ...]` 是本地协作面。显式 Task ID 始终可用；只有带 `MYAGENTS_SESSION_ID` 且该 Session 有 Task execution context 的首轮 Task turn 才可省略 ID。用户 Comment 注入的后续 turn 必须使用 reminder 中的显式 ID，防止把回复写到碰巧最近的 Task。CLI 只调用 Task Application；Comment 的目标 Session、持久化、admission 和通知不在 Node 参数层推断。
 
 **单一真相源**：`VALID_RUNTIMES` 常量在 `src/shared/types/runtime.ts` 定义，`HELP_TEXTS` 模板字符串、validator、factory 全部从此读取；并用一个 type-level assertion (`_exhaustiveRuntimeCheck`) 在 `typecheck` 阶段拦截 `RuntimeType` 联合与 `VALID_RUNTIMES` 元组的漂移。
 

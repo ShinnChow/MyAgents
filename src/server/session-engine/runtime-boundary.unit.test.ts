@@ -214,7 +214,7 @@ describe('SessionEngine runtime boundary', () => {
       /queueState\.(?:messageQueue|pendingMidTurnQueue|turnBoundaryQueue)\.(?:push|unshift|shift|splice)\(/,
       /queueState\.(?:messageQueue|pendingMidTurnQueue|turnBoundaryQueue)\.map\(/,
       /turnState\.(?:injectedTurnOutcomes|discardedInjectedTurnIds)\.(?:set|delete|clear|add)\(/,
-      /turnState\.(?:currentTurnInjectedTurnId|currentTurnImTerminalEmitted|currentPlanFileMinMtimeMs|currentTurnStartTime|currentTurnToolCount|sessionBrowserToolUsed|sessionStorageStateSaved|turnHadSubstantiveActivity|currentTurnCompactResult|currentTurnSawCompactBoundary|currentTurnHadAssistantMessageError|currentTurnLastAssistantMessageError|currentTurnHasOutput|latestMainAssistantUsage|currentTurnAnalyticsSource|currentTurnProviderAnalytics|currentTurnAssistantMessagePresent)\s*(?:(?<!=)=(?!=)|\+\+|--)/,
+      /turnState\.(?:currentTurnInjectedTurnId|currentTurnImTerminalEmitted|currentPlanFileMinMtimeMs|currentTurnStartTime|currentTurnToolCount|turnHadSubstantiveActivity|currentTurnCompactResult|currentTurnSawCompactBoundary|currentTurnHadAssistantMessageError|currentTurnLastAssistantMessageError|currentTurnHasOutput|latestMainAssistantUsage|currentTurnAnalyticsSource|currentTurnProviderAnalytics|currentTurnAssistantMessagePresent)\s*(?:(?<!=)=(?!=)|\+\+|--)/,
       /turnState\.currentTurnUsage\.[A-Za-z0-9_]+\s*(?<!=)=(?!=)/,
       /turnState\.pendingOutputOwners\.(?:push|shift|splice)\(/,
       /turnState\.pendingOutputOwners\.length\s*(?<!=)=(?!=)/,

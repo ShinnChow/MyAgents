@@ -86,6 +86,7 @@ import {
   type PersistedAgentWorkspaceProjection,
 } from './utils/agent-workspace-identity';
 import { buildProactiveAgentTogglePatch } from '../shared/proactiveAgentPolicy';
+import { isReservedBuiltinBrowserMcpId, MANAGED_BROWSER_MCP_ID } from '../shared/browserTools';
 
 // Long-running sidecar operations need their own budget. Anchored to the
 // sidecar's internal `FETCH_TIMEOUT_MS` (300s for tarball download) plus a
@@ -382,6 +383,9 @@ export async function handleMcpAdd(payload: {
   // Validate required fields
   if (!s.id) return { success: false, error: 'Missing required field: id' };
   if (!s.type) return { success: false, error: 'Missing required field: type' };
+  if (isReservedBuiltinBrowserMcpId(s.id)) {
+    return { success: false, error: `MCP ID "${s.id}" is reserved by a built-in Browser tool` };
+  }
 
   // Reject SDK reserved MCP names — these cause the Claude Agent SDK to crash (exit code 1)
   // with "Invalid MCP configuration: X is a reserved MCP name."
@@ -620,6 +624,44 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
   }
   if ((server.type === 'sse' || server.type === 'http') && !server.url) {
     return { success: false, error: `MCP server '${id}' has no URL configured` };
+  }
+
+  // Application Browser Host: __browser_host__ is a product-owned projection
+  // sentinel, never an executable. A generic stdio handshake would therefore
+  // produce the misleading `spawn __browser_host__ ENOENT`. Acquiring the
+  // current Session's capability is the non-disruptive readiness check: opening
+  // a second MCP connection here would retire the live Session connection.
+  if (server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__') {
+    try {
+      const { acquireBrowserCapability } = await import('./browser-host/capability-client');
+      const capability = await acquireBrowserCapability();
+      return {
+        success: true,
+        data: {
+          id,
+          type: 'application-host',
+          state: 'ready',
+          sessionScoped: true,
+          hostGeneration: capability.hostGeneration,
+        },
+        hint: 'MyAgents Browser Host is ready for the current Product Session. __browser_host__ is an internal projection marker, not a PATH executable.',
+      };
+    } catch (error) {
+      return {
+        success: false,
+        error: `MyAgents Browser Host is unavailable for the current Product Session: ${error instanceof Error ? error.message : String(error)}`,
+        data: {
+          id,
+          type: 'application-host',
+          state: 'unavailable',
+          sessionScoped: true,
+        },
+        recoveryHint: {
+          recoveryCommand: 'myagents mcp test myagents-browser',
+          message: 'Run this check from an active MyAgents Agent Session after the application Browser Host is ready.',
+        },
+      };
+    }
   }
 
   // Built-in MCP: delegate to registry.
@@ -3067,7 +3109,6 @@ Commands:
   list                            Compact current-workspace list (--query / --limit supported)
   get <taskId>                    Task metadata + .task/ doc paths
   create-direct <name>            Create a task with inline task.md content
-  create-from-alignment <sid>     Materialize a task from an alignment session
   create-attached                 Create a running task attached to the current AI session
   update <taskId>                 Patch task fields (schedule / notification /
                                   prompt / overrides). Rejected while running.
@@ -3149,15 +3190,6 @@ Per-task RUNTIME overrides (all optional; omit to inherit workspace defaults):
   --runtimeConfig      JSON string for runtime-specific extra config
   --mcpEnabledServers  Comma-separated MCP ids; "" means explicit no MCP
 
-Options for 'create-from-alignment' (identical override flags):
-  Positional: <alignmentSessionId>
-  --name               Task name (required)
-  --executor --description --workspaceId --workspacePath
-  --executionMode --runMode --tags --sourceThoughtId
-  --preselectedSessionId current|<id> --trigger-file <path>
-  --deadline <ISO-with-offset> --maxExecutions <n> --aiCanExit true|false
-  --runtime --providerId --model --permissionMode --runtimeConfig --mcpEnabledServers
-
 Options for 'create-attached':
   --name                  Task name (required)
   --workspaceId           Workspace id (required)
@@ -3210,14 +3242,13 @@ Output:
 Examples:
   myagents task list --query "review" --limit 20
   myagents task create-direct --name "review PR" \\
-      --taskMdContent "Review the latest PR and file findings in progress.md" \\
+      --taskMdContent "Review the latest PR and verify the acceptance criteria" \\
       --runtime codex --model gpt-5.2 --permissionMode full-auto
   # Recurring + IM push — was GUI-only before issue #205
   myagents task create-direct --name "issue triage" \\
       --taskMdFile /tmp/triage-prompt.md \\
       --executionMode recurring --intervalMinutes 180 \\
       --notificationBotChannelId feishu_main
-  myagents task create-from-alignment sess_abc --name "Ship feature X" --runtime claude-code
   myagents task create-attached --name "Space Issue #123" \\
       --workspaceId my-proj --workspacePath /path/to/my-proj \\
       --taskMdContent-file task.md --source space-issue --sourceIssueId iss_123
@@ -3261,17 +3292,6 @@ Related:
     output: 'Persisted Task, caller audit provenance, docs path, overrides, nextExecutionAt, and next-step commands.',
     example: 'myagents task create-direct --name "daily review" --taskMdFile task-action.md --executionMode recurring --cronExpression "0 9 * * *" --json',
     recovery: 'Run task get <id> to verify. agent current is diagnostic, not a prerequisite.',
-  }),
-
-  'task/create-from-alignment': taskLeafHelp({
-    usage: 'myagents task create-from-alignment <alignmentSessionId> --name <name> — Materialize aligned work',
-    when: 'After the task-alignment flow has produced a reviewed Task directory.',
-    effect: 'Moves the alignment artifacts into one ordinary Task and inherits workspace metadata from the alignment Session.',
-    options: '  <alignmentSessionId> Required alignment Session id\n  --name <name>         Required Task name\n  --providerId <id> --model <id>  Optional builtin route pair\n  --run                 Dispatch after successful creation',
-    mutation: 'Creates a once Task; --run also starts its asynchronous AI execution.',
-    output: 'Persisted Task/docs plus optional run result.',
-    example: 'myagents task create-from-alignment <sessionId> --name "ship feature" --run --json',
-    recovery: 'If metadata is missing, pass explicit workspace fields or repair the alignment artifacts.',
   }),
 
   'task/create-attached': taskLeafHelp({
@@ -3502,7 +3522,9 @@ IM bot sessions don't render widgets.`,
 Commands:
   list                       List installed skills + enabled state
   info <name>                Show one skill's manifest + description
-  add <url>                  Install from URL / file path
+  add <source>               Install from GitHub, HTTPS .zip, or a local source
+                             Local: absolute path, file://, explicit ./ or ../
+                             Formats: directory, .zip, .skill (not .tar.gz/.tgz)
                              [--scope user|project] [--plugin <id>] [--skill <id>]
                              [--force] [--dry-run]
   remove <name>              Uninstall a skill   [--scope user|project]
@@ -4020,7 +4042,7 @@ export async function handleCronCreate(payload: Record<string, unknown>): Promis
   const resolvedWorkspacePath = (payload.workspacePath as string | undefined)
     || (payload.workspace_path as string | undefined)
     || defaultCronWorkspace();
-  const finalPayload: Record<string, unknown> = (payload.workspacePath || payload.workspace_path)
+  const finalPayload: Record<string, unknown> = payload.workspacePath
     ? payload
     : { ...payload, workspacePath: resolvedWorkspacePath };
   const schedule = finalPayload.schedule as { kind?: unknown } | undefined;
@@ -4030,6 +4052,12 @@ export async function handleCronCreate(payload: Record<string, unknown>): Promis
       error: 'Loop schedules are Goal Mode tasks. Use myagents goal create --objective-file <path> after writing the objective to that file; do not use myagents cron add.',
     };
   }
+
+  // Cron is a compatibility surface over the canonical Task store. Validate
+  // the same runtime identity before both preview and mutation so --dry-run
+  // cannot report a configuration that the real command would reject.
+  const validationError = await validateTaskOverrides(finalPayload);
+  if (validationError) return validationError;
 
   // Issue #149: --dry-run was silently ignored — the previous implementation
   // forwarded payload to Rust regardless, so `cron add --dry-run` would
@@ -4092,6 +4120,26 @@ export async function handleCronDelete(payload: { taskId: string }): Promise<Adm
 export async function handleCronUpdate(payload: { taskId: string; patch: Record<string, unknown> }): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
+  let validationPayload: Record<string, unknown> = {
+    workspacePath: defaultCronWorkspace(),
+    ...payload.patch,
+  };
+  if (hasTaskRuntimeOverride(payload.patch)) {
+    const current = await handleTaskGet({ id: payload.taskId });
+    if (!current.success) return current;
+    if (!current.data || typeof current.data !== 'object' || Array.isArray(current.data)) {
+      return { success: false, error: `Task '${payload.taskId}' returned invalid persisted data.` };
+    }
+    // Runtime updates are patches. Validate against the persisted complete
+    // identity so changing runtimeConfig/model alone cannot inherit an
+    // unrelated current-Agent default.
+    validationPayload = {
+      ...(current.data as Record<string, unknown>),
+      ...payload.patch,
+    };
+  }
+  const validationError = await validateTaskOverrides(validationPayload);
+  if (validationError) return validationError;
   const resp = await managementApi('/api/cron/update', 'POST', payload);
   if (resp.ok) {
     // Issue #115 — surface the post-update task summary so CLI can echo
@@ -4342,6 +4390,105 @@ function compactTaskForAgent(task: Record<string, unknown>): Record<string, unkn
   };
 }
 
+type TaskAgentReceiptOperation = 'create' | 'get' | 'run' | 'rerun';
+
+function taskStatusMeaning(status: string | null, executionState: string | null): string {
+  switch (status) {
+    case 'todo':
+      return 'The Task is saved but its scheduler is not enabled. Run it when it should start.';
+    case 'running':
+      return executionState
+        ? `The Task scheduler is enabled; the current execution state is '${executionState}'.`
+        : 'The Task scheduler is enabled. This status does not by itself mean an AI turn is executing now.';
+    case 'verifying':
+      return 'The Task is settling or verifying an execution. Do not dispatch a duplicate run.';
+    case 'stopped':
+      return 'The Task scheduler is paused. Use task start to resume it.';
+    case 'blocked':
+      return 'The Task stopped after a failure or blocker. Inspect it, resolve the cause, then use task rerun.';
+    case 'done':
+      return 'The Task reached a completed terminal state. Use task rerun only to start another execution.';
+    case 'archived':
+      return 'The Task is archived and not scheduled. Use task rerun only when intentionally reactivating it.';
+    case 'deleted':
+      return 'The Task has been deleted from ordinary Task surfaces.';
+    default:
+      return 'The authoritative Task status is unavailable in this response; inspect the Task before acting.';
+  }
+}
+
+/**
+ * Add one stable, AI-facing semantic receipt without replacing any legacy
+ * response fields. Everything here is derived from the Task projection that
+ * Rust already returned; this helper owns no lifecycle or persisted state.
+ */
+function withTaskAgentReceipt(
+  response: AdminResponse,
+  operation: TaskAgentReceiptOperation,
+  options: { changed: boolean; taskId?: string },
+): AdminResponse {
+  if (!response.success || !response.data || typeof response.data !== 'object' || Array.isArray(response.data)) {
+    return response;
+  }
+  const data = response.data as Record<string, unknown>;
+  const task = data.task && typeof data.task === 'object' && !Array.isArray(data.task)
+    ? data.task as Record<string, unknown>
+    : data;
+  const taskId = typeof task.id === 'string'
+    ? task.id
+    : typeof data.taskId === 'string'
+      ? data.taskId
+      : typeof data.task_id === 'string'
+        ? data.task_id
+        : options.taskId;
+  if (!taskId) return response;
+
+  const rawStatus = typeof data.status === 'string'
+    ? data.status
+    : typeof task.status === 'string'
+      ? task.status
+      : null;
+  const status = rawStatus?.toLowerCase() ?? null;
+  const executionState = typeof task.executionState === 'string'
+    ? task.executionState
+    : typeof data.executionState === 'string'
+      ? data.executionState
+      : null;
+  const nextExecutionAt = typeof data.nextExecutionAt === 'number'
+    ? data.nextExecutionAt
+    : typeof task.nextExecutionAt === 'number'
+      ? task.nextExecutionAt
+      : null;
+  const changed = typeof data.changed === 'boolean' ? data.changed : options.changed;
+  const boundSession = task.runMode === 'single-session'
+    || task.dispatchOrigin === 'attached-session';
+
+  return {
+    ...response,
+    data: {
+      ...data,
+      receipt: {
+        operation,
+        taskId,
+        status,
+        statusMeaning: taskStatusMeaning(status, executionState),
+        changed,
+        nextExecutionAt,
+        executionState,
+        resultAccess: {
+          mode: boundSession ? 'bound-session' : 'execution-session',
+          summary: boundSession
+            ? 'Execution results stay in the Task bound Session and are not copied into Task comments automatically.'
+            : 'Execution results stay in Task execution Sessions and run history; they are not pushed back to the creating Session or copied into Task comments automatically.',
+          inspectTaskCommand: `myagents task get ${taskId} --json`,
+          inspectRunsCommand: `myagents task runs ${taskId} --limit 5 --full --json`,
+          inspectCommentsCommand: `myagents task comments ${taskId} --limit 50 --json`,
+        },
+      },
+    },
+  };
+}
+
 export async function handleTaskList(payload: {
   workspaceId?: string;
   workspacePath?: string;
@@ -4388,9 +4535,56 @@ export async function handleTaskList(payload: {
 export async function handleTaskGet(payload: { id: string }): Promise<AdminResponse> {
   const resp = await managementApi(`/api/task/get${qsFrom({ id: payload.id })}`);
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).task };
+    return withTaskAgentReceipt(
+      { success: true, data: (resp as Record<string, unknown>).task },
+      'get',
+      { changed: false, taskId: payload.id },
+    );
   }
   return mgmtError(resp, 'Failed to get task');
+}
+
+export async function handleTaskComments(payload: {
+  id: string;
+  before?: string;
+  limit?: number;
+}): Promise<AdminResponse> {
+  const resp = await managementApi(
+    `/api/task/comments${qsFrom(payload as Record<string, string | number | undefined>)}`,
+  );
+  if (resp.ok) return { success: true, data: resp.page };
+  return mgmtError(resp, 'Failed to list Task comments');
+}
+
+export async function handleTaskComment(payload: {
+  id?: string;
+  body: string;
+  replyToCommentId?: string;
+}): Promise<AdminResponse> {
+  // Session identity belongs to this Sidecar process. Never accept a
+  // client-provided value: a CLI payload is untrusted and could otherwise
+  // impersonate another Task-bound Session.
+  const sessionId = process.env.MYAGENTS_SESSION_ID?.trim();
+  if (!sessionId) {
+    return {
+      success: false,
+      error: 'Task Agent comments require MYAGENTS_SESSION_ID; run this command inside the associated Task Session.',
+    };
+  }
+  const taskId = payload.id?.trim() || getCronTaskContext(sessionId).taskId;
+  if (!taskId) {
+    return {
+      success: false,
+      error: 'Task ID is required outside an active Task turn. Pass <taskId> from the Task comment reminder.',
+    };
+  }
+  const resp = await managementApi('/api/task/comment', 'POST', {
+    id: taskId,
+    body: payload.body,
+    replyToCommentId: payload.replyToCommentId,
+    sessionId,
+  });
+  return wrapMgmtResponse(resp);
 }
 
 export async function handleTaskCreateDirect(
@@ -4425,26 +4619,6 @@ export async function handleTaskCreateDirect(
   return enriched;
 }
 
-export async function handleTaskCreateFromAlignment(
-  payload: Record<string, unknown>,
-): Promise<AdminResponse> {
-  const validationError = await validateTaskOverrides(payload);
-  if (validationError) return validationError;
-
-  const overridden = computeOverriddenFields(payload);
-  const resp = await managementApi('/api/task/create-from-alignment', 'POST', payload);
-  const wrapped = wrapMgmtResponse(resp);
-  const enriched = enrichTaskCreateResponse(wrapped, payload, overridden);
-  if (enriched.success) {
-    trackServer('task_create', {
-      source: taskCliAnalyticsSource(payload as TaskCliCaller),
-      origin: 'thought_dispatch',
-      has_workspace: typeof payload.workspacePath === 'string' && payload.workspacePath.length > 0,
-    });
-  }
-  return enriched;
-}
-
 export async function handleTaskCreateAttached(
   payload: Record<string, unknown>,
 ): Promise<AdminResponse> {
@@ -4469,26 +4643,39 @@ export async function handleTaskCreateAttached(
 
 export async function handleTaskRun(payload: { id: string }): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/run', 'POST', payload);
-  const wrapped = wrapMgmtResponse(resp);
+  const wrapped = withTaskAgentReceipt(wrapMgmtResponse(resp), 'run', {
+    changed: resp.changed !== false,
+    taskId: payload.id,
+  });
   if (wrapped.success) {
-    const { attemptOrdinal } = wrapped.data as { attemptOrdinal: number };
-    trackServer('task_run', {
-      source: taskCliAnalyticsSource(payload as TaskCliCaller),
-      run_count: attemptOrdinal,
-    });
+    const { attemptOrdinal, changed } = wrapped.data as {
+      attemptOrdinal?: number;
+      changed?: boolean;
+    };
+    if (changed !== false && typeof attemptOrdinal === 'number') {
+      trackServer('task_run', {
+        source: taskCliAnalyticsSource(payload as TaskCliCaller),
+        run_count: attemptOrdinal,
+      });
+    }
   }
   return wrapped;
 }
 
 export async function handleTaskRerun(payload: { id: string }): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/rerun', 'POST', payload);
-  const wrapped = wrapMgmtResponse(resp);
+  const wrapped = withTaskAgentReceipt(wrapMgmtResponse(resp), 'rerun', {
+    changed: true,
+    taskId: payload.id,
+  });
   if (wrapped.success) {
-    const { attemptOrdinal } = wrapped.data as { attemptOrdinal: number };
-    trackServer('task_run', {
-      source: taskCliAnalyticsSource(payload as TaskCliCaller),
-      run_count: attemptOrdinal,
-    });
+    const { attemptOrdinal } = wrapped.data as { attemptOrdinal?: number };
+    if (typeof attemptOrdinal === 'number') {
+      trackServer('task_run', {
+        source: taskCliAnalyticsSource(payload as TaskCliCaller),
+        run_count: attemptOrdinal,
+      });
+    }
   }
   return wrapped;
 }
@@ -4586,8 +4773,7 @@ function enrichTaskCreateResponse(
           : undefined;
 
   // Read the overrides from the persisted Task, NOT from the request payload.
-  // If serde dropped a field (e.g., prior to v0.1.69 when `TaskCreateFromAlignmentInput`
-  // lacked model/permission_mode), we want the mismatch to be visible here.
+  // Read persisted values so a DTO mismatch cannot masquerade as success.
   const persistedOverrides = {
     runtime: (persistedTask.runtime as string | undefined) ?? null,
     providerId: (persistedTask.providerId as string | undefined) ?? null,
@@ -4625,7 +4811,11 @@ function enrichTaskCreateResponse(
           inspect: `myagents task get ${taskId}`,
         };
   }
-  return { ...response, data: enriched };
+  return withTaskAgentReceipt(
+    { ...response, data: enriched },
+    'create',
+    { changed: true, taskId },
+  );
 }
 
 /**
@@ -4653,13 +4843,10 @@ export async function handleTaskUpdate(
     if (!current.data || typeof current.data !== 'object' || Array.isArray(current.data)) {
       return { success: false, error: `Task '${payload.id}' returned invalid persisted data.` };
     }
-    validationPayload = {
-      ...(current.data as Record<string, unknown>),
-      ...payload,
-      ...(payload.clearRuntimeOverride === true
-        ? { runtime: undefined, runtimeConfig: undefined }
-        : {}),
-    };
+    validationPayload = mergeTaskRuntimeValidationPayload(
+      current.data as Record<string, unknown>,
+      payload,
+    );
   }
   const validationError = await validateTaskOverrides(validationPayload);
   if (validationError) return validationError;
@@ -4740,8 +4927,8 @@ export async function handleTaskDelete(payload: {
 }
 
 /**
- * Read a task's markdown doc (`task.md` / `verify.md` / `progress.md` /
- * `alignment.md`). Missing files return `{ ok: true, content: "" }` so
+ * Read a task's canonical `task.md` or a retained legacy markdown doc.
+ * Missing legacy files return `{ ok: true, content: "" }` so
  * CLI scripting is idempotent. Task docs live under `~/.myagents/tasks/<id>/`
  * since v0.1.69 — this endpoint is the agent-facing read path because the
  * AI runs in the workspace cwd and can't know the user-profile dir.
@@ -4760,9 +4947,8 @@ export async function handleTaskReadDoc(payload: {
 }
 
 /**
- * Write `task.md` or `verify.md`. `progress.md` is agent-appended during
- * runs and rejected here; `alignment.md` is written by the alignment
- * skill via direct file-system access (not through this API).
+ * Write canonical `task.md` or retained legacy `verify.md`. Legacy
+ * `progress.md` / `alignment.md` remain read-only through this API.
  */
 export async function handleTaskWriteDoc(payload: {
   id: string;
@@ -4982,6 +5168,11 @@ LIFECYCLE
   create --json -> parse taskId -> get --json -> run --json.
   'run' is initial Todo enablement; 'start' resumes Stopped; 'rerun' handles a
   terminal Task. Running means scheduler enabled, not necessarily executing now.
+  create/get/run/rerun expose one stable data.receipt with statusMeaning,
+  changed, nextExecutionAt, executionState, and resultAccess. Repeating run for
+  an already-Running Task succeeds with changed=false and does not dispatch twice.
+  Results remain in the bound/execution Session and run history; ordinary
+  assistant output is never copied back to the creating Session or comments.
   A new fixed-interval Task without startAt gets its first tick about 2 seconds
   after run; Cron waits for the next wall-clock tick; scheduled waits for dispatchAt.
 
@@ -5089,9 +5280,19 @@ CREATE OPTIONS (myagents cron add ...)
                                   or explicit UTC.
   --workspace <path>              Workspace the task runs in. Defaults to the
                                   current session workspace.
+  --runtime <builtin|claude-code|codex|gemini>
+  --runtime-config <json-object>  Optional runtime identity/config override.
+  --provider-id / --model / --permission-mode
+                                  Optional Task execution overrides. Omit all
+                                  override flags to inherit the target Agent.
 
 UPDATE OPTIONS (myagents cron update <taskId> ...)
-  --name / --prompt / --message / --prompt-file / --schedule / --every / --model / --permissionMode
+  --name / --prompt / --message / --prompt-file / --schedule / --every
+  --runtime / --runtime-config / --provider-id / --model / --permission-mode
+
+  Runtime override fields use the same validation as canonical Task creation;
+  create dry-run validates the same payload as a real write. Unknown mutation
+  flags fail instead of being ignored.
   (Same semantics as create. --message is an alias for --prompt; file and inline
    prompt sources are mutually exclusive.)
 
@@ -5530,11 +5731,13 @@ export async function handleSkillAdd(payload: {
 }): Promise<AdminResponse> {
   if (!payload.url) return { success: false, error: 'url is required' };
 
-  // Step 1: probe (no confirmedSelection) to learn the mode
+  // Step 1: a probe must be explicitly non-mutating. Without previewOnly the
+  // route intentionally auto-installs an unambiguous single Skill.
   const scope = payload.scope ?? 'user';
   const probe = await sidecarSelf('/api/skill/install-from-url', 'POST', {
     url: payload.url,
     scope,
+    previewOnly: true,
   }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
   if (!probe.json.success) {
     return { success: false, error: String(probe.json.error ?? 'Install probe failed') };
@@ -5542,13 +5745,38 @@ export async function handleSkillAdd(payload: {
 
   const mode = probe.json.mode as string | undefined;
 
-  // Already auto-installed (single, no conflict)
-  if (mode === 'installed') {
-    if (payload.dryRun) return { success: true, data: probe.json, hint: '[dry-run] would install the above' };
+  // Single, unambiguous, no conflict. Commit through the same confirmed path
+  // as every other CLI mode so probe and dry-run are guaranteed write-free.
+  if (mode === 'single') {
+    const preview = probe.json.preview as {
+      skill: { suggestedFolderName: string; name: string; description?: string };
+    };
+    if (payload.dryRun) {
+      return {
+        success: true,
+        dryRun: true,
+        preview: {
+          action: 'install',
+          scope,
+          source: payload.url,
+          skills: [preview.skill.suggestedFolderName],
+        },
+      };
+    }
+    const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
+      url: payload.url,
+      scope,
+      confirmedSelection: {
+        folderNames: [preview.skill.suggestedFolderName],
+      },
+    }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
+    if (!commit.json.success) {
+      return { success: false, error: String(commit.json.error ?? 'Install failed') };
+    }
     return {
       success: true,
-      data: probe.json,
-      hint: `Installed ${(probe.json.installed as unknown[] | undefined)?.length ?? 0} skill(s)`,
+      data: commit.json,
+      hint: `Installed ${(commit.json.installed as unknown[] | undefined)?.length ?? 0} skill(s)`,
     };
   }
 
@@ -5582,8 +5810,14 @@ export async function handleSkillAdd(payload: {
     if (payload.dryRun) {
       return {
         success: true,
-        hint: `[dry-run] would install ${plugin.skills.length} skill(s) from plugin "${plugin.name}"`,
-        data: { plugin: plugin.name, skills: plugin.skills.map(s => s.suggestedFolderName) },
+        dryRun: true,
+        preview: {
+          action: conflicts.length > 0 ? 'overwrite' : 'install',
+          scope,
+          source: payload.url,
+          plugin: plugin.name,
+          skills: plugin.skills.map(s => s.suggestedFolderName),
+        },
       };
     }
     const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
@@ -5629,8 +5863,13 @@ export async function handleSkillAdd(payload: {
     if (payload.dryRun) {
       return {
         success: true,
-        hint: `[dry-run] would install ${wanted.length} skill(s)`,
-        data: { skills: wanted.map(c => c.suggestedFolderName) },
+        dryRun: true,
+        preview: {
+          action: conflicts.length > 0 ? 'overwrite' : 'install',
+          scope,
+          source: payload.url,
+          skills: wanted.map(c => c.suggestedFolderName),
+        },
       };
     }
     const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
@@ -5663,7 +5902,13 @@ export async function handleSkillAdd(payload: {
     if (payload.dryRun) {
       return {
         success: true,
-        hint: `[dry-run] would overwrite "${preview.skill.suggestedFolderName}"`,
+        dryRun: true,
+        preview: {
+          action: 'overwrite',
+          scope,
+          source: payload.url,
+          skills: [preview.skill.suggestedFolderName],
+        },
       };
     }
     const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
@@ -6266,8 +6511,33 @@ interface TaskOverrideFields {
 }
 
 function hasTaskRuntimeOverride(payload: Record<string, unknown>): boolean {
-  return ['runtime', 'runtimeConfig', 'providerId', 'model', 'permissionMode', 'clearRuntimeOverride']
+  return [
+    'runtime',
+    'runtimeConfig',
+    'providerId',
+    'model',
+    'permissionMode',
+    'clearProviderOverride',
+    'clearRuntimeOverride',
+  ]
     .some(field => payload[field] !== undefined && payload[field] !== null && payload[field] !== '');
+}
+
+/** Project TaskUpdateInput clear semantics before validating a merged patch. */
+function mergeTaskRuntimeValidationPayload(
+  current: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...current,
+    ...patch,
+    ...(patch.clearProviderOverride === true
+      ? { providerId: undefined, model: undefined }
+      : {}),
+    ...(patch.clearRuntimeOverride === true
+      ? { runtime: undefined, runtimeConfig: undefined }
+      : {}),
+  };
 }
 
 /**
@@ -6289,8 +6559,47 @@ function hasTaskRuntimeOverride(payload: Record<string, unknown>): boolean {
 async function validateTaskOverrides(
   payload: TaskOverrideFields,
 ): Promise<AdminResponse | null> {
+  if (
+    payload.providerId !== undefined
+    && payload.providerId !== null
+    && (typeof payload.providerId !== 'string' || payload.providerId.trim() === '')
+  ) {
+    return { success: false, error: '--providerId must be a non-empty string.' };
+  }
+  if (
+    payload.model !== undefined
+    && payload.model !== null
+    && typeof payload.model !== 'string'
+  ) {
+    return { success: false, error: '--model must be a string.' };
+  }
+  if (
+    payload.runtimeConfig !== undefined
+    && payload.runtimeConfig !== null
+    && (typeof payload.runtimeConfig !== 'object' || Array.isArray(payload.runtimeConfig))
+  ) {
+    return { success: false, error: '--runtimeConfig must be a JSON object.' };
+  }
   const runtimeConfigModel = taskRuntimeConfigField(payload.runtimeConfig, 'model');
   const rawRuntimeSource = taskRuntimeConfigField(payload.runtimeConfig, 'source');
+  const hasProviderOverride = typeof payload.providerId === 'string' && payload.providerId.trim() !== '';
+  const hasModelOverride = typeof payload.model === 'string' && payload.model.trim() !== '';
+  if (hasProviderOverride && !hasModelOverride) {
+    return {
+      success: false,
+      error: '--providerId requires --model so the Task cannot cross-route a provider to an inherited model.',
+    };
+  }
+  if (
+    hasProviderOverride
+    && typeof payload.runtime === 'string'
+    && ['claude-code', 'codex', 'gemini'].includes(payload.runtime)
+  ) {
+    return {
+      success: false,
+      error: `Runtime '${payload.runtime}' manages its own provider and cannot be combined with --providerId.`,
+    };
+  }
   if (
     rawRuntimeSource !== undefined
     && rawRuntimeSource !== 'system-cli'

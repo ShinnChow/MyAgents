@@ -18,7 +18,22 @@ import type {
   RuntimeProxyPolicy, RuntimeDiagnosticIssue,
   RuntimeSource,
 } from '../../shared/types/runtime';
-import type { McpServerDefinition } from '../../shared/config-types';
+import {
+  MANAGED_CODEX_REQUIRED_RUNTIME,
+  type McpServerDefinition,
+} from '../../shared/config-types';
+import { MANAGED_BROWSER_MCP_ID } from '../../shared/browserTools';
+import {
+  acquireBrowserCapability,
+  adoptBrowserProductSession,
+} from '../browser-host/capability-client';
+import {
+  mcpStartupExecutableIdentity,
+  settleMcpStartupLease,
+  startMcpStartupDemand,
+  type McpStartupDemand,
+  type McpStartupLease,
+} from '../session-core/mcp-startup-admission-client';
 import { CODEX_PERMISSION_MODES } from '../../shared/types/runtime';
 import { coerceFileChanges, formatFileChangeForResult } from '../../shared/fileChange';
 import type { AgentPlanTodo, AgentRuntime, ConversationBranchBoundary, ConversationBranchResult, RuntimeConfigCapabilities, RuntimeProcess, SessionStartOptions, UnifiedEvent, UnifiedEventCallback, ResolvedImagePayload, SubAgentScope } from './types';
@@ -57,27 +72,118 @@ import type {
   ManagedCodexHostToolResult,
   ManagedCodexSkillSpec,
 } from './managed-codex/extensions/contracts';
-import { MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION } from './managed-codex/extensions/contracts';
 import {
   projectManagedCodexMcpLaunchConfig,
 } from './managed-codex/extensions/mcp-launch-projection';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
 /**
- * Extension RPCs below are verified against this exact app-server schema.
- * Keep this independent from the downloadable runtime lock: changing only the
- * lock must fail closed until conformance and this contract advance together.
+ * Managed extension RPCs are verified against the exact binary selected by the
+ * single runtime lock. The lock cannot be advanced until schema generation and
+ * exact-binary conformance pass; duplicating its version here would create a
+ * second authority that can drift from packaging and installation.
  */
-export function assertManagedCodexExtensionProtocolVersion(version: string | undefined): void {
-  if (version !== MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION) {
+export function assertManagedCodexRuntimeConformanceVersion(version: string | undefined): void {
+  if (version !== MANAGED_CODEX_REQUIRED_RUNTIME.version) {
     throw new Error(
-      `Managed Codex extensions require app-server ${MANAGED_CODEX_EXTENSION_PROTOCOL_VERSION}; `
+      `Managed Codex extensions require conformed app-server ${MANAGED_CODEX_REQUIRED_RUNTIME.version}; `
       + `resolved ${version ?? 'unknown'}. Re-run exact-version conformance before upgrading.`,
     );
   }
 }
 
 type CodexDecision = 'deny' | 'allow_once' | 'always_allow';
+type ManagedCodexMcpAdmissionOwner = {
+  key: string;
+  startedAt: number;
+  runtimeGeneration: number;
+  configGeneration: number;
+  serverIds: string[];
+  demand: McpStartupDemand;
+  lease: McpStartupLease | null;
+  state: 'queued' | 'granted' | 'settled' | 'unmanaged';
+};
+let managedCodexMcpAdmissionOwner: ManagedCodexMcpAdmissionOwner | null = null;
+let managedCodexMcpAdmissionGeneration = 0;
+
+function releaseManagedCodexMcpAdmission(): void {
+  const owner = managedCodexMcpAdmissionOwner;
+  managedCodexMcpAdmissionOwner = null;
+  owner?.demand.cancel();
+  if (owner?.lease) void settleMcpStartupLease(owner.lease, 'released');
+}
+
+async function prepareManagedCodexMcpAdmission(
+  servers: readonly McpServerDefinition[],
+  priority: 'interactive' | 'background',
+  acceptedAt: number,
+): Promise<{ includeLocal: boolean; owner: ManagedCodexMcpAdmissionOwner | null }> {
+  const local = servers.filter(server => server.type === 'stdio' && Boolean(server.command));
+  if (local.length === 0) {
+    releaseManagedCodexMcpAdmission();
+    return { includeLocal: true, owner: null };
+  }
+  const executableIdentity = mcpStartupExecutableIdentity(
+    local.map(server => ({ command: server.command!, args: server.args ?? [] })),
+  );
+  const key = `${executableIdentity}:${local.map(server => server.id).sort().join(',')}`;
+  let owner = managedCodexMcpAdmissionOwner;
+  if (!owner || owner.key !== key || owner.state === 'settled') {
+    releaseManagedCodexMcpAdmission();
+    managedCodexMcpAdmissionGeneration += 1;
+    const demand = startMcpStartupDemand({
+      executables: local.map(server => ({ command: server.command!, args: server.args ?? [] })),
+      runtimeGeneration: managedCodexMcpAdmissionGeneration,
+      configGeneration: 1,
+      priority,
+    });
+    const created: ManagedCodexMcpAdmissionOwner = {
+      key,
+      startedAt: acceptedAt,
+      runtimeGeneration: managedCodexMcpAdmissionGeneration,
+      configGeneration: 1,
+      serverIds: local.map(server => server.id).sort(),
+      demand,
+      lease: null,
+      state: 'queued',
+    };
+    owner = created;
+    managedCodexMcpAdmissionOwner = created;
+    void demand.ready.then(lease => {
+      if (managedCodexMcpAdmissionOwner !== created) {
+        if (lease) void settleMcpStartupLease(lease, 'released');
+        return;
+      }
+      if (!lease) {
+        created.state = 'unmanaged';
+        return;
+      }
+      created.lease = lease;
+      created.state = 'granted';
+    });
+  }
+  if (owner.state === 'granted' || owner.state === 'settled' || owner.state === 'unmanaged') {
+    return { includeLocal: true, owner };
+  }
+  const remainingMs = owner.startedAt + MCP_PREWARM_GRACE_MS - Date.now();
+  if (remainingMs > 0) {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      owner.demand.ready,
+      new Promise<void>(resolve => {
+        timeout = setTimeout(resolve, remainingMs);
+        timeout.unref?.();
+      }),
+    ]);
+    if (timeout) clearTimeout(timeout);
+  }
+  const current = managedCodexMcpAdmissionOwner;
+  return {
+    includeLocal: current === owner
+      && (current.state === 'granted' || current.state === 'settled' || current.state === 'unmanaged'),
+    owner,
+  };
+}
 type CodexDynamicToolCallResult = {
   success: boolean;
   contentItems: Array<
@@ -267,7 +373,7 @@ export interface CodexMcpStartupResult {
  */
 export function createCodexMcpStartupBarrier(expectedNames: readonly string[]): {
   observe(notification: CodexMcpStartupStatusNotification): void;
-  arm(): void;
+  arm(startedAt?: number): void;
   fail(error: Error): void;
   wait(): Promise<CodexMcpStartupResult>;
 } {
@@ -320,9 +426,9 @@ export function createCodexMcpStartupBarrier(expectedNames: readonly string[]): 
         resolveComplete();
       }
     },
-    arm() {
+    arm(startedAtOverride) {
       if (startedAt !== null) return;
-      startedAt = Date.now();
+      startedAt = startedAtOverride ?? Date.now();
       deadlineAt = startedAt + MCP_PREWARM_GRACE_MS;
     },
     fail(error) {
@@ -3403,14 +3509,87 @@ export class CodexRuntime implements AgentRuntime {
       ? options.managedCodexExtensions
       : undefined;
     if (extensionSnapshot) {
-      assertManagedCodexExtensionProtocolVersion(context.version);
+      assertManagedCodexRuntimeConformanceVersion(context.version);
     }
     const extensionMaterialization = materializeManagedCodexExtensions(extensionSnapshot);
+    let runtimeMcpServers = extensionSnapshot?.mcpServers ?? options.mcpServers;
+    const usesManagedBrowserHost = runtimeSource === 'managed-provider'
+      && runtimeMcpServers?.some(
+        server => server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__',
+      ) === true;
+    // One absolute dispatch budget starts when this Runtime generation accepts
+    // its desired MCP set. Capability projection, admission queueing, process
+    // initialization and native status observation all consume this same 10s.
+    const mcpDispatchAcceptedAt = runtimeSource === 'managed-provider'
+      && (runtimeMcpServers?.length ?? 0) > 0
+      ? Date.now()
+      : undefined;
+    let browserHostGeneration: number | undefined;
+    let browserCapabilityToken: string | undefined;
+    let browserCapabilityInitiallyUnavailable = false;
+    if (usesManagedBrowserHost) {
+      try {
+        // Browser ownership is Product-Session scoped. Codex's native thread
+        // id is a runtime execution identity and must never be projected into
+        // this domain. For a desktop Sidecar that is still keyed by pending-*,
+        // external-session has already minted the future Product Session id in
+        // options.sessionId, so project that owner before issuing the token.
+        await adoptBrowserProductSession(options.sessionId);
+        const capability = await acquireBrowserCapability();
+        browserHostGeneration = capability.hostGeneration;
+        browserCapabilityToken = capability.token;
+        runtimeMcpServers = (runtimeMcpServers ?? []).map(server => (
+          server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__'
+            ? {
+                ...server,
+                type: 'http' as const,
+                command: undefined,
+                args: undefined,
+                url: capability.url,
+                headers: { Authorization: `Bearer ${capability.token}` },
+              }
+            : server
+        ));
+        console.log(
+          `[codex] MCP ${MANAGED_BROWSER_MCP_ID}: application Browser Host generation=${capability.hostGeneration}`,
+        );
+      } catch (error) {
+        browserCapabilityInitiallyUnavailable = true;
+        runtimeMcpServers = (runtimeMcpServers ?? []).filter(
+          server => !(server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__'),
+        );
+        console.warn(
+          '[codex] Browser Host is temporarily unavailable; starting the base Runtime:',
+          summarizeCodexErrorForLog(error),
+        );
+      }
+    }
+    const desiredRuntimeMcpServers = runtimeMcpServers ?? [];
+    if (runtimeSource !== 'managed-provider') releaseManagedCodexMcpAdmission();
+    const mcpAdmission = runtimeSource === 'managed-provider'
+      ? await prepareManagedCodexMcpAdmission(
+          desiredRuntimeMcpServers,
+          options.initialTurn && options.scenario.type === 'desktop' ? 'interactive' : 'background',
+          mcpDispatchAcceptedAt ?? Date.now(),
+        )
+      : { includeLocal: true, owner: null };
+    const admissionQueuedServerNames = new Set(
+      mcpAdmission.includeLocal ? [] : (mcpAdmission.owner?.serverIds ?? []),
+    );
+    if (!mcpAdmission.includeLocal) {
+      runtimeMcpServers = desiredRuntimeMcpServers.filter(
+        server => !(server.type === 'stdio' && server.command),
+      );
+      console.log(
+        `[codex] MCP startup admission queued generation=${mcpAdmission.owner?.runtimeGeneration ?? 0}`
+          + ` servers=${admissionQueuedServerNames.size}`,
+      );
+    }
     const launchConfig = buildCodexAppServerLaunchConfig({
       commandPath: context.commandPath,
       runtimeSource,
       codexEnv,
-      mcpServers: extensionSnapshot?.mcpServers ?? options.mcpServers,
+      mcpServers: runtimeMcpServers,
       extensionConfigArgs: extensionMaterialization.configArgs,
     });
     const mcpStartup = createCodexMcpStartupBarrier(launchConfig.mcpServerNames);
@@ -3443,11 +3622,16 @@ export class CodexRuntime implements AgentRuntime {
       throw error;
     }
 
+    let browserRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
     const codexProc = new CodexProcess(proc);
     codexProc.extensionSnapshot = extensionSnapshot
       ? { ...extensionSnapshot, skills: extensionMaterialization.skills }
       : null;
-    codexProc.cleanupExtensionResources = extensionMaterialization.cleanup;
+    codexProc.cleanupExtensionResources = () => {
+      if (browserRecoveryTimer) clearTimeout(browserRecoveryTimer);
+      browserRecoveryTimer = null;
+      extensionMaterialization.cleanup();
+    };
     codexProc.sessionId = options.sessionId;
     codexProc.workspacePath = options.workspacePath;
     codexProc.scenario = options.scenario;
@@ -3468,13 +3652,124 @@ export class CodexRuntime implements AgentRuntime {
       withLogContext({ runtime: 'codex', runtimeSource }, () => onEvent(event));
     };
     codexProc.rootEventHandler = wrappedOnEvent;
+    if (admissionQueuedServerNames.size > 0 && mcpAdmission.owner) {
+      const queuedOwner = mcpAdmission.owner;
+      void queuedOwner.demand.ready.then(() => {
+        if (
+          managedCodexMcpAdmissionOwner === queuedOwner
+          && (queuedOwner.state === 'granted' || queuedOwner.state === 'unmanaged')
+          && !codexProc.exited
+        ) {
+          wrappedOnEvent({ kind: 'mcp_startup_admission_ready' });
+        }
+      });
+    }
 
+    const effectiveMcpServerNames = [...new Set([
+      ...launchConfig.mcpServerNames,
+      ...admissionQueuedServerNames,
+      ...(usesManagedBrowserHost ? [MANAGED_BROWSER_MCP_ID] : []),
+    ])].sort();
     const readyMcpServerNames = new Set<string>();
+    const liveMcpStates = new Map<string, CodexMcpStartupState>(
+      effectiveMcpServerNames.map(name => [name, 'starting']),
+    );
+    const observedMcpToolCounts = new Map<string, number>();
+    const authBlockedMcpServerNames = new Set<string>();
     let lastMcpToolCatalog: string[] = [];
+    let lastNativeMcpToolCatalog: string[] = [];
     const extensionToolCatalog = extensionSnapshot?.dynamicTools.map(tool => tool.name) ?? [];
     let mcpCatalogRevision = 0;
+    let mcpDispatch: import('../../shared/mcpEffectiveState').McpEffectiveSnapshot['dispatch'] = {
+      state: browserCapabilityInitiallyUnavailable
+        ? 'released'
+        : admissionQueuedServerNames.size > 0
+        ? 'released'
+        : launchConfig.mcpServerNames.length > 0 ? 'waiting' : 'settled',
+      ...(browserCapabilityInitiallyUnavailable
+        ? { releaseReason: 'status_read_failed' as const }
+        : admissionQueuedServerNames.size > 0
+        ? { releaseReason: 'timeout' as const }
+        : launchConfig.mcpServerNames.length === 0 ? { releaseReason: 'ready' as const } : {}),
+    };
     let mcpCatalogRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+    let browserHostRecovery: Promise<void> | null = null;
+    let browserRecoveryAttempt = 0;
+    const scheduleInitialBrowserHostRecovery = (): void => {
+      if (!browserCapabilityInitiallyUnavailable || codexProc.exited || browserRecoveryTimer) return;
+      const delays = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
+      const delay = delays[Math.min(browserRecoveryAttempt, delays.length - 1)];
+      browserRecoveryAttempt += 1;
+      browserRecoveryTimer = setTimeout(() => {
+        browserRecoveryTimer = null;
+        if (codexProc.exited) return;
+        void adoptBrowserProductSession(options.sessionId)
+          .then(() => acquireBrowserCapability())
+          .then(capability => {
+            if (codexProc.exited) return;
+            browserHostGeneration = capability.hostGeneration;
+            browserCapabilityToken = capability.token;
+            browserCapabilityInitiallyUnavailable = false;
+            wrappedOnEvent({
+              kind: 'mcp_runtime_replacement_required',
+              serverId: MANAGED_BROWSER_MCP_ID,
+            });
+          })
+          .catch(() => scheduleInitialBrowserHostRecovery());
+      }, delay);
+      browserRecoveryTimer.unref?.();
+    };
+    const settleManagedAdmissionIfTerminal = (): void => {
+      const owner = mcpAdmission.owner;
+      if (!mcpAdmission.includeLocal || !owner?.lease || owner.state !== 'granted') return;
+      if (!owner.serverIds.every(name => {
+        const state = liveMcpStates.get(name);
+        return state === 'ready' || state === 'failed';
+      })) return;
+      const ready = owner.serverIds.every(name => liveMcpStates.get(name) === 'ready');
+      const lease = owner.lease;
+      owner.lease = null;
+      owner.state = 'settled';
+      void settleMcpStartupLease(lease, ready ? 'ready' : 'failed');
+    };
+    const publishMcpEffective = (observationStale = false): void => {
+      const now = Date.now();
+      wrappedOnEvent({
+        kind: 'mcp_effective_update',
+        configGeneration: 1,
+        configFingerprint: extensionSnapshot?.revision
+          ?? effectiveMcpServerNames.join('|'),
+        catalogGeneration: mcpCatalogRevision,
+        ...(browserHostGeneration !== undefined ? { browserHostGeneration } : {}),
+        dispatch: mcpDispatch,
+        servers: effectiveMcpServerNames.map(name => {
+          const liveState = liveMcpStates.get(name) ?? 'starting';
+          const catalogObserved = observedMcpToolCounts.has(name);
+          const state = admissionQueuedServerNames.has(name)
+            ? 'queued' as const
+            : authBlockedMcpServerNames.has(name)
+              ? 'needs_auth' as const
+            : liveState === 'ready'
+            ? (catalogObserved ? 'ready' as const : 'starting' as const)
+            : liveState === 'failed'
+              ? 'failed' as const
+              : 'starting' as const;
+          return {
+            id: name,
+            desired: true,
+            state,
+            toolCount: state === 'ready' ? (observedMcpToolCounts.get(name) ?? 0) : 0,
+            ...(state === 'failed' ? { errorCode: 'MCP_STARTUP_FAILED' } : {}),
+            attemptGeneration: 1,
+            updatedAt: now,
+          };
+        }),
+        tools: [...lastNativeMcpToolCatalog],
+        ...(observationStale ? { observationStale: true } : {}),
+      });
+    };
     const publishMcpToolCatalog = (tools: string[]): void => {
+      lastNativeMcpToolCatalog = [...new Set(tools)].sort();
       const combinedTools = [...new Set([...tools, ...extensionToolCatalog])].sort();
       if (
         combinedTools.length === lastMcpToolCatalog.length
@@ -3484,7 +3779,18 @@ export class CodexRuntime implements AgentRuntime {
       wrappedOnEvent({ kind: 'runtime_tool_catalog', tools: combinedTools });
     };
     const emitMcpToolCatalog = (servers: readonly CodexMcpServerStatus[]): void => {
+      observedMcpToolCounts.clear();
+      authBlockedMcpServerNames.clear();
+      for (const server of servers) {
+        if (isCodexMcpAuthUnavailable(server.authStatus)) {
+          authBlockedMcpServerNames.add(server.name);
+          continue;
+        }
+        if (!readyMcpServerNames.has(server.name)) continue;
+        observedMcpToolCounts.set(server.name, Object.keys(server.tools ?? {}).length);
+      }
       publishMcpToolCatalog(buildCodexMcpToolCatalog(servers, readyMcpServerNames));
+      publishMcpEffective();
     };
     const scheduleMcpToolCatalogRefresh = (): void => {
       if (!codexProc.threadId || codexProc.exited || mcpCatalogRefreshTimer) return;
@@ -3501,9 +3807,11 @@ export class CodexRuntime implements AgentRuntime {
           })
           .catch((err) => {
             console.warn('[codex] MCP tool catalog refresh failed:', summarizeCodexErrorForLog(err));
+            publishMcpEffective(true);
           });
       }, 100);
     };
+    publishMcpEffective();
 
     // Wire up notification handler to emit UnifiedEvents
     codexProc.rpc.setNotificationHandler((method, params) => {
@@ -3514,14 +3822,50 @@ export class CodexRuntime implements AgentRuntime {
           || status.threadId === codexProc.threadId;
         if (belongsToActiveThread) {
           mcpStartup.observe(status);
+          liveMcpStates.set(status.name, status.status);
           if (status.status === 'ready') {
             readyMcpServerNames.add(status.name);
           } else {
             readyMcpServerNames.delete(status.name);
+            observedMcpToolCounts.delete(status.name);
+            authBlockedMcpServerNames.delete(status.name);
             const prefix = `mcp__${status.name}__`;
-            publishMcpToolCatalog(lastMcpToolCatalog.filter(tool => !tool.startsWith(prefix)));
+            publishMcpToolCatalog(lastNativeMcpToolCatalog.filter(tool => !tool.startsWith(prefix)));
+          }
+          if (
+            usesManagedBrowserHost
+            && status.name === MANAGED_BROWSER_MCP_ID
+            && status.status === 'failed'
+            && !browserHostRecovery
+          ) {
+            browserHostRecovery = acquireBrowserCapability()
+              .then(capability => {
+                if (
+                  (capability.hostGeneration === browserHostGeneration
+                    && capability.token === browserCapabilityToken)
+                  || codexProc.exited
+                ) return;
+                console.warn(
+                  `[codex] Browser Host transport credential changed generation=${browserHostGeneration ?? 0}->${capability.hostGeneration}; restarting MCP transport`,
+                );
+                wrappedOnEvent({
+                  kind: 'mcp_runtime_replacement_required',
+                  serverId: MANAGED_BROWSER_MCP_ID,
+                });
+              })
+              .catch(error => {
+                console.warn(
+                  '[codex] Browser Host recovery deferred:',
+                  summarizeCodexErrorForLog(error),
+                );
+              })
+              .finally(() => {
+                browserHostRecovery = null;
+              });
           }
           mcpCatalogRevision += 1;
+          settleManagedAdmissionIfTerminal();
+          publishMcpEffective();
           scheduleMcpToolCatalogRefresh();
         }
       }
@@ -3593,6 +3937,14 @@ export class CodexRuntime implements AgentRuntime {
         mcpCatalogRefreshTimer = null;
       }
       mcpStartup.fail(new Error(`Codex process exited during MCP startup with code ${code}`));
+      for (const name of launchConfig.mcpServerNames) liveMcpStates.set(name, 'failed');
+      readyMcpServerNames.clear();
+      observedMcpToolCounts.clear();
+      authBlockedMcpServerNames.clear();
+      lastNativeMcpToolCatalog = [];
+      mcpCatalogRevision += 1;
+      settleManagedAdmissionIfTerminal();
+      publishMcpEffective();
       if (codexProc.intentionalKillDuringStartup) return;
       const heldEvents = this.takeHeldMainTurnForProcessExit(codexProc);
       if (heldEvents) {
@@ -3681,7 +4033,8 @@ export class CodexRuntime implements AgentRuntime {
       // 3. Start or resume thread. The MCP window begins at this native
       // startup boundary, not at process spawn/initialize.
       if (launchConfig.mcpServerNames.length > 0) {
-        mcpStartup.arm();
+        mcpStartup.arm(mcpAdmission.owner?.startedAt ?? mcpDispatchAcceptedAt);
+        publishMcpEffective();
       }
       if (options.resumeSessionId) {
         // Resume existing thread
@@ -3739,17 +4092,23 @@ export class CodexRuntime implements AgentRuntime {
         scheduleMcpToolCatalogRefresh();
       }
 
-      // Managed Codex owns one soft MCP startup window for this runtime
-      // session. Native startup_timeout_sec uses the same policy budget, so
-      // turn/start cannot inherit Codex's longer default hidden wait.
+      // MyAgents owns a 10s dispatch grace; Codex's native attempt remains
+      // alive under its independent 60s bound so a late-ready server can be
+      // observed and used without replaying this turn.
       if (launchConfig.mcpServerNames.length > 0) {
         const startup = await mcpStartup.wait();
+        if (admissionQueuedServerNames.size === 0) {
+          mcpDispatch = startup.outcome === 'ready'
+            ? { state: 'settled', releaseReason: 'ready' }
+            : { state: 'released', releaseReason: startup.reason ?? 'timeout' };
+        }
+        publishMcpEffective();
         const serverStates = launchConfig.mcpServerNames.map(name => (
           `${name}:${startup.states[name] ?? 'pending'}`
         ));
         console.log(
-          `[codex] managed MCP pre-warm terminal outcome=${startup.outcome}`
-          + `${startup.reason ? ` reason=${startup.reason}` : ''}`
+          `[codex] MCP dispatch outcome=${startup.outcome}`
+          + `${startup.reason ? ` releaseReason=${startup.reason}` : ''}`
           + ` elapsedMs=${startup.elapsedMs} budgetMs=${MCP_PREWARM_GRACE_MS}`
           + ` servers=[${serverStates.join(',')}]`,
         );
@@ -3811,6 +4170,7 @@ export class CodexRuntime implements AgentRuntime {
           console.warn('[codex] collectDiagnostics failed:', summarizeCodexErrorForLog(err));
         }
       })();
+      scheduleInitialBrowserHostRecovery();
     } catch (err) {
       // Clean up on startup failure.
       if (mcpCatalogRefreshTimer) {

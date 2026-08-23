@@ -28,7 +28,14 @@ type StopGoalTurnHook = Arc<
 >;
 
 #[cfg(test)]
-type ReleaseGoalOwnerHook = Arc<dyn Fn(&SessionGoal) -> Result<bool, String> + Send + Sync>;
+type ReleaseGoalOwnerHook = Arc<
+    dyn Fn(
+            &SessionGoal,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone)]
 pub struct SessionGoalManager {
@@ -1389,7 +1396,7 @@ impl SessionGoalManager {
     pub(super) async fn release_goal_owner(&self, goal: &SessionGoal) -> Result<bool, String> {
         #[cfg(test)]
         if let Some(hook) = self.release_goal_owner_hook.read().await.clone() {
-            return hook(goal);
+            return hook(goal).await;
         }
         let Some(app_handle) = self.app_handle.read().await.clone() else {
             return Err(
@@ -1403,7 +1410,8 @@ impl SessionGoalManager {
             sidecars.inner(),
             &goal.session_id,
             &SidecarOwner::Goal(goal.id.clone()),
-        )?;
+        )
+        .await?;
         ulog_info!(
             "[Goal] Released owner {} from Session {} (sidecar_stopped={})",
             goal.id,
@@ -1927,11 +1935,10 @@ mod tests {
 
         let sidecars_for_release = sidecars.clone();
         *manager.release_goal_owner_hook.write().await = Some(Arc::new(move |goal| {
-            release_session_sidecar(
-                &sidecars_for_release,
-                &goal.session_id,
-                &SidecarOwner::Goal(goal.id.clone()),
-            )
+            let sidecars = sidecars_for_release.clone();
+            let session_id = goal.session_id.clone();
+            let owner = SidecarOwner::Goal(goal.id.clone());
+            Box::pin(async move { release_session_sidecar(&sidecars, &session_id, &owner).await })
         }));
         let settled = manager.abort_turn(&goal.id, "queue-2").await.unwrap();
         assert!(settled.current_turn.is_none());
@@ -1985,11 +1992,10 @@ mod tests {
                 entered_for_hook.wait();
                 allow_for_hook.wait();
             }
-            release_session_sidecar(
-                &sidecars_for_release,
-                &goal.session_id,
-                &SidecarOwner::Goal(goal.id.clone()),
-            )
+            let sidecars = sidecars_for_release.clone();
+            let session_id = goal.session_id.clone();
+            let owner = SidecarOwner::Goal(goal.id.clone());
+            Box::pin(async move { release_session_sidecar(&sidecars, &session_id, &owner).await })
         }));
 
         let manager_for_first_abort = manager.clone();
@@ -2063,11 +2069,10 @@ mod tests {
         let (sidecars, generation) = live_test_sidecar("session-1", &goal.id);
         let sidecars_for_release = sidecars.clone();
         *manager.release_goal_owner_hook.write().await = Some(Arc::new(move |goal| {
-            release_session_sidecar(
-                &sidecars_for_release,
-                &goal.session_id,
-                &SidecarOwner::Goal(goal.id.clone()),
-            )
+            let sidecars = sidecars_for_release.clone();
+            let session_id = goal.session_id.clone();
+            let owner = SidecarOwner::Goal(goal.id.clone());
+            Box::pin(async move { release_session_sidecar(&sidecars, &session_id, &owner).await })
         }));
 
         manager
@@ -2141,11 +2146,10 @@ mod tests {
         }));
         let sidecars_for_release = sidecars.clone();
         *manager.release_goal_owner_hook.write().await = Some(Arc::new(move |goal| {
-            release_session_sidecar(
-                &sidecars_for_release,
-                &goal.session_id,
-                &SidecarOwner::Goal(goal.id.clone()),
-            )
+            let sidecars = sidecars_for_release.clone();
+            let session_id = goal.session_id.clone();
+            let owner = SidecarOwner::Goal(goal.id.clone());
+            Box::pin(async move { release_session_sidecar(&sidecars, &session_id, &owner).await })
         }));
 
         manager
@@ -2257,7 +2261,8 @@ mod tests {
     async fn pause_keeps_exact_turn_authority_until_stop_settlement() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionGoalManager::with_storage_path(dir.path().join("goals.json"));
-        *manager.release_goal_owner_hook.write().await = Some(Arc::new(|_| Ok(false)));
+        *manager.release_goal_owner_hook.write().await =
+            Some(Arc::new(|_| Box::pin(async { Ok(false) })));
         let goal = manager
             .create_goal(config("session-1", "work"))
             .await
@@ -2352,7 +2357,8 @@ mod tests {
     async fn user_cancel_keeps_exact_turn_authority_until_stop_settlement() {
         let dir = tempfile::tempdir().unwrap();
         let manager = SessionGoalManager::with_storage_path(dir.path().join("goals.json"));
-        *manager.release_goal_owner_hook.write().await = Some(Arc::new(|_| Ok(false)));
+        *manager.release_goal_owner_hook.write().await =
+            Some(Arc::new(|_| Box::pin(async { Ok(false) })));
         let goal = manager
             .create_goal(config("session-1", "work"))
             .await

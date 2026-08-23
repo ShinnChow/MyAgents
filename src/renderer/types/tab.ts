@@ -5,6 +5,8 @@ import type { PermissionMode } from '@/config/types';
 import type { CronSchedule, CronEndConditions, CronDelivery, ScheduledTaskKind } from '@/types/cronTask';
 import type { RuntimeBackedProviderIdentity } from '../../shared/providerExecution';
 import type { OfficialToolId } from '../../shared/official-tools';
+import type { ProductSystemSkillRequirement } from '../../shared/systemSkills';
+import type { SessionOrigin } from '../../shared/session-origin';
 
 /** Cron settings drafted in the launcher input. Sent forward via
  *  `InitialMessage.cron` and consumed by Chat's `autoSend` to switch from
@@ -78,6 +80,8 @@ export interface InitialMessage {
      *  launcher 的 agent-config 写盘是异步的，handoff 不能赌它赢过 sidecar 启动
      *  自解析；与 builtinSelection/runtimeModel 同理。 */
     reasoningEffort?: string;
+    /** App-owned first-turn workflow admission; never persisted to history. */
+    requiredSystemSkill?: ProductSystemSkillRequirement;
     /** Optional cron task configuration drafted in launcher (PRD 0.2.7). */
     cron?: InitialMessageCron;
 }
@@ -88,7 +92,8 @@ export interface InitialMessage {
  * persistence has refreshed App.configRef.
  */
 export interface LaunchSessionBirthHint {
-    permissionMode?: PermissionMode | string;
+    /** Product-facing permission; App converts it to runtime vocabulary at birth. */
+    permissionMode?: PermissionMode;
     mcpEnabledServers?: string[];
     enabledPluginIds?: string[];
     enabledOfficialToolIds?: OfficialToolId[];
@@ -96,6 +101,8 @@ export interface LaunchSessionBirthHint {
     runtimeModel?: string;
     providerExecutionIdentity?: RuntimeBackedProviderIdentity;
     reasoningEffort?: string;
+    /** Explicit metadata origin when a non-Launcher surface delegates birth to App. */
+    origin?: SessionOrigin;
 }
 
 /**

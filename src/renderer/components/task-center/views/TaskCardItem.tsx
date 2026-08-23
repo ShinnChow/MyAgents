@@ -3,13 +3,12 @@
 // v0.1.69 visual rebuild (driven by the mock in
 // prd_0.1.69_task_center_visual_feedback.md v2):
 //
-//   Row 1  — [Category chip left]                       [Status chip + hover actions right]
+//   Row 1  — [Category chip left]                                [hover actions right]
 //   Row 2  — [Title, 14px medium, clamp-2]
 //   Row 3  — [📁 workspace · mode-aware meta · time/rounds]
-// Left vertical stripe was removed — the status chip on the right + the
-// category chip on the left already carry the "state" and "kind" axes;
-// a third indicator in the form of a color stripe would triple-count
-// the same signal. Legacy-cron identity collapses into the category
+// Lifecycle status is expressed by the section that owns the card and remains
+// fully visible in Task Detail. Repeating it on every card weakened the title
+// scan. Legacy-cron identity collapses into the category
 // chip as "目标模式 · 遗留" / "周期 · 遗留" etc., so the grid no longer
 // needs a separate "遗留" pill — see <TaskCategoryBadge legacy />.
 
@@ -22,7 +21,6 @@ import type { Task, TaskExecutionMode, TaskRunStats } from '@/../shared/types/ta
 import { CUSTOM_EVENTS } from '@/../shared/constants';
 import { humanizeCron, relativeTime } from '@/utils/taskCenterUtils';
 import { TaskCategoryBadge } from '../TaskCategoryBadge';
-import { TaskStatusBadge } from '../TaskStatusBadge';
 import { TaskTriggerBadge } from '../TaskTriggerBadge';
 import { TaskItemActions, deriveTaskRowStatus } from './TaskItemActions';
 import type { LegacyCronRow } from './types';
@@ -78,10 +76,18 @@ export function TaskCardItem(props: TaskCardItemProps) {
   }, [shouldFetchStats, task?.id]);
 
   return (
-    <button
-      type="button"
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onOpen}
-      className={`group relative flex w-full flex-col gap-2.5 rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 text-left transition-shadow hover:shadow-sm ${
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onOpen();
+        }
+      }}
+      className={`group relative flex w-full cursor-pointer flex-col gap-2.5 rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 text-left transition-shadow hover:shadow-sm ${
         highlighted ? 'ring-1 ring-[var(--accent-warm)] shadow-xs' : ''
       }`}
     >
@@ -93,9 +99,8 @@ export function TaskCardItem(props: TaskCardItemProps) {
       <div className="flex w-full items-center gap-1.5">
         <div className="flex items-center gap-1.5">
           {task?.trigger?.detector.type === 'command' && <TaskTriggerBadge />}
-          <TaskStatusBadge status={status} executionState={task?.executionState} />
+          <TaskCategoryBadge mode={category} legacy={isLegacy} />
         </div>
-        <TaskCategoryBadge mode={category} legacy={isLegacy} />
         <div className="ml-auto flex shrink-0 items-center gap-1">
           <ViewSessionButton task={task} />
           <TaskItemActions
@@ -135,7 +140,7 @@ export function TaskCardItem(props: TaskCardItemProps) {
         locale={locale}
         t={t}
       />
-    </button>
+    </div>
   );
 }
 
@@ -301,7 +306,7 @@ export function ViewSessionButton({ task }: { task?: Task }) {
     );
   };
   return (
-    <div className="group/view-session relative opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+    <div className="group/view-session relative opacity-0 transition-opacity group-hover:opacity-100 group-focus:opacity-100 focus-within:opacity-100">
       <button
         type="button"
         onClick={handleClick}

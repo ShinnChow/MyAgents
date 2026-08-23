@@ -1,16 +1,16 @@
 // TaskCenter — single-instance tab combining Thought stream (left) and Task list (right).
 // PRD §5 / §6.
 
-import { useCallback, useState } from 'react';
+import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ThoughtPanel } from '@/components/task-center/ThoughtPanel';
 import { TaskListPanel } from '@/components/task-center/TaskListPanel';
-import { DispatchTaskDialog } from '@/components/task-center/DispatchTaskDialog';
 import { taskCenterAvailable } from '@/api/taskCenter';
 import { track } from '@/analytics';
 import { CUSTOM_EVENTS } from '@/../shared/constants';
 import type { Thought } from '@/../shared/types/thought';
-import type { Task } from '@/../shared/types/task';
+import type { TaskCreateRequest } from '@/../shared/taskDiscussion';
+import type { PendingAppRoute } from '@/../shared/appRoute';
 
 interface Props {
   isActive?: boolean;
@@ -22,12 +22,18 @@ interface Props {
    *  forces the consumer's effect to re-fire when the same intent is sent
    *  back-to-back (e.g. user clicking the Launcher search icon twice). */
   pendingIntent?: { autofocusSearch?: boolean; nonce: number } | null;
+  pendingRoute?: PendingAppRoute | null;
+  onRouteConsumed?: (generation: number) => void;
 }
 
-export default function TaskCenter({ isActive, pendingIntent, currentSessionId }: Props) {
+export default function TaskCenter({
+  isActive,
+  pendingIntent,
+  currentSessionId,
+  pendingRoute,
+  onRouteConsumed,
+}: Props) {
   const { t } = useTranslation('task');
-  const [dispatching, setDispatching] = useState<Thought | null>(null);
-  const [refreshKey, setRefreshKey] = useState(0);
 
   // Child panels react to `isActive` transitions on their own (via refreshKey
   // derived from it below). We do NOT setState in an effect here — the lint
@@ -39,8 +45,14 @@ export default function TaskCenter({ isActive, pendingIntent, currentSessionId }
   // `isActive` straight through accomplishes that without a derived counter.
 
   const handleDispatch = useCallback((t: Thought) => {
-    setDispatching(t);
-  }, []);
+    const request: TaskCreateRequest = {
+      initialMode: 'manual',
+      source: 'thought',
+      currentSessionId: currentSessionId ?? null,
+      thought: { id: t.id, content: t.content, tags: t.tags },
+    };
+    window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_TASK_CREATE, { detail: request }));
+  }, [currentSessionId]);
 
   const handleDiscuss = useCallback((t: Thought, workspaceId: string) => {
     track('task_align_discuss', {});
@@ -59,15 +71,14 @@ export default function TaskCenter({ isActive, pendingIntent, currentSessionId }
     );
   }, []);
 
-  const handleDispatched = useCallback((task: Task) => {
-    track('task_create', {
-      source: 'desktop',
-      origin: 'thought_dispatch',
-      has_workspace: !!task.workspacePath,
-    });
-    setDispatching(null);
-    setRefreshKey((k) => k + 1);
-  }, []);
+  const handleCreateTask = useCallback(() => {
+    const request: TaskCreateRequest = {
+      initialMode: 'smart',
+      source: 'task-center',
+      currentSessionId: currentSessionId ?? null,
+    };
+    window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_TASK_CREATE, { detail: request }));
+  }, [currentSessionId]);
 
   // The DispatchTaskDialog returns the full Task, but for Phase 4 we only need
   // to know "something changed" to re-fetch both panels. Future Phase 5 hook:
@@ -115,7 +126,7 @@ export default function TaskCenter({ isActive, pendingIntent, currentSessionId }
           <ThoughtPanel
             onDispatchThought={handleDispatch}
             onDiscussThought={handleDiscuss}
-            refreshKey={`${refreshKey}:${isActive ? '1' : '0'}`}
+            refreshKey={isActive ? '1' : '0'}
             // Suppress thought-input autofocus when the user arrived via
             // the Launcher 「我的任务」 search icon — in that flow the
             // caret belongs in the TaskListPanel search field, not the
@@ -136,21 +147,15 @@ export default function TaskCenter({ isActive, pendingIntent, currentSessionId }
         {/* Right: Task list */}
         <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
           <TaskListPanel
-            refreshKey={`${refreshKey}:${isActive ? '1' : '0'}`}
+            refreshKey={isActive ? '1' : '0'}
             pendingIntent={pendingIntent ?? null}
-            currentSessionId={currentSessionId ?? null}
+            pendingRoute={pendingRoute ?? null}
+            onRouteConsumed={onRouteConsumed}
+            onCreateTask={handleCreateTask}
           />
         </div>
       </div>
 
-      {dispatching && (
-        <DispatchTaskDialog
-          thought={dispatching}
-          currentSessionId={currentSessionId ?? null}
-          onClose={() => setDispatching(null)}
-          onDispatched={handleDispatched}
-        />
-      )}
     </div>
   );
 }

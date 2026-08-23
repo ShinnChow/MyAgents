@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,33 +29,23 @@ struct BlockedExecutable {
 #[derive(Debug)]
 struct RuntimeLaunchCircuit {
     probe_interval: Duration,
-    current_identity: Option<String>,
     next_epoch: u64,
-    blocked: Option<BlockedExecutable>,
+    blocked: HashMap<String, BlockedExecutable>,
 }
 
 impl RuntimeLaunchCircuit {
     fn new(probe_interval: Duration) -> Self {
         Self {
             probe_interval,
-            current_identity: None,
             next_epoch: 1,
-            blocked: None,
+            blocked: HashMap::new(),
         }
     }
 
     fn admit(&mut self, identity: &str, now: Instant) -> LaunchAdmission {
-        // An app update/reinstall changes the path metadata hash. Do not let a
-        // failure or late settlement from the previous executable poison the
-        // replacement.
-        if self.current_identity.as_deref() != Some(identity) {
-            self.current_identity = Some(identity.to_owned());
-            self.blocked = None;
-        }
-
         let admission_epoch = self.next_epoch;
         self.next_epoch = self.next_epoch.saturating_add(1);
-        let Some(blocked) = self.blocked.as_mut() else {
+        let Some(blocked) = self.blocked.get_mut(identity) else {
             return admitted(admission_epoch);
         };
 
@@ -87,16 +78,12 @@ impl RuntimeLaunchCircuit {
         error_code: Option<&str>,
         now: Instant,
     ) {
-        // A settlement from the executable replaced by an update is stale.
-        if self.current_identity.as_deref() != Some(identity) {
-            return;
-        }
         // Once a newer failure epoch exists, an older success/failure cannot
         // clear or replace it. This is the circuit equivalent of the Session
         // generation fence used elsewhere in the app.
         if self
             .blocked
-            .as_ref()
+            .get(identity)
             .is_some_and(|blocked| blocked.failure_epoch > admission_epoch)
         {
             return;
@@ -104,14 +91,17 @@ impl RuntimeLaunchCircuit {
 
         match outcome {
             LaunchOutcome::Ready => {
-                self.blocked = None;
+                self.blocked.remove(identity);
             }
             LaunchOutcome::SpawnDenied => {
-                self.blocked = Some(BlockedExecutable {
-                    error_code: error_code.unwrap_or("EPERM").to_owned(),
-                    next_probe_at: now + self.probe_interval,
-                    failure_epoch: admission_epoch,
-                });
+                self.blocked.insert(
+                    identity.to_owned(),
+                    BlockedExecutable {
+                        error_code: error_code.unwrap_or("EPERM").to_owned(),
+                        next_probe_at: now + self.probe_interval,
+                        failure_epoch: admission_epoch,
+                    },
+                );
             }
             LaunchOutcome::Released => {}
         }

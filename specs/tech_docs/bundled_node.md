@@ -127,6 +127,10 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 - 通过 `process_cmd::new()` spawn（Windows 自动 `CREATE_NO_WINDOW`）
 - 环境变量通过 `proxy_config::apply_to_subprocess` 注入 `NO_PROXY` 保护 localhost
 
+标准 `playwright` preset 继续走这条通用 stdio 路径：锁定 package spec，但保留上游 argv 与浏览器资源语义；仅在用户从未保存 args 时默认追加 `--isolated`。它与新增的 `myagents-browser` /「浏览器」不是同一个工具。
+
+「浏览器」使用 App 生产依赖中锁定的 `@playwright/mcp` 控制代码，并把保留 sentinel 投影为 Global Sidecar Browser Host 的认证 HTTP transport。它不调用 `npx`，也不从 bundled Node、系统 Chrome 或用户 Playwright cache 寻找浏览器。Rust resource owner 只在用户首次明确安装后，按 App 内锁定的官方 Playwright artifact URL、size 与 SHA-256 下载并解析精确 Chromium executable path；Chromium 资源不属于 bundled Node，也不进入 Tauri resources。
+
 ### 内置 in-process MCP（懒加载）
 
 当前 user-toggleable `gemini-image` / `edge-tts` 通过 `src/server/tools/builtin-mcp-meta.ts` 的 META 登记 + `createXxxServer()` 工厂懒加载，**不在** Sidecar 冷启动时创建；历史 `cron-tools` / `im-cron` / `im-media` 已迁移到 `myagents` CLI。runtime-dynamic `im-bridge-tools` 由独立的 context-injected surface owner 懒初始化，不进入 META registry。见 `pit_of_success.md §Builtin MCP 懒加载架构`。
@@ -140,7 +144,9 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 3. **Plugin Bridge 打包**：esbuild bundle `src/server/plugin-bridge/index.ts` → `plugin-bridge-dist.mjs`
 4. **CLI 打包**：esbuild bundle `src/cli/myagents.ts` → `resources/cli/myagents.cjs`；扩展名固定 CommonJS 语义，不受安装目录上层 `package.json` 影响
 5. **SDK native binary**：按 target triple 拷贝 + codesign
-6. **Tauri 构建**：`npm run tauri:build -- --target <triple>`
+6. **Tauri 构建**：`npm run tauri:build -- --target <triple>`；该命令不下载、不 staging 也不打包 Chromium/Headless Shell/FFmpeg
+
+「浏览器」不建立 MyAgents 自有的 Chromium 镜像或 runtime publisher。版本升级时，维护者显式核对锁定 `playwright-core` 的 Chromium descriptor，为五个平台更新 `managed-browser-runtime.json` 中的官方 source/final URL、size、SHA-256 与 executable layout；该核对不属于 `tauri:dev`、`tauri:build` 或桌面 release build，任何 App 构建入口都不下载浏览器。
 
 `src-tauri/resources/` 是当前构建的 staging，不是跨构建缓存。构建脚本必须在
 Tauri 读取前完整替换自己负责的目录：macOS release 在每个 target loop 内分别
