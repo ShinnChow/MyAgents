@@ -226,7 +226,7 @@ Node.js SSE Server (`src/server/sse.ts`) 管理客户端连接、heartbeat、广
 
 Cloud 通知同样不归 Tab，但有独立的进程级 Owner：`space_cloud::notifications` 随 Tauri App 启动，通过一个 optional-auth Cloud feed 投影公开公告与当前账号的 Space Issue 评论；Renderer 只消费 normalized snapshot。通知 receipt 统一写入应用全局 `~/.myagents/notification-state.json`：本地 Task receipt 不跟随 Space 环境，Cloud 公告与 pending read 则先按规范化 base URL 的 hash、再按账号 hash 隔离；私有标题、评论摘要、actor、target 和 URL 永不落盘。登录、登出与 401 是同步清空私有内存的 identity boundary；1 / 5 分钟前后台节奏、wake、退避、分页、baseline 与 toast 去重都由同一个 sync gate/loop 裁决，不由 Window、Tab 或 Space 页面另建 interval。
 
-通知 target 进入 shared typed `AppRoute`，当前唯一 wire 为 `myagents://open/v1/spaces/:spaceId/issues/:issueId`。OS deep link 先在 Rust 严格解析并进入 latest-wins queue，App Shell 再创建/聚焦唯一 Space Tab 并下发 generation intent；Space 页面通过既有 store 切换 Space、进入 Issues、打开准确详情。应用导航 scheme 与 WebView 二进制资源 scheme 分离：新资源只生成 `myagents-resource://`（Windows 为对应 localhost projection），旧 `myagents://attachment` 只在历史内容读取边界兼容，不能进入 AppRoute。
+通知 target 进入 shared typed `AppRoute`，当前 wire 包括 `myagents://open/v1/spaces/:spaceId/issues/:issueId` 与 `myagents://open/v1/tasks/:taskId/comments/:commentId`。OS deep link 先在 Rust 严格解析并进入 latest-wins queue，App Shell 再按 route 类型创建或聚焦唯一目标 Tab 并下发 generation intent：`space.issue` 进入 Space Tab 的准确 Issue 详情，`task.comment` 进入 Task Center 的准确 Task 与评论。应用导航 scheme 与 WebView 二进制资源 scheme 分离：新资源只生成 `myagents-resource://`（Windows 为对应 localhost projection），旧 `myagents://attachment` 只在历史内容读取边界兼容，不能进入 AppRoute。
 
 ### HTTP API 调用
 
@@ -264,7 +264,7 @@ Global control request
 | 前缀 | 职责 | 调用方 |
 |------|------|--------|
 | `/api/cron/*` | Scheduled Task 兼容 CRUD + 调度控制 | CLI、`im-cron-tool.ts` |
-| `/api/task/*`（20 条） | Task Center 任务 CRUD、run/run-now/rerun、Trigger validate/test/check-now/reset-checkpoint 与 doc 读写 | CLI、`admin-api.ts` |
+| `/api/task/*` | Task Center 任务 CRUD、run/run-now/rerun、Trigger validate/test/check-now/reset-checkpoint 与 doc 读写 | CLI、`admin-api.ts` |
 | `/api/document/*`（4 条） | App-owned 本地文档 conversion job submit/status/cancel/list | `admin-api.ts` 的 AnyDoc 薄转发 |
 | `/api/mcp/remove-references` | Task 中删除 custom MCP identity 的持久引用 | `admin-api.ts` MCP remove cascade |
 | `/api/app/config-changed` | 将 disk-first AppConfig 失效信号广播到所有 WebView（空 payload，不携带 secret） | `admin-api.ts` model / MCP mutation |
@@ -372,7 +372,7 @@ Tab 内 MUST 用 `useTabState()` 的 `apiGet` / `apiPost`，禁止全局 `apiPos
 
 `GlobalSidebar` 挂在 `App` 的 Tab Workspace 之外，是应用级导航和资源投影，不是新的页面容器或 Session owner。顶部 Tab 仍是所有主内容页面的唯一 authority：active、关闭、恢复、拖拽、Sidecar owner token 与 pending-session birth 都继续由现有 Tab 状态机管理。
 
-App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Thought 只提交创建/讨论意图，不各自挂第二个 modal；`task.detail` / `task.comment` route 都由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
+App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Thought 只提交创建/讨论意图，不各自挂第二个 modal；普通 Task 详情选择属于 Task Center 内部状态，`task.comment` typed route 则由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
 
 - 桌面主窗口的 renderable surface 投影由 App Shell 拥有：`useTrayEvents` 在 focus、resize、document visibility 与主动 hide 边界采样 Tauri `isVisible() && !isMinimized()`，零尺寸 resize 可先行判为 unavailable；Rust-owned 的全局快捷键 hide/show 通过 `tray::hide_main_window` / `tray::show_main_window` 在现有 Tauri event channel 同步投影同一个 surface edge，避免 WebView suspend 让异步 renderer 采样吞掉完整 hidden interval。`App` 只在 available→unavailable 时推进 presentation generation，并只把该投影交给 active Chat。focus 值仅服务通知/input attention，不拥有 Chat 滚动、窗口可见性或 geometry；仍在展示的窗口即使失焦也持续把 live 消息交给 Virtuoso，失焦/重新聚焦本身不得产生 scroll command。
 - MessageList 外层 viewport 的非零 `ResizeObserver` 结果是当前 presentation generation 的 renderer readiness authority。internal inactive Tab、native minimized/hidden surface 或尚未 ready 的恢复 generation 都冻结 Virtuoso 的 data/index/height input；消息/SSE 与 TabProvider/Sidecar 生命周期继续推进。`useChatScrollController` 是唯一 continuity owner：viewport admission 从 true→false 时保存 follow 或最近可信 message anchor，从 false→true 时只执行一个受 Session/transaction identity 保护的恢复意图；未挂载 anchor 通过 Virtuoso `itemsRendered` 事件结算，禁止 focus snapshot、固定延时、RAF 猜测或把可见的 `align:start` 当最终位置。完整不变量见 [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md)。
@@ -646,7 +646,7 @@ Managed Codex 子 Agent 的原生 child turn lifecycle 只由 `codex.ts` 在既�
 | 目标 Tab 存在但 Sidecar 不活跃 | 复用该 Tab，由 Rust lifecycle revive 目标 Sidecar |
 | 目标 Session 尚无 Tab | 新建从首帧即绑定目标 Session 的 Tab，再 ensure 目标 Sidecar |
 
-**导航 owner**：Global Sidebar、Search Overlay、通知 / Task deep-link 与开发者模式 Chat History 都必须进入 `App.handleOpenTargetSession()`，由 `planSessionOpen()` 只决定 open / jump；目标 Tab 的 live create / reuse 统一进入 App 的 existing-Session materialization，并由 `reconcileExistingSessionTabOwner()` 取得 exact Tab owner。顶部“恢复上次对话”是同一能力的批量入口：候选先按既有恢复校验过滤，再一次提交最终 live Chat Tabs 与 active correlation；所有 surviving Tab 从首帧挂载正常 `TabProvider`，并各自独立进入同一个 materialization / reconcile，单目标失败只回收该 Tab。这里“正常 `TabProvider`”只承诺 Session identity、SSE、history lifecycle 与 exact owner 立即成立，不要求一次同步提交挂载全部重型 `Chat` 子树：批量恢复先绘制 provider-owned `ChatBootOverlay`，随后只 reveal active Chat；未访问的 inactive Chat 在首次选中并完成轻量帧后 reveal，已 reveal 的 Chat 继续保持挂载。不得恢复一排尚无 owner、依赖首次切换才打开的 placeholder Tab，也不得复制 Sidecar owner、port 或 workspace 状态。Chat 与 `TabProvider` 不得自行把当前真实 Session A hot-swap 为 B；历史恢复也不得修改 Node runtime binding。旧 `POST /sessions/switch` 与 `SessionEngine.switchToExistingSession` 已删除。新对话、pending→real、desktop reset 与已确认 surface migration 继续走各自既有 identity handover，不属于历史导航。
+**导航 owner**：Global Sidebar、Search Overlay、Session-targeting 通知 / Task execution 链接与开发者模式 Chat History 都必须进入 `App.handleOpenTargetSession()`，由 `planSessionOpen()` 只决定 open / jump；`space.issue`、`task.comment` 等 feature AppRoute 则由 `App.handleOpenAppRoute()` 分发到对应页面，不创建或恢复 Session。目标 Session Tab 的 live create / reuse 统一进入 App 的 existing-Session materialization，并由 `reconcileExistingSessionTabOwner()` 取得 exact Tab owner。顶部“恢复上次对话”是同一能力的批量入口：候选先按既有恢复校验过滤，再一次提交最终 live Chat Tabs 与 active correlation；所有 surviving Tab 从首帧挂载正常 `TabProvider`，并各自独立进入同一个 materialization / reconcile，单目标失败只回收该 Tab。这里“正常 `TabProvider`”只承诺 Session identity、SSE、history lifecycle 与 exact owner 立即成立，不要求一次同步提交挂载全部重型 `Chat` 子树：批量恢复先绘制 provider-owned `ChatBootOverlay`，随后只 reveal active Chat；未访问的 inactive Chat 在首次选中并完成轻量帧后 reveal，已 reveal 的 Chat 继续保持挂载。不得恢复一排尚无 owner、依赖首次切换才打开的 placeholder Tab，也不得复制 Sidecar owner、port 或 workspace 状态。Chat 与 `TabProvider` 不得自行把当前真实 Session A hot-swap 为 B；历史恢复也不得修改 Node runtime binding。旧 `POST /sessions/switch` 与 `SessionEngine.switchToExistingSession` 已删除。新对话、pending→real、desktop reset 与已确认 surface migration 继续走各自既有 identity handover，不属于历史导航。
 
 **Sidecar owner**：目标 Tab 的 Session identity 在 mount 前已经确定；App 的 `reconcileExistingSessionTabOwner()` 串起 exact Tab owner 的 ensure 与废弃请求清理。Rust manager 在同一把锁内确认当前 generation 仍包含该 Tab owner，并释放临时 `BackgroundCompletion` 交接 owner；并发 Task owner 不受影响。pending→real adoption 按 Tab 串行，Rust 只接受 exact Tab owner 的 source 或已迁移 target。配置 push / adopt 只服从锁内返回的 `result.isNew`。
 

@@ -620,7 +620,7 @@ sendExternalMessage(text, images?, permissionMode?, model?, context?)
 
 ### 打开历史 Session
 
-桌面 History 不再执行 Runtime 内的 real→real hot-swap。Global Sidebar、Search、通知 / Task deep-link 与开发者 Chat History 都进入 App 的 canonical new / jump / revive 导航：目标已在 Tab 中就跳转，Tab 存在但 Sidecar 已停就复用该 Tab 并由 Rust revive，否则新建从首帧即绑定目标 Session 的 Tab。`codex/system-cli` 与 `codex/managed-provider` 等完整 runtime identity 由目标 Session 自己的 Sidecar 冻结，不需要在当前 Tab 上做兼容性比较。
+桌面 History 不再执行 Runtime 内的 real→real hot-swap。Global Sidebar、Search、Session-targeting 通知 / Task execution 链接与开发者 Chat History 都进入 App 的 canonical new / jump / revive 导航：目标已在 Tab 中就跳转，Tab 存在但 Sidecar 已停就复用该 Tab 并由 Rust revive，否则新建从首帧即绑定目标 Session 的 Tab。`task.comment`、`space.issue` 等 typed AppRoute 由 App Shell 打开对应功能页面，不属于 Runtime Session 导航。`codex/system-cli` 与 `codex/managed-provider` 等完整 runtime identity 由目标 Session 自己的 Sidecar 冻结，不需要在当前 Tab 上做兼容性比较。
 
 因此 Renderer 的 persisted restore 只读 `GET /sessions/:id`，不会调用 Node binding mutation；`POST /sessions/switch` 与 `SessionEngine.switchToExistingSession()` 已删除。普通 `cmd_upgrade_session_id(old,new)` 只服务 exact Tab 的 pending→real / desktop reset，不能扩展为 History navigation。桌面绑定 surface 的 real→real 迁移走独立 proof-bearing contract：Rust 先证明 exact `Tab + Agent`，再把同一个 target ID 交给 `SessionEngine.migrateBoundSurfaceSession()`；Builtin 与 External adapter 都不得自行 mint 第二个 ID。IM `/new` 不进入 Runtime facade，只在 Rust 轮换 Agent binding。External adapter 在 target binding 提交后把 metadata publication / pre-warm 失败降为 warning，避免把已提交身份误报为可回滚失败。
 
