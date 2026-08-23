@@ -278,7 +278,7 @@ let _adminApi: Promise<AdminApiModule> | null = null;
 const getAdminApi = (): Promise<AdminApiModule> => (_adminApi ??= import('./admin-api'));
 import { setImMediaContext } from './tools/im-media-tool';
 import { ensureImBridgeToolSurface } from './tools/im-bridge-tools';
-import { normalizeHostInteractionCapability } from './host-interaction';
+import { normalizeHostInteractionCapability, resolveImGroupToolsDeny } from './host-interaction';
 import { getBuiltinMcpInstance } from './tools/builtin-mcp-registry';
 // NOTE: builtin MCP META is auto-registered when agent-session.ts side-effect-imports
 // './tools/builtin-mcp-meta'. No duplicate import needed here.
@@ -7685,13 +7685,7 @@ async function main() {
             finalMessage = `[引用回复]\n> ${payload.replyToBody.split('\n').join('\n> ')}\n\n${finalMessage}`;
           }
 
-          const DEFAULT_GROUP_TOOLS_DENY = ['Bash', 'Edit', 'Write'];
-          if (payload.sourceType === 'group') {
-            const denyList = payload.groupToolsDeny !== undefined ? payload.groupToolsDeny : DEFAULT_GROUP_TOOLS_DENY;
-            setGroupToolsDeny(denyList);
-          } else {
-            setGroupToolsDeny([]);
-          }
+          setGroupToolsDeny(resolveImGroupToolsDeny(payload.sourceType, payload.groupToolsDeny));
 
           const metadata = {
             source: payload.source as SessionSource,

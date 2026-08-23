@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   getChannelInteractionDisallowedTools,
   isBridgeAskUserQuestionTool,
+  resolveImGroupToolsDeny,
   shouldDisallowAskUserQuestion,
   shouldHardDenyChannelInteractionTool,
   shouldUseNonBypassForNativeAskUserQuestion,
@@ -11,6 +12,15 @@ import {
 import type { InteractionScenario } from './system-prompt';
 
 describe('host interaction policy', () => {
+  it('defaults group tool deny to empty while preserving explicit overrides', () => {
+    expect(resolveImGroupToolsDeny('group', undefined)).toEqual([]);
+    expect(resolveImGroupToolsDeny('group', [])).toEqual([]);
+    expect(resolveImGroupToolsDeny('group', ['CustomDangerousTool'])).toEqual([
+      'CustomDangerousTool',
+    ]);
+    expect(resolveImGroupToolsDeny('private', ['CustomDangerousTool'])).toEqual([]);
+  });
+
   it('defaults channel sessions to disabling AskUserQuestion', () => {
     const scenario: InteractionScenario = { type: 'im', platform: 'telegram', sourceType: 'private' };
 

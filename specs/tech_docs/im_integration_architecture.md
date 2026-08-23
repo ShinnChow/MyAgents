@@ -682,7 +682,7 @@ Rust 构建 `GroupStreamContext` 后，Sidecar `/api/im/enqueue` 端点组装最
 
 #### 群工具禁用
 
-群聊默认禁用危险工具：`['Bash', 'Edit', 'Write']`。可通过 `groupToolsDeny` 配置覆盖（空数组 = 全部允许）。
+群聊的 `groupToolsDeny` 默认为空数组，即不额外隐藏 Runtime 工具。用户仍可通过非空列表为特定 Channel 增加群聊专属的工具禁用项；这不会替代群审批、Channel 权限模式、MCP 开关或工具自身的安全约束。
 
 #### ImMessage 群聊相关字段
 
@@ -1196,7 +1196,7 @@ Agent Channel 是无人值守入口。没有 `ChannelOverrides.permissionMode` �
 - Codex → `no-restrictions`
 - Gemini → `yolo`
 
-`AgentConfig.permissionMode` 仍然是桌面/Agent 默认对话权限；它不能静默降低 IM Channel。用户显式配置 Channel permission override 时才按 override 执行。群聊的 `groupToolsDeny` 是独立安全层，默认仍可额外禁止 `Bash` / `Edit` / `Write`。
+`AgentConfig.permissionMode` 仍然是桌面/Agent 默认对话权限；它不能静默降低 IM Channel。用户显式配置 Channel permission override 时才按 override 执行。群聊的 `groupToolsDeny` 是独立的可选禁用层，默认值为空；只有用户显式配置非空列表时才额外隐藏对应工具。
 
 ### Mino 模板与 Agent 默认能力
 
