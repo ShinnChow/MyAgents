@@ -1,6 +1,6 @@
 # MyAgents Design Guide
 
-> **Version**: 2.8.62
+> **Version**: 2.8.63
 > **Last Updated**: 2026-08-23
 > **Status**: Active
 > **Platform**: macOS / Windows Desktop Client
@@ -256,6 +256,8 @@ meta（v2.5——11px 中文在 Windows 低分屏雅黑下偏虚，且 11/12/13 
 **\*立档例外与禁令边界**：
 - 聊天输入框 textarea（SimpleChatInput）行高为 26px 整数常量（≈1.625）——自适应高度
   计算依赖整数像素，不随 prose 档 1.7 配对行高，属字号同档、行高立档例外。
+- Task Center 左栏是高密度想法流：compact 输入正文、卡片阅读态与编辑态统一使用
+  `text-sm` 14px / `leading-relaxed`；Launcher 想法输入仍与聊天输入保持 `text-base` 16px / 26px 行高。
 - eslint 只封禁 **px 字面量**；rem/em 相对值（Theme brand title `2.5/3.5rem`、行内代码 `0.9em`）
   与 `style={{fontSize}}` API 配置项（Monaco/xterm/语法高亮等）不在射程内——新增此类
   用法需对照本表自证档位。
@@ -1442,6 +1444,7 @@ Task Center 的列表与卡片只保留执行类型 tag，生命周期状态由�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.63 | 2026-08-23 | **Task Center 想法正文降档**：左栏 compact 输入与想法卡片查看/编辑正文由 16px prose 档收至 14px UI 档，Launcher 想法输入继续与聊天输入保持 16px |
 | 2.8.62 | 2026-08-23 | **Task 编辑与创建对齐**：编辑 sheet 移除简短描述和标签，把可持久化的 Agent 工作区选择放在高级配置之前；立即执行/定时一次隐藏并清理周期专属会话与触发状态 |
 | 2.8.61 | 2026-08-23 | **Task route 与创建表单收口**：active Task Center 重复通知仍投送新 route generation；引用改为轻量满行省略，执行记录使用整行 disclosure；手动创建移除独立验收，仅周期任务显示会话与触发策略 |
 | 2.8.60 | 2026-08-22 | **Task 列表层级收口**：列表/卡片移除重复状态 tag；按进行中、待恢复、已完成、规划中分组；列表完成项按 10 条渐进展开，搜索不截断；会话入口在 hover/focus 时复用日期槽；详情状态使用更清晰的实色底 |

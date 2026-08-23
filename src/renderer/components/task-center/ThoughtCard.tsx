@@ -71,7 +71,7 @@ interface Props {
 }
 
 const VIEW_CLAMP_LINES = 5;
-const EDIT_MAX_HEIGHT_PX = 224; // ~8.75 行 @ text-base 16px × leading-[1.6] = 25.6px/行
+const EDIT_MAX_HEIGHT_PX = 200; // ~8.8 行 @ text-sm 14px × leading-relaxed 1.625 ≈ 22.75px/行
 
 export function ThoughtCard({
   thought,
@@ -469,12 +469,12 @@ export function ThoughtCard({
             maxHeight: `${EDIT_MAX_HEIGHT_PX}px`,
             overflowY: 'auto',
           }}
-          className="w-full resize-none rounded-[var(--radius-sm)] bg-transparent text-base leading-[1.6] text-[var(--ink)] focus:outline-none"
+          className="w-full resize-none rounded-[var(--radius-sm)] bg-transparent text-sm leading-relaxed text-[var(--ink)] focus:outline-none"
         />
       ) : (
         <div
           ref={viewRef}
-          className="cursor-text whitespace-pre-wrap break-words text-base leading-[1.6] text-[var(--ink-secondary)]"
+          className="cursor-text whitespace-pre-wrap break-words text-sm leading-relaxed text-[var(--ink-secondary)]"
           style={
             expanded
               ? undefined
