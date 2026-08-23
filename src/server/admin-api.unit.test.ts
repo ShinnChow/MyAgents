@@ -1711,6 +1711,7 @@ describe('admin-api task runtime model identity', () => {
     const payload = {
       id: 'task-clear-provider-switch',
       runtime: 'codex',
+      runtimeConfig: { source: 'managed-provider' },
       clearProviderOverride: true,
     };
 
