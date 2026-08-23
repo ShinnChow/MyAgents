@@ -45,6 +45,7 @@ export function TaskListRow(props: TaskListRowProps) {
     ? task.executionMode
     : inferLegacyCategory(legacy);
   const hasSession = !!task?.sessionIds.length;
+  const isRunning = task?.status === 'running' || legacy?.status === 'running';
 
   return (
     <div
@@ -68,9 +69,21 @@ export function TaskListRow(props: TaskListRowProps) {
         {task?.trigger?.detector.type === 'command' && <TaskTriggerBadge compact />}
         <TaskCategoryBadge mode={category} legacy={isLegacy} compact />
       </div>
-      <span className="min-w-0 flex-1 truncate text-sm text-[var(--ink)]">
-        {name}
-      </span>
+      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+        <span className="min-w-0 truncate text-sm text-[var(--ink)]">
+          {name}
+        </span>
+        {isRunning && (
+          <span
+            className="relative flex h-1.5 w-1.5 shrink-0"
+            data-task-running-indicator
+            aria-hidden="true"
+          >
+            <span className="absolute inset-0 rounded-full bg-[var(--success)]" />
+            <span className="absolute inset-0 animate-[tab-dot-pulse_1.6s_cubic-bezier(.22,.61,.36,1)_infinite] rounded-full bg-[var(--success)] motion-reduce:animate-none" />
+          </span>
+        )}
+      </div>
       {workspace && (
         <span className="hidden max-w-[110px] shrink-0 truncate text-xs text-[var(--ink-muted)] sm:block">
           {workspace}

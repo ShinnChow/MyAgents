@@ -40,6 +40,7 @@ describe('Task list presentation', () => {
 
     expect(screen.queryByText('进行中')).not.toBeInTheDocument();
     expect(screen.getByText('周期')).toBeInTheDocument();
+    expect(container.querySelector('[data-task-running-indicator]')).not.toBeNull();
 
     const sessionButton = screen.getByRole('button', { name: '查看会话详情' });
     expect(sessionButton.parentElement).toHaveClass(
@@ -65,5 +66,16 @@ describe('Task list presentation', () => {
     fireEvent.keyDown(row!, { key: 'Enter' });
     fireEvent.keyDown(row!, { key: ' ' });
     expect(onOpen).toHaveBeenCalledTimes(2);
+  });
+
+  it('only shows the breathing indicator for a running task', () => {
+    const { container } = render(
+      <TaskListRow
+        task={task({ status: 'stopped' })}
+        onOpen={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector('[data-task-running-indicator]')).toBeNull();
   });
 });
