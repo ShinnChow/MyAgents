@@ -2,7 +2,7 @@
   "name": "myagents",
   "description": "MyAgents - Desktop Claude Code for everyone. AI-powered productivity, not just for developers.",
   "type": "module",
-  "version": "0.4.10",
+  "version": "0.4.11",
   "license": "AGPL-3.0-only",
   "packageManager": "npm@11.13.0",
   "engines": {
@@ -45,7 +45,7 @@
     "lint:deps": "depcruise --config .dependency-cruiser.cjs src",
     "test": "npm run test:classification && npm run test:build-scripts && npm run test:unit && npm run test:dom && npm run test:integration",
     "test:classification": "node scripts/check-test-classification.mjs",
-    "test:build-scripts": "node --test scripts/browser-runtime-packaging.test.mjs scripts/build-resource-staging.test.mjs scripts/cli-bundle-contract.test.mjs scripts/document-processing-build-tools.test.mjs scripts/document-processing-resource-cache.test.mjs",
+    "test:build-scripts": "node --test scripts/browser-runtime-packaging.test.mjs scripts/build-resource-staging.test.mjs scripts/cli-bundle-contract.test.mjs scripts/document-processing-build-tools.test.mjs scripts/document-processing-resource-cache.test.mjs scripts/server-bundle-browser-host.test.mjs",
     "test:unit": "vitest run --project unit",
     "test:dom": "vitest run --project dom",
     "test:integration": "vitest run --project integration",

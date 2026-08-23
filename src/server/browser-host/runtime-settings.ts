@@ -1,7 +1,7 @@
 import { existsSync, realpathSync } from "fs";
 import { basename, dirname, isAbsolute, relative, resolve } from "path";
 
-import { createConnection } from "@playwright/mcp";
+import type { createConnection } from "@playwright/mcp";
 import type { BrowserContextOptions, LaunchOptions } from "playwright";
 
 export type PlaywrightConnectionConfig = NonNullable<

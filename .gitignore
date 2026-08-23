@@ -66,6 +66,7 @@ src-tauri/resources/document-processing/*
 !src-tauri/resources/document-processing/.gitkeep
 src-tauri/resources/document-processing-cache/
 src-tauri/resources/tsx-runtime
+src-tauri/resources/playwright-control
 src-tauri/resources/nodejs/*
 !src-tauri/resources/nodejs/.gitkeep
 src-tauri/resources/nodejs-cache/
