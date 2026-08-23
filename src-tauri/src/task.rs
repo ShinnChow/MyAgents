@@ -119,10 +119,32 @@ pub enum TaskStatus {
     Deleted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum TaskExecutionTrigger {
     Scheduled,
     Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskLastExecution {
+    pub at: i64,
+    pub trigger: TaskExecutionTrigger,
+    pub success: bool,
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TaskExecutionSettlement {
+    pub success: bool,
+    pub duration_ms: u64,
+    pub session_id: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -541,6 +563,14 @@ pub struct Task {
     pub last_scheduled_at: Option<i64>,
     #[serde(default)]
     pub execution_count: u32,
+    /// Consecutive failed scheduled AI turns. Manual run-now is observational
+    /// and does not change this counter. A successful scheduled turn resets it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub consecutive_execution_failures: u32,
+    /// Authoritative summary used by Task Center. `cron_runs` remains an audit
+    /// projection and must not be stitched back into current Task state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_execution: Option<TaskLastExecution>,
     /// Durable receipt for the most recently admitted command-trigger event.
     /// It closes the cross-file crash window between Task outcome accounting
     /// and clearing the Trigger outbox. Startup may safely settle a matching
@@ -564,6 +594,10 @@ impl Task {
     pub fn effective_trigger(&self) -> TaskTrigger {
         self.trigger.clone().unwrap_or_default()
     }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 pub(crate) fn task_bound_session_ids(task: &Task) -> Vec<String> {
@@ -2421,6 +2455,8 @@ impl TaskStore {
             last_executed_at: None,
             last_scheduled_at: None,
             execution_count: 0,
+            consecutive_execution_failures: 0,
+            last_execution: None,
             last_activation_event_id: None,
             status_history: vec![StatusTransition {
                 from: None,
@@ -2590,6 +2626,8 @@ impl TaskStore {
             last_executed_at: None,
             last_scheduled_at: None,
             execution_count: 0,
+            consecutive_execution_failures: 0,
+            last_execution: None,
             last_activation_event_id: None,
             status_history: vec![StatusTransition {
                 from: None,
@@ -2767,6 +2805,8 @@ impl TaskStore {
             last_executed_at: Some(now),
             last_scheduled_at: None,
             execution_count: 0,
+            consecutive_execution_failures: 0,
+            last_execution: None,
             last_activation_event_id: None,
             status_history: vec![created_transition, attached_transition],
             notification: input.notification,
@@ -3749,31 +3789,39 @@ impl TaskStore {
         Ok(updated)
     }
 
-    /// Commit one completed scheduler attempt to the Task authority. Run
-    /// details remain in the existing JSONL history keyed by the same Task id.
-    pub async fn record_execution_if_status(
+    /// Replace a deleted fixed Session identity while the scheduler holds
+    /// lifecycle guards for both the stale and replacement IDs.
+    pub(crate) async fn rebind_missing_single_session_with_lifecycle_held(
         &self,
         id: &str,
-        trigger: TaskExecutionTrigger,
-        expected_status: TaskStatus,
+        expected_session_id: &str,
+        replacement_session_id: &str,
     ) -> Result<Option<Task>, String> {
         self.ensure_writable()?;
         let mut inner = self.inner.write().await;
-        let existing = inner
-            .get(id)
-            .ok_or_else(|| String::from(TaskOpError::not_found(id)))?
-            .clone();
-        if existing.status != expected_status || existing.deleted {
+        let Some(existing) = inner.get(id).cloned() else {
+            return Err(String::from(TaskOpError::not_found(id)));
+        };
+        if existing.run_mode != Some(TaskRunMode::SingleSession)
+            || existing.preselected_session_id.as_deref() != Some(expected_session_id)
+            || existing.deleted
+        {
             return Ok(None);
         }
+
         let mut updated = existing;
-        let executed_at = now_ms();
-        updated.execution_count = updated.execution_count.saturating_add(1);
-        updated.last_executed_at = Some(executed_at);
-        if trigger == TaskExecutionTrigger::Scheduled {
-            updated.last_scheduled_at = Some(executed_at);
+        updated.preselected_session_id = Some(replacement_session_id.to_string());
+        updated
+            .session_ids
+            .retain(|session_id| session_id != expected_session_id);
+        if updated
+            .session_ids
+            .iter()
+            .all(|session_id| session_id != replacement_session_id)
+        {
+            updated.session_ids.push(replacement_session_id.to_string());
         }
-        updated.updated_at = executed_at;
+        updated.updated_at = now_ms();
 
         let mut next = inner.clone();
         next.insert(updated.id.clone(), updated.clone());
@@ -3782,29 +3830,29 @@ impl TaskStore {
         drop(inner);
 
         emit_task_event(
-            "task:execution-complete",
+            "task:session-rebound",
             serde_json::json!({
                 "taskId": updated.id,
-                "executionCount": updated.execution_count,
-                "lastExecutedAt": updated.last_executed_at,
+                "fromSessionId": expected_session_id,
+                "toSessionId": replacement_session_id,
             }),
         );
         Ok(Some(updated))
     }
 
-    /// Atomically commit an admitted command-trigger turn to the Task row.
+    /// Atomically settle one completed AI turn into the Task authority.
     ///
-    /// The Trigger outbox is a separate crash-durable file. We therefore
-    /// persist the execution count, event receipt, and any terminal Task
-    /// transition together *before* clearing that outbox. If the app exits in
-    /// between, startup recognizes the receipt and settles the matching event
-    /// without dispatching the AI turn again.
-    pub(crate) async fn record_activation_execution_if_status(
+    /// The Task row owns the current outcome summary, counters, consecutive
+    /// scheduled failure count, and any terminal status transition. The
+    /// append-only `cron_runs` file is written afterwards as an audit
+    /// projection and is never read back to reconstruct these facts.
+    pub(crate) async fn settle_execution_if_status(
         &self,
         id: &str,
-        event_id: &str,
+        activation_event_id: Option<&str>,
         trigger: TaskExecutionTrigger,
         expected_status: TaskStatus,
+        settlement: TaskExecutionSettlement,
         terminal: Option<TaskExecutionTerminalTransition>,
     ) -> Result<Option<Task>, String> {
         self.ensure_writable()?;
@@ -3825,27 +3873,43 @@ impl TaskStore {
         if existing.deleted {
             return Ok(None);
         }
-        if existing.last_activation_event_id.as_deref() == Some(event_id) {
+        if activation_event_id.is_some()
+            && existing.last_activation_event_id.as_deref() == activation_event_id
+        {
             return Ok(Some(existing));
         }
         if existing.status != expected_status {
             return Ok(None);
         }
-
         let mut updated = existing;
         let executed_at = now_ms();
         updated.execution_count = updated.execution_count.saturating_add(1);
         updated.last_executed_at = Some(executed_at);
-        updated.last_activation_event_id = Some(event_id.to_string());
         if trigger == TaskExecutionTrigger::Scheduled {
             updated.last_scheduled_at = Some(executed_at);
+            updated.consecutive_execution_failures = if settlement.success {
+                0
+            } else {
+                updated.consecutive_execution_failures.saturating_add(1)
+            };
+        }
+        updated.last_execution = Some(TaskLastExecution {
+            at: executed_at,
+            trigger,
+            success: settlement.success,
+            duration_ms: settlement.duration_ms,
+            session_id: settlement.session_id,
+            error: settlement.error,
+        });
+        if let Some(event_id) = activation_event_id {
+            updated.last_activation_event_id = Some(event_id.to_string());
         }
         let transition = if let Some(terminal) = terminal {
             if !matches!(terminal.status, TaskStatus::Done | TaskStatus::Blocked)
                 || !is_transition_legal(updated.status, terminal.status)
             {
                 return Err(format!(
-                    "invalid activation terminal transition: {} -> {}",
+                    "invalid execution terminal transition: {} -> {}",
                     updated.status.as_str(),
                     terminal.status.as_str()
                 ));
@@ -3879,7 +3943,8 @@ impl TaskStore {
                 "taskId": updated.id,
                 "executionCount": updated.execution_count,
                 "lastExecutedAt": updated.last_executed_at,
-                "activationEventId": event_id,
+                "success": updated.last_execution.as_ref().map(|value| value.success),
+                "activationEventId": activation_event_id,
             }),
         );
         if let Some(transition) = transition.as_ref() {
@@ -5232,8 +5297,8 @@ pub async fn cmd_task_open_docs_dir(
     Ok(())
 }
 
-/// Aggregate runtime telemetry from the Task authority and its run-history
-/// projection. No scheduler state is persisted separately.
+/// Aggregate runtime telemetry from the Task authority. The append-only run
+/// history is an audit projection and is deliberately not consulted here.
 ///
 /// The renderer uses this in the detail overlay's "运行统计" section
 /// without having to stitch three data sources together.
@@ -5274,9 +5339,8 @@ pub async fn cmd_task_get_run_stats(
             .map(|value| value.timestamp_millis()),
     };
 
-    let runs = crate::cron_task::read_cron_runs(&task.id, 1);
-    if let Some(last) = runs.last() {
-        stats.last_success = Some(last.ok);
+    if let Some(last) = task.last_execution.as_ref() {
+        stats.last_success = Some(last.success);
         stats.last_duration_ms = Some(last.duration_ms as i64);
     }
 
@@ -5378,6 +5442,15 @@ mod tests {
             source_thought_id: Some("thought-1".to_string()),
             tags: vec!["MyAgents".to_string()],
             notification: None,
+        }
+    }
+
+    fn successful_settlement() -> TaskExecutionSettlement {
+        TaskExecutionSettlement {
+            success: true,
+            duration_ms: 12,
+            session_id: Some("test-session".to_string()),
+            error: None,
         }
     }
 
@@ -5862,10 +5935,13 @@ mod tests {
         assert_eq!(imported.execution_count, 5);
 
         let current = store
-            .record_execution_if_status(
+            .settle_execution_if_status(
                 &task.id,
+                None,
                 TaskExecutionTrigger::Scheduled,
                 TaskStatus::Stopped,
+                successful_settlement(),
+                None,
             )
             .await
             .unwrap()
@@ -5950,19 +6026,93 @@ mod tests {
         let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
 
         let scheduled = store
-            .record_execution_if_status(&task.id, TaskExecutionTrigger::Scheduled, task.status)
+            .settle_execution_if_status(
+                &task.id,
+                None,
+                TaskExecutionTrigger::Scheduled,
+                task.status,
+                successful_settlement(),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         let manual = store
-            .record_execution_if_status(&task.id, TaskExecutionTrigger::Manual, task.status)
+            .settle_execution_if_status(
+                &task.id,
+                None,
+                TaskExecutionTrigger::Manual,
+                task.status,
+                successful_settlement(),
+                None,
+            )
             .await
             .unwrap()
             .unwrap();
 
         assert_eq!(manual.last_scheduled_at, scheduled.last_scheduled_at);
         assert!(manual.last_executed_at >= scheduled.last_executed_at);
+    }
+
+    #[tokio::test]
+    async fn scheduled_success_resets_consecutive_failures_and_updates_authoritative_summary() {
+        ensure_test_docs_root();
+        let dir = tempdir().unwrap();
+        let ws = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws).unwrap();
+        let store = TaskStore::new(dir.path().join("data"));
+        let task = store.create_direct(sample_direct_input(&ws)).await.unwrap();
+
+        let mut current = task;
+        for attempt in 1..=4 {
+            current = store
+                .settle_execution_if_status(
+                    &current.id,
+                    None,
+                    TaskExecutionTrigger::Scheduled,
+                    current.status,
+                    TaskExecutionSettlement {
+                        success: false,
+                        duration_ms: attempt,
+                        session_id: Some(format!("failed-{attempt}")),
+                        error: Some("temporary failure".to_string()),
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(current.consecutive_execution_failures, 4);
+        assert_eq!(current.execution_count, 4);
+        assert_eq!(current.last_execution.as_ref().unwrap().duration_ms, 4);
+        assert!(!current.last_execution.as_ref().unwrap().success);
+
+        let recovered = store
+            .settle_execution_if_status(
+                &current.id,
+                None,
+                TaskExecutionTrigger::Scheduled,
+                current.status,
+                successful_settlement(),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.consecutive_execution_failures, 0);
+        assert_eq!(recovered.execution_count, 5);
+        assert!(recovered.last_execution.as_ref().unwrap().success);
+        assert_eq!(
+            recovered
+                .last_execution
+                .as_ref()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("test-session")
+        );
     }
 
     #[tokio::test]
@@ -6027,11 +6177,12 @@ mod tests {
             .unwrap();
 
         let committed = store
-            .record_activation_execution_if_status(
+            .settle_execution_if_status(
                 &task.id,
-                "build-319",
+                Some("build-319"),
                 TaskExecutionTrigger::Scheduled,
                 TaskStatus::Running,
+                successful_settlement(),
                 Some(TaskExecutionTerminalTransition {
                     status: TaskStatus::Done,
                     message: "Task execution completed".to_string(),
@@ -6059,11 +6210,12 @@ mod tests {
         // idempotent; startup can now settle only the matching pending event.
         let recovered = TaskStore::new(data_dir);
         let replay = recovered
-            .record_activation_execution_if_status(
+            .settle_execution_if_status(
                 &task.id,
-                "build-319",
+                Some("build-319"),
                 TaskExecutionTrigger::Scheduled,
                 TaskStatus::Running,
+                successful_settlement(),
                 None,
             )
             .await
@@ -6161,7 +6313,14 @@ mod tests {
             .unwrap();
 
         let committed = store
-            .record_execution_if_status(&task.id, TaskExecutionTrigger::Scheduled, TaskStatus::Todo)
+            .settle_execution_if_status(
+                &task.id,
+                None,
+                TaskExecutionTrigger::Scheduled,
+                TaskStatus::Todo,
+                successful_settlement(),
+                None,
+            )
             .await
             .unwrap();
 

@@ -55,7 +55,8 @@ pub(super) async fn execute(
                 sidecars.inner(),
                 &goal.session_id,
                 &SidecarOwner::Goal(goal.id.clone()),
-            );
+            )
+            .await;
         }
         return Err("Goal changed while its Sidecar was starting".to_string());
     }

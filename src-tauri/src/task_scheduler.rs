@@ -10,9 +10,9 @@ use tokio::sync::RwLock;
 use crate::cron_task::CronRunRecord;
 use crate::task::task_protects_session_identity;
 use crate::task::{
-    task_protected_session_ids, Task, TaskExecutionMode, TaskExecutionTerminalTransition,
-    TaskExecutionTrigger, TaskListFilter, TaskStatus, TaskUpdateStatusInput, TransitionActor,
-    TransitionSource,
+    task_protected_session_ids, Task, TaskExecutionMode, TaskExecutionSettlement,
+    TaskExecutionTerminalTransition, TaskExecutionTrigger, TaskListFilter, TaskStatus,
+    TaskUpdateStatusInput, TransitionActor, TransitionSource,
 };
 use crate::task_trigger::{
     DetectorCancellation, DetectorInvocationCause, DetectorRunRequest, PendingTaskActivation,
@@ -585,20 +585,22 @@ impl TaskSchedulerController {
         } else {
             match (&active, app_handle.as_ref(), task.as_ref()) {
                 (Some((queue_id, active_session, _)), Some(handle), Some(task)) => {
-                    crate::task_execution::stop_task_turn(
+                    let stopped = crate::task_execution::stop_task_turn(
                         handle,
                         task,
                         active_session.as_deref(),
                         queue_id,
                     )
-                    .await
-                    .map(|()| {
+                    .await;
+                    if stopped.is_ok() {
                         crate::task_execution::release_task_sessions(
                             handle,
                             task,
                             active_session.as_deref(),
-                        );
-                    })
+                        )
+                        .await;
+                    }
+                    stopped
                 }
                 // Draft/spec Detector tests deliberately have no TaskStore
                 // row, but they are registered in the same exact lifecycle
@@ -607,7 +609,7 @@ impl TaskSchedulerController {
                 (Some(_), None, _) => Err("Task scheduler app handle is unavailable".to_string()),
                 (Some(_), _, None) => Err(format!("task not found while stopping: {task_id}")),
                 (None, Some(handle), Some(task)) => {
-                    crate::task_execution::release_task_sessions(handle, task, None);
+                    crate::task_execution::release_task_sessions(handle, task, None).await;
                     Ok(())
                 }
                 (None, _, _) => Ok(()),
@@ -1429,6 +1431,16 @@ async fn reserve_claimed_execution_session(
             let replacement_session_id = uuid::Uuid::new_v4().to_string();
             let replacement_lifecycle =
                 crate::sidecar::acquire_session_lifecycle(&[&replacement_session_id]).await;
+            store
+                .rebind_missing_single_session_with_lifecycle_held(
+                    &task.id,
+                    &selected_session_id,
+                    &replacement_session_id,
+                )
+                .await?
+                .ok_or_else(|| {
+                    "Task Session binding changed while reserving its replacement".to_string()
+                })?;
             drop(selected_lifecycle);
             (replacement_session_id, replacement_lifecycle, true)
         } else {
@@ -1555,7 +1567,8 @@ async fn execute_task_with_reservation(
     executions: &ActiveExecutions,
     reservation: Option<ReservedExecutionSession>,
     activation: Option<TaskActivationPayload>,
-) -> Result<crate::task_execution::TaskExecutionOutcome, String> {
+) -> Result<crate::task_execution::TaskExecutionOutcome, crate::task_execution::TaskExecutionFailure>
+{
     let Some(reservation) = reservation else {
         return crate::task_execution::execute_managed_task(handle, task, queue_id).await;
     };
@@ -1587,6 +1600,26 @@ async fn execute_task_with_reservation(
     result
 }
 
+/// Apply the post-attempt Session-owner policy without giving cleanup any
+/// authority over Task outcome. Ambiguous termination keeps the exact owner;
+/// a materialized single-session Task keeps it only while still Running.
+async fn release_task_owner_after_attempt(
+    handle: &AppHandle,
+    task: &Task,
+    session_id: Option<&str>,
+    termination_unconfirmed: bool,
+) {
+    if termination_unconfirmed {
+        return;
+    }
+    let session_materialized = session_id.is_some_and(|value| {
+        crate::sidecar::runtime_identity::resolve_session_runtime_identity_full(value).is_some()
+    });
+    if !crate::task_execution::retain_owner_between_runs(task, session_materialized) {
+        crate::task_execution::release_task_sessions(handle, task, session_id).await;
+    }
+}
+
 async fn release_execution(executions: &ActiveExecutions, task_id: &str, queue_id: &str) {
     let mut active = executions.write().await;
     if active
@@ -1612,6 +1645,23 @@ async fn retain_unconfirmed_execution(
         execution.state = TaskExecutionState::StopFailed;
         execution.error = Some(error);
     }
+}
+
+fn execution_authorizes_terminal_settlement(
+    execution: &ActiveTaskExecution,
+    queue_id: &str,
+    termination_unconfirmed: bool,
+) -> bool {
+    execution.queue_id == queue_id
+        && (!execution.canceled
+            || (termination_unconfirmed && execution.state == TaskExecutionState::StopFailed))
+}
+
+fn activation_turn_was_admitted(
+    activation: Option<&PendingTaskActivation>,
+    outcome: Option<&crate::task_execution::TaskExecutionOutcome>,
+) -> bool {
+    activation.is_some() && outcome.is_some_and(|value| value.turn_dispatched)
 }
 
 async fn emit_execution_state_event(
@@ -2615,10 +2665,13 @@ async fn run_one_claimed(
             )
             .await
         }
-        Err(error) => Err(error.clone()),
+        Err(error) => Err(crate::task_execution::TaskExecutionFailure {
+            message: error.clone(),
+            retryable: false,
+        }),
     };
 
-    let (record, outcome) = match execution {
+    let (record, outcome, preflight_failure_retryable) = match execution {
         Ok(outcome) => (
             CronRunRecord {
                 ts: Utc::now().timestamp_millis(),
@@ -2628,16 +2681,18 @@ async fn run_one_claimed(
                 error: outcome.error.clone(),
             },
             Some(outcome),
+            None,
         ),
-        Err(error) => (
+        Err(failure) => (
             CronRunRecord {
                 ts: Utc::now().timestamp_millis(),
                 ok: false,
                 duration_ms: started.elapsed().as_millis() as u64,
                 content: None,
-                error: Some(error.clone()),
+                error: Some(failure.message),
             },
             None,
+            Some(failure.retryable),
         ),
     };
 
@@ -2660,6 +2715,9 @@ async fn run_one_claimed(
         }
     }
 
+    let termination_unconfirmed = outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.termination_unconfirmed);
     if let Some(outcome) = outcome
         .as_ref()
         .filter(|outcome| outcome.termination_unconfirmed)
@@ -2682,73 +2740,46 @@ async fn run_one_claimed(
     // transition all belong to this generation before creating the next one.
     let task_control = acquire_task_control(task_id).await;
     let active = executions.read().await;
-    let authorized = active
+    let authorized = active.get(task_id).is_some_and(|execution| {
+        execution_authorizes_terminal_settlement(execution, queue_id, termination_unconfirmed)
+    });
+    let active_session_id = active
         .get(task_id)
-        .is_some_and(|execution| execution.queue_id == queue_id && !execution.canceled);
+        .and_then(|execution| execution.session_id.clone());
     if !authorized {
         return Ok(RunDisposition::Stop);
     }
-    let activation_execution = activation.is_some();
-    let execution_commit = if let Some(activation) = activation.as_ref() {
-        let Some(outcome) = outcome.as_ref() else {
-            drop(active);
-            let error = record
-                .error
-                .clone()
-                .unwrap_or_else(|| "Task turn failed before Runtime admission".to_string());
-            if trigger == TaskExecutionTrigger::Scheduled {
-                release_execution(executions, task_id, queue_id).await;
-                emit_execution_state_event(executions, app_handle, task_id).await;
-                let _ = block_task_with_control_held(
-                    store,
-                    &task,
-                    format!("Activation Event was not admitted; retry required: {error}"),
-                    &task_control,
-                )
-                .await;
-            }
-            return Err(error);
-        };
-        if !outcome.turn_dispatched {
-            drop(active);
-            let error = outcome
-                .error
-                .clone()
-                .unwrap_or_else(|| "Task turn was rejected before Runtime admission".to_string());
-            if trigger == TaskExecutionTrigger::Scheduled {
-                release_execution(executions, task_id, queue_id).await;
-                emit_execution_state_event(executions, app_handle, task_id).await;
-                let _ = block_task_with_control_held(
-                    store,
-                    &task,
-                    format!("Activation Event was not admitted; retry required: {error}"),
-                    &task_control,
-                )
-                .await;
-            }
-            return Err(error);
-        }
-        let terminal = activation_terminal_transition(
-            &task,
+    // Runtime admission, not Detector activation, consumes the durable
+    // Activation Event. A pre-admission failure still settles the Task attempt
+    // through the shared retry policy, but leaves the outbox entry available
+    // for the next scheduled recovery.
+    let activation_admitted = activation_turn_was_admitted(activation.as_ref(), outcome.as_ref());
+    let terminal = execution_terminal_transition(
+        &task,
+        trigger,
+        activation.as_ref().map(|value| value.invocation_cause),
+        &record,
+        outcome.as_ref(),
+        preflight_failure_retryable,
+    );
+    let execution_commit = store
+        .settle_execution_if_status(
+            task_id,
+            activation
+                .as_ref()
+                .filter(|_| activation_admitted)
+                .map(|value| value.event.id.as_str()),
             trigger,
-            activation.invocation_cause,
-            &record,
-            outcome,
-        );
-        store
-            .record_activation_execution_if_status(
-                task_id,
-                &activation.event.id,
-                trigger,
-                task.status,
-                terminal,
-            )
-            .await
-    } else {
-        store
-            .record_execution_if_status(task_id, trigger, task.status)
-            .await
-    };
+            task.status,
+            TaskExecutionSettlement {
+                success: record.ok,
+                duration_ms: record.duration_ms,
+                session_id: outcome.as_ref().and_then(|value| value.session_id.clone()),
+                error: record.error.clone(),
+            },
+            terminal,
+        )
+        .await;
     let updated = match execution_commit {
         Ok(Some(updated)) => updated,
         Ok(None) => return Ok(RunDisposition::Stop),
@@ -2763,25 +2794,39 @@ async fn run_one_claimed(
                 )
                 .await;
             }
+            if let (Ok(handle), Some(current)) = (handle.as_ref(), store.get(task_id).await) {
+                release_task_owner_after_attempt(
+                    handle,
+                    &current,
+                    outcome
+                        .as_ref()
+                        .and_then(|value| value.session_id.as_deref())
+                        .or(active_session_id.as_deref()),
+                    outcome
+                        .as_ref()
+                        .is_some_and(|value| value.termination_unconfirmed),
+                )
+                .await;
+            }
             return Err(format!("task execution commit failed: {error}"));
         }
     };
     drop(active);
-    if let Some(activation) = activation.as_ref() {
+    if let Some(activation) = activation.as_ref().filter(|_| activation_admitted) {
         if let Err(error) = store
             .settle_pending_activation(task_id, &activation.event.id)
             .await
         {
-            if updated.status == TaskStatus::Running {
-                let _ = block_task_with_control_held(
-                    store,
-                    &updated,
-                    format!("Activation Event settlement failed; retry required: {error}"),
-                    &task_control,
-                )
-                .await;
-            }
-            return Err(format!("Activation Event settlement failed: {error}"));
+            // The Task row already carries the durable event receipt and
+            // authoritative outcome. Startup/next check can retry clearing
+            // the trigger outbox; this projection failure cannot rewrite the
+            // completed Task turn.
+            ulog_warn!(
+                "[task-scheduler] Activation Event outbox settlement deferred task={} event={}: {}",
+                task_id,
+                activation.event.id,
+                error
+            );
         }
     }
     if let Err(error) = crate::cron_task::record_cron_run(task_id, &record).await {
@@ -2815,104 +2860,25 @@ async fn run_one_claimed(
         crate::task_execution::deliver_task_result(handle, &task, outcome).await;
     }
 
-    // A user may stop/delete the Task while the runtime turn is unwinding.
-    // The committed status is authoritative; never let the late outcome
-    // transition that terminal Task again.
-    if updated.status != TaskStatus::Running {
-        // `execute_task()` made its retain/release decision before the atomic
-        // activation receipt commit terminalized the Task, so it observed the
-        // old Running row. Close that time-of-check gap explicitly or a
-        // single-session Task owner can keep the Sidecar alive indefinitely.
-        if let (Ok(handle), Some(outcome)) = (handle.as_ref(), outcome.as_ref()) {
-            crate::task_execution::release_task_sessions(
-                handle,
-                &updated,
-                outcome.session_id.as_deref(),
-            );
-        }
-        return Ok(RunDisposition::Stop);
+    // Task settlement is now authoritative. Session/Browser retirement is a
+    // post-commit lifecycle effect and cannot rewrite the outcome above.
+    if let Ok(handle) = handle.as_ref() {
+        let session_id = outcome
+            .as_ref()
+            .and_then(|value| value.session_id.as_deref())
+            .or(active_session_id.as_deref());
+        let termination_unconfirmed = outcome
+            .as_ref()
+            .is_some_and(|value| value.termination_unconfirmed);
+        release_task_owner_after_attempt(handle, &updated, session_id, termination_unconfirmed)
+            .await;
     }
 
-    if activation_execution {
-        // Command-trigger terminal transitions were committed atomically with
-        // the event receipt above. A recurring non-terminal outcome simply
-        // keeps the scheduler armed.
-        return Ok(RunDisposition::Continue);
+    if updated.status == TaskStatus::Running {
+        Ok(RunDisposition::Continue)
+    } else {
+        Ok(RunDisposition::Stop)
     }
-
-    if trigger == TaskExecutionTrigger::Manual {
-        // Run-now is an observational execution of the existing schedule.
-        // Its AI exit/end-condition result must not terminalize a recurring
-        // Task or change whether the scheduler remains armed.
-        return Ok(RunDisposition::Continue);
-    }
-
-    let provider_failure = record.error.as_deref().is_some_and(|error| {
-        error.starts_with("Provider '")
-            && (error.contains("not found in config") || error.contains("has no API Key"))
-    });
-    if provider_failure || outcome.is_none() {
-        block_task_with_control_held(
-            store,
-            &updated,
-            record
-                .error
-                .clone()
-                .unwrap_or_else(|| "Task execution failed".to_string()),
-            &task_control,
-        )
-        .await?;
-        return Ok(RunDisposition::Stop);
-    }
-
-    let outcome = outcome.expect("checked above");
-    if !outcome.success
-        && matches!(
-            updated.execution_mode,
-            TaskExecutionMode::Once | TaskExecutionMode::Scheduled
-        )
-    {
-        block_task_with_control_held(
-            store,
-            &updated,
-            outcome
-                .error
-                .clone()
-                .unwrap_or_else(|| "Task execution failed".to_string()),
-            &task_control,
-        )
-        .await?;
-        return Ok(RunDisposition::Stop);
-    }
-
-    if let Some(reason) = outcome.ai_exit_reason {
-        finish_task_with_control_held(
-            store,
-            &updated,
-            &reason,
-            TransitionSource::EndCondition,
-            &task_control,
-        )
-        .await?;
-        return Ok(RunDisposition::Stop);
-    }
-    if matches!(
-        updated.execution_mode,
-        TaskExecutionMode::Once | TaskExecutionMode::Scheduled
-    ) || end_condition_reached(&updated)
-    {
-        finish_task_with_control_held(
-            store,
-            &updated,
-            "Task execution completed",
-            TransitionSource::EndCondition,
-            &task_control,
-        )
-        .await?;
-        return Ok(RunDisposition::Stop);
-    }
-
-    Ok(RunDisposition::Continue)
 }
 
 async fn emit_cron_ui_event(
@@ -3021,6 +2987,8 @@ enum DetectorScheduledOutcome {
     Failure { consecutive_failures: u32 },
 }
 
+const RECURRING_FAILURE_BLOCK_THRESHOLD: u32 = 5;
+
 /// Decide only the Task-level effect of a scheduled Detector result that did
 /// not activate AI. Activate enters the durable AI execution path, whose
 /// terminal transition is decided separately below.
@@ -3041,7 +3009,9 @@ fn detector_scheduled_terminal_status(
         }
         DetectorScheduledOutcome::Failure {
             consecutive_failures,
-        } if mode == TaskExecutionMode::Recurring && consecutive_failures >= 3 => {
+        } if mode == TaskExecutionMode::Recurring
+            && consecutive_failures >= RECURRING_FAILURE_BLOCK_THRESHOLD =>
+        {
             Some(TaskStatus::Blocked)
         }
         DetectorScheduledOutcome::QuietOrDeduplicated
@@ -3049,12 +3019,13 @@ fn detector_scheduled_terminal_status(
     }
 }
 
-fn activation_terminal_transition(
+fn execution_terminal_transition(
     task: &Task,
     trigger: TaskExecutionTrigger,
-    invocation_cause: DetectorInvocationCause,
+    invocation_cause: Option<DetectorInvocationCause>,
     record: &CronRunRecord,
-    outcome: &crate::task_execution::TaskExecutionOutcome,
+    outcome: Option<&crate::task_execution::TaskExecutionOutcome>,
+    preflight_failure_retryable: Option<bool>,
 ) -> Option<TaskExecutionTerminalTransition> {
     // Run-now remains observational. Check-now is different: when its
     // Activation Event belongs to a Running Task it is a real AI execution and
@@ -3062,16 +3033,26 @@ fn activation_terminal_transition(
     // Stopped or Blocked Task, check-now remains a one-shot diagnostic and must
     // preserve the user's status choice.
     if trigger == TaskExecutionTrigger::Manual
-        && (invocation_cause != DetectorInvocationCause::CheckNow
+        && (invocation_cause != Some(DetectorInvocationCause::CheckNow)
             || task.status != TaskStatus::Running)
     {
         return None;
     }
-    let provider_failure = record.error.as_deref().is_some_and(|error| {
-        error.starts_with("Provider '")
-            && (error.contains("not found in config") || error.contains("has no API Key"))
-    });
-    if provider_failure {
+    let failure_retryable = outcome
+        .map(|value| value.failure_retryable)
+        .or(preflight_failure_retryable)
+        .unwrap_or(true);
+    let termination_unconfirmed = outcome.is_some_and(|value| value.termination_unconfirmed);
+    if !record.ok
+        && (termination_unconfirmed
+            || !failure_retryable
+            || matches!(
+                task.execution_mode,
+                TaskExecutionMode::Once | TaskExecutionMode::Scheduled
+            )
+            || task.consecutive_execution_failures.saturating_add(1)
+                >= RECURRING_FAILURE_BLOCK_THRESHOLD)
+    {
         return Some(TaskExecutionTerminalTransition {
             status: TaskStatus::Blocked,
             message: record
@@ -3081,22 +3062,10 @@ fn activation_terminal_transition(
             source: TransitionSource::Scheduler,
         });
     }
-    if !outcome.success
-        && matches!(
-            task.execution_mode,
-            TaskExecutionMode::Once | TaskExecutionMode::Scheduled
-        )
-    {
-        return Some(TaskExecutionTerminalTransition {
-            status: TaskStatus::Blocked,
-            message: outcome
-                .error
-                .clone()
-                .unwrap_or_else(|| "Task execution failed".to_string()),
-            source: TransitionSource::Scheduler,
-        });
+    if !record.ok {
+        return None;
     }
-    if let Some(reason) = outcome.ai_exit_reason.as_ref() {
+    if let Some(reason) = outcome.and_then(|value| value.ai_exit_reason.as_ref()) {
         return Some(TaskExecutionTerminalTransition {
             status: TaskStatus::Done,
             message: reason.clone(),
@@ -3801,7 +3770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_now_reservation_returns_the_session_bound_and_persisted_for_this_run() {
+    async fn run_now_reservation_keeps_a_new_session_transient_until_runtime_admission() {
         let task: Task = serde_json::from_value(serde_json::json!({
             "id": "task-run-now",
             "name": "run now",
@@ -3844,7 +3813,8 @@ mod tests {
         );
         assert_eq!(
             persisted.session_ids.last().map(String::as_str),
-            Some(returned_session.session_id.as_str())
+            Some("previous-run"),
+            "new-session relation is persisted only by the Runtime admission callback"
         );
 
         drop(returned_session);
@@ -4163,6 +4133,35 @@ mod tests {
             execution.error.as_deref(),
             Some("runtime process may still be alive")
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_termination_ambiguity_still_authorizes_terminal_settlement() {
+        let executions: ActiveExecutions = Arc::new(RwLock::new(HashMap::new()));
+        let queue_id = claim_execution(&executions, "task-orphan-settlement")
+            .await
+            .unwrap();
+        retain_unconfirmed_execution(
+            &executions,
+            "task-orphan-settlement",
+            &queue_id,
+            "runtime process may still be alive".to_string(),
+        )
+        .await;
+
+        let active = executions.read().await;
+        let execution = active.get("task-orphan-settlement").unwrap();
+        assert!(execution_authorizes_terminal_settlement(
+            execution, &queue_id, true,
+        ));
+        assert!(!execution_authorizes_terminal_settlement(
+            execution,
+            "another-generation",
+            true,
+        ));
+        assert!(!execution_authorizes_terminal_settlement(
+            execution, &queue_id, false,
+        ));
     }
 
     #[test]
@@ -4568,6 +4567,7 @@ mod tests {
             success,
             turn_dispatched: true,
             termination_unconfirmed: false,
+            failure_retryable: true,
             error: (!success).then(|| "AI execution failed".to_string()),
             ai_exit_reason: None,
             output_text: None,
@@ -4615,19 +4615,20 @@ mod tests {
                 detector_scheduled_terminal_status(
                     mode,
                     DetectorScheduledOutcome::Failure {
-                        consecutive_failures: 3,
+                        consecutive_failures: 5,
                     },
                 ),
                 Some(TaskStatus::Blocked),
-                "third Detector program failure matrix for {mode:?}"
+                "fifth Detector program failure matrix for {mode:?}"
             );
 
-            let transition = activation_terminal_transition(
+            let transition = execution_terminal_transition(
                 &matrix_task(mode),
                 TaskExecutionTrigger::Scheduled,
-                DetectorInvocationCause::Scheduled,
+                Some(DetectorInvocationCause::Scheduled),
                 &success_record,
-                &matrix_outcome(true),
+                Some(&matrix_outcome(true)),
+                None,
             );
             assert_eq!(
                 transition.as_ref().map(|value| value.status),
@@ -4640,12 +4641,13 @@ mod tests {
                 error: Some("AI execution failed".to_string()),
                 ..success_record.clone()
             };
-            let transition = activation_terminal_transition(
+            let transition = execution_terminal_transition(
                 &matrix_task(mode),
                 TaskExecutionTrigger::Scheduled,
-                DetectorInvocationCause::Scheduled,
+                Some(DetectorInvocationCause::Scheduled),
                 &ai_failure_record,
-                &matrix_outcome(false),
+                Some(&matrix_outcome(false)),
+                None,
             );
             assert_eq!(
                 transition.as_ref().map(|value| value.status),
@@ -4653,6 +4655,154 @@ mod tests {
                 "activate AI-failure matrix for {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn recurring_ai_failures_block_only_on_fifth_retryable_or_first_permanent_failure() {
+        let record = crate::cron_task::CronRunRecord {
+            ts: 1,
+            ok: false,
+            duration_ms: 1,
+            content: None,
+            error: Some("execution failed".to_string()),
+        };
+        let retryable = matrix_outcome(false);
+        let mut recurring = matrix_task(TaskExecutionMode::Recurring);
+
+        for prior_failures in 0..4 {
+            recurring.consecutive_execution_failures = prior_failures;
+            assert!(execution_terminal_transition(
+                &recurring,
+                TaskExecutionTrigger::Scheduled,
+                None,
+                &record,
+                Some(&retryable),
+                None,
+            )
+            .is_none());
+        }
+
+        recurring.consecutive_execution_failures = 4;
+        assert_eq!(
+            execution_terminal_transition(
+                &recurring,
+                TaskExecutionTrigger::Scheduled,
+                None,
+                &record,
+                Some(&retryable),
+                None,
+            )
+            .map(|transition| transition.status),
+            Some(TaskStatus::Blocked)
+        );
+
+        recurring.consecutive_execution_failures = 0;
+        let mut permanent = matrix_outcome(false);
+        permanent.failure_retryable = false;
+        assert_eq!(
+            execution_terminal_transition(
+                &recurring,
+                TaskExecutionTrigger::Scheduled,
+                None,
+                &record,
+                Some(&permanent),
+                None,
+            )
+            .map(|transition| transition.status),
+            Some(TaskStatus::Blocked)
+        );
+        assert_eq!(
+            execution_terminal_transition(
+                &recurring,
+                TaskExecutionTrigger::Scheduled,
+                None,
+                &record,
+                None,
+                Some(false),
+            )
+            .map(|transition| transition.status),
+            Some(TaskStatus::Blocked),
+            "permanent preflight failures use structured classification"
+        );
+
+        let mut ambiguous = matrix_outcome(false);
+        ambiguous.termination_unconfirmed = true;
+        assert_eq!(
+            execution_terminal_transition(
+                &recurring,
+                TaskExecutionTrigger::Scheduled,
+                None,
+                &record,
+                Some(&ambiguous),
+                None,
+            )
+            .map(|transition| transition.status),
+            Some(TaskStatus::Blocked),
+            "unknown termination blocks immediately and retains exact owner authority"
+        );
+
+        assert!(execution_terminal_transition(
+            &recurring,
+            TaskExecutionTrigger::Manual,
+            None,
+            &record,
+            Some(&permanent),
+            None,
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn recurring_preadmission_activation_failure_uses_retry_policy_without_receipt() {
+        let mut task = matrix_task(TaskExecutionMode::Recurring);
+        task.id = format!("activation-retry-{}", uuid::Uuid::new_v4());
+        let (_dir, store) = store_with_task(&task);
+        let activation = matrix_pending(DetectorInvocationCause::Scheduled);
+        let mut rejected = matrix_outcome(false);
+        rejected.turn_dispatched = false;
+        rejected.error = Some("Runtime admission transport failed".to_string());
+        let record = crate::cron_task::CronRunRecord {
+            ts: 1,
+            ok: false,
+            duration_ms: 1,
+            content: None,
+            error: rejected.error.clone(),
+        };
+
+        assert!(!activation_turn_was_admitted(
+            Some(&activation),
+            Some(&rejected),
+        ));
+        let terminal = execution_terminal_transition(
+            &task,
+            TaskExecutionTrigger::Scheduled,
+            Some(DetectorInvocationCause::Scheduled),
+            &record,
+            Some(&rejected),
+            None,
+        );
+        assert!(terminal.is_none(), "failure 1 must remain retryable");
+
+        let updated = store
+            .settle_execution_if_status(
+                &task.id,
+                None,
+                TaskExecutionTrigger::Scheduled,
+                task.status,
+                TaskExecutionSettlement {
+                    success: false,
+                    duration_ms: 1,
+                    session_id: rejected.session_id.clone(),
+                    error: rejected.error.clone(),
+                },
+                terminal,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, TaskStatus::Running);
+        assert_eq!(updated.consecutive_execution_failures, 1);
+        assert_eq!(updated.last_activation_event_id, None);
     }
 
     #[test]
@@ -4679,12 +4829,13 @@ mod tests {
             error: None,
         };
         assert_eq!(
-            activation_terminal_transition(
+            execution_terminal_transition(
                 &recurring,
                 TaskExecutionTrigger::Scheduled,
-                DetectorInvocationCause::Scheduled,
+                Some(DetectorInvocationCause::Scheduled),
                 &record,
-                &matrix_outcome(true),
+                Some(&matrix_outcome(true)),
+                None,
             )
             .map(|value| value.status),
             Some(TaskStatus::Done)
@@ -4707,12 +4858,13 @@ mod tests {
             error: None,
         };
         assert_eq!(
-            activation_terminal_transition(
+            execution_terminal_transition(
                 &recurring,
                 TaskExecutionTrigger::Manual,
-                DetectorInvocationCause::CheckNow,
+                Some(DetectorInvocationCause::CheckNow),
                 &record,
-                &matrix_outcome(true),
+                Some(&matrix_outcome(true)),
+                None,
             )
             .map(|value| value.status),
             Some(TaskStatus::Done),
@@ -4722,12 +4874,13 @@ mod tests {
         let mut ai_exit = matrix_outcome(true);
         ai_exit.ai_exit_reason = Some("Goal reached".to_string());
         assert_eq!(
-            activation_terminal_transition(
+            execution_terminal_transition(
                 &recurring,
                 TaskExecutionTrigger::Manual,
-                DetectorInvocationCause::CheckNow,
+                Some(DetectorInvocationCause::CheckNow),
                 &record,
-                &ai_exit,
+                Some(&ai_exit),
+                None,
             )
             .map(|value| value.message),
             Some("Goal reached".to_string())
@@ -4735,12 +4888,13 @@ mod tests {
 
         for status in [TaskStatus::Stopped, TaskStatus::Blocked] {
             recurring.status = status;
-            assert!(activation_terminal_transition(
+            assert!(execution_terminal_transition(
                 &recurring,
                 TaskExecutionTrigger::Manual,
-                DetectorInvocationCause::CheckNow,
+                Some(DetectorInvocationCause::CheckNow),
                 &record,
-                &ai_exit,
+                Some(&ai_exit),
+                None,
             )
             .is_none());
             assert_eq!(recurring.status, status);

@@ -65,7 +65,7 @@ timer handle 只负责“何时触发”。真正的 AI Turn 是独立执行作�
 - `cron run-now` 是兼容的 manual trigger：Running/Stopped Task 可执行，不启用 scheduler，不改变原 schedule/status；其他终态必须先走 rerun。
 - `lastExecutedAt` 记录任何执行；`lastScheduledAt` 只记录 timer tick。Recurring 的下一次触发只使用后者，因此 manual run 不会移动调度锚点。
 
-每次执行前都重新读取 `task.md`，用户修改会在下一次执行生效。运行历史继续写 `cron_runs/<taskId>.jsonl`，这是查询/审计投影，不是 Task 状态权威。
+每次执行前都重新读取 `task.md`，用户修改会在下一次执行生效。Runtime terminal 返回后，scheduler 先在 TaskStore 单次原子写中提交 `executionCount`、执行时间、`lastExecution`、连续 scheduled 失败次数与可选终态；然后才写事件、通知、`cron_runs` 和释放 Session owner。运行历史继续写 `cron_runs/<taskId>.jsonl`，只作为查询/审计投影，Task Center 的最近执行不得从中反向拼接。Browser Host retire、Sidecar drain、通知或审计写入失败都不能改判已经结算的 Task outcome。
 
 普通 Task 不再按 `dispatchOrigin` 选择不同的内容 executor。Scheduler 对 direct、AI 讨论后创建及 legacy provenance 都构造同一份完整 `task.md` 首轮 query；Agent 使用工作区、Skill 和工具自行执行与验证。Task status/outcome 仍由 TaskApplication/scheduler 裁决，Agent 不通过内容型 Skill 重写生命周期。
 
@@ -87,7 +87,7 @@ Detector protocol v1 只允许 `quiet | activate`。进程退出、timeout、输
 
 `trigger-state.json` 由 TaskStore 独占，保存 bounded checkpoint、检查/健康统计、最近 128 个已结算 event id 与一个 pending Activation Event。pending 同时持久化 Detector invocation cause；旧文件缺失该字段时按 `scheduled` 兼容。activate 必须先把 checkpoint 和 pending event 写入同一次原子替换，再 claim 并持久绑定 ordinary queue id，之后才能进入 Session admission；这个绑定不是“已被 Runtime 接纳”的回执，而是崩溃恢复与 stop 所需的 exact identity。AI Turn 确认接纳并终结时，Task row 原子提交 execution count、terminal status 与 `lastActivationEventId` receipt，然后才清 outbox；若在两次写之间崩溃，启动恢复只结算匹配 receipt 的 event，不重复唤醒。Running Task 的 pending 由 scheduler 按原 cause 恢复；Stopped/Blocked Task 只恢复 `check-now` 产生的一次性 manual admission，不 arm timer、不改变既有状态。Session 忙碌复用既有 SessionEngine queue，不建立 Trigger 专用队列。
 
-`checkCount` 统计真实 scheduled/check-now Detector 检查，`executionCount` 只统计已接纳并结算的 AI Turn。Running Task 上由 check-now 命中的 AI Turn 同样服从 `maxExecutions`、AI exit 与 provider/terminal 规则；到达 end condition 后不得再做新的 check。Stopped/Blocked 上的 check-now 保留原状态。recurring failure 采用有界退避，连续 3 次失败进入 Blocked；once/scheduled failure 立即 Blocked。Stop 保留 checkpoint 但取消尚未投送的 pending event，取消持久化失败必须返回错误供用户重试；reset 只清平台 checkpoint；delete 在精确 Detector/AI 进程确认停止后移除 trigger state，不删除用户脚本。Task 从 command 切到 always 时先持久化 non-command 行，再 best-effort 删除 state；该行本身就是启动恢复的清理义务。切回 command 时必须先幂等删除任何旧 state，失败则保持 non-command，避免旧 checkpoint/health/event 复活。
+`checkCount` 统计真实 scheduled/check-now Detector 检查，`executionCount` 只统计已接纳并结算的 AI Turn。Running Task 上由 check-now 命中的 AI Turn 同样服从 `maxExecutions`、AI exit 与 provider/terminal 规则；到达 end condition 后不得再做新的 check。Stopped/Blocked 上的 check-now 保留原状态。recurring 的可重试 Detector/AI failure 采用有界退避，连续第 1–4 次保持 Running，第 5 次进入 Blocked；任一次 scheduled 成功都会把连续失败数清零。once/scheduled failure、termination 无法确认，以及结构化标记的永久配置/场景/authority failure 立即 Blocked；manual run-now 只记录本轮摘要，不改变 durable status。失败类别来自 Detector/SessionEngine 的结构化结果，不从本地化 error 文本推断。Stop 保留 checkpoint 但取消尚未投送的 pending event，取消持久化失败必须返回错误供用户重试；reset 只清平台 checkpoint；delete 在精确 Detector/AI 进程确认停止后移除 trigger state，不删除用户脚本。Task 从 command 切到 always 时先持久化 non-command 行，再 best-effort 删除 state；该行本身就是启动恢复的清理义务。切回 command 时必须先幂等删除任何旧 state，失败则保持 non-command，避免旧 checkpoint/health/event 复活。
 
 ## 3. Session 与配置边界
 
@@ -122,7 +122,7 @@ TaskStore 维护可重建、最多 5000 条的 Agent Comment locator/excerpt ind
 
 memory update、memory evolution、Agent heartbeat 等内部定时工作也写入带 `managedKind` 的隐藏 Task，由同一个 Task scheduler 执行。普通 Task Center 列表默认过滤 managed Task，但 Session/history/audit 保留。`memory_auto_update_batch` 是遍历多个候选存量 Session 的调度器，本身不拥有持久 Session binding：Task row 使用现有 schema 的非固定绑定形态 `runMode=new-session` 且不写 `preselectedSessionId`，但该 `managedKind` 明确绕过 Session Engine，不会为调度器新建 Session；实际运行时才在 queue authority 下逐个绑定存量 Session 并发送 Memory Update query。历史 single-session 行由配置 reconcile 原位归一。Memory Gardener / Molt 才是实际创建新 Session 执行 Skill 的独立 managed Task。
 
-Memory Gardener / Molt 的执行 Session 对用户保持隐藏，因此不发送逐次桌面通知，也不生成指向隐藏 Session 的 deep-link。Agent 设置中的 Evo 区域直接读取这两类 managed Task 的最近一条权威 run record，只展示最近一次执行成功或失败及其时间；Renderer 不从隐藏 Session 文本推断结果，也不复制一份独立运行状态。
+Memory Gardener / Molt 的执行 Session 对用户保持隐藏，因此不发送逐次桌面通知，也不生成指向隐藏 Session 的 deep-link。Agent 设置中的 Evo 区域直接读取这两类 managed Task 的 `lastExecution` 权威摘要，只展示最近一次执行成功或失败及其时间；Renderer 不从隐藏 Session 文本或 `cron_runs` 推断结果，也不复制一份独立运行状态。
 
 managed job 不再创建 managed CronTask 旁路。memory auto-update 的 configure 以 exact Agent ID 串行，并以 managed Task 的 `workspace_id` 持久化该 identity；进入锁后重新读取 `config.json`，只有 `Agent.enabled && memoryAutoUpdate.enabled` 才具备主动执行资格，关闭顶层主动能力不改写 Memory 子配置。磁盘上的 exact Agent 配置是 enable/disable、schedule 与参数的唯一权威，renderer 到达顺序和同路径 Agent 的持久化顺序都不能覆盖它。Project projection 解析出的 workspace 只负责当前执行目录与 workspace 级文件 IO 互斥，不参与 AgentConfig 选择或 Task 去重。
 

@@ -163,7 +163,7 @@ where
 
     if let Some(old_session_id) = old_session_id.as_deref() {
         let owner = SidecarOwner::Agent(session_key.to_string());
-        if let Err(error) = release_session_sidecar(manager, old_session_id, &owner) {
+        if let Err(error) = release_session_sidecar(manager, old_session_id, &owner).await {
             let rolled_back = router_guard.rollback_peer_binding_transition(&transition);
             let rollback_persisted = if rolled_back {
                 health
@@ -561,7 +561,12 @@ pub(super) async fn shutdown_bot_instance(
     .await;
 
     // Release all Sidecar sessions
-    instance.router.lock().await.release_all(sidecar_manager)?;
+    instance
+        .router
+        .lock()
+        .await
+        .release_all(sidecar_manager)
+        .await?;
 
     // Final health state: mark as Stopped and persist
     instance.health.set_status(ImStatus::Stopped).await;
@@ -3485,7 +3490,11 @@ async fn create_bot_instance_with_pending_cron_events<R: Runtime>(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let collected_keys = router_for_idle.lock().await.collect_idle_sessions(&manager_for_idle);
+                    let collected_keys = router_for_idle
+                        .lock()
+                        .await
+                        .collect_idle_sessions(&manager_for_idle)
+                        .await;
                     // C3 fix: cancel ImEventConsumer for each collected session.
                     // The Sidecar port has been released to 0; the long-poll loop
                     // would otherwise hammer the dead port until backoff cap.

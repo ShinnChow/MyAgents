@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::cron_task::CronRunRecord;
 use crate::im::types::{HeartbeatConfig, MemoryAutoUpdateConfig};
 use crate::task::{
     self, NotificationConfig, TaskCreateDirectInput, TaskEndConditions, TaskExecutionMode,
-    TaskExecutor, TaskListFilter, TaskRunMode, TaskStatus, TaskUpdateInput, TaskUpdateStatusInput,
-    TransitionActor, TransitionSource, MANAGED_KIND_MEMORY_GARDENER, MANAGED_KIND_MEMORY_MOLT,
+    TaskExecutor, TaskLastExecution, TaskListFilter, TaskRunMode, TaskStatus, TaskUpdateInput,
+    TaskUpdateStatusInput, TransitionActor, TransitionSource, MANAGED_KIND_MEMORY_GARDENER,
+    MANAGED_KIND_MEMORY_MOLT,
 };
 
 const GARDENER_INTERVAL_MINUTES: u32 = 72 * 60;
@@ -70,18 +70,20 @@ pub async fn cmd_get_memory_evolution_status(
                 Some(MANAGED_KIND_MEMORY_GARDENER | MANAGED_KIND_MEMORY_MOLT)
             ) && crate::cron_task::normalize_path(&task.workspace_path) == normalized_workspace
         })
-        .filter_map(|task| crate::cron_task::read_cron_runs(&task.id, 1).pop());
+        .filter_map(|task| task.last_execution);
 
     Ok(latest_run(records))
 }
 
-fn latest_run(records: impl IntoIterator<Item = CronRunRecord>) -> Option<MemoryEvolutionLastRun> {
+fn latest_run(
+    records: impl IntoIterator<Item = TaskLastExecution>,
+) -> Option<MemoryEvolutionLastRun> {
     records
         .into_iter()
-        .max_by_key(|record| record.ts)
+        .max_by_key(|record| record.at)
         .map(|record| MemoryEvolutionLastRun {
-            executed_at: record.ts,
-            success: record.ok,
+            executed_at: record.at,
+            success: record.success,
         })
 }
 
@@ -713,13 +715,14 @@ async fn find_existing_job(
 mod tests {
     use super::*;
 
-    fn run(ts: i64, ok: bool) -> CronRunRecord {
-        CronRunRecord {
-            ts,
-            ok,
+    fn run(at: i64, success: bool) -> TaskLastExecution {
+        TaskLastExecution {
+            at,
+            trigger: crate::task::TaskExecutionTrigger::Scheduled,
+            success,
             duration_ms: 1,
-            content: None,
-            error: (!ok).then(|| "failed".to_string()),
+            session_id: None,
+            error: (!success).then(|| "failed".to_string()),
         }
     }
 

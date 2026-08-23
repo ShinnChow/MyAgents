@@ -518,7 +518,7 @@ mod lifecycle_contract_tests {
         let release_manager = manager.clone();
         let (released_tx, released_rx) = std::sync::mpsc::channel();
         let release_thread = std::thread::spawn(move || {
-            let result = crate::sidecar::release_session_sidecar(
+            let result = crate::sidecar::release_session_sidecar_from_blocking_thread(
                 &release_manager,
                 "session-a",
                 &SidecarOwner::Tab("tab-a".to_string()),
@@ -561,6 +561,39 @@ mod lifecycle_contract_tests {
             .expect("manager lock")
             .sidecars
             .contains_key("session-a"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_last_owner_release_keeps_blocking_browser_retirement_off_tokio() {
+        let manager = Arc::new(Mutex::new(SidecarManager::new()));
+        {
+            let mut guard = manager.lock().expect("manager lock");
+            insert_test_sidecar(&mut guard, "session-async", SidecarState::Healthy);
+            let generation = guard.next_instance_generation();
+            guard.insert_instance(
+                GLOBAL_SIDECAR_ID.to_string(),
+                test_global_instance(9, generation, true),
+            );
+        }
+
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::sidecar::release_session_sidecar(
+                &manager,
+                "session-async",
+                &SidecarOwner::Tab("tab-a".to_string()),
+            ),
+        )
+        .await
+        .expect("blocking retirement runs on a blocking worker")
+        .expect("owner release succeeds even when Browser Host is unavailable");
+
+        assert!(stopped);
+        assert!(!manager
+            .lock()
+            .expect("manager lock")
+            .sidecars
+            .contains_key("session-async"));
     }
 
     #[test]

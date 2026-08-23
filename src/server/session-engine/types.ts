@@ -187,6 +187,7 @@ export type InjectedTurnResult = {
   assistantMessagePresent?: boolean;
   text?: string;
   error?: string;
+  code?: 'session_bind_failed' | 'configuration_failed' | 'scenario_failed';
   status?: number;
 };
 

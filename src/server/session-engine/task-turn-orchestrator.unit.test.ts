@@ -274,9 +274,61 @@ describe('Task turn orchestrator', () => {
     expect(result).toEqual({
       success: false,
       error: 'Failed to switch to required Task session missing-session',
+      code: 'session_bind_failed',
       status: 409,
     });
     expect(runInjectedTurn).not.toHaveBeenCalled();
+  });
+
+  it('preserves prepare-stage permanent failure codes for Rust Task policy', async () => {
+    mocks.metadata.set('session-1', { id: 'session-1' });
+    const { engine, runInjectedTurn } = fakeEngine({
+      prepareResult: {
+        success: false,
+        code: 'configuration_failed',
+        error: 'Provider configuration is invalid',
+        status: 500,
+      },
+    });
+
+    const result = await createTaskTurnOrchestrator().runScheduledTurn(
+      engine,
+      payload(),
+      '/workspace',
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      code: 'configuration_failed',
+      status: 500,
+    });
+    expect(runInjectedTurn).not.toHaveBeenCalled();
+  });
+
+  it('preserves structured permanent failure codes for Rust Task policy', async () => {
+    mocks.metadata.set('session-1', { id: 'session-1' });
+    const { engine } = fakeEngine({
+      turnResult: {
+        success: false,
+        enqueued: false,
+        code: 'configuration_failed',
+        error: 'Provider configuration is invalid',
+        status: 400,
+      },
+    });
+
+    const result = await createTaskTurnOrchestrator().runScheduledTurn(
+      engine,
+      payload(),
+      '/workspace',
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      turnDispatched: false,
+      code: 'configuration_failed',
+      status: 400,
+    });
   });
 
   it('lets an exact Stop cancel a creator while it waits for the scheduled lock', async () => {

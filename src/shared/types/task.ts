@@ -232,6 +232,15 @@ export interface RecurringWindow {
   end: string;
 }
 
+export interface TaskLastExecution {
+  at: number;
+  trigger: 'scheduled' | 'manual';
+  success: boolean;
+  durationMs: number;
+  sessionId?: string;
+  error?: string;
+}
+
 /** A Task — workspace-scoped execution unit. */
 export interface Task {
   id: string;
@@ -308,6 +317,10 @@ export interface Task {
   /** Timer anchor; manual run-now must not move the recurring schedule. */
   lastScheduledAt?: number;
   executionCount?: number;
+  /** Consecutive scheduled failures; a scheduled success resets this to zero. */
+  consecutiveExecutionFailures?: number;
+  /** TaskStore-owned current execution summary. Run history is audit-only. */
+  lastExecution?: TaskLastExecution;
   /** Internal durable receipt for the last admitted command-trigger event. */
   lastActivationEventId?: string;
   /** Append-only audit log of status changes. See PRD §3.2 / §10.2.1. */
@@ -480,9 +493,9 @@ export interface TaskUpdateInput {
 export interface TaskRunStats {
   executionCount: number;
   lastExecutedAt?: number;
-  /** `ok` flag from the most recent `cron_runs/<id>.jsonl` row. */
+  /** Success flag from `Task.lastExecution`. */
   lastSuccess?: boolean;
-  /** Duration of the most recent run (ms). */
+  /** Duration from `Task.lastExecution` (ms). */
   lastDurationMs?: number;
   /** Task scheduler status. */
   schedulerStatus?: string;

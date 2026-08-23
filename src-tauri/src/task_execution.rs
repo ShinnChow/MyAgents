@@ -18,10 +18,36 @@ pub struct TaskExecutionOutcome {
     pub turn_dispatched: bool,
     pub termination_unconfirmed: bool,
     pub error: Option<String>,
+    pub failure_retryable: bool,
     pub ai_exit_reason: Option<String>,
     pub output_text: Option<String>,
     pub session_id: Option<String>,
     pub duration_ms: u64,
+}
+
+/// Structured failure for errors that happen before SessionEngine can return
+/// a terminal response. Scheduler policy consumes `retryable` directly and
+/// never classifies localized error strings.
+#[derive(Debug, Clone)]
+pub struct TaskExecutionFailure {
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl TaskExecutionFailure {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
 }
 
 fn run_mode(task: &Task) -> TaskRunMode {
@@ -58,18 +84,30 @@ fn schedule_kind(task: &Task) -> Option<String> {
     }
 }
 
-fn retain_owner_between_runs(task: &Task, session_materialized: bool) -> bool {
+fn response_failure_retryable(success: bool, code: Option<&str>, status: Option<u16>) -> bool {
+    success
+        || (!matches!(
+            code,
+            Some("configuration_failed" | "scenario_failed" | "session_bind_failed")
+        ) && status.is_none_or(|status| {
+            status == 408 || status == 409 || status == 425 || status == 429 || status >= 500
+        }))
+}
+
+pub(crate) fn retain_owner_between_runs(task: &Task, session_materialized: bool) -> bool {
     session_materialized
         && run_mode(task) == TaskRunMode::SingleSession
         && task.status == TaskStatus::Running
 }
 
-fn release_task_owner(sidecar: &ManagedSidecarManager, task_id: &str, session_id: &str) {
+async fn release_task_owner(sidecar: &ManagedSidecarManager, task_id: &str, session_id: &str) {
     if let Err(error) = release_session_sidecar(
         sidecar,
         session_id,
         &SidecarOwner::Task(task_id.to_string()),
-    ) {
+    )
+    .await
+    {
         ulog_warn!(
             "[task] failed to release Task owner task={} session={}: {}",
             task_id,
@@ -97,15 +135,17 @@ pub(crate) async fn execute_managed_task(
     handle: &AppHandle,
     task: &Task,
     queue_id: &str,
-) -> Result<TaskExecutionOutcome, String> {
+) -> Result<TaskExecutionOutcome, TaskExecutionFailure> {
     let started = Instant::now();
     if task.managed_kind.as_deref() != Some(crate::task::MANAGED_KIND_MEMORY_AUTO_UPDATE_BATCH) {
-        return Err(format!(
+        return Err(TaskExecutionFailure::permanent(format!(
             "task {} requires a reserved execution Session",
             task.id
-        ));
+        )));
     }
-    let batch = crate::memory_auto_update::run_managed_task_batch(handle, task, queue_id).await?;
+    let batch = crate::memory_auto_update::run_managed_task_batch(handle, task, queue_id)
+        .await
+        .map_err(TaskExecutionFailure::retryable)?;
     Ok(TaskExecutionOutcome {
         success: batch.success,
         turn_dispatched: true,
@@ -113,6 +153,7 @@ pub(crate) async fn execute_managed_task(
         error: batch
             .termination_unconfirmed
             .then(|| "Memory update turn termination was not confirmed".to_string()),
+        failure_retryable: !batch.termination_unconfirmed,
         ai_exit_reason: None,
         output_text: Some(batch.output_text),
         session_id: None,
@@ -128,7 +169,7 @@ pub(crate) async fn execute_task(
     initialize_session: bool,
     session_lifecycle: Arc<SessionLifecycleGuard>,
     activation: Option<crate::task_trigger::TaskActivationPayload>,
-) -> Result<TaskExecutionOutcome, String> {
+) -> Result<TaskExecutionOutcome, TaskExecutionFailure> {
     let started = Instant::now();
 
     let is_memory_evolution = matches!(
@@ -154,6 +195,7 @@ pub(crate) async fn execute_task(
                 turn_dispatched: false,
                 termination_unconfirmed: false,
                 error: None,
+                failure_retryable: false,
                 ai_exit_reason: Some("proactive-agent-disabled".to_string()),
                 output_text: Some(
                     "Memory evolution skipped because Proactive Agent is disabled or archived."
@@ -166,15 +208,20 @@ pub(crate) async fn execute_task(
         crate::workspace_files::memory_rules::ensure_memory_rule_substrate_for_workspace(
             &task.workspace_path,
         )
-        .map_err(|error| format!("ensure memory rule substrate: {error}"))?;
+        .map_err(|error| {
+            TaskExecutionFailure::permanent(format!("ensure memory rule substrate: {error}"))
+        })?;
     }
 
     let sidecar = handle
         .try_state::<ManagedSidecarManager>()
-        .ok_or_else(|| "SidecarManager state not available".to_string())?;
+        .ok_or_else(|| TaskExecutionFailure::permanent("SidecarManager state not available"))?;
     let prompt = crate::task::build_dispatch_prompt(&task.id)
         .await
-        .ok_or_else(|| format!("task {} disappeared before dispatch", task.id))??;
+        .ok_or_else(|| {
+            TaskExecutionFailure::permanent(format!("task {} disappeared before dispatch", task.id))
+        })?
+        .map_err(TaskExecutionFailure::permanent)?;
     let effective_run_mode = run_mode(task);
     let payload = CronExecutePayload {
         task_id: task.id.clone(),
@@ -218,47 +265,22 @@ pub(crate) async fn execute_task(
         session_lifecycle,
     )
     .await;
-    // A creator can fail before /cron/execute-sync materializes SessionStore
-    // metadata. Keeping its Sidecar owner in that state would make every
-    // subsequent shared-session Task an `isNew=false` adopter of an unindexed
-    // identity. Release the owner so the next reservation can become the new
-    // creator. Existing/materialized sessions retain the normal single-session
-    // owner across ticks.
-    let termination_unconfirmed = result
-        .as_ref()
-        .map(|response| response.termination_unconfirmed)
-        .unwrap_or(false);
-    let session_materialized =
-        crate::sidecar::runtime_identity::resolve_session_runtime_identity_full(&session_id)
-            .is_some();
-    let execution_is_current = crate::task_scheduler::get_task_scheduler()
-        .authorize_dispatch(&task.id, queue_id)
-        .await;
-    let retain_owner = termination_unconfirmed
-        || (execution_is_current
-            && match crate::task::get_task_store() {
-                Some(store) => store.get(&task.id).await.is_some_and(|current| {
-                    retain_owner_between_runs(&current, session_materialized)
-                }),
-                None => false,
-            });
-    if !retain_owner {
-        release_task_owner(&sidecar, &task.id, &session_id);
-    }
-
     let response = result.map_err(|error| {
         ulog_error!(
             "[task] execution transport failed task={}: {}",
             task.id,
             error
         );
-        error
+        TaskExecutionFailure::retryable(error)
     })?;
+    let failure_retryable =
+        response_failure_retryable(response.success, response.code.as_deref(), response.status);
     Ok(TaskExecutionOutcome {
         success: response.success,
         turn_dispatched: response.turn_dispatched,
         termination_unconfirmed: response.termination_unconfirmed,
         error: response.error,
+        failure_retryable,
         ai_exit_reason: response
             .ai_requested_exit
             .unwrap_or(false)
@@ -356,7 +378,11 @@ fn should_deliver_desktop_notification(task: &Task) -> bool {
         .unwrap_or(true)
 }
 
-pub fn release_task_sessions(handle: &AppHandle, task: &Task, active_session_id: Option<&str>) {
+pub async fn release_task_sessions(
+    handle: &AppHandle,
+    task: &Task,
+    active_session_id: Option<&str>,
+) {
     let Some(sidecar) = handle.try_state::<ManagedSidecarManager>() else {
         return;
     };
@@ -374,7 +400,7 @@ pub fn release_task_sessions(handle: &AppHandle, task: &Task, active_session_id:
         }
     }
     for session_id in sessions {
-        release_task_owner(&sidecar, &task.id, session_id);
+        release_task_owner(&sidecar, &task.id, session_id).await;
     }
 }
 
@@ -525,6 +551,31 @@ mod tests {
 
         task.managed_kind = None;
         assert!(uses_session_engine(&task));
+    }
+
+    #[test]
+    fn structured_response_classifies_retryable_and_permanent_failures() {
+        for (code, status) in [
+            (None, Some(408)),
+            (None, Some(409)),
+            (None, Some(425)),
+            (None, Some(429)),
+            (None, Some(500)),
+        ] {
+            assert!(response_failure_retryable(false, code, status));
+        }
+        for (code, status) in [
+            (Some("configuration_failed"), Some(503)),
+            (Some("scenario_failed"), Some(500)),
+            (Some("session_bind_failed"), Some(409)),
+            (None, Some(400)),
+            (None, Some(401)),
+            (None, Some(403)),
+            (None, Some(404)),
+        ] {
+            assert!(!response_failure_retryable(false, code, status));
+        }
+        assert!(response_failure_retryable(true, None, Some(200)));
     }
 
     #[test]

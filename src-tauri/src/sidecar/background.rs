@@ -281,7 +281,9 @@ fn poll_background_completion<R: Runtime>(
                 session_id,
                 BG_MAX_DURATION_SECS / 60
             );
-            let sidecar_stopped = match release_session_sidecar(manager, session_id, &bg_owner) {
+            let sidecar_stopped = match release_session_sidecar_from_blocking_thread(
+                manager, session_id, &bg_owner,
+            ) {
                 Ok(stopped) => stopped,
                 Err(error) => {
                     ulog_error!(
@@ -682,8 +684,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn explicit_cancel_releases_background_owner_during_recovery_gap() {
+    #[tokio::test]
+    async fn explicit_cancel_releases_background_owner_during_recovery_gap() {
         let owner = SidecarOwner::BackgroundCompletion("session-a".to_string());
         let mut manager = SidecarManager::new();
         manager.insert_test_ready_frontend_sidecar("session-a", 32001, owner.clone());
@@ -691,7 +693,7 @@ mod tests {
         let manager = Arc::new(Mutex::new(manager));
 
         assert_eq!(
-            cancel_background_completion(&manager, "session-a"),
+            cancel_background_completion(&manager, "session-a").await,
             Ok(true)
         );
         let guard = manager.lock().expect("manager lock");
@@ -711,7 +713,7 @@ mod tests {
 /// Pre-check whether the BackgroundCompletion owner exists before calling
 /// release (release returns Ok(false) for non-existent owners too, but we
 /// want to distinguish "no-op because nothing to cancel" from "released").
-pub fn cancel_background_completion(
+pub async fn cancel_background_completion(
     manager: &ManagedSidecarManager,
     session_id: &str,
 ) -> Result<bool, String> {
@@ -735,7 +737,7 @@ pub fn cancel_background_completion(
 
     // Delegate to the canonical release path so the "owners empty → stop"
     // invariant is enforced and any ancillary cleanup runs.
-    let stopped = release_session_sidecar(manager, session_id, &bg_owner)?;
+    let stopped = release_session_sidecar(manager, session_id, &bg_owner).await?;
     ulog_info!(
         "[bg-completion] Cancelled background completion for session {} (sidecar_stopped: {})",
         session_id,
@@ -767,10 +769,7 @@ pub async fn cmd_cancel_background_completion(
     state: tauri::State<'_, ManagedSidecarManager>,
     sessionId: String,
 ) -> Result<bool, String> {
-    let manager = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || cancel_background_completion(&manager, &sessionId))
-        .await
-        .map_err(|error| format!("Background completion cancel task failed: {error:?}"))?
+    cancel_background_completion(state.inner(), &sessionId).await
 }
 
 /// Get session IDs that have active background completions

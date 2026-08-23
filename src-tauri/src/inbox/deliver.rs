@@ -235,7 +235,7 @@ pub async fn start_fresh_session(
     let port = match ensure {
         Ok(result) => result.port,
         Err(error) => {
-            release_transient_owner(manager, &session_id, &transient_owner);
+            release_transient_owner(manager, &session_id, &transient_owner).await;
             return outcome(
                 "delivery_failed",
                 Some(format!("sidecar start failed: {error}")),
@@ -285,7 +285,7 @@ pub async fn start_fresh_session(
     };
     // BackgroundCompletion, when attached, now owns the ordinary lifecycle.
     // No fresh-start-specific durable token or recovery state is introduced.
-    release_transient_owner(manager, &session_id, &transient_owner);
+    release_transient_owner(manager, &session_id, &transient_owner).await;
     drop(lifecycle);
     result
 }
@@ -425,7 +425,7 @@ where
             }
             Err(e) => {
                 ulog_error!("[inbox] resume failed for {}: {}", to_sid, e);
-                release_transient_owner(manager, &to_sid, &transient_owner);
+                release_transient_owner(manager, &to_sid, &transient_owner).await;
                 return DeliverOutcome::DeliveryFailed {
                     reason: format!("resume failed: {}", e),
                 };
@@ -435,7 +435,7 @@ where
 
     let outcome = http_post_drain(port, &message).await;
     start_headless_completion_if_delivered(app_handle, manager, &to_sid, &outcome);
-    release_transient_owner(manager, &to_sid, &transient_owner);
+    release_transient_owner(manager, &to_sid, &transient_owner).await;
     outcome
 }
 
@@ -478,12 +478,12 @@ fn start_headless_completion(
 
 /// Release the transient inbox-delivery owner. Idempotent — no-op if the
 /// sidecar was already torn down or the owner was never inserted.
-fn release_transient_owner(
+async fn release_transient_owner(
     manager: &ManagedSidecarManager,
     session_id: &str,
     owner: &SidecarOwner,
 ) {
-    match crate::sidecar::release_session_sidecar(manager, session_id, owner) {
+    match crate::sidecar::release_session_sidecar(manager, session_id, owner).await {
         Ok(stopped) => {
             ulog_info!(
                 "[inbox] released transient owner for {}; sidecar_stopped={}",
