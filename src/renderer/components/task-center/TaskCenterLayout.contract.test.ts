@@ -69,5 +69,8 @@ describe('Task Center layout contract', () => {
     expect(card).toContain(
       'break-words text-sm leading-relaxed text-[var(--ink-secondary)]',
     );
+    expect(card).toContain(
+      'bg-[var(--accent-warm-subtle)] px-1 text-xs text-[var(--accent-warm)]',
+    );
   });
 });

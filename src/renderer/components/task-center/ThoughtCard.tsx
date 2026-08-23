@@ -563,12 +563,13 @@ function renderWithTagHighlights(
   onTagClick?: (tag: string) => void,
   searchQuery?: string,
 ) {
-  // Pill styling matches the ThoughtInput overlay — single source of truth
-  // for what a `#tag` looks like across authoring & display. Parser is
-  // shared with Rust (`thought.tags[]`) so highlight ≡ persisted tags.
+  // Saved-card tags sit one typography step below the compact thought body,
+  // so they read as metadata rather than competing with the prose. Keep the
+  // authoring overlay separate: its glyph metrics must match the textarea for
+  // cursor/highlight alignment.
   const parts = splitWithTagHighlights(content);
   const pillCls =
-    'rounded-[var(--radius-sm)] bg-[var(--accent-warm-subtle)] px-1 text-[var(--accent-warm)]';
+    'rounded-[var(--radius-sm)] bg-[var(--accent-warm-subtle)] px-1 text-xs text-[var(--accent-warm)]';
   // Search-keyword highlight is intentionally only applied to non-tag
   // segments. Tag pills are already a coloured block; layering a `<mark>`
   // inside them doubles the visual emphasis and looks broken.
