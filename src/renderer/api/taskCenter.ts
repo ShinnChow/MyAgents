@@ -8,6 +8,12 @@ import type {
   ThoughtUpdateInput,
 } from "@/../shared/types/thought";
 import type {
+  RecordDetail,
+  RecordListFilter,
+  RecordSummary,
+  TextRecordCreateInput,
+} from "@/../shared/types/record";
+import type {
   Task,
   TaskCreateAttachedInput,
   TaskCreateDirectInput,
@@ -41,6 +47,24 @@ async function inv<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 }
 
 // ==================== Thoughts ====================
+
+// Legacy names below remain thin compatibility wrappers. New surfaces use
+// these canonical Record APIs and never read the legacy Thought directory.
+export function recordCreate(
+  input: TextRecordCreateInput,
+): Promise<RecordDetail> {
+  return inv("cmd_record_create", { input });
+}
+
+export function recordList(
+  filter?: RecordListFilter,
+): Promise<RecordSummary[]> {
+  return inv("cmd_record_list", { filter });
+}
+
+export function recordGet(id: string): Promise<RecordDetail | null> {
+  return inv("cmd_record_get", { id });
+}
 
 export function thoughtCreate(input: ThoughtCreateInput): Promise<Thought> {
   return inv("cmd_thought_create", { input });

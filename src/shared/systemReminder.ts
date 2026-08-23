@@ -55,8 +55,8 @@ export interface TaskDiscussionReminderInput {
   candidatesDir: string;
   workspaceId: string;
   workspacePath: string;
-  sourceThoughtId?: string;
-  sourceThoughtTags?: string[];
+  sourceRecordId?: string;
+  sourceRecordTags?: string[];
   visibleUserMessage: string;
 }
 
@@ -245,12 +245,12 @@ export function buildTaskDiscussionReminder(input: TaskDiscussionReminderInput):
     `workspaceId: ${escapeSystemReminderText(input.workspaceId)}`,
     `workspacePath: ${escapeSystemReminderText(input.workspacePath)}`,
   ];
-  if (input.sourceThoughtId?.trim()) {
-    lines.push(`sourceThoughtId: ${escapeSystemReminderText(input.sourceThoughtId.trim())}`);
+  if (input.sourceRecordId?.trim()) {
+    lines.push(`sourceRecordId: ${escapeSystemReminderText(input.sourceRecordId.trim())}`);
   }
-  const tags = input.sourceThoughtTags?.map(tag => tag.trim()).filter(Boolean) ?? [];
+  const tags = input.sourceRecordTags?.map(tag => tag.trim()).filter(Boolean) ?? [];
   if (tags.length > 0) {
-    lines.push('sourceThoughtTags:', ...tags.map(tag => `- ${escapeSystemReminderText(tag)}`));
+    lines.push('sourceRecordTags:', ...tags.map(tag => `- ${escapeSystemReminderText(tag)}`));
   }
   lines.push(`</${TASK_DISCUSSION_TAG}>`, SYSTEM_REMINDER_CLOSE, input.visibleUserMessage.trim());
   return lines.join('\n');

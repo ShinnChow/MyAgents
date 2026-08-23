@@ -342,6 +342,7 @@ Commands:
   goal      Manage the current session Goal (get/create/update)
   task      Manage Task Center and scheduled automation tasks
   thought   Manage Task Center thoughts (list/create)
+  record    Manage text and audio records (list/create)
   space     Discover Cloud Goals and manage Space Issues/attachments
   im        IM runtime actions for current chat (send-media)
   session   Discover, start, message, and observe Agent execution contexts
@@ -441,6 +442,7 @@ Examples:
   myagents space issue close <issueId> --space <slug>
   myagents space attachment download <attachmentId> --space <slug> --output myagents_files/space/file.bin
   myagents thought list
+  myagents record list
   myagents plugin list
   myagents cc-plugin list
   myagents cc-plugin install anthropics/example-plugin
@@ -779,6 +781,10 @@ export function printResult(
   }
   if (group === 'thought' && action === 'list') {
     printThoughtList(result.data as Array<Record<string, unknown>>);
+    return;
+  }
+  if (group === 'record' && action === 'list') {
+    printRecordList(result.data as Array<Record<string, unknown>>);
     return;
   }
   if (group === 'skill' && action === 'list') {
@@ -2334,6 +2340,21 @@ function printThoughtList(thoughts: Array<Record<string, unknown>>): void {
   }
 }
 
+function printRecordList(records: Array<Record<string, unknown>>): void {
+  if (!records || records.length === 0) {
+    console.log('(no records)');
+    return;
+  }
+  console.log(`Records (${records.length}):`);
+  for (const record of records) {
+    const title = String(record.title ?? '') || '(untitled record)';
+    const kind = String(record.kind ?? 'text');
+    const tags = Array.isArray(record.tags) ? (record.tags as string[]) : [];
+    console.log(`  ${record.id}  [${kind}] ${title}`);
+    if (tags.length > 0) console.log(`     tags=${tags.join(',')}`);
+  }
+}
+
 function printMcpOAuth(data: Record<string, unknown>): void {
   if (!data) return;
   const id = data.id ?? '';
@@ -2842,7 +2863,7 @@ const PUBLISHED_ADMIN_ROUTES = new Set([
   'task/list', 'task/get', 'task/comments', 'task/comment', 'task/create-direct', 'task/create-attached', 'task/run',
   'task/run-now', 'task/rerun', 'task/trigger/validate', 'task/trigger/test', 'task/check-now',
   'task/reset-checkpoint', 'task/update', 'task/update-status', 'task/append-session', 'task/archive', 'task/delete',
-  'thought/list', 'thought/create',
+  'thought/list', 'thought/create', 'record/list', 'record/create',
   'space/list', 'space/whoami', 'space/assignee-list', 'space/goal-list', 'space/issue-create', 'space/issue-update',
   'space/issue-list', 'space/issue-get', 'space/issue-comment', 'space/issue-comments', 'space/issue-comment-get',
   'space/issue-status', 'space/issue-claim', 'space/issue-close', 'space/issue-complete', 'space/issue-cancel-claim',
@@ -2852,7 +2873,7 @@ const PUBLISHED_ADMIN_ROUTES = new Set([
 
 const PUBLISHED_COMMAND_GROUPS = new Set([
   'anydoc', 'mcp', 'tool', 'vision', 'model', 'agent', 'runtime', 'diagnose', 'cron', 'goal', 'im', 'widget',
-  'plugin', 'cc-plugin', 'skill', 'config', 'task', 'thought', 'space', 'issue', 'session',
+  'plugin', 'cc-plugin', 'skill', 'config', 'task', 'thought', 'record', 'space', 'issue', 'session',
   'status', 'reload', 'version',
 ]);
 
@@ -5075,7 +5096,7 @@ export function buildRequestBody(
         trigger: flags.triggerFile !== undefined
           ? resolveTaskTriggerFile(flags.triggerFile)
           : undefined,
-        sourceThoughtId: flags.sourceThoughtId,
+        sourceRecordId: flags.sourceRecordId ?? flags.sourceThoughtId,
         tags: typeof flags.tags === 'string'
           ? (flags.tags as string).split(',').map(s => s.trim()).filter(Boolean)
           : undefined,
@@ -5226,13 +5247,20 @@ export function buildRequestBody(
     return {};
   }
 
-  // Thought (v0.1.69) — `myagents thought <list|create>`
-  if (group === 'thought') {
+  // Canonical Record CLI plus the published Thought compatibility alias.
+  if (group === 'record' || group === 'thought') {
     if (action === 'list') {
+      const kind = typeof flags.kind === 'string' ? flags.kind : undefined;
+      if (group === 'record' && kind !== undefined && kind !== 'text' && kind !== 'audio') {
+        console.error('Error: record list --kind must be text or audio.');
+        process.exit(1);
+      }
       return {
+        kind: group === 'record' ? kind : undefined,
         tag: flags.tag,
         query: flags.query,
         limit: flags.limit ? Number(flags.limit) : undefined,
+        archived: flags.archived ? 'archived' : flags.all ? 'all' : undefined,
       };
     }
     if (action === 'create') {
@@ -5252,7 +5280,7 @@ export function buildRequestBody(
         (typeof flags.content === 'string' ? flags.content : undefined) ?? rest.join(' ');
       if (flags.contentFile && typeof flags.contentFile === 'string') {
         try {
-          // Lazy-require keeps cold path short for non-thought commands.
+          // Lazy-require keeps the cold path short for other commands.
           const fs = require('fs') as typeof import('fs');
           const MAX_BYTES = 1024 * 1024; // 1 MB — pathological for a thought
           const stat = fs.statSync(flags.contentFile);
@@ -5273,13 +5301,13 @@ export function buildRequestBody(
       }
       const trimmed = contentText?.trim() ?? '';
       if (!trimmed) {
-        console.error('Error: thought create requires a non-empty content. Pass it as a positional arg, --content "<text>", or --content-file <path>.');
+        console.error(`Error: ${group} create requires non-empty content. Pass it as a positional arg, --content "<text>", or --content-file <path>.`);
         console.error('  → Tip: shells with quirky quoting (Windows / pwsh) drop quoted args sometimes — write the text to a file and pass --content-file.');
         process.exit(1);
       }
       return { content: trimmed };
     }
-    if (action === 'readme') return {}; // graceful no-op surfaced via admin-api
+    if (group === 'thought' && action === 'readme') return {}; // legacy readme
     return {};
   }
 

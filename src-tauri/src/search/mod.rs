@@ -199,7 +199,7 @@ impl SearchEngine {
         query: &str,
         limit: usize,
     ) -> Result<ThoughtSearchResult, String> {
-        let Some(store) = crate::thought::get_thought_store() else {
+        let Some(store) = crate::record::get_record_store() else {
             return Ok(ThoughtSearchResult {
                 hits: vec![],
                 total: 0,
@@ -208,11 +208,13 @@ impl SearchEngine {
         let start = std::time::Instant::now();
         // Search intentionally spans archived thoughts too (v0.2.16 PRD
         // §2.2 decision 4 — mailbox-archive semantics). The default
-        // ThoughtListFilter hides archived since v0.2.16, so we have to
+        // The compatibility search is text-only but reads the canonical
+        // RecordStore and intentionally spans archived Records.
         // ask for `All` explicitly here.
         let all = store
-            .list(crate::thought::ThoughtListFilter {
-                archived: Some(crate::thought::ThoughtArchiveFilter::All),
+            .list_full(crate::record::RecordListFilter {
+                kind: Some(crate::record::RecordKind::Text),
+                archived: Some(crate::record::RecordArchiveFilter::All),
                 ..Default::default()
             })
             .await;
@@ -223,7 +225,11 @@ impl SearchEngine {
                 if needle.is_empty() {
                     return true;
                 }
-                t.content.to_lowercase().contains(&needle)
+                t.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&needle)
                     || t.tags
                         .iter()
                         .any(|tag| tag.to_lowercase().contains(&needle))
@@ -231,7 +237,7 @@ impl SearchEngine {
             .take(limit)
             .map(|t| ThoughtSearchHit {
                 id: t.id,
-                snippet: make_snippet(&t.content, &needle, 180),
+                snippet: make_snippet(t.content.as_deref().unwrap_or_default(), &needle, 180),
                 tags: t.tags,
                 updated_at: t.updated_at,
             })

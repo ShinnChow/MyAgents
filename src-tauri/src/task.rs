@@ -546,8 +546,13 @@ pub struct Task {
     /// lists, but kept in task history/session records for auditability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_thought_id: Option<String>,
+    #[serde(
+        default,
+        rename = "sourceRecordId",
+        alias = "sourceThoughtId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_record_id: Option<String>,
     #[serde(default)]
     pub session_ids: Vec<String>,
     pub status: TaskStatus,
@@ -1099,8 +1104,8 @@ pub struct TaskCreateDirectInput {
     /// Internal system-managed task marker. Only a small allow-list is accepted.
     #[serde(default)]
     pub managed_kind: Option<String>,
-    #[serde(default)]
-    pub source_thought_id: Option<String>,
+    #[serde(default, rename = "sourceRecordId", alias = "sourceThoughtId")]
+    pub source_record_id: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -1147,10 +1152,10 @@ pub struct TaskDiscussionMetadata {
     pub discussion_id: String,
     pub workspace_id: String,
     pub workspace_path: String,
-    #[serde(default)]
-    pub source_thought_id: Option<String>,
-    #[serde(default)]
-    pub source_thought_tags: Vec<String>,
+    #[serde(default, rename = "sourceRecordId", alias = "sourceThoughtId")]
+    pub source_record_id: Option<String>,
+    #[serde(default, rename = "sourceRecordTags", alias = "sourceThoughtTags")]
+    pub source_record_tags: Vec<String>,
     pub created_at: i64,
 }
 
@@ -2452,7 +2457,7 @@ impl TaskStore {
             runtime_config: input.runtime_config,
             mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
             managed_kind,
-            source_thought_id: input.source_thought_id,
+            source_record_id: input.source_record_id,
             session_ids: Vec::new(),
             status: TaskStatus::Todo,
             tags: input.tags,
@@ -2623,7 +2628,7 @@ impl TaskStore {
             runtime_config: input.runtime_config,
             mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
             managed_kind,
-            source_thought_id: input.source_thought_id,
+            source_record_id: input.source_record_id,
             session_ids: Vec::new(),
             status: initial_status,
             tags: input.tags,
@@ -2802,7 +2807,7 @@ impl TaskStore {
             runtime_config: None,
             mcp_enabled_servers: None,
             managed_kind: None,
-            source_thought_id: None,
+            source_record_id: None,
             session_ids: vec![input.current_session_id.clone()],
             status: TaskStatus::Running,
             tags: input.tags,
@@ -5082,8 +5087,8 @@ pub async fn cmd_task_prepare_discussion(
     discussion_id: String,
     workspace_id: String,
     workspace_path: String,
-    source_thought_id: Option<String>,
-    source_thought_tags: Option<Vec<String>>,
+    source_record_id: Option<String>,
+    source_record_tags: Option<Vec<String>>,
 ) -> Result<PreparedTaskDiscussion, String> {
     validate_safe_id(&discussion_id, "discussionId")?;
     let root = crate::app_dirs::myagents_data_dir()
@@ -5106,8 +5111,8 @@ pub async fn cmd_task_prepare_discussion(
         discussion_id: discussion_id.clone(),
         workspace_id,
         workspace_path,
-        source_thought_id,
-        source_thought_tags: source_thought_tags.unwrap_or_default(),
+        source_record_id,
+        source_record_tags: source_record_tags.unwrap_or_default(),
         created_at: now_ms(),
     };
     let json = serde_json::to_string_pretty(&meta)
@@ -5116,7 +5121,7 @@ pub async fn cmd_task_prepare_discussion(
     ulog_debug!(
         "[task] prepared discussion id={} thought={:?}",
         discussion_id,
-        meta.source_thought_id,
+        meta.source_record_id,
     );
     Ok(PreparedTaskDiscussion {
         discussion_id,
@@ -5484,7 +5489,7 @@ mod tests {
             runtime_config: None,
             mcp_enabled_servers: None,
             managed_kind: None,
-            source_thought_id: Some("thought-1".to_string()),
+            source_record_id: Some("record-1".to_string()),
             tags: vec!["MyAgents".to_string()],
             notification: None,
         }

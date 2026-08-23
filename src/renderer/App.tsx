@@ -3151,15 +3151,15 @@ export default function App() {
           discussionId,
           workspaceId: workspace.id,
           workspacePath: workspace.path,
-          sourceThoughtId: thoughtId || undefined,
-          sourceThoughtTags: tags ?? [],
+          sourceRecordId: thoughtId || undefined,
+          sourceRecordTags: tags ?? [],
         });
         const discussionPrompt = buildTaskDiscussionReminder({
           ...prepared,
           workspaceId: workspace.id,
           workspacePath: workspace.path,
-          sourceThoughtId: thoughtId || undefined,
-          sourceThoughtTags: tags ?? [],
+          sourceRecordId: thoughtId || undefined,
+          sourceRecordTags: tags ?? [],
           visibleUserMessage: content,
         });
 
@@ -3239,9 +3239,9 @@ export default function App() {
 
   const handleCreateDialogDiscussion = useCallback(async (request: TaskDiscussionRequest) => {
     const opened = await handleStartTaskDiscussion({
-      thoughtId: request.sourceThoughtId,
+      thoughtId: request.sourceRecordId,
       content: request.content,
-      tags: request.sourceThoughtTags,
+      tags: request.sourceRecordTags,
       workspaceId: request.workspaceId,
     });
     if (opened) setTaskCreateIntent(null);

@@ -15,6 +15,7 @@ mod crash_artifact_retention;
 pub mod cron_task;
 pub mod device_identity;
 pub mod document_processing;
+mod durable_fs;
 pub mod floating_ball;
 pub mod floating_ball_pets;
 mod global_shortcut;
@@ -43,6 +44,7 @@ pub mod process_cleanup;
 pub mod process_cmd;
 mod proxy_config;
 mod proxy_spill;
+pub mod record;
 pub mod runtime_launch_guard;
 pub mod search;
 pub mod session_goal;
@@ -287,15 +289,19 @@ pub fn run() {
     let browser_state = browser::BrowserManager::new();
     let browser_state_for_exit = browser_state.clone();
 
-    // Create Task Center state (v0.1.69 — thought & task stores)
+    // RecordStore is the sole authority for both canonical Records and the
+    // legacy Thought compatibility surface. Its startup adapter migrates old
+    // Thought files before the in-memory snapshot becomes visible.
     let data_dir = app_dirs::myagents_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let thought_state: thought::ManagedThoughtStore =
-        Arc::new(thought::ThoughtStore::new(data_dir.join("thoughts")));
+    let record_state: record::ManagedRecordStore = Arc::new(record::RecordStore::new(
+        data_dir.join("records"),
+        Some(data_dir.join("thoughts")),
+    ));
     let task_state: task::ManagedTaskStore = Arc::new(task::TaskStore::new(data_dir.clone()));
     // Expose the same Arcs via OnceLock singletons so the Rust Management API
     // (used by Bun CLI bridge → /api/admin/task/*) can read/write tasks without
     // access to Tauri `State`. They point at the same inner store.
-    thought::set_thought_store(thought_state.clone());
+    record::set_record_store(record_state.clone());
     task::set_task_store(task_state.clone());
 
     // Create SSE proxy state
@@ -378,7 +384,7 @@ pub fn run() {
         .manage(agent_state)
         .manage(terminal_state)
         .manage(browser_state)
-        .manage(thought_state)
+        .manage(record_state)
         .manage(task_state)
         .manage(app_route_queue)
         .manage(notification_center)
@@ -665,6 +671,10 @@ pub fn run() {
             search::cmd_refresh_workspace_index,
             search::cmd_search_thoughts,
             search::cmd_search_tasks,
+            // Canonical Record commands.
+            record::cmd_record_create,
+            record::cmd_record_list,
+            record::cmd_record_get,
             // Task Center — Thought commands (v0.1.69)
             thought::cmd_thought_create,
             thought::cmd_thought_list,

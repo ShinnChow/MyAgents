@@ -25,8 +25,8 @@ describe('systemReminder', () => {
       candidatesDir: '/Users/me/.myagents/task-discussions/discussion-1/candidates',
       workspaceId: 'workspace-1',
       workspacePath: '/Users/me/project<&',
-      sourceThoughtId: 'thought-1',
-      sourceThoughtTags: ['release', '<urgent>'],
+      sourceRecordId: 'record-1',
+      sourceRecordTags: ['release', '<urgent>'],
       visibleUserMessage: '每周整理一次发布记录',
     });
 

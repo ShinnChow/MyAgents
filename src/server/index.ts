@@ -1427,6 +1427,8 @@ async function routeAdminApi(
   if (route === 'task/write-doc') return await api.handleTaskWriteDoc(payload as Parameters<typeof api.handleTaskWriteDoc>[0]);
   if (route === 'thought/list') return await api.handleThoughtList(payload as Parameters<typeof api.handleThoughtList>[0]);
   if (route === 'thought/create') return await api.handleThoughtCreate(payload as Parameters<typeof api.handleThoughtCreate>[0]);
+  if (route === 'record/list') return await api.handleRecordList(payload as Parameters<typeof api.handleRecordList>[0]);
+  if (route === 'record/create') return await api.handleRecordCreate(payload as Parameters<typeof api.handleRecordCreate>[0]);
 
   // MyAgents Cloud Space — Registered Agent CLI bridge.
   if (route === 'space/list') return await api.handleSpaceList();

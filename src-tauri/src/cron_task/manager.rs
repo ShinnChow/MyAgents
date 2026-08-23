@@ -423,7 +423,7 @@ fn task_input_from_cron_config(
         runtime_config: config.runtime_config,
         mcp_enabled_servers: config.mcp_enabled_servers,
         managed_kind: config.managed_kind,
-        source_thought_id: None,
+        source_record_id: None,
         tags: config
             .source_bot_id
             .into_iter()

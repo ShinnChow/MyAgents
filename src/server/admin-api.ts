@@ -4985,6 +4985,28 @@ export async function handleThoughtCreate(payload: {
   return wrapped;
 }
 
+export async function handleRecordList(payload: {
+  kind?: 'text' | 'audio';
+  tag?: string;
+  query?: string;
+  limit?: number;
+  archived?: 'active' | 'archived' | 'all';
+}): Promise<AdminResponse> {
+  const resp = await managementApi(`/api/record/list${qsFrom(payload)}`);
+  if (resp.ok) {
+    return { success: true, data: (resp as Record<string, unknown>).records ?? [] };
+  }
+  return mgmtError(resp, 'Failed to list records');
+}
+
+export async function handleRecordCreate(payload: {
+  content: string;
+  images?: string[];
+}): Promise<AdminResponse> {
+  const resp = await managementApi('/api/record/create', 'POST', payload);
+  return wrapMgmtResponse(resp);
+}
+
 // ---------------------------------------------------------------------------
 // Session-scoped capabilities for external runtimes (v0.1.67)
 //

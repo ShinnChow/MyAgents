@@ -344,7 +344,7 @@ export function DispatchTaskDialog({
         runtimeConfig: executionOverrides.runtimeConfig as Record<string, unknown> | undefined,
         permissionMode: advPermissionMode,
         mcpEnabledServers: advMcpEnabledServers,
-        sourceThoughtId: thought?.id,
+        sourceRecordId: thought?.id,
         tags: thought?.tags ?? [],
         notification,
       });
@@ -408,8 +408,8 @@ export function DispatchTaskDialog({
         content: smartPrompt.trim(),
         workspaceId: workspace.id,
         workspacePath: workspace.path,
-        sourceThoughtId: thought?.id,
-        sourceThoughtTags: thought?.tags,
+        sourceRecordId: thought?.id,
+        sourceRecordTags: thought?.tags,
       });
       if (!opened) setBusy(false);
     } catch (error) {

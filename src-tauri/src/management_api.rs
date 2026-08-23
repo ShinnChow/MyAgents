@@ -229,6 +229,8 @@ pub async fn start_management_api() -> Result<u16, String> {
         .route("/api/task/write-doc", post(task_write_doc_handler))
         .route("/api/thought/list", get(thought_list_handler))
         .route("/api/thought/create", post(thought_create_handler))
+        .route("/api/record/list", get(record_list_handler))
+        .route("/api/record/create", post(record_create_handler))
         .route("/api/space/list", post(space_list_handler))
         .route("/api/space/whoami", post(space_whoami_handler))
         .route(
@@ -3813,10 +3815,10 @@ struct ThoughtListQuery {
 }
 
 async fn thought_list_handler(Query(q): Query<ThoughtListQuery>) -> Json<serde_json::Value> {
-    let Some(store) = thought::get_thought_store() else {
+    let Some(store) = crate::record::get_record_store() else {
         return Json(serde_json::json!({
             "ok": false,
-            "error": "thought store not initialized"
+            "error": "record store not initialized"
         }));
     };
     let archive_mode = match q.archived.as_deref() {
@@ -3828,28 +3830,104 @@ async fn thought_list_handler(Query(q): Query<ThoughtListQuery>) -> Json<serde_j
         _ => Some(thought::ThoughtArchiveFilter::Active),
     };
     let thoughts = store
-        .list(thought::ThoughtListFilter {
-            tag: q.tag,
-            query: q.query,
-            limit: q.limit,
-            archived: archive_mode,
-        })
-        .await;
-    Json(serde_json::json!({ "ok": true, "thoughts": thoughts }))
+        .list_full(
+            thought::ThoughtListFilter {
+                tag: q.tag,
+                query: q.query,
+                limit: q.limit,
+                archived: archive_mode,
+            }
+            .into(),
+        )
+        .await
+        .into_iter()
+        .map(thought::Thought::try_from)
+        .collect::<Result<Vec<_>, _>>();
+    match thoughts {
+        Ok(thoughts) => Json(serde_json::json!({ "ok": true, "thoughts": thoughts })),
+        Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
+    }
 }
 
 async fn thought_create_handler(
     Json(input): Json<thought::ThoughtCreateInput>,
 ) -> Json<serde_json::Value> {
-    let Some(store) = thought::get_thought_store() else {
+    let Some(store) = crate::record::get_record_store() else {
         return Json(serde_json::json!({
             "ok": false,
-            "error": "thought store not initialized"
+            "error": "record store not initialized"
         }));
     };
-    match store.create(input).await {
-        Ok(t) => Json(serde_json::json!({ "ok": true, "thought": t })),
+    match store
+        .create_text(crate::record::TextRecordCreateInput {
+            content: input.content,
+            images: input.images,
+        })
+        .await
+        .and_then(thought::Thought::try_from)
+    {
+        Ok(record) => Json(serde_json::json!({ "ok": true, "thought": record })),
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordListQuery {
+    kind: Option<String>,
+    tag: Option<String>,
+    query: Option<String>,
+    limit: Option<usize>,
+    archived: Option<String>,
+}
+
+async fn record_list_handler(Query(query): Query<RecordListQuery>) -> Json<serde_json::Value> {
+    let Some(store) = crate::record::get_record_store() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "record store not initialized"
+        }));
+    };
+    let kind = match query.kind.as_deref() {
+        Some("text") => Some(crate::record::RecordKind::Text),
+        Some("audio") => Some(crate::record::RecordKind::Audio),
+        Some(_) => {
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": "record kind must be text or audio"
+            }));
+        }
+        None => None,
+    };
+    let archived = match query.archived.as_deref() {
+        Some("archived") => Some(crate::record::RecordArchiveFilter::Archived),
+        Some("all") => Some(crate::record::RecordArchiveFilter::All),
+        _ => Some(crate::record::RecordArchiveFilter::Active),
+    };
+    let records = store
+        .list(crate::record::RecordListFilter {
+            kind,
+            tag: query.tag,
+            query: query.query,
+            limit: query.limit,
+            archived,
+        })
+        .await;
+    Json(serde_json::json!({ "ok": true, "records": records }))
+}
+
+async fn record_create_handler(
+    Json(input): Json<crate::record::TextRecordCreateInput>,
+) -> Json<serde_json::Value> {
+    let Some(store) = crate::record::get_record_store() else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": "record store not initialized"
+        }));
+    };
+    match store.create_text(input).await {
+        Ok(record) => Json(serde_json::json!({ "ok": true, "record": record })),
+        Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
     }
 }
 
