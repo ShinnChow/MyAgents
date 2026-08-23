@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.11] - 2026-08-24
+
+### Fixed
+
+- **发布版托管浏览器恢复可用**：Playwright 控制代码保留完整的包目录和运行时资源，不再因单文件 ESM 打包破坏模块路径，首次启用“浏览器”时可以正常启动 Browser Host。
+
+---
+
 ## [0.4.10] - 2026-08-23
 
 > MyAgents 0.4.10 将 Task Center 升级为围绕 `task.md`、执行 Session 与本地评论协作的任务中枢，并新增应用托管浏览器、统一通知中心、Space 团队工具资源池和飞书扫码接入。版本同时改善长对话滚动、工具启动与多 Runtime 会话的稳定性。

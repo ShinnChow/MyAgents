@@ -21,6 +21,8 @@ import { build } from 'esbuild';
 import { readFile, mkdir, readdir, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
+import { preparePlaywrightControlRuntime } from './prepare-playwright-control-runtime.mjs';
+
 // Read package.json version once and inject as a compile-time constant.
 // This is the ONLY way `myagents version` can show the real shipped
 // version in production: the runtime `process.env.npm_package_version`
@@ -55,12 +57,22 @@ const TARGETS = {
     format: 'esm',
     sourcemap: true,
     banner: { js: ESM_INTEROP_BANNER },
-    // Playwright's optional macOS watcher is guarded by a runtime try/catch,
-    // and its BiDi-over-CDP bridge is loaded only by that explicit protocol.
-    // Neither belongs to the Browser Host's supported launch path. Keeping
-    // these optional native/private edges external lets the public
-    // @playwright/mcp API bundle portably without packaging host-only addons.
-    external: ['fsevents', 'chromium-bidi/*'],
+    // Playwright must keep its package-local CommonJS layout and data files.
+    // Bundling it into this ESM file leaves module-scoped globals such as
+    // `__dirname` unbound and breaks its relative package.json/assets lookup
+    // in release builds. Tauri ships these three pinned *control-code*
+    // packages under Resources/node_modules; Chromium itself remains a
+    // separately managed runtime artifact and is not part of the app bundle.
+    external: [
+      '@playwright/mcp',
+      '@playwright/mcp/*',
+      'playwright',
+      'playwright/*',
+      'playwright-core',
+      'playwright-core/*',
+      'fsevents',
+      'chromium-bidi/*',
+    ],
     /** Post-build: catch hardcoded `__dirname = "<dev-machine path>"` leaks.
      *  esbuild treats a top-level `__dirname` as a compile-time constant; the
      *  source must use `import.meta.url` / `getScriptDir()` instead. If anyone
@@ -132,6 +144,10 @@ if (!cfg) {
 // nuked target/), `src-tauri/resources/cli/` may not exist yet.
 const outputDir = dirname(cfg.outfile);
 await mkdir(outputDir, { recursive: true });
+
+if (targetName === 'server') {
+  preparePlaywrightControlRuntime();
+}
 
 // The package must contain exactly one CLI business payload. Remove artifacts
 // emitted by older build logic (notably myagents.cmd) before rebuilding while

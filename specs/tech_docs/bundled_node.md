@@ -129,7 +129,7 @@ Detector 在 `env_clear()` 后只恢复本地命令所需的 OS home/user/temp/s
 
 标准 `playwright` preset 继续走这条通用 stdio 路径：锁定 package spec，但保留上游 argv 与浏览器资源语义；仅在用户从未保存 args 时默认追加 `--isolated`。它与新增的 `myagents-browser` /「浏览器」不是同一个工具。
 
-「浏览器」使用 App 生产依赖中锁定的 `@playwright/mcp` 控制代码，并把保留 sentinel 投影为 Global Sidecar Browser Host 的认证 HTTP transport。它不调用 `npx`，也不从 bundled Node、系统 Chrome 或用户 Playwright cache 寻找浏览器。Rust resource owner 只在用户首次明确安装后，按 App 内锁定的官方 Playwright artifact URL、size 与 SHA-256 下载并解析精确 Chromium executable path；Chromium 资源不属于 bundled Node，也不进入 Tauri resources。
+「浏览器」使用 App 生产依赖中锁定的 `@playwright/mcp` 控制代码，并把保留 sentinel 投影为 Global Sidecar Browser Host 的认证 HTTP transport。Playwright 三个控制包保持上游目录结构随 Tauri 进入 `Resources/node_modules`，由 ESM `server-dist.js` 在 Browser Host 懒加载边界作为 external package 动态加载；不要把依赖 package-local `__dirname` / data file 的代码重新 bundle 进单文件。`prepare-playwright-control-runtime.mjs` 每次构建都从锁定依赖重建 staging，并移除无关的 `fsevents` 原生模块、拒绝其它 native library 与 browser artifact。它不调用 `npx`，也不从 bundled Node、系统 Chrome 或用户 Playwright cache 寻找浏览器。Rust resource owner 只在用户首次明确安装后，按 App 内锁定的官方 Playwright artifact URL、size 与 SHA-256 下载并解析精确 Chromium executable path；Chromium 资源不属于 bundled Node，也不进入 Tauri resources。
 
 ### 内置 in-process MCP（懒加载）
 

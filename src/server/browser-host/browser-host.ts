@@ -4,7 +4,6 @@ import { isAbsolute, relative } from 'path';
 import { pathToFileURL } from 'url';
 
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import { createConnection } from '@playwright/mcp';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 
 import { BrowserContextRegistry } from './context-registry';
@@ -377,6 +376,7 @@ export class PlaywrightBrowserHost {
     this.dependencies.registry.retainConnection(binding.productSessionId);
     let server: Server;
     try {
+      const { createConnection } = await import('@playwright/mcp');
       server = await createConnection(
         compiled.connectionConfig,
         () => this.dependencies.registry.getContext(

@@ -1,9 +1,8 @@
-import {
-  chromium,
-  type Browser,
-  type BrowserContext,
-  type BrowserType,
-  type Page,
+import type {
+  Browser,
+  BrowserContext,
+  BrowserType,
+  Page,
 } from 'playwright';
 
 import type { VerifiedBrowserCapability } from './capability-client';
@@ -189,7 +188,7 @@ export interface BrowserContextRegistryDependencies {
     state: BrowserIdentityState,
     signal?: AbortSignal,
   ): Promise<BrowserIdentitySnapshot & { conflictCount: number }>;
-  browserType: BrowserType;
+  loadBrowserType(): Promise<BrowserType>;
   resolveResource(signal?: AbortSignal): Promise<BrowserResourceResolution>;
   onContextClosed(productSessionId: string): void;
 }
@@ -197,7 +196,7 @@ export interface BrowserContextRegistryDependencies {
 const DEFAULT_DEPENDENCIES: BrowserContextRegistryDependencies = {
   readIdentity: readBrowserIdentity,
   checkpointIdentity: checkpointBrowserIdentity,
-  browserType: chromium,
+  loadBrowserType: async () => (await import('playwright')).chromium,
   resolveResource: waitForBrowserResource,
   onContextClosed: () => {},
 };
@@ -448,8 +447,8 @@ export class BrowserContextRegistry {
   ): Promise<Browser> {
     if (this.browser?.isConnected()) return this.browser;
     if (!this.browserPromise) {
-      this.browserPromise = this.dependencies.browserType
-        .launch(launchOptions)
+      this.browserPromise = this.dependencies.loadBrowserType()
+        .then(browserType => browserType.launch(launchOptions))
         .then(browser => {
           this.browser = browser;
           browser.once('disconnected', () => {
