@@ -18,10 +18,7 @@ import type {
   RuntimeProxyPolicy, RuntimeDiagnosticIssue,
   RuntimeSource,
 } from '../../shared/types/runtime';
-import {
-  MANAGED_CODEX_REQUIRED_RUNTIME,
-  type McpServerDefinition,
-} from '../../shared/config-types';
+import type { McpServerDefinition } from '../../shared/config-types';
 import { MANAGED_BROWSER_MCP_ID } from '../../shared/browserTools';
 import {
   acquireBrowserCapability,
@@ -76,21 +73,6 @@ import {
   projectManagedCodexMcpLaunchConfig,
 } from './managed-codex/extensions/mcp-launch-projection';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
-
-/**
- * Managed extension RPCs are verified against the exact binary selected by the
- * single runtime lock. The lock cannot be advanced until schema generation and
- * exact-binary conformance pass; duplicating its version here would create a
- * second authority that can drift from packaging and installation.
- */
-export function assertManagedCodexRuntimeConformanceVersion(version: string | undefined): void {
-  if (version !== MANAGED_CODEX_REQUIRED_RUNTIME.version) {
-    throw new Error(
-      `Managed Codex extensions require conformed app-server ${MANAGED_CODEX_REQUIRED_RUNTIME.version}; `
-      + `resolved ${version ?? 'unknown'}. Re-run exact-version conformance before upgrading.`,
-    );
-  }
-}
 
 type CodexDecision = 'deny' | 'allow_once' | 'always_allow';
 type ManagedCodexMcpAdmissionOwner = {
@@ -3508,9 +3490,6 @@ export class CodexRuntime implements AgentRuntime {
     const extensionSnapshot = runtimeSource === 'managed-provider'
       ? options.managedCodexExtensions
       : undefined;
-    if (extensionSnapshot) {
-      assertManagedCodexRuntimeConformanceVersion(context.version);
-    }
     const extensionMaterialization = materializeManagedCodexExtensions(extensionSnapshot);
     let runtimeMcpServers = extensionSnapshot?.mcpServers ?? options.mcpServers;
     const usesManagedBrowserHost = runtimeSource === 'managed-provider'
