@@ -16,6 +16,8 @@ import {
 import { compileBrowserRuntimeSettings } from './runtime-settings';
 import { waitForBrowserResource, type BrowserResourceResolution } from './resource-client';
 
+type BrowserCookie = Parameters<BrowserContext['addCookies']>[0][number];
+
 const CHECKPOINT_DEBOUNCE_MS = 750;
 const CONTEXT_REATTACH_GRACE_MS = 15_000;
 const CONTEXT_CLOSE_TIMEOUT_MS = 4_000;
@@ -396,10 +398,15 @@ export class BrowserContextRegistry {
       ...compiled.launchOptions,
       executablePath: resource.executablePath,
     });
-    const context = await browser.newContext({
-      ...compiled.contextOptions,
-      storageState: identity.state as never,
-    });
+    const context = await browser.newContext(compiled.contextOptions);
+    try {
+      if (identity.state.cookies.length > 0) {
+        await context.addCookies(identity.state.cookies as BrowserCookie[]);
+      }
+    } catch (error) {
+      await context.close().catch(() => {});
+      throw error;
+    }
 
     if (signal?.aborted) {
       await context.close();
@@ -486,7 +493,14 @@ export class BrowserContextRegistry {
     if (entry.checkpointPromise) return entry.checkpointPromise;
 
     entry.checkpointPromise = (async () => {
-      const state = await entry.context.storageState({ indexedDB: true }) as unknown as BrowserIdentityState;
+      // `storageState()` materializes every non-visible Web Storage origin in
+      // a real Playwright page. In headed Chromium that leaks as a temporary
+      // tab cycling through historical sites. Managed Browser identity is
+      // therefore deliberately cookie-only and uses page-free cookie APIs.
+      const state: BrowserIdentityState = {
+        cookies: await entry.context.cookies() as unknown as Array<Record<string, unknown>>,
+        origins: [],
+      };
       const result = await this.dependencies.checkpointIdentity(
         productSessionId,
         entry.identity,

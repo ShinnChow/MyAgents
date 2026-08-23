@@ -72,7 +72,7 @@ assembler。调用方传入：
 模板直接内联在 TypeScript 中，不从运行时文件系统加载。原因是打包后的 Bun
 `__dirname` 不能稳定定位模板资源；内联内容同时让生产包与源码使用同一个事实来源。
 
-受管「浏览器」的登录态保存不属于 Prompt 契约。应用级 Browser Host 会在成功工具调用和 Context teardown 边界自动 checkpoint Cookie、localStorage 与 IndexedDB；模型无需、也不应被提示主动调用存储工具来维持产品正确性。标准 `playwright` 仍遵循上游 MCP 的 argv/storage-state 语义，MyAgents 不用隐藏 Prompt 改写它。
+受管「浏览器」的登录态保存不属于 Prompt 契约。应用级 Browser Host 会在成功工具调用和 Context teardown 边界自动 checkpoint Cookie；模型无需、也不应被提示主动调用存储工具来维持产品正确性。该 headed Context 不使用 Playwright `storageState()`，避免身份维护创建用户可见的临时页面；localStorage 与 IndexedDB 不跨 Product Session 恢复。标准 `playwright` 仍遵循上游 MCP 的 argv/storage-state 语义，MyAgents 不用隐藏 Prompt 改写它。
 
 ### 场景模型
 

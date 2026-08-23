@@ -31,6 +31,8 @@ function fakeContext(): BrowserContext {
     newPage: vi.fn(),
     route: vi.fn(),
     unroute: vi.fn(),
+    addCookies: vi.fn(async () => {}),
+    cookies: vi.fn(async () => []),
     storageState: vi.fn(async () => EMPTY_STATE),
   } as unknown as BrowserContext;
 }
@@ -102,6 +104,46 @@ describe('BrowserContextRegistry', () => {
       executablePath: '/managed/chromium',
     }));
     expect(browser.newContext).toHaveBeenCalledTimes(3);
+  });
+
+  it('hydrates and checkpoints only cookies without Playwright storage pages', async () => {
+    const cookie = {
+      name: 'session',
+      value: 'cookie-value',
+      domain: '.example.com',
+      path: '/',
+      expires: -1,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Lax',
+    };
+    const identityState = {
+      cookies: [cookie],
+      origins: [{
+        origin: 'https://www.sina.com.cn',
+        localStorage: [{ name: 'historical', value: 'state' }],
+        indexedDB: [],
+      }],
+    };
+    const context = fakeContext();
+    vi.mocked(context.cookies).mockResolvedValue([cookie] as never);
+    const { registry, browser, checkpointIdentity } = harness([context], {
+      readIdentity: vi.fn(async () => ({ revision: 1, state: identityState })),
+    });
+
+    await registry.getContext(binding('a'));
+    await registry.checkpoint('a');
+
+    expect(vi.mocked(browser.newContext).mock.calls[0]?.[0]).not.toHaveProperty('storageState');
+    expect(context.addCookies).toHaveBeenCalledWith([cookie]);
+    expect(context.storageState).not.toHaveBeenCalled();
+    expect(context.cookies).toHaveBeenCalledOnce();
+    expect(checkpointIdentity).toHaveBeenCalledWith(
+      'a',
+      { revision: 1, state: identityState },
+      identityState,
+      { cookies: [cookie], origins: [] },
+    );
   });
 
   it('cancels only an in-flight resource wait and permits a later retry', async () => {
@@ -190,7 +232,7 @@ describe('BrowserContextRegistry', () => {
       origins: [],
     };
     const context = fakeContext();
-    vi.mocked(context.storageState).mockResolvedValue(staleState as never);
+    vi.mocked(context.cookies).mockResolvedValue(staleState.cookies as never);
     const browser = {
       isConnected: vi.fn(() => true),
       newContext: vi.fn(async () => context),

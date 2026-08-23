@@ -292,7 +292,7 @@ Rust 为 Global 与 Session 两类 Sidecar 都在 spawn 前分配 process-global
 受管工具只把 JS 控制代码与 App 一起发布，Chromium、Chromium Headless Shell 与 FFmpeg 不进入 App bundle、installer 或 updater。`src/shared/managed-browser-runtime.json` 是随 App 签名发布的 required runtime set 与各平台官方 artifact 计划：它锁定 Playwright 官方来源解析出的最终 Chrome for Testing / Playwright CDN URL、archive size、SHA-256、归档根和 executable path。Rust App owner 从未安装时只在用户点击“安装资源”后直连该锁定官方 artifact，完成摘要校验、安全解压与原子安装；读取状态不访问网络。首次成功形成 install authorization，后续 App revision 变化自动维护且最多重试两次；没有用户卸载入口。Browser Host 只能消费 Rust 投影的精确 executable path，不回退系统 Chrome、用户 Playwright cache、`npx playwright install` 或 App resources。
 
 - 一个 App Browser generation 共享一个 Chromium Browser process；每个 Product Session 一个隔离 `BrowserContext` 和原生窗口，同一 Context 的 Pages 是 Tabs。不存在 persistent/user-data-dir/Profile lease 模式。
-- Context 从 Rust-owned Browser Identity revision 初始化，Host 在成功工具调用后防抖保存，并在 close/teardown/shutdown 前强制保存 Cookie、localStorage 与 IndexedDB；并发 checkpoint 通过 revision + key-level CAS 合并。
+- Context 从 Rust-owned Browser Identity revision 初始化，Host 仅通过 `addCookies()` / `cookies()` 恢复和保存 Cookie，并在成功工具调用后防抖保存、在 close/teardown/shutdown 前强制保存；禁止对 headed Context 使用 Playwright `storageState()`，因为它会用用户可见的临时页面遍历历史 Web Storage origin。并发 checkpoint 通过 revision + key-level CAS 合并；旧版本留下的 localStorage / IndexedDB origin 只作兼容读取并在后续 checkpoint 清理，不再恢复。
 - Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
 - `config.mcpEnabledServers` 只表达全局可用性，因此两个固定内置 ID 可以同时启用。真正形成执行工具集的 Session、Agent 默认、Launcher 与 Task override 选择入口才互斥：选择一个会移除另一个，取消选择不改变对方；最终 Session 工具集仍取全局可用集与该执行选择集的交集。自定义 MCP 不参与该规则。
 
