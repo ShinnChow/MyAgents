@@ -52,6 +52,7 @@ import myAgentsLogo from '@/assets/runtime-icons/myagents.png';
 import type { SessionMetadata } from '@/api/sessionClient';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import FeedbackPopover from '@/components/FeedbackPopover';
+import { APP_SHELL_POPOVER_CHROME } from '@/components/global-sidebar/appShellPopoverChrome';
 import OverlayBackdrop from '@/components/OverlayBackdrop';
 import PathInputDialog from '@/components/PathInputDialog';
 import SessionStatsModal from '@/components/SessionStatsModal';
@@ -1227,7 +1228,11 @@ export default memo(function GlobalSidebar({
               {t('notificationCenter.bell')}
             </span>
           </button>
-          <div ref={feedbackTriggerRef} className={expanded ? '' : 'flex justify-center'}>
+          <div
+            ref={feedbackTriggerRef}
+            className={`-mr-3 pr-3 ${expanded ? '' : 'flex justify-center'}`}
+            data-feedback-popover-anchor
+          >
             <SidebarNavButton
               expanded={expanded}
               icon={<Bot className="h-4 w-4" />}
@@ -1255,7 +1260,7 @@ export default memo(function GlobalSidebar({
       {!expanded && flyoutOpen && (
         <div
           ref={flyoutRef}
-          className="fixed bottom-28 left-[calc(var(--global-sidebar-rail-width)+var(--space-2))] top-32 z-[240] w-[var(--global-sidebar-flyout-width)] overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--global-sidebar-bg)] shadow-md"
+          className={`fixed bottom-28 left-[calc(var(--global-sidebar-rail-width)+var(--space-2))] top-32 z-[240] w-[var(--global-sidebar-flyout-width)] ${APP_SHELL_POPOVER_CHROME}`}
           data-global-sidebar-flyout
           onPointerEnter={handleFlyoutPointerEnter}
           onPointerLeave={handleFlyoutPointerLeave}
@@ -1286,7 +1291,7 @@ export default memo(function GlobalSidebar({
           role="dialog"
           aria-label={t('notificationCenter.title')}
           aria-modal="false"
-          className="fixed z-[245] overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--global-sidebar-bg)] shadow-md"
+          className={`fixed z-[245] ${APP_SHELL_POPOVER_CHROME}`}
           style={{
             left: expanded
               ? 'calc(var(--global-sidebar-expanded-width) + var(--space-2))'

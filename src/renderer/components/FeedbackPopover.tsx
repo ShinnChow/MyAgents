@@ -1,7 +1,7 @@
 /**
  * FeedbackPopover - Quick access popover for AI assistant and community QR code
  *
- * Drops down from the feedback button in the titlebar.
+ * Opens beside the helper entry in the App Shell sidebar.
  * Two modules: "AI 小助理" (opens BugReportOverlay) and "加入用户群" (shows QR code).
  */
 
@@ -10,6 +10,7 @@ import { useTranslation } from 'react-i18next';
 import { Bot, Loader2, Users, X } from 'lucide-react';
 
 import { apiGetJson } from '@/api/apiFetch';
+import { APP_SHELL_POPOVER_CHROME } from '@/components/global-sidebar/appShellPopoverChrome';
 import { Popover } from '@/components/ui/Popover';
 import { isTauriEnvironment } from '@/utils/browserMock';
 
@@ -17,7 +18,7 @@ interface FeedbackPopoverProps {
     open: boolean;
     onClose: () => void;
     onOpenBugReport: () => void;
-    /** Ref to the trigger button — anchors the popover. */
+    /** Ref to the trigger region — anchors the popover at the sidebar edge. */
     triggerRef: React.RefObject<HTMLElement | null>;
 }
 
@@ -52,10 +53,11 @@ export default function FeedbackPopover({ open, onClose, onOpenBugReport, trigge
             open={open}
             onClose={onClose}
             anchorRef={triggerRef}
-            placement="bottom-end"
-            offset={6}
+            placement="right-end"
+            offset={8}
             zIndex={200}
-            className="w-72 rounded-xl shadow-lg"
+            className={`${APP_SHELL_POPOVER_CHROME} w-72`}
+            unstyled
         >
             {/* Header */}
             <div className="flex items-center justify-between px-4 pt-3.5 pb-2">

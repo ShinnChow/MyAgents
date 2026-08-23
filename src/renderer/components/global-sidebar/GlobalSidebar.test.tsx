@@ -227,7 +227,23 @@ describe('GlobalSidebar rail flyout', () => {
     expect(screen.getByRole('dialog', {
       name: String(i18n.t('app:notificationCenter.title')),
     })).toBeInTheDocument();
+    const shell = document.querySelector<HTMLElement>('[data-notification-center-shell]');
+    expect(shell).not.toBeNull();
+    expect(shell).toHaveClass(
+      'bg-[var(--paper-elevated)]',
+      'shadow-xl',
+      'rounded-xl',
+      'border-[var(--line)]',
+    );
+    expect(shell).not.toHaveClass('bg-[var(--global-sidebar-bg)]', 'shadow-md');
     expect(document.querySelectorAll('[data-notification-center-shell]')).toHaveLength(1);
+  });
+
+  it('extends the helper popover anchor to the sidebar edge', () => {
+    renderSidebar();
+
+    const anchor = document.querySelector('[data-feedback-popover-anchor]');
+    expect(anchor).toHaveClass('-mr-3', 'pr-3');
   });
 
   it('keeps App Shell flyouts mutually exclusive in both directions', () => {
@@ -263,7 +279,16 @@ describe('GlobalSidebar rail flyout', () => {
 
     fireEvent.pointerEnter(trigger);
     act(() => vi.advanceTimersByTime(125));
-    expect(screen.getByRole('region', { name: 'Agent 工作区' })).toBeInTheDocument();
+    const region = screen.getByRole('region', { name: 'Agent 工作区' });
+    expect(region).toBeInTheDocument();
+    const shell = region.closest('[data-global-sidebar-flyout]');
+    expect(shell).toHaveClass(
+      'bg-[var(--paper-elevated)]',
+      'shadow-xl',
+      'rounded-xl',
+      'border-[var(--line)]',
+    );
+    expect(shell).not.toHaveClass('bg-[var(--global-sidebar-bg)]', 'shadow-md');
 
     fireEvent.click(trigger);
     expect(screen.getByRole('region', { name: 'Agent 工作区' })).toBeInTheDocument();
@@ -440,7 +465,7 @@ describe('GlobalSidebar rail flyout', () => {
     expect(screen.queryByRole('button', { name: /Focused session/ })).not.toBeInTheDocument();
   });
 
-  it('uses the sidebar surface and invisible fixed-height placeholders in the rail flyout', () => {
+  it('uses the shared App Shell surface and invisible fixed-height placeholders in the rail flyout', () => {
     mocks.projects.push({ id: 'project-1', name: 'Project one', path: '/work/project-one' });
     mocks.taskData.workspaceSessionStates.set('/work/project-one', { isLoading: true, error: null });
     window.localStorage.setItem(GLOBAL_SIDEBAR_PREFERENCE_KEY, JSON.stringify({
@@ -456,10 +481,10 @@ describe('GlobalSidebar rail flyout', () => {
 
     const region = screen.getByRole('region', { name: 'Agent 工作区' });
     const flyout = region.closest('[data-global-sidebar-flyout]');
-    expect(flyout).toHaveClass('bg-[var(--global-sidebar-bg)]');
+    expect(flyout).toHaveClass('bg-[var(--paper-elevated)]', 'shadow-xl');
     expect(flyout).toHaveClass('fixed', 'top-32', 'bottom-28');
     expect(flyout).not.toHaveClass('absolute', 'top-12', 'bottom-3');
-    expect(flyout).not.toHaveClass('bg-[var(--paper-elevated)]');
+    expect(flyout).not.toHaveClass('bg-[var(--global-sidebar-bg)]', 'shadow-md');
     const placeholder = region.querySelector('[data-global-sidebar-session-placeholder]')!;
     expect(placeholder.children).toHaveLength(3);
     for (const row of Array.from(placeholder.children)) {
