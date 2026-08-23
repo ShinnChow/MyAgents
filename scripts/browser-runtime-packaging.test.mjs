@@ -5,7 +5,9 @@ import test from 'node:test';
 
 const repoRoot = new URL('..', import.meta.url).pathname;
 const lock = JSON.parse(readFileSync(join(repoRoot, 'src/shared/managed-browser-runtime.json'), 'utf8'));
+const rootPackage = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
 const mcpPackage = JSON.parse(readFileSync(join(repoRoot, 'node_modules/@playwright/mcp/package.json'), 'utf8'));
+const playwrightPackage = JSON.parse(readFileSync(join(repoRoot, 'node_modules/playwright/package.json'), 'utf8'));
 const corePackage = JSON.parse(readFileSync(join(repoRoot, 'node_modules/playwright-core/package.json'), 'utf8'));
 const browsers = JSON.parse(readFileSync(join(repoRoot, 'node_modules/playwright-core/browsers.json'), 'utf8')).browsers;
 const chromium = browsers.find((browser) => browser.name === 'chromium');
@@ -18,6 +20,22 @@ test('Browser runtime lock is pinned to the installed Playwright dependency grap
   assert.equal(lock.chromiumRevision, chromium.revision);
   assert.equal(lock.chromiumBrowserVersion, chromium.browserVersion);
   assert.equal(lock.runtimeSet, `playwright-${corePackage.version}-chromium-${chromium.revision}`);
+});
+
+test('Browser Host owns every Playwright package it imports directly', () => {
+  assert.equal(rootPackage.dependencies?.['@playwright/mcp'], mcpPackage.version);
+  assert.equal(rootPackage.dependencies?.playwright, playwrightPackage.version);
+  assert.equal(mcpPackage.dependencies?.playwright, playwrightPackage.version);
+});
+
+test('Windows build entrypoints reconcile root dependencies before typecheck', () => {
+  for (const relativePath of ['build_windows.ps1', 'build_dev_win.ps1']) {
+    const script = readFileSync(join(repoRoot, relativePath), 'utf8');
+    const installIndex = script.indexOf('npm install --no-audit --no-fund');
+    const typecheckIndex = script.indexOf('npm run typecheck');
+    assert.ok(installIndex >= 0, `${relativePath} must reconcile root dependencies`);
+    assert.ok(typecheckIndex > installIndex, `${relativePath} must install before typecheck`);
+  }
 });
 
 test('every supported target pins one official headed Chromium artifact', () => {
@@ -47,13 +65,12 @@ test('every supported target pins one official headed Chromium artifact', () => 
 });
 
 test('Browser resources have no build-time packager or Tauri bundle entry', () => {
-  const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'));
   const tauriConfig = JSON.parse(readFileSync(join(repoRoot, 'src-tauri/tauri.conf.json'), 'utf8'));
   const releaseWorkflow = readFileSync(join(repoRoot, '.github/workflows/release.yml'), 'utf8');
-  assert.equal(packageJson.scripts['package:browser-runtime'], undefined);
+  assert.equal(rootPackage.scripts['package:browser-runtime'], undefined);
   assert.equal(existsSync(join(repoRoot, 'scripts/package-browser-runtime.mjs')), false);
-  assert.doesNotMatch(packageJson.scripts['tauri:build'], /browser|playwright/i);
-  assert.doesNotMatch(packageJson.scripts['tauri:dev'], /browser|playwright/i);
+  assert.doesNotMatch(rootPackage.scripts['tauri:build'], /browser|playwright/i);
+  assert.doesNotMatch(rootPackage.scripts['tauri:dev'], /browser|playwright/i);
   assert.equal(Object.keys(tauriConfig.bundle.resources).some((path) => /browser|playwright/i.test(path)), false);
   assert.doesNotMatch(releaseWorkflow, /prepare-playwright-runtime|playwright-browsers|package:browser-runtime/);
 });

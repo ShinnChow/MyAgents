@@ -158,6 +158,18 @@ foreach ($dll in @("vcruntime140.dll", "vcruntime140_1.dll")) {
 Write-ColorOutput "✓ 已清理并创建占位符" "Green"
 Write-Host ""
 
+# package.json/package-lock.json are the dependency authority; node_modules
+# is derived state and may be stale after switching branches. Keep the dev
+# build self-contained by reconciling it before any Node consumer runs.
+Write-ColorOutput "[准备] 对齐 Node.js 项目依赖..." "Blue"
+& npm install --no-audit --no-fund
+if ($LASTEXITCODE -ne 0) {
+    Write-ColorOutput "✗ Node.js 项目依赖安装失败" "Red"
+    exit 1
+}
+Write-ColorOutput "✓ Node.js 项目依赖已就绪" "Green"
+Write-Host ""
+
 # Rust toolchain/components/target 与 rust-toolchain.toml、CI 和 release build 保持一致。
 Write-ColorOutput "[准备] 准备 Rust toolchain / components / Windows target..." "Blue"
 try {

@@ -397,6 +397,18 @@ try {
     Write-Host "  OK - 依赖检查通过" -ForegroundColor Green
     Write-Host ""
 
+    # package.json/package-lock.json are the dependency authority; node_modules
+    # is derived state and may be stale after switching branches. Keep the
+    # release build self-contained by letting npm reconcile it before any Node
+    # consumer runs. A current tree is a fast no-op.
+    Write-Host "  对齐 Node.js 项目依赖..." -ForegroundColor Cyan
+    & npm install --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) {
+        throw "Node.js 项目依赖安装失败"
+    }
+    Write-Host "  OK - Node.js 项目依赖已就绪" -ForegroundColor Green
+    Write-Host ""
+
     # ========================================
     # 验证 CSP 配置（不再覆盖）
     # ========================================
