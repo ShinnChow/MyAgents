@@ -10,8 +10,10 @@ import type {
 import type {
   RecordDetail,
   RecordListFilter,
+  RecordMergeResult,
   RecordSummary,
   TextRecordCreateInput,
+  TextRecordUpdateInput,
 } from "@/../shared/types/record";
 import type {
   Task,
@@ -64,6 +66,22 @@ export function recordList(
 
 export function recordGet(id: string): Promise<RecordDetail | null> {
   return inv("cmd_record_get", { id });
+}
+
+export function recordUpdateText(input: TextRecordUpdateInput): Promise<RecordDetail> {
+  return inv("cmd_record_update_text", { input });
+}
+
+export function recordSetArchived(id: string, archived: boolean): Promise<RecordDetail> {
+  return inv("cmd_record_set_archived", { id, archived });
+}
+
+export function recordDelete(id: string): Promise<void> {
+  return inv("cmd_record_delete", { id });
+}
+
+export function recordMergeText(sourceIds: string[]): Promise<RecordMergeResult> {
+  return inv("cmd_record_merge_text", { sourceIds });
 }
 
 export function thoughtCreate(input: ThoughtCreateInput): Promise<Thought> {

@@ -915,6 +915,42 @@ describe('myagents CLI Space issue contracts', () => {
       positional: ['maybe'],
       flags: { humanOnly: true, humanOnlyInvalidValue: 'maybe', json: true },
     });
+    expect(parseArgs(['record', 'list', '--all', '-p', 'next'])).toMatchObject({
+      positional: ['record', 'list'],
+      flags: { all: true, prompt: 'next' },
+    });
+  });
+
+  it('keeps canonical Record requests and legacy Thought aliases distinct', () => {
+    expect(buildRoute('record', 'list', [])).toBe('record/list');
+    expect(buildRoute('record', 'create', [])).toBe('record/create');
+    expect(buildRequestBody('record', 'list', [], {
+      kind: 'audio',
+      tag: 'meeting',
+      query: 'roadmap',
+      limit: '20',
+      all: true,
+    })).toEqual({
+      kind: 'audio',
+      tag: 'meeting',
+      query: 'roadmap',
+      limit: 20,
+      archived: 'all',
+    });
+    expect(buildRequestBody('record', 'create', ['  # Note  '], {})).toEqual({
+      content: '# Note',
+    });
+    expect(buildRoute('thought', 'list', [])).toBe('thought/list');
+    expect(buildRequestBody('thought', 'list', [], {
+      kind: 'audio',
+      archived: true,
+    })).toEqual({
+      kind: undefined,
+      tag: undefined,
+      query: undefined,
+      limit: undefined,
+      archived: 'archived',
+    });
   });
 
   it('accepts the existing goalId alias and each single body source for update', () => {

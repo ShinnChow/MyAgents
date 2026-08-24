@@ -110,6 +110,7 @@ export function parseArgs(args: string[]): { positional: string[]; flags: Record
         key === 'stdin' ||
         key === 'active' ||
         key === 'archived' ||
+        key === 'all' ||
         key === 'include-archived' ||
         key === 'clear-goal' ||
         key === 'create-attached' ||
@@ -5096,7 +5097,7 @@ export function buildRequestBody(
         trigger: flags.triggerFile !== undefined
           ? resolveTaskTriggerFile(flags.triggerFile)
           : undefined,
-        sourceRecordId: flags.sourceRecordId ?? flags.sourceThoughtId,
+        sourceRecordId: flags.sourceRecordId,
         tags: typeof flags.tags === 'string'
           ? (flags.tags as string).split(',').map(s => s.trim()).filter(Boolean)
           : undefined,

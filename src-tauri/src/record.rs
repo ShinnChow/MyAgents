@@ -11,8 +11,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, OnceLock};
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 use crate::durable_fs::{rename_directory_noreplace, sync_directory};
@@ -22,6 +23,7 @@ use crate::{ulog_info, ulog_warn};
 const RECORD_SCHEMA_VERSION: u32 = 1;
 const RECORD_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const TEXT_CONTENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const TEXT_ATTACHMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const LEGACY_THOUGHT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +93,15 @@ pub struct AudioRecordSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct RecordArtifact {
+    pub kind: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct Record {
     pub id: String,
     pub kind: RecordKind,
@@ -107,6 +118,8 @@ pub struct Record {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<RecordArtifact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +172,8 @@ struct RecordManifest {
     audio: Option<AudioRecordSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     images: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    artifacts: Vec<RecordArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     content_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +195,7 @@ impl RecordManifest {
             revision: record.revision,
             audio: record.audio.clone(),
             images: record.images.clone(),
+            artifacts: record.artifacts.clone(),
             content_sha256: record.content.as_deref().map(sha256_text),
             legacy_thought_digest,
         }
@@ -199,6 +215,7 @@ impl RecordManifest {
             audio: self.audio,
             content,
             images: self.images,
+            artifacts: self.artifacts,
         }
     }
 }
@@ -259,9 +276,25 @@ struct StoredRecord {
     legacy_thought_digest: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordChangeKind {
+    Upsert,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordChange {
+    pub sequence: u64,
+    pub id: String,
+    pub kind: RecordChangeKind,
+}
+
 pub struct RecordStore {
     inner: Arc<RwLock<HashMap<String, StoredRecord>>>,
     root: PathBuf,
+    published_ids: StdRwLock<HashSet<String>>,
+    changes: broadcast::Sender<RecordChange>,
+    change_sequence: AtomicU64,
 }
 
 impl RecordStore {
@@ -273,10 +306,15 @@ impl RecordStore {
             migrate_legacy_thoughts(&root, legacy_root);
         }
         let initial = scan_records(&root);
+        let published_ids = initial.keys().cloned().collect();
+        let (changes, _) = broadcast::channel(256);
         ulog_info!("[record] loaded {} record(s) from disk", initial.len());
         Self {
             inner: Arc::new(RwLock::new(initial)),
             root,
+            published_ids: StdRwLock::new(published_ids),
+            changes,
+            change_sequence: AtomicU64::new(0),
         }
     }
 
@@ -284,9 +322,46 @@ impl RecordStore {
         &self.root
     }
 
+    pub fn subscribe_changes(&self) -> broadcast::Receiver<RecordChange> {
+        self.changes.subscribe()
+    }
+
+    pub fn has_published_record(&self, id: &str) -> bool {
+        match self.published_ids.read() {
+            Ok(ids) => ids.contains(id),
+            Err(poisoned) => poisoned.into_inner().contains(id),
+        }
+    }
+
+    fn set_published_record(&self, id: &str, published: bool) {
+        let mut ids = match self.published_ids.write() {
+            Ok(ids) => ids,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if published {
+            ids.insert(id.to_string());
+        } else {
+            ids.remove(id);
+        }
+    }
+
+    fn emit_change(&self, id: &str, kind: RecordChangeKind) {
+        let sequence = self.change_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.changes.send(RecordChange {
+            sequence,
+            id: id.to_string(),
+            kind,
+        });
+    }
+
     pub async fn create_text(&self, input: TextRecordCreateInput) -> Result<Record, String> {
         if input.content.trim().is_empty() {
             return Err("record content must not be empty".to_string());
+        }
+        if !input.images.is_empty() {
+            return Err(
+                "text Record images must be imported through the attachment owner".to_string(),
+            );
         }
         let now = now_ms();
         let record = Record {
@@ -302,6 +377,7 @@ impl RecordStore {
             audio: None,
             content: Some(input.content),
             images: input.images,
+            artifacts: Vec::new(),
         };
         self.publish_and_insert(record, None, |_| Ok(())).await
     }
@@ -332,13 +408,27 @@ impl RecordStore {
                 legacy_thought_digest: legacy_digest,
             },
         );
+        self.set_published_record(&record.id, true);
+        self.emit_change(&record.id, RecordChangeKind::Upsert);
         ulog_info!("[record] created id={} kind={:?}", record.id, record.kind);
         Ok(record)
     }
 
     pub async fn list(&self, filter: RecordListFilter) -> Vec<RecordSummary> {
+        self.filtered_records(filter)
+            .await
+            .iter()
+            .map(RecordSummary::from)
+            .collect()
+    }
+
+    pub async fn list_full(&self, filter: RecordListFilter) -> Vec<Record> {
+        self.filtered_records(filter).await
+    }
+
+    async fn filtered_records(&self, filter: RecordListFilter) -> Vec<Record> {
         let inner = self.inner.read().await;
-        let mut records: Vec<&Record> = inner.values().map(|stored| &stored.record).collect();
+        let mut records: Vec<Record> = inner.values().map(|stored| stored.record.clone()).collect();
         match filter.archived.unwrap_or(RecordArchiveFilter::Active) {
             RecordArchiveFilter::Active => records.retain(|record| !record.archived),
             RecordArchiveFilter::Archived => records.retain(|record| record.archived),
@@ -375,16 +465,7 @@ impl RecordStore {
         if let Some(limit) = filter.limit {
             records.truncate(limit);
         }
-        records.into_iter().map(RecordSummary::from).collect()
-    }
-
-    pub async fn list_full(&self, filter: RecordListFilter) -> Vec<Record> {
-        let summaries = self.list(filter).await;
-        let inner = self.inner.read().await;
-        summaries
-            .into_iter()
-            .filter_map(|summary| inner.get(&summary.id).map(|stored| stored.record.clone()))
-            .collect()
+        records
     }
 
     pub async fn get(&self, id: &str) -> Option<Record> {
@@ -416,7 +497,11 @@ impl RecordStore {
             content_changed = true;
         }
         if let Some(images) = input.images {
-            updated.images = images;
+            if images != updated.images {
+                return Err(
+                    "Record attachments cannot be changed through the text update API".to_string(),
+                );
+            }
         }
         if let Some(task_ids) = input.converted_task_ids {
             updated.converted_task_ids = dedup_preserving_order(task_ids);
@@ -436,6 +521,7 @@ impl RecordStore {
                 ..stored
             },
         );
+        self.emit_change(&updated.id, RecordChangeKind::Upsert);
         Ok(updated)
     }
 
@@ -465,6 +551,7 @@ impl RecordStore {
                 ..stored
             },
         );
+        self.emit_change(id, RecordChangeKind::Upsert);
         Ok(updated)
     }
 
@@ -499,6 +586,7 @@ impl RecordStore {
                 ..stored
             },
         );
+        self.emit_change(record_id, RecordChangeKind::Upsert);
         Ok(updated)
     }
 
@@ -530,6 +618,7 @@ impl RecordStore {
                 ..stored
             },
         );
+        self.emit_change(record_id, RecordChangeKind::Upsert);
         Ok(())
     }
 
@@ -539,14 +628,24 @@ impl RecordStore {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("Record not found: {id}"))?;
+        let parent = stored
+            .path
+            .parent()
+            .ok_or_else(|| "Record directory has no parent".to_string())?
+            .to_path_buf();
         remove_plain_record_directory(&stored.path)?;
         inner.remove(id);
-        Ok(())
+        self.set_published_record(id, false);
+        self.emit_change(id, RecordChangeKind::Delete);
+        sync_directory(&parent).map_err(|error| format!("sync Record parent: {error}"))
     }
 
     pub async fn merge_text(&self, source_ids: Vec<String>) -> Result<RecordMergeResult, String> {
         if source_ids.len() < 2 {
             return Err("merge requires at least 2 source records".to_string());
+        }
+        if source_ids.iter().collect::<HashSet<_>>().len() != source_ids.len() {
+            return Err("merge source records must be unique".to_string());
         }
         let snapshots = {
             let inner = self.inner.read().await;
@@ -560,38 +659,76 @@ impl RecordStore {
                 }
                 ensure_plain_directory(&stored.path)
                     .map_err(|error| format!("source {id} unreachable on disk: {error}"))?;
-                snapshots.push(stored.record.clone());
+                snapshots.push(stored.clone());
             }
             snapshots
         };
 
-        let content = snapshots
-            .iter()
-            .filter_map(|record| record.content.as_deref())
-            .collect::<Vec<_>>()
-            .join("\n—\n");
+        let mut merged_bodies = Vec::with_capacity(snapshots.len());
+        let mut merged_images = Vec::new();
+        let mut merged_artifacts = Vec::new();
+        let mut artifact_copies = Vec::new();
+        for stored in &snapshots {
+            let mut body = stored.record.content.clone().unwrap_or_default();
+            let mut rewritten_paths = HashMap::new();
+            for artifact in &stored.record.artifacts {
+                let relative = validate_record_relative_path(&artifact.path)?;
+                let source = resolve_plain_record_artifact(&stored.path, &relative)?;
+                let tail = relative
+                    .strip_prefix("attachments")
+                    .unwrap_or(relative.as_path());
+                let destination = PathBuf::from("attachments")
+                    .join(&stored.record.id)
+                    .join(tail);
+                let merged_artifact =
+                    record_artifact_from_file(&source, &destination, &artifact.kind)?;
+                body = body.replace(&artifact.path, &merged_artifact.path);
+                rewritten_paths.insert(artifact.path.clone(), merged_artifact.path.clone());
+                artifact_copies.push((source, destination));
+                merged_artifacts.push(merged_artifact);
+            }
+            for image in &stored.record.images {
+                let rewritten = rewritten_paths
+                    .get(image)
+                    .ok_or_else(|| format!("Record image is not inventoried: {image}"))?;
+                merged_images.push(rewritten.clone());
+            }
+            merged_bodies.push(body);
+        }
+        let content = merged_bodies.join("\n—\n");
         let now = now_ms();
         let merged = Record {
             id: Uuid::new_v4().to_string(),
             kind: RecordKind::Text,
             title: derive_text_title(&content),
-            tags: dedup_preserving_order(snapshots.iter().flat_map(|record| record.tags.clone())),
+            tags: dedup_preserving_order(
+                snapshots
+                    .iter()
+                    .flat_map(|stored| stored.record.tags.clone()),
+            ),
             created_at: now,
             updated_at: now,
             archived: false,
             converted_task_ids: dedup_preserving_order(
                 snapshots
                     .iter()
-                    .flat_map(|record| record.converted_task_ids.clone()),
+                    .flat_map(|stored| stored.record.converted_task_ids.clone()),
             ),
             revision: 1,
             audio: None,
             content: Some(content),
-            images: dedup_preserving_order(
-                snapshots.iter().flat_map(|record| record.images.clone()),
-            ),
+            images: dedup_preserving_order(merged_images),
+            artifacts: merged_artifacts,
         };
-        let merged = self.publish_and_insert(merged, None, |_| Ok(())).await?;
+        let merged = self
+            .publish_and_insert(merged, None, move |staging| {
+                for (source, destination) in &artifact_copies {
+                    let bytes = read_bounded_regular_file(source, TEXT_ATTACHMENT_MAX_BYTES)?;
+                    write_new_synced_file(&staging.join(destination), &bytes)?;
+                }
+                Ok(())
+            })
+            .await?;
 
         let mut failures = Vec::new();
         for id in source_ids {
@@ -673,6 +810,17 @@ fn read_record_directory_inner(
                 .is_some_and(|name| name.starts_with(&format!(".{}.staging-", manifest.id))));
     if !is_safe_id(&manifest.id) || !name_matches {
         return Err("record id does not match directory".to_string());
+    }
+    validate_record_artifacts(path, &manifest.artifacts, allow_staging_name)?;
+    if !manifest.artifacts.is_empty()
+        && manifest.images.iter().any(|image| {
+            !manifest
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.path == *image)
+        })
+    {
+        return Err("record image is missing from artifact inventory".to_string());
     }
     let content = match manifest.kind {
         RecordKind::Text => {
@@ -818,6 +966,129 @@ fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Str
     Ok(bytes)
 }
 
+fn validate_record_artifacts(
+    record_dir: &Path,
+    artifacts: &[RecordArtifact],
+    verify_digest: bool,
+) -> Result<(), String> {
+    let mut paths = HashSet::new();
+    for artifact in artifacts {
+        if artifact.kind.trim().is_empty()
+            || artifact.sha256.len() != 64
+            || !artifact
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !paths.insert(artifact.path.as_str())
+        {
+            return Err("record artifact inventory contains an invalid entry".to_string());
+        }
+        let relative = validate_record_relative_path(&artifact.path)?;
+        let path = resolve_plain_record_artifact(record_dir, &relative)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect Record artifact: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != artifact.size_bytes
+        {
+            return Err(format!("Record artifact is invalid: {}", artifact.path));
+        }
+        if verify_digest {
+            let digest = sha256_regular_file_exact(&path, artifact.size_bytes)?;
+            if digest != artifact.sha256 {
+                return Err(format!(
+                    "Record artifact digest mismatch: {}",
+                    artifact.path
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_artifact_from_file(
+    source: &Path,
+    destination: &Path,
+    kind: &str,
+) -> Result<RecordArtifact, String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("inspect Record artifact source: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("Record artifact source is not a regular file".to_string());
+    }
+    let path = path_to_forward_slashes(destination)?;
+    Ok(RecordArtifact {
+        kind: kind.to_string(),
+        path,
+        size_bytes: metadata.len(),
+        sha256: sha256_regular_file_exact(source, metadata.len())?,
+    })
+}
+
+fn sha256_regular_file_exact(path: &Path, expected_size: u64) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("open artifact: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut read_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining = expected_size.saturating_add(1).saturating_sub(read_bytes);
+        if remaining == 0 {
+            break;
+        }
+        let read_limit = remaining.min(buffer.len() as u64) as usize;
+        let count = file
+            .read(&mut buffer[..read_limit])
+            .map_err(|error| format!("read artifact: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        read_bytes = read_bytes.saturating_add(count as u64);
+    }
+    if read_bytes != expected_size {
+        return Err("Record artifact size changed while reading".to_string());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn validate_record_relative_path(value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("Record artifact path is unsafe: {value}"));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn resolve_plain_record_artifact(record_dir: &Path, relative: &Path) -> Result<PathBuf, String> {
+    ensure_plain_directory(record_dir)?;
+    let mut current = record_dir.to_path_buf();
+    let component_count = relative.components().count();
+    for (index, component) in relative.components().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err("Record artifact path is unsafe".to_string());
+        };
+        current.push(name);
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| format!("inspect Record artifact path: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err("Record artifact path contains a symlink".to_string());
+        }
+        if index + 1 < component_count && !metadata.is_dir() {
+            return Err("Record artifact parent is not a directory".to_string());
+        }
+    }
+    let metadata = fs::symlink_metadata(&current)
+        .map_err(|error| format!("inspect Record artifact: {error}"))?;
+    if !metadata.is_file() {
+        return Err("Record artifact is not a regular file".to_string());
+    }
+    Ok(current)
+}
+
 fn reject_non_regular_target(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -892,10 +1163,20 @@ pub fn derive_text_title(content: &str) -> String {
         return String::new();
     };
     let trimmed = line.trim();
-    let without_heading = trimmed
-        .strip_prefix('#')
-        .map(|rest| rest.trim_start_matches('#').trim_start())
-        .unwrap_or(trimmed);
+    let heading_markers = trimmed
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    let without_heading = if (1..=6).contains(&heading_markers)
+        && trimmed[heading_markers..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+    {
+        trimmed[heading_markers..].trim_start()
+    } else {
+        trimmed
+    };
     without_heading.chars().take(80).collect()
 }
 
@@ -1079,6 +1360,10 @@ fn migrate_one_legacy_thought(
 
     let (content, images, attachment_sources) =
         prepare_legacy_attachments(legacy_root, source, &legacy.content, &legacy.images)?;
+    let artifacts = attachment_sources
+        .iter()
+        .map(|(source, destination)| record_artifact_from_file(source, destination, "attachment"))
+        .collect::<Result<Vec<_>, _>>()?;
     let record = Record {
         id: legacy.id,
         kind: RecordKind::Text,
@@ -1092,6 +1377,7 @@ fn migrate_one_legacy_thought(
         audio: None,
         content: Some(content),
         images,
+        artifacts,
     };
     let final_path = record_path(record_root, &record);
     let copy_sources = attachment_sources.clone();
@@ -1109,7 +1395,7 @@ fn migrate_one_legacy_thought(
                 fs::create_dir_all(parent)
                     .map_err(|error| format!("create attachment directory: {error}"))?;
                 ensure_plain_directory(parent)?;
-                let bytes = read_bounded_regular_file(source_path, TEXT_CONTENT_MAX_BYTES)?;
+                let bytes = read_bounded_regular_file(source_path, TEXT_ATTACHMENT_MAX_BYTES)?;
                 write_new_synced_file(&destination, &bytes)?;
             }
             Ok(())
@@ -1361,6 +1647,39 @@ pub async fn cmd_record_get(
     Ok(state.get(&id).await)
 }
 
+#[tauri::command]
+pub async fn cmd_record_update_text(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: TextRecordUpdateInput,
+) -> Result<Record, String> {
+    state.update_text(input).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_set_archived(
+    state: tauri::State<'_, ManagedRecordStore>,
+    id: String,
+    archived: bool,
+) -> Result<Record, String> {
+    state.set_archived(&id, archived).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_delete(
+    state: tauri::State<'_, ManagedRecordStore>,
+    id: String,
+) -> Result<(), String> {
+    state.delete(&id).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_merge_text(
+    state: tauri::State<'_, ManagedRecordStore>,
+    source_ids: Vec<String>,
+) -> Result<RecordMergeResult, String> {
+    state.merge_text(source_ids).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,6 +1692,11 @@ mod tests {
     #[test]
     fn title_is_shared_unicode_safe_policy() {
         assert_eq!(derive_text_title("\n  ## 会议标题\n正文"), "会议标题");
+        assert_eq!(derive_text_title("#tag 不是标题"), "#tag 不是标题");
+        assert_eq!(
+            derive_text_title("####### 也不是标题"),
+            "####### 也不是标题"
+        );
         assert_eq!(derive_text_title("   \n"), "");
         assert_eq!(derive_text_title(&"你".repeat(100)).chars().count(), 80);
     }
@@ -1406,6 +1730,32 @@ mod tests {
             reloaded.get(&first.id).await.unwrap().content.as_deref(),
             Some("# First\nbody #tag")
         );
+    }
+
+    #[tokio::test]
+    async fn committed_mutations_publish_exact_search_observer_changes() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let mut changes = store.subscribe_changes();
+        let record = store
+            .create_text(TextRecordCreateInput {
+                content: "observer".to_string(),
+                images: Vec::new(),
+            })
+            .await
+            .unwrap();
+        let created = changes.recv().await.unwrap();
+        assert_eq!(created.id, record.id);
+        assert_eq!(created.kind, RecordChangeKind::Upsert);
+        assert_eq!(created.sequence, 1);
+        assert!(store.has_published_record(&record.id));
+
+        store.delete(&record.id).await.unwrap();
+        let deleted = changes.recv().await.unwrap();
+        assert_eq!(deleted.id, record.id);
+        assert_eq!(deleted.kind, RecordChangeKind::Delete);
+        assert_eq!(deleted.sequence, 2);
+        assert!(!store.has_published_record(&record.id));
     }
 
     #[tokio::test]
@@ -1461,6 +1811,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migrated_attachments_are_inventoried_and_survive_merge() {
+        let temp = tempdir().unwrap();
+        let month = temp.path().join("thoughts/2023-11");
+        let images = month.join("images");
+        fs::create_dir_all(&images).unwrap();
+        fs::write(images.join("a.png"), b"image-a").unwrap();
+        fs::write(images.join("b.png"), b"image-b").unwrap();
+        fs::write(
+            month.join("alpha.md"),
+            "---\nid: alpha\ncreatedAt: 1700000000000\nupdatedAt: 1700000000000\ntags: []\nimages: [\"images/a.png\"]\nconvertedTaskIds: []\n---\n\nAlpha ![a](images/a.png)\n",
+        )
+        .unwrap();
+        fs::write(
+            month.join("bravo.md"),
+            "---\nid: bravo\ncreatedAt: 1700000001000\nupdatedAt: 1700000001000\ntags: []\nimages: [\"images/b.png\"]\nconvertedTaskIds: []\n---\n\nBravo ![b](images/b.png)\n",
+        )
+        .unwrap();
+
+        let store = store_at(temp.path());
+        let alpha = store.get("alpha").await.unwrap();
+        assert_eq!(alpha.images, vec!["attachments/images/a.png"]);
+        assert_eq!(alpha.artifacts.len(), 1);
+        assert_eq!(alpha.artifacts[0].size_bytes, 7);
+        assert_eq!(alpha.artifacts[0].sha256, sha256_bytes(b"image-a"));
+
+        let source_paths = [
+            record_path(store.root_dir(), &alpha),
+            record_path(store.root_dir(), &store.get("bravo").await.unwrap()),
+        ];
+        let merged = store
+            .merge_text(vec!["alpha".to_string(), "bravo".to_string()])
+            .await
+            .unwrap()
+            .merged;
+        assert!(source_paths.iter().all(|path| !path.exists()));
+        assert_eq!(
+            merged.images,
+            vec![
+                "attachments/alpha/images/a.png",
+                "attachments/bravo/images/b.png"
+            ]
+        );
+        assert_eq!(merged.artifacts.len(), 2);
+        let merged_path = record_path(store.root_dir(), &merged);
+        assert_eq!(
+            fs::read(merged_path.join(&merged.images[0])).unwrap(),
+            b"image-a"
+        );
+        assert_eq!(
+            fs::read(merged_path.join(&merged.images[1])).unwrap(),
+            b"image-b"
+        );
+        assert!(merged
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("attachments/alpha/images/a.png"));
+
+        drop(store);
+        let reloaded = store_at(temp.path());
+        assert_eq!(reloaded.get(&merged.id).await.unwrap(), merged);
+    }
+
+    #[tokio::test]
     async fn conflicting_target_keeps_legacy_bytes() {
         let temp = tempdir().unwrap();
         let records = temp.path().join("records");
@@ -1479,6 +1893,7 @@ mod tests {
             audio: None,
             content: Some(content.to_string()),
             images: Vec::new(),
+            artifacts: Vec::new(),
         };
         let path = records.join("2023-11/conflict");
         fs::write(path.join("content.md"), content).unwrap();

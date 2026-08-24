@@ -267,6 +267,7 @@ mod tests {
             audio: None,
             content: Some("body".to_string()),
             images: Vec::new(),
+            artifacts: Vec::new(),
         })
         .unwrap();
         let value = serde_json::to_value(thought).unwrap();

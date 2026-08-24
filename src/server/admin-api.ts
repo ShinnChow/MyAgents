@@ -3151,7 +3151,7 @@ Options for 'create-direct':
                        MYAGENTS_SESSION_ID before the Task is created
   --trigger-file <path> Strict Trigger v1 JSON (always or command Detector)
   --tags               Comma-separated tag list
-  --sourceThoughtId    Link back to the originating thought
+  --sourceRecordId     Link back to the originating Record
 
 End conditions for scheduled/recurring Task creation:
   --deadline 2026-08-31T23:59:00+08:00  Stop starting AI turns after this instant

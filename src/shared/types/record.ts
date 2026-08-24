@@ -39,6 +39,13 @@ export interface AudioRecordSummary {
   sizeBytes: number;
 }
 
+export interface RecordArtifact {
+  kind: string;
+  path: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
 export interface RecordSummary {
   id: string;
   kind: RecordKind;
@@ -55,6 +62,7 @@ export interface RecordSummary {
 export interface RecordDetail extends RecordSummary {
   content?: string;
   images?: string[];
+  artifacts?: RecordArtifact[];
 }
 
 export type RecordArchiveFilter = "active" | "archived" | "all";
@@ -70,4 +78,21 @@ export interface RecordListFilter {
 export interface TextRecordCreateInput {
   content: string;
   images?: string[];
+}
+
+export interface TextRecordUpdateInput {
+  id: string;
+  content?: string;
+  images?: string[];
+  convertedTaskIds?: string[];
+}
+
+export interface RecordDeleteFailure {
+  id: string;
+  error: string;
+}
+
+export interface RecordMergeResult {
+  merged: RecordDetail;
+  failedSourceDeletes: RecordDeleteFailure[];
 }

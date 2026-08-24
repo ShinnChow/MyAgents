@@ -297,11 +297,11 @@ pub fn run() {
         data_dir.join("records"),
         Some(data_dir.join("thoughts")),
     ));
+    record::set_record_store(record_state.clone());
     let task_state: task::ManagedTaskStore = Arc::new(task::TaskStore::new(data_dir.clone()));
     // Expose the same Arcs via OnceLock singletons so the Rust Management API
     // (used by Bun CLI bridge → /api/admin/task/*) can read/write tasks without
     // access to Tauri `State`. They point at the same inner store.
-    record::set_record_store(record_state.clone());
     task::set_task_store(task_state.clone());
 
     // Create SSE proxy state
@@ -665,6 +665,7 @@ pub fn run() {
             workspace_files::watcher::cmd_workspace_watch_stop,
             // Full-text search commands
             search::cmd_search_sessions,
+            search::cmd_search_records,
             search::cmd_search_workspace_files,
             search::cmd_search_index_status,
             search::cmd_invalidate_workspace_index,
@@ -675,6 +676,10 @@ pub fn run() {
             record::cmd_record_create,
             record::cmd_record_list,
             record::cmd_record_get,
+            record::cmd_record_update_text,
+            record::cmd_record_set_archived,
+            record::cmd_record_delete,
+            record::cmd_record_merge_text,
             // Task Center — Thought commands (v0.1.69)
             thought::cmd_thought_create,
             thought::cmd_thought_list,
@@ -1376,7 +1381,7 @@ pub fn run() {
             if let Some(data_dir) = app_dirs::myagents_data_dir() {
                 match search::SearchEngine::new(data_dir) {
                     Ok(engine) => {
-                        engine.start_background_indexing();
+                        engine.start_background_indexing(app.handle().clone());
                         app.manage(Arc::new(engine));
                         ulog_info!("[App] SearchEngine initialized");
                     }
