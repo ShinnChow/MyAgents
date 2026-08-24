@@ -1,6 +1,9 @@
 //! App-owned local document conversion queue and Worker lifecycle.
 
 use crate::durable_fs::{rename_directory_noreplace, sync_directory};
+use crate::local_inference::{
+    InferenceRuntimeKind, LocalInferenceRuntimeIdentity, LocalInferenceRuntimeRegistry,
+};
 use crate::process_cmd;
 use crate::workspace_files::path_safety::open_regular_file_no_follow;
 use chrono::{DateTime, Duration, Local, Utc};
@@ -21,7 +24,7 @@ const MIN_FREE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKER_STDERR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 pub const DOCUMENT_HISTORY_RETENTION_DAYS: i64 = 30;
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const PIPELINE_VERSION: &str = "anydoc-0.1.9_ppocrv6-small_v1";
 const JOB_ID_RANDOM_HEX: usize = 12;
 const JOB_DEADLINE_SECONDS: u64 = 30 * 60;
@@ -377,6 +380,8 @@ pub struct DocumentProcessingManager {
     root: PathBuf,
     worker_path: PathBuf,
     manifest_path: PathBuf,
+    onnx_runtime_path: PathBuf,
+    onnx_runtime_version: String,
     state: Mutex<ManagerState>,
     wake: Notify,
 }
@@ -385,6 +390,7 @@ impl DocumentProcessingManager {
     pub fn initialize(
         data_root: PathBuf,
         resource_root: PathBuf,
+        runtime_registry: &LocalInferenceRuntimeRegistry,
     ) -> Result<ManagedDocumentProcessing, String> {
         let root = data_root.join("document-processing");
         let jobs_root = root.join("jobs");
@@ -401,7 +407,18 @@ impl DocumentProcessingManager {
         };
         let worker_path = resource_dir.join(worker_name);
         let manifest_path = resource_dir.join("manifest.json");
-        let resource_error = validate_resource_surface(&worker_path, &manifest_path).err();
+        let runtime_validation =
+            validate_resource_surface(&worker_path, &manifest_path, runtime_registry);
+        let resource_error = runtime_validation.as_ref().err().cloned();
+        let (onnx_runtime_path, onnx_runtime_version) = runtime_validation
+            .ok()
+            .map(|identity| {
+                (
+                    identity.path().to_path_buf(),
+                    identity.version().to_string(),
+                )
+            })
+            .unwrap_or_else(|| (resource_dir.join("invalid-onnx-runtime"), "unknown".into()));
         let mut jobs = load_jobs(&root)?;
         recover_publish_intents(&root, &mut jobs);
         recover_nonterminal_jobs(&root, &mut jobs);
@@ -413,6 +430,8 @@ impl DocumentProcessingManager {
             root,
             worker_path,
             manifest_path,
+            onnx_runtime_path,
+            onnx_runtime_version,
             state: Mutex::new(ManagerState {
                 accepting: true,
                 jobs,
@@ -624,7 +643,7 @@ impl DocumentProcessingManager {
             warnings: Vec::new(),
             error: None,
             metrics: None,
-            pipeline: default_pipeline(),
+            pipeline: default_pipeline(&self.onnx_runtime_version),
         };
         if persist_job(&self.root, &job).is_err() {
             let _ = fs::remove_dir_all(&private_dir);
@@ -971,6 +990,7 @@ impl DocumentProcessingManager {
                 source_name: &job.source.display_name,
                 staging_path: &pending.staging_dir,
                 resource_manifest_path: &self.manifest_path,
+                onnx_runtime_path: &self.onnx_runtime_path,
                 password: pending.password.as_ref().map(SecretString::expose),
             };
             stdin
@@ -1595,6 +1615,7 @@ struct WorkerStartRequest<'a> {
     source_name: &'a str,
     staging_path: &'a Path,
     resource_manifest_path: &'a Path,
+    onnx_runtime_path: &'a Path,
     password: Option<&'a str>,
 }
 
@@ -2422,7 +2443,11 @@ struct ResourceSigning {
     identity: String,
 }
 
-fn validate_resource_surface(worker: &Path, manifest: &Path) -> Result<(), DocumentServiceError> {
+fn validate_resource_surface(
+    worker: &Path,
+    manifest: &Path,
+    runtime_registry: &LocalInferenceRuntimeRegistry,
+) -> Result<LocalInferenceRuntimeIdentity, DocumentServiceError> {
     let manifest_metadata =
         fs::symlink_metadata(manifest).map_err(|_| resource_error("DOCUMENT_RESOURCE_MISSING"))?;
     if !manifest_metadata.is_file()
@@ -2474,7 +2499,6 @@ fn validate_resource_surface(worker: &Path, manifest: &Path) -> Result<(), Docum
     }
     let worker_metadata = verify_resource_file(root, &parsed.worker)?;
     for file in [
-        &parsed.files.onnx_runtime,
         &parsed.files.pdfium,
         &parsed.files.detector_model,
         &parsed.files.recognizer_model,
@@ -2489,7 +2513,26 @@ fn validate_resource_surface(worker: &Path, manifest: &Path) -> Result<(), Docum
             return Err(resource_error("DOCUMENT_RESOURCE_INVALID"));
         }
     }
-    Ok(())
+    runtime_registry
+        .verify_manifest_reference(
+            InferenceRuntimeKind::OnnxCpu,
+            root,
+            &parsed.files.onnx_runtime.path,
+            &parsed.files.onnx_runtime.sha256,
+            parsed.files.onnx_runtime.size,
+            &parsed.files.onnx_runtime.upstream_revision,
+        )
+        .map_err(|error| {
+            crate::ulog_warn!(
+                "[document] shared runtime identity rejected code={}",
+                error.code()
+            );
+            resource_error(if error.code() == "LOCAL_RUNTIME_TARGET_MISMATCH" {
+                "DOCUMENT_RESOURCE_TARGET_MISMATCH"
+            } else {
+                "DOCUMENT_RESOURCE_INVALID"
+            })
+        })
 }
 
 fn resource_path(
@@ -2557,7 +2600,7 @@ fn resource_error(code: &str) -> DocumentServiceError {
     )
 }
 
-fn default_pipeline() -> DocumentPipeline {
+fn default_pipeline(onnx_runtime_version: &str) -> DocumentPipeline {
     DocumentPipeline {
         version: PIPELINE_VERSION.into(),
         anydoc_version: Some("0.1.9+myagents-assets.1".into()),
@@ -2569,7 +2612,7 @@ fn default_pipeline() -> DocumentPipeline {
             "det@28fe5895c24fd108c19eb3e8479f4ab385fbfc62;rec@b8f84f0b80c529de40b4fbb3544b84fa7233a513"
                 .into(),
         ),
-        onnx_runtime_version: Some("1.28.0".into()),
+        onnx_runtime_version: Some(onnx_runtime_version.into()),
         pdfium_revision: Some("chromium/7999".into()),
     }
 }
@@ -3243,7 +3286,7 @@ mod tests {
             warnings: Vec::new(),
             error: None,
             metrics: None,
-            pipeline: default_pipeline(),
+            pipeline: default_pipeline("1.28.0"),
         }
     }
 
@@ -3255,6 +3298,8 @@ mod tests {
             root: root.to_path_buf(),
             worker_path: root.join("unused-worker"),
             manifest_path: root.join("unused-manifest"),
+            onnx_runtime_path: root.join("unused-onnx-runtime"),
+            onnx_runtime_version: "1.28.0".into(),
             state: Mutex::new(ManagerState {
                 accepting: true,
                 jobs: HashMap::from([(job_id.clone(), job)]),
@@ -4157,7 +4202,7 @@ mod tests {
                 pages_ocr: Some(1),
                 assets_written: Some(0),
             }),
-            pipeline: default_pipeline(),
+            pipeline: default_pipeline("1.28.0"),
         };
 
         let value = serde_json::to_value(job).unwrap();

@@ -27,6 +27,7 @@ mod keyed_lifecycle;
 pub mod legacy_upgrade;
 mod litellm_cache;
 pub mod local_http;
+pub mod local_inference;
 pub mod logger;
 #[cfg(target_os = "macos")]
 mod macos_arrow_filter;
@@ -1315,14 +1316,35 @@ pub fn run() {
             // The Desktop App owns one global document queue and at most one
             // isolated Worker. Initialize it before the Management API starts
             // so every Sidecar observes the same durable job authority.
+            let compute_coordinator = local_inference::LocalComputeCoordinator::new();
+            if let Err(error) = local_inference::set_global_compute_coordinator(
+                compute_coordinator.clone(),
+            ) {
+                ulog_error!("[local-inference] Failed to register compute coordinator: {}", error);
+            } else {
+                app.manage(compute_coordinator);
+            }
             match app.path().resource_dir() {
                 Ok(resource_dir) => {
                     let resource_dir = sidecar::normalize_external_path(resource_dir);
+                    let runtime_registry =
+                        local_inference::LocalInferenceRuntimeRegistry::initialize(&resource_dir);
+                    if let Err(error) = local_inference::set_global_runtime_registry(
+                        runtime_registry.clone(),
+                    ) {
+                        ulog_error!(
+                            "[local-inference] Failed to register runtime registry: {}",
+                            error
+                        );
+                    } else {
+                        app.manage(runtime_registry.clone());
+                    }
                     match app_dirs::myagents_data_dir() {
                         Some(data_dir) => {
                             match document_processing::DocumentProcessingManager::initialize(
                                 data_dir,
                                 resource_dir,
+                                runtime_registry.as_ref(),
                             ) {
                                 Ok(manager) => {
                                     if let Err(error) =

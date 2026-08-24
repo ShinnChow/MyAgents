@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -29,6 +29,7 @@ pub struct StartRequest {
     pub source_name: String,
     pub staging_path: String,
     pub resource_manifest_path: String,
+    pub onnx_runtime_path: String,
     pub password: Option<SecretString>,
 }
 

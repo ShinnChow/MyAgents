@@ -82,6 +82,9 @@ fn run() -> Result<(), String> {
         Ok(resources) => resources,
         Err(code) => return terminal_error(&job_id, generation, &code),
     };
+    if !runtime_identity_matches(&start.onnx_runtime_path, &resources.onnx_runtime) {
+        return terminal_error(&job_id, generation, "DOCUMENT_RESOURCE_MANIFEST_INVALID");
+    }
     let mut stdout = io::stdout().lock();
     let mut progress = |stage: &str, _value: u8| {
         let _ = write_frame(
@@ -136,6 +139,11 @@ fn run() -> Result<(), String> {
             .map_err(|_| "failed to write terminal frame".to_string())
         }
     }
+}
+
+fn runtime_identity_matches(requested: &str, verified: &Path) -> bool {
+    let requested = Path::new(requested);
+    requested.is_absolute() && requested == verified
 }
 
 fn terminal_error(job_id: &str, generation: u64, code: &str) -> Result<(), String> {
@@ -195,7 +203,7 @@ fn public_error_message(code: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::public_error_code;
+    use super::{public_error_code, runtime_identity_matches};
 
     #[test]
     fn internal_worker_failures_normalize_to_the_public_error_contract() {
@@ -215,5 +223,20 @@ mod tests {
             public_error_code("DOCUMENT_PDF_PAGE_COVERAGE_INVALID"),
             "DOCUMENT_WORKER_PROTOCOL_ERROR"
         );
+    }
+
+    #[test]
+    fn worker_accepts_only_the_manager_supplied_verified_runtime_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let verified = root.path().join("onnxruntime");
+        assert!(runtime_identity_matches(
+            verified.to_str().unwrap(),
+            &verified
+        ));
+        assert!(!runtime_identity_matches("relative/onnxruntime", &verified));
+        assert!(!runtime_identity_matches(
+            root.path().join("other").to_str().unwrap(),
+            &verified
+        ));
     }
 }
