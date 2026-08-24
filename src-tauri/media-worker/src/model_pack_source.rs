@@ -1,5 +1,9 @@
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 pub const MODEL_PACK_SOURCE_LOCK: &str = include_str!("../model-pack-source-lock.json");
 
@@ -27,6 +31,34 @@ pub enum SourceLockError {
     InvalidLegalArtifact,
     DuplicateIdentity,
     SizeMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledPackError {
+    ManifestUnavailable,
+    ManifestMismatch,
+    InvalidInventory,
+    MissingFile,
+    UnsafePath,
+    FileMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedModelPack {
+    pub pack_revision: String,
+    pub manifest_path: PathBuf,
+    pub sense_voice_model: PathBuf,
+    pub sense_voice_tokens: PathBuf,
+    pub silero_vad_model: PathBuf,
+    pub pyannote_segmentation_model: PathBuf,
+    pub speaker_embedding_model: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedInstalledFile {
+    path: String,
+    sha256: String,
+    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,6 +319,154 @@ pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
     Ok(())
 }
 
+/// Verifies the exact activated speech model pack without trusting mutable
+/// manifest fields. The manifest bytes must equal the source lock compiled
+/// into this worker generation; every selected model and legal notice is then
+/// re-opened as a no-symlink regular file and checked by size and SHA-256.
+pub fn verify_installed_pack(
+    manifest_path: &Path,
+) -> Result<VerifiedModelPack, InstalledPackError> {
+    if !manifest_path.is_absolute() {
+        return Err(InstalledPackError::UnsafePath);
+    }
+    let metadata =
+        fs::symlink_metadata(manifest_path).map_err(|_| InstalledPackError::ManifestUnavailable)?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() != MODEL_PACK_SOURCE_LOCK.len() as u64
+    {
+        return Err(InstalledPackError::ManifestMismatch);
+    }
+    let manifest_bytes =
+        fs::read(manifest_path).map_err(|_| InstalledPackError::ManifestUnavailable)?;
+    if manifest_bytes != MODEL_PACK_SOURCE_LOCK.as_bytes() {
+        return Err(InstalledPackError::ManifestMismatch);
+    }
+    let lock: SourceLock = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| InstalledPackError::ManifestMismatch)?;
+    let root = manifest_path
+        .parent()
+        .ok_or(InstalledPackError::UnsafePath)?;
+    ensure_plain_directory(root)?;
+    let expected = expected_installed_files(&lock)?;
+    let verified = verify_file_inventory(root, &expected)?;
+    let path = |relative: &str| {
+        verified
+            .get(relative)
+            .cloned()
+            .ok_or(InstalledPackError::InvalidInventory)
+    };
+    Ok(VerifiedModelPack {
+        pack_revision: lock.pack_revision,
+        manifest_path: manifest_path.to_path_buf(),
+        sense_voice_model: path("models/sensevoice/model.int8.onnx")?,
+        sense_voice_tokens: path("models/sensevoice/tokens.txt")?,
+        silero_vad_model: path("models/vad/silero_vad.int8.onnx")?,
+        pyannote_segmentation_model: path(
+            "models/diarization/pyannote-segmentation-3.0.int8.onnx",
+        )?,
+        speaker_embedding_model: path("models/diarization/3dspeaker-eres2net-base-zh-16k.onnx")?,
+    })
+}
+
+fn expected_installed_files(
+    lock: &SourceLock,
+) -> Result<Vec<ExpectedInstalledFile>, InstalledPackError> {
+    let mut expected = Vec::with_capacity(EXPECTED_MODEL_PATHS.len() + lock.legal_artifacts.len());
+    for asset in &lock.assets {
+        for selected in &asset.selected_files {
+            expected.push(ExpectedInstalledFile {
+                path: selected.install_path.clone(),
+                sha256: selected.sha256.clone(),
+                size: selected.size,
+            });
+        }
+    }
+    for legal in &lock.legal_artifacts {
+        let (sha256, size) = match &legal.source {
+            LegalSource::Remote { sha256, size, .. }
+            | LegalSource::Archive { sha256, size, .. } => (sha256.clone(), *size),
+        };
+        expected.push(ExpectedInstalledFile {
+            path: legal.install_path.clone(),
+            sha256,
+            size,
+        });
+    }
+    let unique = expected
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    if expected.len() != EXPECTED_MODEL_PATHS.len() + lock.legal_artifacts.len()
+        || unique.len() != expected.len()
+    {
+        return Err(InstalledPackError::InvalidInventory);
+    }
+    Ok(expected)
+}
+
+fn verify_file_inventory(
+    root: &Path,
+    expected: &[ExpectedInstalledFile],
+) -> Result<HashMap<String, PathBuf>, InstalledPackError> {
+    let mut verified = HashMap::with_capacity(expected.len());
+    for file in expected {
+        let path = resolve_plain_file(root, &file.path)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|_| InstalledPackError::MissingFile)?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() != file.size
+            || sha256_file(&path)? != file.sha256
+        {
+            return Err(InstalledPackError::FileMismatch);
+        }
+        verified.insert(file.path.clone(), path);
+    }
+    Ok(verified)
+}
+
+fn ensure_plain_directory(path: &Path) -> Result<(), InstalledPackError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| InstalledPackError::UnsafePath)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(InstalledPackError::UnsafePath);
+    }
+    Ok(())
+}
+
+fn resolve_plain_file(root: &Path, relative: &str) -> Result<PathBuf, InstalledPackError> {
+    if !safe_relative_path(relative) {
+        return Err(InstalledPackError::UnsafePath);
+    }
+    let mut path = root.to_path_buf();
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(InstalledPackError::UnsafePath);
+        };
+        path.push(name);
+        if index + 1 < components.len() {
+            ensure_plain_directory(&path)?;
+        }
+    }
+    Ok(path)
+}
+
+fn sha256_file(path: &Path) -> Result<String, InstalledPackError> {
+    let mut file = fs::File::open(path).map_err(|_| InstalledPackError::MissingFile)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| InstalledPackError::FileMismatch)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value
@@ -316,6 +496,7 @@ fn safe_relative_path(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn committed_source_lock_has_exact_models_sizes_licenses_and_signature_policy() {
@@ -379,6 +560,74 @@ mod tests {
         assert_eq!(
             validate_source_lock_json(&missing_license),
             Err(SourceLockError::InvalidLegalArtifact)
+        );
+    }
+
+    #[test]
+    fn installed_inventory_accepts_only_plain_files_with_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("models")).unwrap();
+        fs::create_dir(root.path().join("legal")).unwrap();
+        fs::write(root.path().join("models/model.onnx"), b"model-bytes").unwrap();
+        fs::write(root.path().join("legal/LICENSE.txt"), b"license-bytes").unwrap();
+        let expected = vec![
+            ExpectedInstalledFile {
+                path: "models/model.onnx".into(),
+                sha256: format!("{:x}", Sha256::digest(b"model-bytes")),
+                size: 11,
+            },
+            ExpectedInstalledFile {
+                path: "legal/LICENSE.txt".into(),
+                sha256: format!("{:x}", Sha256::digest(b"license-bytes")),
+                size: 13,
+            },
+        ];
+        let verified = verify_file_inventory(root.path(), &expected).unwrap();
+        assert_eq!(verified.len(), 2);
+
+        fs::write(root.path().join("models/model.onnx"), b"model-drift").unwrap();
+        assert_eq!(
+            verify_file_inventory(root.path(), &expected),
+            Err(InstalledPackError::FileMismatch)
+        );
+    }
+
+    #[test]
+    fn installed_manifest_must_be_absolute_and_byte_identical() {
+        assert_eq!(
+            verify_installed_pack(Path::new("relative/manifest.json")),
+            Err(InstalledPackError::UnsafePath)
+        );
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            MODEL_PACK_SOURCE_LOCK.replace("1.13.6", "1.13.5"),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_installed_pack(&manifest),
+            Err(InstalledPackError::ManifestMismatch)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_inventory_rejects_symlinked_parent_or_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("model.onnx"), b"model-bytes").unwrap();
+        symlink(outside.path(), root.path().join("models")).unwrap();
+        let expected = vec![ExpectedInstalledFile {
+            path: "models/model.onnx".into(),
+            sha256: format!("{:x}", Sha256::digest(b"model-bytes")),
+            size: 11,
+        }];
+        assert_eq!(
+            verify_file_inventory(root.path(), &expected),
+            Err(InstalledPackError::UnsafePath)
         );
     }
 }
