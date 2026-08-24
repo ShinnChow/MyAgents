@@ -2,3 +2,5 @@
 CFBundleDisplayName = "MyAgents";
 CFBundleName = "MyAgents";
 NSAppleEventsUsageDescription = "MyAgents needs to control other apps so the AI can activate windows, run AppleScript, and perform desktop automation on your behalf.";
+NSMicrophoneUsageDescription = "MyAgents uses the microphone when you record a meeting and stores the recording locally.";
+NSAudioCaptureUsageDescription = "MyAgents captures system audio when you record a meeting and stores the recording locally.";

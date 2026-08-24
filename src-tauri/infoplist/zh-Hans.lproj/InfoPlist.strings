@@ -2,3 +2,5 @@
 CFBundleDisplayName = "MyAgents";
 CFBundleName = "MyAgents";
 NSAppleEventsUsageDescription = "MyAgents 需要控制其他应用，以便 AI 为你激活窗口、运行 AppleScript 并完成桌面自动化任务。";
+NSMicrophoneUsageDescription = "MyAgents 需要使用麦克风，以便按你的操作录制会议声音并保存在本机。";
+NSAudioCaptureUsageDescription = "MyAgents 需要采集系统音频，以便按你的操作完整录制会议并保存在本机。";
