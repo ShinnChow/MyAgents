@@ -131,13 +131,13 @@ echo -e "${BLUE}[准备] 准备 Rust toolchain / components...${NC}"
 echo -e "${GREEN}✓ Rust toolchain ready${NC}"
 echo ""
 
-DEV_DOCUMENT_TARGET="x86_64-apple-darwin"
+DEV_NATIVE_TARGET="x86_64-apple-darwin"
 if [[ "$(uname -m)" == "arm64" || "$(uname -m)" == "aarch64" ]]; then
-    DEV_DOCUMENT_TARGET="aarch64-apple-darwin"
+    DEV_NATIVE_TARGET="aarch64-apple-darwin"
 fi
-echo -e "${BLUE}[准备] 准备离线文档转换资源 (${DEV_DOCUMENT_TARGET})...${NC}"
-node "${PROJECT_DIR}/scripts/prepare-document-processing.mjs" "$DEV_DOCUMENT_TARGET"
-echo -e "${GREEN}✓ 文档转换资源 ready${NC}"
+echo -e "${BLUE}[准备] 准备离线文档与语音推理资源 (${DEV_NATIVE_TARGET})...${NC}"
+node "${PROJECT_DIR}/scripts/prepare-native-inference.mjs" "$DEV_NATIVE_TARGET"
+echo -e "${GREEN}✓ 原生推理资源 ready${NC}"
 echo ""
 
 # TypeScript 检查

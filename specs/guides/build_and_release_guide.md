@@ -67,7 +67,7 @@ myagents-releases/
 
 **构建流程**：
 1. 加载 `.env` 签名配置
-2. 检查依赖（Rust 通过 `rustup` 使用仓库 `rust-toolchain.toml` 固定版本、Node.js、codesign；Intel 冷构建额外检查 Git、Python ≥ 3.8、CMake ≥ 3.28 与 Apple Clang）
+2. 检查依赖（Rust 通过 `rustup` 使用仓库 `rust-toolchain.toml` 固定版本、Node.js、codesign；任一 macOS 架构的原生推理资源冷构建额外检查 Git、Python ≥ 3.8、CMake ≥ 3.28 与 Apple Clang）
 3. 配置生产环境 CSP
 4. TypeScript 类型检查
 5. 构建前端和服务端代码
@@ -97,7 +97,7 @@ myagents-releases/
 
 **注意**：如果未设置 `TAURI_SIGNING_PRIVATE_KEY`，脚本会显示警告并询问是否继续。构建出的应用**无法使用自动更新功能**。
 
-Intel 文档资源需要从锁定源码构建 ONNX Runtime。`build_macos.sh` 会在正式构建前通过统一 prepare owner 检查所需工具；已有当前 fingerprint 的完整 prepared cache 时不会强制要求这些源码构建工具。脚本不会自动执行 Homebrew 或修改系统环境，缺项时会给出对应的安装与验证命令。
+MyAgents 支持 macOS 13，而官方 ONNX Runtime 1.28 arm64 archive 的最低系统版本是 macOS 14，且没有 x64 archive。因此 Apple Silicon 与 Intel 都从锁定源码按 deployment target 13.0 构建共享 ONNX Runtime。`build_macos.sh` 会在正式构建前通过 `scripts/prepare-native-inference.mjs` 统一检查并准备 document/speech 两个 capability；已有当前 fingerprint 的完整 prepared cache 时不会强制要求源码构建工具。脚本不会自动执行 Homebrew 或修改系统环境，缺项时会给出对应的安装与验证命令。
 
 ---
 

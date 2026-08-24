@@ -672,9 +672,9 @@ try {
     Write-Host "[6/7] 构建 Tauri 应用 (Release)..." -ForegroundColor Blue
     Write-Host "  这可能需要几分钟，请耐心等待..." -ForegroundColor Yellow
 
-    Write-Host "  准备离线文档转换 Worker / OCR / PDFium 资源..." -ForegroundColor Cyan
-    & node "$ProjectDir\scripts\prepare-document-processing.mjs" "x86_64-pc-windows-msvc"
-    if ($LASTEXITCODE -ne 0) { throw "文档转换资源准备失败" }
+    Write-Host "  准备离线文档与语音推理资源..." -ForegroundColor Cyan
+    & node "$ProjectDir\scripts\prepare-native-inference.mjs" "x86_64-pc-windows-msvc"
+    if ($LASTEXITCODE -ne 0) { throw "原生推理资源准备失败" }
 
     & npm run tauri:build -- --target x86_64-pc-windows-msvc --config src-tauri/tauri.windows.conf.json
     if ($LASTEXITCODE -ne 0) {

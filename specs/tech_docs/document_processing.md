@@ -151,13 +151,13 @@ AnyDoc 自身 package entry、展开与 asset hard cap 继续生效。上限不�
 
 ## 随包资源与构建
 
-权威供应链锁为 `src-tauri/document-worker/resource-lock.json`，唯一 prepare owner 为 `scripts/prepare-document-processing.mjs`。`setup.sh`、`setup_windows.ps1`、macOS/Windows dev build、三平台 release build 与 `npm run tauri:dev` 都只能调用该 owner，不得各自实现下载、展开、Worker 构建或签名逻辑。
+权威供应链锁为 `src-tauri/document-worker/resource-lock.json`，App 原生推理资源的唯一顶层 prepare owner 为 `scripts/prepare-native-inference.mjs`。`setup.sh`、`setup_windows.ps1`、macOS/Windows dev build、三平台 release build 与 `npm run tauri:dev` 都只能调用该 owner，不得各自实现下载、展开、Worker 构建或签名逻辑。顶层 owner 在同一把仓库级锁下依次调用 document 与 speech capability preparer；`prepare-document-processing.mjs`、`prepare-speech-inference.mjs` 是内部能力构建器，不是新的 build 入口。二者通过 `document-processing-resource-cache.mjs` 共用 content-addressed 下载和 App-owned ORT authority。
 
 prepare owner 把生命周期分成三层：
 
 - `src-tauri/resources/document-processing-cache/downloads/` 是按锁定 digest 内容寻址的原始下载缓存；每次命中仍校验 regular file、size 与 SHA，损坏文件不得命中。旧版 `src-tauri/target/document-processing-cache` 中的有效原始文件仅作为一次性迁移源。
-- `.../prepared/<target>/<build-fingerprint>/` 是完整的已验证 bundle 缓存。fingerprint 覆盖 App 版本、target、resource lock、prepare/helper 源码、Worker/AnyDoc/office-crypto 源码与 Cargo lock、固定 Rust toolchain identity 和签名 identity/配置；只有这些输入完全相同时才能复用，因此版本发布或任一构建输入变化都会生成新 bundle，完全相同版本的 warm build 才不重复下载、展开、Worker build 或签名。
-- `src-tauri/resources/document-processing/v1` 只是当前 Tauri build 要快照的投影，不是缓存 authority。prepare 在仓库级跨进程锁内使用唯一 work/staging，完整校验 manifest 与所有 artifact 后才切换投影；切换失败会恢复上一份有效投影。
+- `.../prepared/<target>/<build-fingerprint>/` 与 `.../prepared-speech/<target>/<build-fingerprint>/` 是 document/speech 各自完整的已验证 bundle 缓存。fingerprint 覆盖 App 版本、target、resource lock、prepare/helper 源码、对应 Worker/adapter 源码与 Cargo lock、固定 Rust toolchain identity 和签名 identity/配置；只有这些输入完全相同时才能复用，因此版本发布或任一构建输入变化都会生成新 bundle，完全相同版本的 warm build 才不重复下载、展开、Worker build 或签名。
+- `src-tauri/resources/document-processing/v1` 与 `src-tauri/resources/speech-inference/v1` 只是当前 Tauri build 要快照的 capability 投影，不是缓存 authority。prepare 在仓库级跨进程锁内使用唯一 work/staging，完整校验 manifest 与所有 artifact 后才切换投影；切换失败会恢复上一份有效投影。speech manifest 只记录并校验 document projection 中的 ORT 绝对引用、revision、size 与 hash，不复制 ORT；其 Worker、sherpa adapter、sherpa C API 与 legal inventory 的 target-specific 安装增量硬上限为 80 MiB。
 
 持久缓存不入 Git，也不在 `npm run clean`/Cargo `target` 生命周期内；这是刻意的 repo-local derived cache，不读取用户级模型 cache，也不会随 App 打包。可用 `--offline` 验证全离线路径，缓存缺项时 fail closed；`--force` 只用于显式重建当前 fingerprint。构建 Worker 使用 `cargo build --locked --release --target ...`。macOS 有 signing identity 时先 codesign native 文件和 Worker；Windows 同时提供 `WINDOWS_SIGNTOOL_PATH` 与 `WINDOWS_CERTIFICATE_SHA1` 时先做 Authenticode 签名与验证。manifest 最后按签名后的实际 bytes 生成，并记录 fingerprint、每个 artifact 的来源及 signing kind/identity。
 
@@ -169,7 +169,7 @@ prepare owner 把生命周期分成三层：
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
 
-ONNX Runtime 官方 1.28 release 未提供 macOS x64 binary，因此该 target 从精确 commit `da9b5e364c465de65c49d91e696cd6485270757f`、固定 recipe 构建 x86_64 shared library；其余 target 使用锁定官方 archive。该源码路径由 prepare owner 在 cache miss 后、任何文档资源网络/源码 mutation 前统一检查 Git、Python 3.8+、CMake 3.28+ 与 Apple Clang；`--check-prerequisites` 提供给平台 build 做早期只读预检。已有有效 prepared bundle 时不要求源码工具，脚本也不自动安装系统包。PDFium 全部使用 `chromium/7999` 锁定 archive。安装资源同时包含 AnyDoc/Paddle/ORT/PDFium license 与 PDFium 第三方 license tree；顶层 `THIRD_PARTY_NOTICES.md` 保留组件分类。
+ONNX Runtime 官方 1.28 macOS arm64 archive 的最低系统版本是 macOS 14，且没有 macOS x64 binary；MyAgents 最低支持 macOS 13，因此两个 macOS target 都从精确 commit `da9b5e364c465de65c49d91e696cd6485270757f`、固定 recipe 与 deployment target 13.0 构建 shared library，其余 target 使用锁定官方 archive。该源码路径由 prepare owner 在 cache miss 后、任何资源网络/源码 mutation 前统一检查 Git、Python 3.8+、CMake 3.28+ 与 Apple Clang；`--check-prerequisites` 提供给平台 build 做早期只读预检。已有对应 fingerprint 的有效 prepared bundle 时不要求源码工具，脚本也不自动安装系统包。PDFium 全部使用 `chromium/7999` 锁定 archive。安装资源同时包含 AnyDoc/Paddle/ORT/PDFium license 与 PDFium 第三方 license tree；顶层 `THIRD_PARTY_NOTICES.md` 保留组件分类。speech 使用锁定 sherpa-onnx/codec 源码及其 legal tree，构建时显式关闭 CoreML 并链接上述同一 App-owned CPU ORT。
 
 App 启动时 Manager 校验 manifest target/pipeline、Worker 可执行位和 Worker/native/model/dictionary 的 size + SHA；资源问题只让 document admission fail closed，不阻止 MyAgents UI 启动。Worker 启动后再次校验它实际要加载的五个资源。运行时不得下载、访问 Hugging Face 或使用用户 cache。
 

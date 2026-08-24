@@ -32,6 +32,14 @@ const documentResourceCache = readFileSync(
   resolve(repoRoot, 'scripts/document-processing-resource-cache.mjs'),
   'utf8',
 );
+const nativeResourceScript = readFileSync(
+  resolve(repoRoot, 'scripts/prepare-native-inference.mjs'),
+  'utf8',
+);
+const speechResourceScript = readFileSync(
+  resolve(repoRoot, 'scripts/prepare-speech-inference.mjs'),
+  'utf8',
+);
 const syncVersionScript = readFileSync(
   resolve(repoRoot, 'scripts/sync-version.js'),
   'utf8',
@@ -101,10 +109,7 @@ test('bundled workspace templates are committed, clean, and setup-independent', 
     assert.doesNotMatch(setup, /openmino/i);
     assert.doesNotMatch(setup, /git clone[^\n]*mino/i);
   }
-  assert.match(
-    buildMacos,
-    /bundled-workspaces\/mino\/CLAUDE\.md/,
-  );
+  assert.match(buildMacos, /bundled-workspaces\/mino\/CLAUDE\.md/);
 });
 
 test('macOS dev build replaces every mutable native resource staging directory', () => {
@@ -214,9 +219,9 @@ test('CLI bundle staging owns its complete mutable resource inventory', () => {
   assert.doesNotMatch(esbuildBundle, /copyFile|src\/cli\/myagents\.cmd/);
 });
 
-test('every setup, dev, and release entry point delegates document resources to the prepare owner', () => {
+test('every setup, dev, and release entry point delegates native resources to one prepare owner', () => {
   const macPreflight = buildMacos.indexOf(
-    'prepare-document-processing.mjs" "$TARGET" --check-prerequisites',
+    'prepare-native-inference.mjs" "$TARGET" --check-prerequisites',
   );
   const macTargetBuildLoop = buildMacos.indexOf(
     'for TARGET in "${BUILD_TARGETS[@]}"; do',
@@ -228,13 +233,13 @@ test('every setup, dev, and release entry point delegates document resources to 
   );
 
   const macDevPrepare = buildDev.indexOf(
-    'prepare-document-processing.mjs" "$DEV_DOCUMENT_TARGET"',
+    'prepare-native-inference.mjs" "$DEV_NATIVE_TARGET"',
   );
   const macDevBuild = buildDev.indexOf('npm run tauri:build -- --debug');
   assert.ok(macDevPrepare >= 0 && macDevPrepare < macDevBuild);
 
   const windowsDevPrepare = buildDevWindows.indexOf(
-    'prepare-document-processing.mjs" "x86_64-pc-windows-msvc"',
+    'prepare-native-inference.mjs" "x86_64-pc-windows-msvc"',
   );
   const windowsDevBuild = buildDevWindows.indexOf(
     'npm run tauri:build -- --debug',
@@ -242,7 +247,7 @@ test('every setup, dev, and release entry point delegates document resources to 
   assert.ok(windowsDevPrepare >= 0 && windowsDevPrepare < windowsDevBuild);
 
   const macPrepare = buildMacos.indexOf(
-    'prepare-document-processing.mjs" "$TARGET"',
+    'prepare-native-inference.mjs" "$TARGET"',
   );
   const macBuild = buildMacos.indexOf(
     'npm run tauri:build -- --target "$TARGET"',
@@ -250,16 +255,14 @@ test('every setup, dev, and release entry point delegates document resources to 
   assert.ok(macPrepare >= 0 && macPrepare < macBuild);
 
   const linuxPrepare = buildLinux.indexOf(
-    'prepare-document-processing.mjs" "$TARGET"',
+    'prepare-native-inference.mjs" "$TARGET"',
   );
   const linuxBuild = buildLinux.indexOf(
     'npm run tauri:build -- --target "$TARGET"',
   );
   assert.ok(linuxPrepare >= 0 && linuxPrepare < linuxBuild);
 
-  const windowsPrepare = buildWindows.indexOf(
-    'prepare-document-processing.mjs',
-  );
+  const windowsPrepare = buildWindows.indexOf('prepare-native-inference.mjs');
   const windowsBuild = buildWindows.indexOf(
     'npm run tauri:build -- --target x86_64-pc-windows-msvc',
   );
@@ -267,20 +270,26 @@ test('every setup, dev, and release entry point delegates document resources to 
 
   assert.match(
     setupUnix,
-    /node "\$\{PROJECT_DIR\}\/scripts\/prepare-document-processing\.mjs"/,
+    /node "\$\{PROJECT_DIR\}\/scripts\/prepare-native-inference\.mjs"/,
   );
   assert.match(
     setupWindows,
-    /node "\$ProjectDir\\scripts\\prepare-document-processing\.mjs" "x86_64-pc-windows-msvc"/,
+    /node "\$ProjectDir\\scripts\\prepare-native-inference\.mjs" "x86_64-pc-windows-msvc"/,
   );
   assert.equal(
     packageJson.scripts['prepare:document-processing'],
-    'node scripts/prepare-document-processing.mjs',
+    'npm run prepare:native-inference',
+  );
+  assert.equal(
+    packageJson.scripts['prepare:native-inference'],
+    'node scripts/prepare-native-inference.mjs',
   );
   assert.match(
     packageJson.scripts['tauri:dev'],
-    /^npm run prepare:document-processing && tauri dev$/,
+    /^npm run prepare:native-inference && tauri dev$/,
   );
+  assert.match(nativeResourceScript, /prepare-document-processing\.mjs/);
+  assert.match(nativeResourceScript, /prepare-speech-inference\.mjs/);
 });
 
 test('document processing locks all release targets and publishes only verified reusable resources', () => {
@@ -310,11 +319,19 @@ test('document processing locks all release targets and publishes only verified 
     );
     assert.match(target.pdfium.sha256, /^[0-9a-f]{64}$/);
   }
+  for (const macTarget of [
+    documentResourceLock.targets['aarch64-apple-darwin'],
+    documentResourceLock.targets['x86_64-apple-darwin'],
+  ]) {
+    assert.equal(macTarget.onnxRuntime.sourceBuild.deploymentTarget, '13.0');
+    assert.equal(macTarget.onnxRuntime.sourceBuild.recipeVersion, 2);
+    assert.equal(macTarget.onnxRuntime.url, undefined);
+  }
   assert.match(
     documentResourceScript,
     /cargo[\s\S]*--locked[\s\S]*--release[\s\S]*--target/,
   );
-  assert.match(documentResourceScript, /Locked size\/digest mismatch/);
+  assert.match(documentResourceCache, /Locked size\/digest mismatch/);
   assert.match(
     documentResourceScript,
     /writeFileSync\(\s*join\(stageRoot, 'manifest\.json'\)/,
@@ -362,5 +379,53 @@ test('document processing locks all release targets and publishes only verified 
   assert.equal(
     tauriConfig.bundle.resources['../src-tauri/resources/document-processing'],
     'document-processing',
+  );
+});
+
+test('speech inference builds a signed exact native inventory around the shared ORT', () => {
+  const speech = documentResourceLock.speechInference;
+  assert.equal(speech.adapterAbiVersion, 1);
+  assert.equal(speech.sherpaOnnxVersion, '1.13.6');
+  assert.match(speech.sherpaOnnxCommit, /^[0-9a-f]{40}$/);
+  assert.equal(speech.onnxRuntimeVersion, '1.28.0');
+  assert.equal(speech.opus2Version, '0.4.0');
+  assert.equal(speech.libopusSysVersion, '0.3.3');
+  assert.equal(speech.nativeIncrementHardLimitBytes, 80 * 1024 * 1024);
+  assert.match(speech.source.sha256, /^[0-9a-f]{64}$/);
+  assert.deepEqual(speech.dependencies.map(({ id }) => id).sort(), [
+    'eigen',
+    'hclust-cpp',
+    'kaldi-decoder',
+    'kaldi-native-fbank',
+    'kaldifst',
+    'kissfft',
+    'nlohmann-json',
+    'openfst',
+    'simple-sentencepiece',
+  ]);
+  for (const dependency of speech.dependencies) {
+    assert.match(dependency.sha256, /^[0-9a-f]{64}$/);
+    assert.ok(dependency.size > 0);
+    assert.ok(dependency.license);
+    assert.ok(dependency.upstreamRevision);
+  }
+
+  assert.match(speechResourceScript, /acquireLockedResource/);
+  assert.match(speechResourceScript, /documentRuntimeReference/);
+  assert.match(speechResourceScript, /nativeIncrementHardLimitBytes/);
+  assert.match(speechResourceScript, /SHERPA_ONNXRUNTIME_LIB_DIR/);
+  assert.match(
+    speechResourceScript,
+    /CMAKE_CXX_FLAGS=-DSHERPA_ONNX_DISABLE_COREML=1/,
+  );
+  assert.match(speechResourceScript, /--target[\s\S]*sherpa-onnx-c-api/);
+  assert.match(speechResourceScript, /signNativeFiles/);
+  assert.doesNotMatch(
+    speechResourceScript,
+    /stageRoot[\s\S]{0,200}onnxruntime\.(?:dll|dylib|so)/i,
+  );
+  assert.equal(
+    tauriConfig.bundle.resources['../src-tauri/resources/speech-inference'],
+    'speech-inference',
   );
 });

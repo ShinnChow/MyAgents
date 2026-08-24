@@ -1,8 +1,8 @@
 const MINIMUM_CMAKE_VERSION = [3, 28, 0];
 const MINIMUM_PYTHON_VERSION = [3, 8, 0];
 
-export const MINIMUM_MAC_X64_CMAKE_VERSION = MINIMUM_CMAKE_VERSION.join('.');
-export const MINIMUM_MAC_X64_PYTHON_VERSION =
+export const MINIMUM_MAC_SOURCE_CMAKE_VERSION = MINIMUM_CMAKE_VERSION.join('.');
+export const MINIMUM_MAC_SOURCE_PYTHON_VERSION =
   MINIMUM_PYTHON_VERSION.join('.');
 
 export function parseCmakeVersion(output) {
@@ -27,7 +27,7 @@ function versionAtLeast(actual, minimum) {
   return true;
 }
 
-export function macX64SourceBuildPrerequisiteFailures(tools) {
+export function macSourceBuildPrerequisiteFailures(tools) {
   const failures = [];
   if (!tools.gitVersion) {
     failures.push({
@@ -40,21 +40,21 @@ export function macX64SourceBuildPrerequisiteFailures(tools) {
   const pythonVersion = parsePythonVersion(tools.pythonVersion);
   if (!tools.pythonVersion) {
     failures.push({
-      name: `Python >= ${MINIMUM_MAC_X64_PYTHON_VERSION}`,
+      name: `Python >= ${MINIMUM_MAC_SOURCE_PYTHON_VERSION}`,
       reason: 'python3 was not found',
       install: 'brew install python',
       verify: 'python3 --version',
     });
   } else if (!pythonVersion) {
     failures.push({
-      name: `Python >= ${MINIMUM_MAC_X64_PYTHON_VERSION}`,
+      name: `Python >= ${MINIMUM_MAC_SOURCE_PYTHON_VERSION}`,
       reason: `could not parse: ${tools.pythonVersion.split('\n')[0]}`,
       install: 'brew upgrade python',
       verify: 'python3 --version',
     });
   } else if (!versionAtLeast(pythonVersion, MINIMUM_PYTHON_VERSION)) {
     failures.push({
-      name: `Python >= ${MINIMUM_MAC_X64_PYTHON_VERSION}`,
+      name: `Python >= ${MINIMUM_MAC_SOURCE_PYTHON_VERSION}`,
       reason: `found ${pythonVersion.join('.')}`,
       install: 'brew upgrade python',
       verify: 'python3 --version',
@@ -64,21 +64,21 @@ export function macX64SourceBuildPrerequisiteFailures(tools) {
   const cmakeVersion = parseCmakeVersion(tools.cmakeVersion);
   if (!tools.cmakeVersion) {
     failures.push({
-      name: `CMake >= ${MINIMUM_MAC_X64_CMAKE_VERSION}`,
+      name: `CMake >= ${MINIMUM_MAC_SOURCE_CMAKE_VERSION}`,
       reason: 'cmake was not found',
       install: 'brew install cmake',
       verify: 'cmake --version',
     });
   } else if (!cmakeVersion) {
     failures.push({
-      name: `CMake >= ${MINIMUM_MAC_X64_CMAKE_VERSION}`,
+      name: `CMake >= ${MINIMUM_MAC_SOURCE_CMAKE_VERSION}`,
       reason: `could not parse: ${tools.cmakeVersion.split('\n')[0]}`,
       install: 'brew upgrade cmake',
       verify: 'cmake --version',
     });
   } else if (!versionAtLeast(cmakeVersion, MINIMUM_CMAKE_VERSION)) {
     failures.push({
-      name: `CMake >= ${MINIMUM_MAC_X64_CMAKE_VERSION}`,
+      name: `CMake >= ${MINIMUM_MAC_SOURCE_CMAKE_VERSION}`,
       reason: `found ${cmakeVersion.join('.')}`,
       install: 'brew upgrade cmake',
       verify: 'cmake --version',

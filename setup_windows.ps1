@@ -553,15 +553,15 @@ try {
     Pop-Location
     Write-Host "OK - Rust 依赖下载完成" -ForegroundColor Green
 
-    Write-Host "`nStep 7.5/8: 准备离线文档转换资源" -ForegroundColor Blue
-    & node "$ProjectDir\scripts\prepare-document-processing.mjs" "x86_64-pc-windows-msvc"
+    Write-Host "`nStep 7.5/8: 准备离线文档与语音推理资源" -ForegroundColor Blue
+    & node "$ProjectDir\scripts\prepare-native-inference.mjs" "x86_64-pc-windows-msvc"
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "  文档转换资源准备失败" -ForegroundColor Red
+        Write-Host "  原生推理资源准备失败" -ForegroundColor Red
         Write-Host "`n按回车键退出..." -ForegroundColor Yellow
         Read-Host
         exit 1
     }
-    Write-Host "OK - 文档转换资源 ready" -ForegroundColor Green
+    Write-Host "OK - 原生推理资源 ready" -ForegroundColor Green
 
     Write-Host "`nStep 8/8: 初始化完成!" -ForegroundColor Blue
     Write-Host "`n=========================================" -ForegroundColor Green

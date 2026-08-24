@@ -1,15 +1,26 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
+  copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
 
 const PREPARE_LOCK_NAME = '.prepare.lock';
 const DEFAULT_LOCK_TIMEOUT_MS = 2 * 60 * 60 * 1000;
@@ -60,6 +71,105 @@ export function validateLockedFile(path, entry) {
     createHash('sha512').update(readFileSync(path)).digest('base64') ===
     entry.sha512Base64
   );
+}
+
+export async function acquireLockedResource({
+  cacheRoot,
+  legacyCacheRoot,
+  entry,
+  cacheName,
+  offline = false,
+  stats,
+}) {
+  const destination = contentAddressedDownloadPath(cacheRoot, entry, cacheName);
+  const legacy = legacyCacheRoot ? join(legacyCacheRoot, cacheName) : null;
+  mkdirSync(dirname(destination), { recursive: true });
+  if (validateLockedFile(destination, entry)) {
+    if (stats) stats.hits += 1;
+    return destination;
+  }
+  if (legacy && validateLockedFile(legacy, entry)) {
+    copyFileSync(legacy, destination);
+    if (stats) stats.migrated += 1;
+    console.log(
+      `  [cache] migrated ${cacheName} from legacy Cargo target cache`,
+    );
+    return destination;
+  }
+  if (offline) {
+    throw new Error(
+      `Offline native resource cache miss: ${cacheName} (${destination})`,
+    );
+  }
+
+  rmSync(destination, { force: true });
+  const temporary = `${destination}.${process.pid}.${randomUUID()}.partial`;
+  rmSync(temporary, { force: true });
+  console.log(
+    `  [download] ${cacheName} (${(entry.size / 1024 / 1024).toFixed(1)} MiB)`,
+  );
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(entry.url, { redirect: 'follow' });
+      if (!response.ok || !response.body) {
+        throw new Error(`Download failed (${response.status}): ${entry.url}`);
+      }
+      const bytes = Buffer.from(await response.arrayBuffer());
+      writeFileSync(temporary, bytes, { mode: 0o600 });
+      if (!validateLockedFile(temporary, entry)) {
+        throw new Error(`Locked size/digest mismatch: ${entry.url}`);
+      }
+      renameSync(temporary, destination);
+      lastError = undefined;
+      break;
+    } catch (error) {
+      lastError = error;
+      rmSync(temporary, { force: true });
+      if (attempt < 3) {
+        await new Promise((resolveDelay) =>
+          setTimeout(resolveDelay, attempt * 500),
+        );
+      }
+    }
+  }
+  if (lastError) {
+    console.warn(
+      `  [download] Node fetch failed; falling back to curl: ${lastError.message}`,
+    );
+    let curlError;
+    try {
+      execFileSync(
+        'curl',
+        [
+          '--fail',
+          '--location',
+          '--retry',
+          '3',
+          '--retry-delay',
+          '1',
+          '--output',
+          temporary,
+          entry.url,
+        ],
+        { stdio: 'inherit' },
+      );
+      if (!validateLockedFile(temporary, entry)) {
+        throw new Error(`Locked size/digest mismatch: ${entry.url}`);
+      }
+      renameSync(temporary, destination);
+      curlError = undefined;
+    } catch (error) {
+      curlError = error;
+      rmSync(temporary, { force: true });
+    }
+    if (curlError) throw curlError;
+  }
+  if (!validateLockedFile(destination, entry)) {
+    throw new Error(`Locked size/digest mismatch: ${entry.url}`);
+  }
+  if (stats) stats.downloaded += 1;
+  return destination;
 }
 
 function sourceFilesUnder(path, result) {

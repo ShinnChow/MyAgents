@@ -443,7 +443,7 @@ CLI 业务 bundle 只位于当前 app。由于 SDK 子进程与用户 shell 的 
 
 每个 job 使用一个独立 Rust `myagents-document-worker` 进程。Manager 通过 `process_cmd::spawn_tree()` 保留精确 `ChildTree`，用有界 length-prefixed JSON 私有协议传入单次任务；Worker 只读取 Manager 已复制的私有输入，并在输出根内的隐藏 staging 目录运行 AnyDoc、pdf-inspector、PDFium 与 PP-OCRv6 Small。成功后由 Manager 校验 active `(jobId, generation)` 与输出根 identity，以私有 crash-durable publish intent + 随目录 marker 协调同卷 no-replace rename、目录 sync 和 terminal `job.json`；未知持久化结果必须保留 intent。启动恢复只能由同一个 Manager owner 完成已 durable 的 success，或清理未提交 authenticated public path 后把非终态收敛为 `interrupted`。durable terminal 不可逆；artifact 发布后由用户拥有，删除/修改只影响派生 `artifactAvailable`。公开 artifact 固定为 `<output-root>/<job-id>/document.md` 和实际引用的 `assets/`。Worker crash、取消、超时或 App 退出均不得发布 partial artifact。
 
-ONNX Runtime CPU、PDFium、PP-OCRv6 Small 模型/字典和 Worker 按 target 随 App 资源发布；启动时 Manager 校验 manifest 和所有文件 hash，Worker 使用同一 manifest 再校验并只从绝对资源路径加载。运行时不联网，不依赖 GPT、API key、系统 Python/Node、GPU 或系统安装的 native runtime。详细状态机、限制、资源矩阵和排查见 [`tech_docs/document_processing.md`](./tech_docs/document_processing.md)。
+ONNX Runtime CPU、PDFium、PP-OCRv6 Small 模型/字典和 Worker 按 target 随 App 资源发布；启动时 Manager 校验 manifest 和所有文件 hash，Worker 使用同一 manifest 再校验并只从绝对资源路径加载。ONNX Runtime 是 App-owned 的共享本地推理资源：document 与 speech capability 必须消费同一 target artifact identity，speech bundle 只携带自身 Worker、sherpa adapter/C API 与 legal inventory，禁止复制第二份 ORT。构建入口统一为 `scripts/prepare-native-inference.mjs`，在同一锁和 content-addressed cache 下准备并原子投影两个 capability。运行时不联网，不依赖 GPT、API key、系统 Python/Node、GPU 或系统安装的 native runtime。详细状态机、限制、资源矩阵和排查见 [`tech_docs/document_processing.md`](./tech_docs/document_processing.md)。
 
 ### 5. 定时任务系统
 

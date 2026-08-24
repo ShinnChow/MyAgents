@@ -13,6 +13,7 @@ use crate::native_adapter::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -25,6 +26,13 @@ const SHERPA_ONNX_VERSION: &str = "1.13.6";
 const SHERPA_ONNX_COMMIT: &str = "1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911";
 const ONNX_RUNTIME_VERSION: &str = "1.28.0";
 const ONNX_RUNTIME_REVISION: &str = "v1.28.0@da9b5e364c465de65c49d91e696cd6485270757f";
+const REQUIRED_LEGAL_FILES: [&str; 5] = [
+    "legal/LIBOPUS-LICENSE",
+    "legal/OPUS2-LICENSE-APACHE",
+    "legal/OPUS2-LICENSE-MIT",
+    "legal/SHERPA-ONNX-LICENSE",
+    "legal/SPEECH_INFERENCE_NOTICES.md",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeBundleError {
@@ -86,10 +94,12 @@ struct NativeManifest {
     adapter_abi_version: u32,
     platform: String,
     architecture: String,
+    build_fingerprint: String,
     native_increment_bytes: u64,
     framework: NativeFramework,
     files: NativeFiles,
     onnx_runtime: RuntimeReference,
+    legal_files: Vec<IntegrityFile>,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +147,14 @@ struct NativeSigning {
     identity: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct IntegrityFile {
+    path: String,
+    sha256: String,
+    size: u64,
+}
+
 /// Verify the target-specific native inventory before any dynamic loader call.
 ///
 /// `requested_runtime` is the exact absolute path supplied by the App's shared
@@ -162,6 +180,7 @@ pub fn verify_native_bundle(
     if manifest.schema_version != 1
         || manifest.capability != "speech-inference"
         || manifest.adapter_abi_version != ADAPTER_ABI_VERSION
+        || !valid_sha256(&manifest.build_fingerprint)
         || manifest.native_increment_bytes == 0
         || manifest.native_increment_bytes > MAX_NATIVE_INCREMENT_BYTES
     {
@@ -213,6 +232,7 @@ pub fn verify_native_bundle(
     if worker_path != current_worker {
         return Err(NativeBundleError::WorkerIdentityMismatch);
     }
+    verify_legal_inventory(root, &manifest.legal_files)?;
 
     let runtime = &manifest.onnx_runtime;
     if !valid_sha256(&runtime.sha256)
@@ -233,6 +253,70 @@ pub fn verify_native_bundle(
         sherpa_onnx_path,
         onnx_runtime_path: requested_runtime.to_path_buf(),
     })
+}
+
+fn verify_legal_inventory(
+    root: &Path,
+    legal_files: &[IntegrityFile],
+) -> Result<(), NativeBundleError> {
+    if legal_files.is_empty() {
+        return Err(NativeBundleError::ManifestInvalid);
+    }
+    let mut declared = HashSet::new();
+    for file in legal_files {
+        if !file.path.starts_with("legal/")
+            || !valid_sha256(&file.sha256)
+            || file.size == 0
+            || !declared.insert(file.path.clone())
+        {
+            return Err(NativeBundleError::ManifestInvalid);
+        }
+        let path = resolve_plain_file(root, &file.path)?;
+        verify_plain_file(&path, file.size, &file.sha256)?;
+    }
+    if REQUIRED_LEGAL_FILES
+        .iter()
+        .any(|required| !declared.contains(*required))
+    {
+        return Err(NativeBundleError::ManifestInvalid);
+    }
+
+    let legal_root = root.join("legal");
+    ensure_plain_directory(&legal_root)?;
+    let mut actual = HashSet::new();
+    collect_plain_files(root, &legal_root, &mut actual)?;
+    if actual != declared {
+        return Err(NativeBundleError::ManifestInvalid);
+    }
+    Ok(())
+}
+
+fn collect_plain_files(
+    bundle_root: &Path,
+    current: &Path,
+    result: &mut HashSet<String>,
+) -> Result<(), NativeBundleError> {
+    for entry in fs::read_dir(current).map_err(|_| NativeBundleError::FileMissing)? {
+        let entry = entry.map_err(|_| NativeBundleError::FileMismatch)?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| NativeBundleError::FileMismatch)?;
+        if metadata.file_type().is_symlink() {
+            return Err(NativeBundleError::UnsafePath);
+        }
+        if metadata.is_dir() {
+            collect_plain_files(bundle_root, &path, result)?;
+        } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(bundle_root)
+                .map_err(|_| NativeBundleError::UnsafePath)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            result.insert(relative);
+        } else {
+            return Err(NativeBundleError::FileMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn verify_native_file(
@@ -557,12 +641,24 @@ mod tests {
         let adapter = write_file(root, "native/adapter", b"adapter");
         let sherpa = write_file(root, "native/sherpa", b"sherpa");
         let runtime = write_file(root, "shared/onnxruntime", b"runtime");
+        let legal_files = REQUIRED_LEGAL_FILES
+            .iter()
+            .map(|relative| {
+                let file = write_file(root, relative, relative.as_bytes());
+                json!({
+                    "path": file.relative,
+                    "sha256": file.sha256,
+                    "size": file.size
+                })
+            })
+            .collect::<Vec<_>>();
         let manifest = json!({
             "schemaVersion": 1,
             "capability": "speech-inference",
             "adapterAbiVersion": 1,
             "platform": platform,
             "architecture": architecture,
+            "buildFingerprint": "f".repeat(64),
             "nativeIncrementBytes": worker.size + adapter.size + sherpa.size,
             "framework": {
                 "sherpaOnnxVersion": SHERPA_ONNX_VERSION,
@@ -580,7 +676,8 @@ mod tests {
                 "size": runtime.size,
                 "license": "MIT",
                 "upstreamRevision": ONNX_RUNTIME_REVISION
-            }
+            },
+            "legalFiles": legal_files
         });
         let manifest_path = root.join("manifest.json");
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
@@ -652,6 +749,25 @@ mod tests {
         assert_eq!(
             verify_native_bundle(&manifest, &runtime, &worker),
             Err(NativeBundleError::FileMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_unlisted_legal_files() {
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, runtime, worker) = write_manifest(root.path());
+        fs::remove_file(root.path().join("legal/LIBOPUS-LICENSE")).unwrap();
+        assert_eq!(
+            verify_native_bundle(&manifest, &runtime, &worker),
+            Err(NativeBundleError::FileMissing)
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let (manifest, runtime, worker) = write_manifest(root.path());
+        fs::write(root.path().join("legal/undeclared"), b"drift").unwrap();
+        assert_eq!(
+            verify_native_bundle(&manifest, &runtime, &worker),
+            Err(NativeBundleError::ManifestInvalid)
         );
     }
 

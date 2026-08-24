@@ -82,6 +82,7 @@ jobs:
           mkdir -p src-tauri/resources/sharp-runtime
           mkdir -p src-tauri/resources/tsx-runtime
           mkdir -p src-tauri/resources/nodejs
+          mkdir -p src-tauri/resources/speech-inference
           printf 'console.log("ci server-dist placeholder");\n' > src-tauri/resources/server-dist.js
           printf 'console.log("ci plugin-bridge placeholder");\n' > src-tauri/resources/plugin-bridge-dist.mjs
           printf 'ci placeholder\n' > src-tauri/resources/claude-agent-sdk/.ci-placeholder
@@ -114,6 +115,7 @@ jobs:
             'src-tauri/resources/sharp-runtime',
             'src-tauri/resources/tsx-runtime',
             'src-tauri/resources/nodejs',
+            'src-tauri/resources/speech-inference',
             'src-tauri/resources/cli',
             'src-tauri/binaries'
           )
