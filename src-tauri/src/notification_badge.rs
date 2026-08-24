@@ -53,27 +53,6 @@ fn apply_notification_badge<R: Runtime>(app: &AppHandle<R>, count: u32, enabled:
                 ulog_warn!("[NotificationBadge] Failed to set macOS Dock badge: {}", e);
             }
         }
-        if let Some(handles) = app.try_state::<crate::tray::TrayMenuHandles>() {
-            // macOS convention: Dock uses a red badge; menu-bar extras show a
-            // plain count next to the template icon (like WeChat), not a red
-            // badge painted into the status icon itself.
-            if let Err(e) = handles
-                .tray
-                .set_title(Some(macos_tray_title(label.as_deref())))
-            {
-                ulog_warn!("[NotificationBadge] Failed to set macOS tray title: {}", e);
-            }
-            let icon_result = macos_base_tray_icon().and_then(|icon| {
-                handles.tray.set_icon(Some(icon))?;
-                handles.tray.set_icon_as_template(true)
-            });
-            if let Err(e) = icon_result {
-                ulog_warn!(
-                    "[NotificationBadge] Failed to restore macOS tray template icon: {}",
-                    e
-                );
-            }
-        }
     }
 
     #[cfg(target_os = "windows")]
@@ -102,6 +81,8 @@ fn apply_notification_badge<R: Runtime>(app: &AppHandle<R>, count: u32, enabled:
             }
         }
     }
+
+    crate::tray::set_notification_projection(app, count, enabled);
 }
 
 fn badge_label(count: u32) -> Option<String> {
@@ -121,20 +102,6 @@ fn build_windows_badge_icon(count: u32) -> tauri::image::Image<'static> {
     draw_circle(&mut rgba, SIZE, 16.0, 16.0, 15.0);
     draw_label_centered(&mut rgba, SIZE, &short_badge_text(count), 4, 16.0, 16.0);
     tauri::image::Image::new_owned(rgba, SIZE, SIZE)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_base_tray_icon() -> tauri::Result<tauri::image::Image<'static>> {
-    tauri::image::Image::from_bytes(include_bytes!("../icons/trayIconTemplate@2x.png"))
-        .map(|icon| icon.to_owned())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_tray_title(label: Option<&str>) -> &str {
-    // tray-icon 0.23 macOS treats set_title(None) as a no-op: it updates the
-    // stored attrs but never calls NSStatusBarButton.setTitle, leaving the old
-    // count visible. An explicit empty string clears the menu-bar text.
-    label.unwrap_or("")
 }
 
 #[cfg(target_os = "windows")]
@@ -248,12 +215,5 @@ mod tests {
         assert_eq!(badge_label(1).as_deref(), Some("1"));
         assert_eq!(badge_label(99).as_deref(), Some("99"));
         assert_eq!(badge_label(100).as_deref(), Some("99+"));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn macos_tray_title_clears_with_empty_string() {
-        assert_eq!(macos_tray_title(None), "");
-        assert_eq!(macos_tray_title(Some("1")), "1");
     }
 }

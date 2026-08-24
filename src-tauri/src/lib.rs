@@ -45,6 +45,7 @@ pub mod process_cmd;
 mod proxy_config;
 mod proxy_spill;
 pub mod record;
+pub mod recording;
 pub mod runtime_launch_guard;
 pub mod search;
 pub mod session_goal;
@@ -298,6 +299,8 @@ pub fn run() {
         Some(data_dir.join("thoughts")),
     ));
     record::set_record_store(record_state.clone());
+    let recording_state = recording::RecordingManager::new(record_state.clone());
+    let recording_state_for_exit = recording_state.clone();
     let task_state: task::ManagedTaskStore = Arc::new(task::TaskStore::new(data_dir.clone()));
     // Expose the same Arcs via OnceLock singletons so the Rust Management API
     // (used by Bun CLI bridge → /api/admin/task/*) can read/write tasks without
@@ -385,6 +388,7 @@ pub fn run() {
         .manage(terminal_state)
         .manage(browser_state)
         .manage(record_state)
+        .manage(recording_state)
         .manage(task_state)
         .manage(app_route_queue)
         .manage(notification_center)
@@ -680,6 +684,11 @@ pub fn run() {
             record::cmd_record_set_archived,
             record::cmd_record_delete,
             record::cmd_record_merge_text,
+            recording::manager::cmd_recording_snapshot,
+            recording::manager::cmd_recording_start,
+            recording::manager::cmd_recording_pause,
+            recording::manager::cmd_recording_resume,
+            recording::manager::cmd_recording_stop,
             // Task Center — Thought commands (v0.1.69)
             thought::cmd_thought_create,
             thought::cmd_thought_list,
@@ -786,6 +795,34 @@ pub fn run() {
             // calls (extremely early startup) fall back to a synchronous
             // append protected by a mutex.
             logger::init_buffered_writer();
+            let recording_manager = app
+                .state::<recording::ManagedRecordingManager>()
+                .inner()
+                .clone();
+            let recording_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut changes = recording_manager.subscribe_changes();
+                loop {
+                    match changes.recv().await {
+                        Ok(change) => {
+                            tray::set_recording_projection(
+                                &recording_handle,
+                                change.snapshot.as_ref().map(|snapshot| snapshot.record_id.clone()),
+                            );
+                            if let Err(error) = recording_handle.emit("recording:changed", change) {
+                                ulog_warn!("[recording] failed to emit state change: {}", error);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            ulog_warn!(
+                                "[recording] UI event bridge lagged; skipped {} state changes",
+                                skipped
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
             // Only users who completed the explicit first install have opted
             // into Browser resources. Future app-locked revisions maintain
             // themselves in the background; a never-installed app stays idle.
@@ -1134,6 +1171,14 @@ pub fn run() {
             if let Err(e) = tray::setup_tray(app) {
                 ulog_error!("[App] Failed to setup system tray: {}", e);
             }
+
+            let recording_manager = app
+                .state::<recording::ManagedRecordingManager>()
+                .inner()
+                .clone();
+            tauri::async_runtime::spawn(async move {
+                recording_manager.recover_interrupted().await;
+            });
 
             // PRD 0.2.35 — boot-time hydrate the user's force wake-lock intent
             // from disk. If `forceWakeLock: true`, acquire the OS assertion now.
@@ -1530,7 +1575,17 @@ pub fn run() {
     app.run(move |_app_handle, event| {
         match event {
             // Handle app exit events (Cmd+Q, Dock right-click quit, etc.)
-            tauri::RunEvent::ExitRequested { code, .. } => {
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
+                if let Err(error) = tauri::async_runtime::block_on(
+                    recording_state_for_exit.stop_for_app_exit(),
+                ) {
+                    ulog_error!(
+                        "[recording] app exit blocked because capture finalization is not durable: {}",
+                        error
+                    );
+                    api.prevent_exit();
+                    return;
+                }
                 // Only cleanup once (Relaxed is sufficient for simple flag)
                 use std::sync::atomic::Ordering::Relaxed;
                 if !cleanup_done_for_exit.swap(true, Relaxed) {
@@ -1771,7 +1826,7 @@ mod nav_guard_tests {
         }
 
         let exit_handler = source
-            .split_once("tauri::RunEvent::ExitRequested { code, .. } => {")
+            .split_once("tauri::RunEvent::ExitRequested { code, api, .. } => {")
             .and_then(|(_, tail)| tail.split_once("// Handle Dock icon click on macOS"))
             .map(|(handler, _)| handler)
             .expect("app exit handler source");

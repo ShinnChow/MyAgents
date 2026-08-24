@@ -9,10 +9,13 @@
 //   Windows:       http://myagents-resource.localhost/attachment/<sessionId>/<filename.ext>
 //   macOS / Linux: myagents-resource://tool-attachment/<sessionId>/<turnId>/<filename.ext>
 //   Windows:       http://myagents-resource.localhost/tool-attachment/<sessionId>/<turnId>/<filename.ext>
+//   macOS / Linux: myagents-resource://record-media/<recordId>/<track>.opus
+//   Windows:       http://myagents-resource.localhost/record-media/<recordId>/<track>.opus
 //
 // The old `myagents://attachment` and `myagents://tool-attachment` forms are
 // accepted only by the separately registered WebView compatibility handler.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,7 +23,10 @@ use tauri::http::{Request, Response, StatusCode};
 use tauri::{Manager, Runtime, UriSchemeContext, UriSchemeResponder};
 
 use crate::app_dirs::myagents_data_dir;
+use crate::record::{AudioTrackKind, ManagedRecordStore, ResolvedRecordMedia};
 use crate::sidecar::ManagedSidecarManager;
+
+const RECORD_MEDIA_CHUNK_BYTES: u64 = 2 * 1024 * 1024;
 
 fn attachments_root() -> Option<PathBuf> {
     myagents_data_dir().map(|d| d.join("attachments"))
@@ -87,6 +93,22 @@ fn extract_tool_attachment_segments(uri: &str) -> Option<(String, String, String
         segments[1].to_string(),
         segments[2].to_string(),
     ))
+}
+
+fn extract_record_media_segments(uri: &str) -> Option<(String, AudioTrackKind)> {
+    let rel = extract_path_after_marker(uri, "://record-media/")
+        .or_else(|| extract_path_after_marker(uri, "/record-media/"))?;
+    let segments: Vec<&str> = rel.split('/').collect();
+    if segments.len() != 2 || segments.iter().any(|segment| has_unsafe_segment(segment)) {
+        return None;
+    }
+    let track = match segments[1] {
+        "microphone.opus" => AudioTrackKind::Microphone,
+        "system.opus" => AudioTrackKind::System,
+        "mixed.opus" => AudioTrackKind::Mixed,
+        _ => return None,
+    };
+    Some((segments[0].to_string(), track))
 }
 
 fn has_unsafe_segment(segment: &str) -> bool {
@@ -235,6 +257,134 @@ fn build_tool_attachment_response(
     builder.body(bytes).unwrap()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+fn parse_single_range(raw: &str, size: u64) -> Result<ByteRange, ()> {
+    let value = raw.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') || size == 0 {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    let range = if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        ByteRange {
+            start: size.saturating_sub(suffix.min(size)),
+            end: size - 1,
+        }
+    } else {
+        let start = start.parse::<u64>().map_err(|_| ())?;
+        if start >= size {
+            return Err(());
+        }
+        let requested_end = if end.is_empty() {
+            size - 1
+        } else {
+            end.parse::<u64>().map_err(|_| ())?.min(size - 1)
+        };
+        if requested_end < start {
+            return Err(());
+        }
+        ByteRange {
+            start,
+            end: requested_end,
+        }
+    };
+    Ok(ByteRange {
+        start: range.start,
+        end: range
+            .end
+            .min(range.start.saturating_add(RECORD_MEDIA_CHUNK_BYTES - 1)),
+    })
+}
+
+fn record_media_error(status: StatusCode, size: Option<u64>) -> Response<Vec<u8>> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Accept-Ranges", "bytes")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Cache-Control", "private, no-cache");
+    if let Some(size) = size {
+        builder = builder.header("Content-Range", format!("bytes */{size}"));
+    }
+    builder.body(Vec::new()).unwrap()
+}
+
+fn build_record_media_response(
+    request: &Request<Vec<u8>>,
+    media: ResolvedRecordMedia,
+) -> Response<Vec<u8>> {
+    let is_head = request.method() == tauri::http::Method::HEAD;
+    let requested_range = request
+        .headers()
+        .get(tauri::http::header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let range = match requested_range {
+        Some(value) => match parse_single_range(value, media.size_bytes) {
+            Ok(range) => range,
+            Err(()) => {
+                return record_media_error(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    Some(media.size_bytes),
+                )
+            }
+        },
+        None if media.size_bytes > 0 => ByteRange {
+            start: 0,
+            end: (media.size_bytes - 1).min(RECORD_MEDIA_CHUNK_BYTES - 1),
+        },
+        None => return record_media_error(StatusCode::NOT_FOUND, None),
+    };
+    let response_len = range.end - range.start + 1;
+    let partial = requested_range.is_some() || response_len != media.size_bytes;
+    let mut bytes = Vec::new();
+    if !is_head {
+        let mut file = match std::fs::File::open(&media.path) {
+            Ok(file) => file,
+            Err(_) => return record_media_error(StatusCode::NOT_FOUND, None),
+        };
+        let actual_size = match file.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata.len(),
+            _ => return record_media_error(StatusCode::NOT_FOUND, None),
+        };
+        if actual_size != media.size_bytes || file.seek(SeekFrom::Start(range.start)).is_err() {
+            return record_media_error(StatusCode::CONFLICT, None);
+        }
+        let Ok(length) = usize::try_from(response_len) else {
+            return record_media_error(StatusCode::INTERNAL_SERVER_ERROR, None);
+        };
+        bytes.resize(length, 0);
+        if file.read_exact(&mut bytes).is_err() {
+            return record_media_error(StatusCode::CONFLICT, None);
+        }
+    }
+    let mut builder = Response::builder()
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
+        .header("Content-Type", media.mime_type)
+        .header("Content-Length", response_len.to_string())
+        .header("Accept-Ranges", "bytes")
+        .header("Access-Control-Allow-Origin", "*")
+        .header("Cache-Control", "private, no-cache")
+        .header("ETag", format!("\"{}\"", media.sha256));
+    if partial {
+        builder = builder.header(
+            "Content-Range",
+            format!("bytes {}-{}/{}", range.start, range.end, media.size_bytes),
+        );
+    }
+    builder.body(bytes).unwrap()
+}
+
 fn session_sidecar_port<R: Runtime>(
     ctx: &UriSchemeContext<'_, R>,
     session_id: &str,
@@ -252,6 +402,28 @@ pub fn handle<R: Runtime>(
     responder: UriSchemeResponder,
 ) {
     let uri_str = request.uri().to_string();
+    if let Some((record_id, track)) = extract_record_media_segments(&uri_str) {
+        let store = ctx
+            .app_handle()
+            .try_state::<ManagedRecordStore>()
+            .map(|state| state.inner().clone());
+        tauri::async_runtime::spawn(async move {
+            let media = match store {
+                Some(store) => store.resolve_record_media(&record_id, track).await.ok(),
+                None => None,
+            };
+            let response = match media {
+                Some(media) => tauri::async_runtime::spawn_blocking(move || {
+                    build_record_media_response(&request, media)
+                })
+                .await
+                .unwrap_or_else(|_| record_media_error(StatusCode::INTERNAL_SERVER_ERROR, None)),
+                None => record_media_error(StatusCode::NOT_FOUND, None),
+            };
+            responder.respond(response);
+        });
+        return;
+    }
     if let Some((session_id, turn_id, filename)) = extract_tool_attachment_segments(&uri_str) {
         let port = session_sidecar_port(&ctx, &session_id);
         tauri::async_runtime::spawn_blocking(move || {
@@ -275,6 +447,9 @@ pub fn handle<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::tempdir;
 
     #[test]
     fn extract_macos_form() {
@@ -321,6 +496,110 @@ mod tests {
             r,
             ("s".to_string(), "t".to_string(), "file.png".to_string())
         );
+    }
+
+    #[test]
+    fn extracts_record_media_on_macos_and_windows() {
+        assert_eq!(
+            extract_record_media_segments(
+                "myagents-resource://record-media/record-1/microphone.opus"
+            ),
+            Some(("record-1".to_string(), AudioTrackKind::Microphone))
+        );
+        assert_eq!(
+            extract_record_media_segments(
+                "http://myagents-resource.localhost/record-media/record-1/system.opus?v=2"
+            ),
+            Some(("record-1".to_string(), AudioTrackKind::System))
+        );
+        assert!(extract_record_media_segments(
+            "myagents-resource://record-media/record-1/../system.opus"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn byte_ranges_are_bounded_and_reject_multi_range() {
+        assert_eq!(
+            parse_single_range("bytes=10-19", 100),
+            Ok(ByteRange { start: 10, end: 19 })
+        );
+        assert_eq!(
+            parse_single_range("bytes=-5", 100),
+            Ok(ByteRange { start: 95, end: 99 })
+        );
+        assert!(parse_single_range("bytes=0-1,4-5", 100).is_err());
+        assert!(parse_single_range("bytes=100-", 100).is_err());
+        let bounded = parse_single_range("bytes=0-", RECORD_MEDIA_CHUNK_BYTES * 2).unwrap();
+        assert_eq!(bounded.end + 1, RECORD_MEDIA_CHUNK_BYTES);
+    }
+
+    fn test_media(path: PathBuf, size_bytes: u64) -> ResolvedRecordMedia {
+        ResolvedRecordMedia {
+            record_id: "record-1".to_string(),
+            revision: 3,
+            track: AudioTrackKind::Microphone,
+            path,
+            size_bytes,
+            sha256: "abc123".to_string(),
+            mime_type: "audio/ogg; codecs=opus",
+        }
+    }
+
+    #[test]
+    fn record_media_serves_head_zero_tail_and_rejects_invalid_ranges() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("microphone.opus");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&(0_u8..100).collect::<Vec<_>>()).unwrap();
+        file.sync_all().unwrap();
+
+        let request = Request::builder()
+            .uri("myagents-resource://record-media/record-1/microphone.opus")
+            .header("Range", "bytes=0-9")
+            .body(Vec::new())
+            .unwrap();
+        let response = build_record_media_response(&request, test_media(path.clone(), 100));
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.body(), &(0_u8..10).collect::<Vec<_>>());
+        assert_eq!(response.headers()["Content-Range"], "bytes 0-9/100");
+
+        let request = Request::builder()
+            .uri("myagents-resource://record-media/record-1/microphone.opus")
+            .header("Range", "bytes=-4")
+            .body(Vec::new())
+            .unwrap();
+        let response = build_record_media_response(&request, test_media(path.clone(), 100));
+        assert_eq!(response.body(), &vec![96, 97, 98, 99]);
+
+        let request = Request::builder()
+            .method("HEAD")
+            .uri("myagents-resource://record-media/record-1/microphone.opus")
+            .body(Vec::new())
+            .unwrap();
+        let response = build_record_media_response(&request, test_media(path.clone(), 100));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.body().is_empty());
+        assert_eq!(response.headers()["Content-Length"], "100");
+
+        for range in ["bytes=100-", "bytes=0-1,4-5"] {
+            let request = Request::builder()
+                .uri("myagents-resource://record-media/record-1/microphone.opus")
+                .header("Range", range)
+                .body(Vec::new())
+                .unwrap();
+            let response = build_record_media_response(&request, test_media(path.clone(), 100));
+            assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+            assert_eq!(response.headers()["Content-Range"], "bytes */100");
+        }
+
+        std::fs::remove_file(&path).unwrap();
+        let request = Request::builder()
+            .uri("myagents-resource://record-media/record-1/microphone.opus")
+            .body(Vec::new())
+            .unwrap();
+        let response = build_record_media_response(&request, test_media(path, 100));
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]

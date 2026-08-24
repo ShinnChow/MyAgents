@@ -270,6 +270,30 @@ pub struct RecordMergeResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct AudioRecordCreateInput {
+    pub title: String,
+    pub tracks: Vec<AudioTrackKind>,
+    pub transcription_status: TranscriptionStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioTrackArtifactInput {
+    pub track: AudioTrackKind,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedRecordMedia {
+    pub record_id: String,
+    pub revision: u64,
+    pub track: AudioTrackKind,
+    pub path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub mime_type: &'static str,
+}
+
+#[derive(Debug, Clone)]
 struct StoredRecord {
     record: Record,
     path: PathBuf,
@@ -380,6 +404,215 @@ impl RecordStore {
             artifacts: Vec::new(),
         };
         self.publish_and_insert(record, None, |_| Ok(())).await
+    }
+
+    pub async fn create_audio(&self, input: AudioRecordCreateInput) -> Result<Record, String> {
+        if input.title.trim().is_empty() {
+            return Err("audio Record title must not be empty".to_string());
+        }
+        let now = now_ms();
+        let record = Record {
+            id: Uuid::new_v4().to_string(),
+            kind: RecordKind::Audio,
+            title: input.title,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            converted_task_ids: Vec::new(),
+            revision: 1,
+            audio: Some(AudioRecordSummary {
+                media_duration_ms: 0,
+                capture_status: CaptureStatus::Preparing,
+                transcription_status: input.transcription_status,
+                diarization_status: DiarizationStatus::NotApplicable,
+                tracks: dedup_audio_tracks(input.tracks),
+                size_bytes: 0,
+            }),
+            content: None,
+            images: Vec::new(),
+            artifacts: Vec::new(),
+        };
+        self.publish_and_insert(record, None, |staging| {
+            for directory in ["audio", "analysis", "transcript", "diarization"] {
+                let path = staging.join(directory);
+                fs::create_dir(&path)
+                    .map_err(|error| format!("create audio Record directory: {error}"))?;
+            }
+            write_new_synced_file(&staging.join("lifecycle.jsonl"), b"")?;
+            write_new_synced_file(&staging.join("timeline.jsonl"), b"")
+        })
+        .await
+    }
+
+    pub(crate) async fn audio_workspace_path(&self, id: &str) -> Result<PathBuf, String> {
+        let inner = self.inner.read().await;
+        let stored = inner
+            .get(id)
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        ensure_plain_directory(&stored.path)?;
+        Ok(stored.path.clone())
+    }
+
+    pub(crate) async fn update_audio_capture(
+        &self,
+        id: &str,
+        capture_status: CaptureStatus,
+        media_duration_ms: u64,
+        tracks: Option<Vec<AudioTrackKind>>,
+    ) -> Result<Record, String> {
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        let mut updated = stored.record;
+        let audio = updated
+            .audio
+            .as_mut()
+            .ok_or_else(|| format!("audio Record summary missing: {id}"))?;
+        audio.capture_status = capture_status;
+        audio.media_duration_ms = media_duration_ms;
+        if let Some(tracks) = tracks {
+            audio.tracks = dedup_audio_tracks(tracks);
+        }
+        updated.updated_at = now_ms();
+        updated.revision = updated.revision.saturating_add(1);
+        persist_existing_record(
+            &stored.path,
+            &updated,
+            stored.legacy_thought_digest.clone(),
+            false,
+        )?;
+        inner.insert(
+            id.to_string(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(id, RecordChangeKind::Upsert);
+        Ok(updated)
+    }
+
+    pub(crate) async fn finalize_audio_capture(
+        &self,
+        id: &str,
+        capture_status: CaptureStatus,
+        media_duration_ms: u64,
+        track_artifacts: Vec<AudioTrackArtifactInput>,
+    ) -> Result<Record, String> {
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio {
+            return Err(format!("Record is not audio: {id}"));
+        }
+
+        let mut inventory = Vec::with_capacity(track_artifacts.len());
+        let mut actual_tracks = Vec::with_capacity(track_artifacts.len());
+        for artifact in track_artifacts {
+            let expected = audio_track_relative_path(artifact.track);
+            if artifact.relative_path != expected {
+                return Err(format!(
+                    "audio track path does not match {:?}: {}",
+                    artifact.track, artifact.relative_path
+                ));
+            }
+            let relative = validate_record_relative_path(&artifact.relative_path)?;
+            let source = resolve_plain_record_artifact(&stored.path, &relative)?;
+            inventory.push(record_artifact_from_file(
+                &source,
+                &relative,
+                "audio/ogg-opus",
+            )?);
+            actual_tracks.push(artifact.track);
+        }
+        let size_bytes = inventory
+            .iter()
+            .try_fold(0_u64, |total, artifact| {
+                total.checked_add(artifact.size_bytes)
+            })
+            .ok_or_else(|| "audio artifact size overflow".to_string())?;
+
+        let mut updated = stored.record;
+        updated
+            .artifacts
+            .retain(|artifact| artifact.kind != "audio/ogg-opus");
+        updated.artifacts.extend(inventory);
+        let audio = updated
+            .audio
+            .as_mut()
+            .ok_or_else(|| format!("audio Record summary missing: {id}"))?;
+        audio.capture_status = capture_status;
+        audio.media_duration_ms = media_duration_ms;
+        audio.tracks = dedup_audio_tracks(actual_tracks);
+        audio.size_bytes = size_bytes;
+        updated.updated_at = now_ms();
+        updated.revision = updated.revision.saturating_add(1);
+        persist_existing_record(
+            &stored.path,
+            &updated,
+            stored.legacy_thought_digest.clone(),
+            false,
+        )?;
+        inner.insert(
+            id.to_string(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(id, RecordChangeKind::Upsert);
+        Ok(updated)
+    }
+
+    pub async fn resolve_record_media(
+        &self,
+        id: &str,
+        track: AudioTrackKind,
+    ) -> Result<ResolvedRecordMedia, String> {
+        let inner = self.inner.read().await;
+        let stored = inner
+            .get(id)
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        let expected_path = audio_track_relative_path(track);
+        let artifact = stored
+            .record
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "audio/ogg-opus" && artifact.path == expected_path)
+            .ok_or_else(|| format!("Record media track not found: {id}/{expected_path}"))?;
+        let relative = validate_record_relative_path(&artifact.path)?;
+        let path = resolve_plain_record_artifact(&stored.path, &relative)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect Record media: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != artifact.size_bytes
+        {
+            return Err("Record media no longer matches its inventory".to_string());
+        }
+        Ok(ResolvedRecordMedia {
+            record_id: id.to_string(),
+            revision: stored.record.revision,
+            track,
+            path,
+            size_bytes: artifact.size_bytes,
+            sha256: artifact.sha256.clone(),
+            mime_type: "audio/ogg; codecs=opus",
+        })
     }
 
     async fn publish_and_insert<F>(
@@ -1239,6 +1472,25 @@ where
         .into_iter()
         .filter(|value| seen.insert(value.clone()))
         .collect()
+}
+
+fn dedup_audio_tracks(values: Vec<AudioTrackKind>) -> Vec<AudioTrackKind> {
+    let mut output = Vec::with_capacity(values.len());
+    for value in values {
+        if !output.contains(&value) {
+            output.push(value);
+        }
+    }
+    output
+}
+
+pub(crate) fn audio_track_relative_path(track: AudioTrackKind) -> String {
+    let filename = match track {
+        AudioTrackKind::Microphone => "microphone.opus",
+        AudioTrackKind::System => "system.opus",
+        AudioTrackKind::Mixed => "mixed.opus",
+    };
+    format!("audio/{filename}")
 }
 
 fn now_ms() -> i64 {
