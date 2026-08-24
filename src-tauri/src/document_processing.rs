@@ -550,10 +550,12 @@ impl DocumentProcessingManager {
         ensure_free_space(
             &output_root,
             MAX_OUTPUT_BYTES.saturating_add(MIN_FREE_RESERVE_BYTES),
+            "output",
         )?;
         ensure_free_space(
             &self.root,
             source_metadata.len().saturating_add(MIN_FREE_RESERVE_BYTES),
+            "private",
         )?;
 
         let mut state = self.state.lock().map_err(|_| manager_unavailable())?;
@@ -2379,21 +2381,25 @@ fn prepare_output_root(path: &Path) -> Result<PathBuf, DocumentServiceError> {
     })
 }
 
-fn ensure_free_space(path: &Path, required: u64) -> Result<(), DocumentServiceError> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let disk = disks
-        .list()
-        .iter()
-        .filter(|disk| path.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().components().count())
-        .ok_or_else(|| {
-            DocumentServiceError::new(
-                "DOCUMENT_DISK_SPACE_UNAVAILABLE",
-                "Free disk space could not be determined for the document job.",
-                "Choose a local output directory on a mounted volume and retry.",
-            )
-        })?;
-    if disk.available_space() < required {
+fn ensure_free_space(
+    path: &Path,
+    required: u64,
+    target: &'static str,
+) -> Result<(), DocumentServiceError> {
+    let available = crate::filesystem_capacity::available_space(path).map_err(|error| {
+        crate::ulog_warn!(
+            "[document] disk capacity unavailable target={} error_kind={:?} os_code={:?}",
+            target,
+            error.kind(),
+            error.raw_os_error(),
+        );
+        DocumentServiceError::new(
+            "DOCUMENT_DISK_SPACE_UNAVAILABLE",
+            "Free disk space could not be determined for the document job.",
+            "Choose a local output directory on a mounted volume and retry.",
+        )
+    })?;
+    if available < required {
         return Err(DocumentServiceError::new(
             "DOCUMENT_INSUFFICIENT_DISK_SPACE",
             "There is not enough free disk space to convert this document safely.",

@@ -16,6 +16,7 @@ pub mod cron_task;
 pub mod device_identity;
 pub mod document_processing;
 mod durable_fs;
+mod filesystem_capacity;
 pub mod floating_ball;
 pub mod floating_ball_pets;
 mod global_shortcut;

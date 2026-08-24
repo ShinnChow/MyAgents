@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { translateError } from './openai-bridge/translate/errors';
 import {
   joinAnthropicMessagesUrl,
   classifyOpenAiProbeStatus,
@@ -147,13 +148,13 @@ describe('verifyTimeoutMessage — honest copy, no false "请检查网络连接"
   });
 });
 
-describe('parseProviderError — 402/balance bucket + regression', () => {
-  it('buckets 402 / balance / quota / insufficient / 欠费 / 余额 to the billing message', () => {
+describe('parseProviderError — structured retryability + billing regression', () => {
+  it('buckets strong 402 / billing / balance evidence to the billing message', () => {
     for (const t of [
       'HTTP 402 payment required',
       'Insufficient Balance',
-      'You exceeded your current quota',
       'insufficient_quota',
+      'billing_not_active',
       '账户欠费',
       '余额不足',
     ]) {
@@ -171,5 +172,35 @@ describe('parseProviderError — 402/balance bucket + regression', () => {
   });
   it('429 rate-limit still buckets to rate-limit (not billing) when no quota words present', () => {
     expect(parseProviderError('429 too many requests rate limit').error).toBe('请求频率限制，请稍后再试');
+  });
+  it('uses the projected 429 status instead of guessing from generic quota text', () => {
+    const parsed = parseProviderError(
+      'allocated quota exceeded, please increase your quota limit.',
+      'Allocated quota exceeded, please increase your quota limit.',
+      429,
+    );
+    expect(parsed).toMatchObject({
+      error: '请求频率限制，请稍后再试',
+      retryable: true,
+    });
+  });
+  it('keeps a projected permanent 402 authoritative over an original 429 in the message', () => {
+    const translated = translateError(429, JSON.stringify({
+      error: {
+        code: 'insufficient_quota',
+        message: 'HTTP 429: insufficient_quota',
+      },
+    }));
+    const wireBody = JSON.stringify(translated.body);
+    const parsed = parseProviderError(wireBody.toLowerCase(), wireBody, translated.status);
+
+    expect(translated.status).toBe(402);
+    expect(parsed).toMatchObject({
+      error: '余额不足或账户欠费，请检查供应商账户',
+    });
+    expect(parsed.retryable).toBeUndefined();
+  });
+  it('does not guess permanent billing from generic quota wording without a status', () => {
+    expect(parseProviderError('allocated quota exceeded').error).toBe('allocated quota exceeded');
   });
 });

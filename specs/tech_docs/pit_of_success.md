@@ -174,6 +174,17 @@ v0.2.0 Windows 版的 IM Bot 全部启动失败就是这个 trap：`find_tsx_run
 
 ---
 
+<a id="filesystem_capacity"></a>
+## `filesystem_capacity::available_space` (`src-tauri/src/filesystem_capacity.rs`)
+
+**Problem.** 文件系统容量是“这个现存目标路径属于哪个文件系统”的 OS 事实。枚举 mount 后用 `Path::starts_with()` 推断，在 Windows canonical `\\?\C:\...` 与 `C:\` 表示不一致时会找不到目标盘，也会把无关的未就绪卷带入裁决。
+
+**Surface.** `crate::filesystem_capacity::available_space(path: &Path) -> io::Result<u64>`——直接查询现存路径所属文件系统。调用方继续拥有容量预算、业务错误和 lifecycle。
+
+**Don't.** 不要枚举卷、比较路径字符串、剥掉 `\\?\` 后继续做前缀匹配，也不要为容量查询增加 mount cache、坏盘表或扫描重试。`normalize_external_path` 只用于路径离开 Rust 的边界，不用于修补 Rust 内 filesystem query。
+
+---
+
 <a id="async_runtime"></a>
 ## `tauri::async_runtime::spawn` + `clippy.toml` ban
 

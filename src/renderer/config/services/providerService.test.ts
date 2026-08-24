@@ -14,6 +14,7 @@ import {
     isProviderAvailable,
     resolveBuiltinSelection,
     resolveProvider,
+    shouldInvalidateProviderAfterVerification,
 } from './providerService';
 
 const makeProvider = (id: string, primaryModel = `${id}-model`): Provider => ({
@@ -151,6 +152,21 @@ describe('provider availability with enablement', () => {
             { deepseek: 'deepseek-key' },
             {},
         )).toBeUndefined();
+    });
+});
+
+describe('provider verification persistence policy', () => {
+    it('does not invalidate an existing credential fact for a retryable attempt', () => {
+        expect(shouldInvalidateProviderAfterVerification({ success: false, retryable: true })).toBe(false);
+    });
+
+    it('still persists determinate verification failures', () => {
+        expect(shouldInvalidateProviderAfterVerification({ success: false })).toBe(true);
+        expect(shouldInvalidateProviderAfterVerification({ success: false, retryable: false })).toBe(true);
+    });
+
+    it('never invalidates a successful verification', () => {
+        expect(shouldInvalidateProviderAfterVerification({ success: true })).toBe(false);
     });
 });
 

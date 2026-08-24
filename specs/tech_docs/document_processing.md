@@ -141,6 +141,8 @@ Adapter 负责 detector resize/normalize、DB bitmap/box filtering、crop/order�
 
 AnyDoc 自身 package entry、展开与 asset hard cap 继续生效。上限不是设置项或环境变量；修改必须有压力/性能证据并同步代码、help、测试和本文。
 
+两次容量 admission 都通过 Rust OS boundary 的 `filesystem_capacity::available_space(existing_path)` 查询目标路径所属文件系统，不枚举 mount、比较路径前缀或受其它未就绪卷影响。Manager 仍分别拥有 output/private 预算和 `DOCUMENT_INSUFFICIENT_DISK_SPACE` / `DOCUMENT_DISK_SPACE_UNAVAILABLE` 映射；共享 helper 不拥有业务错误或状态。
+
 ## 路径与 artifact 安全
 
 - CLI 仅做 cwd-relative lexical absolute resolution；Rust 才是 regular-file、链接、大小、权限、identity 与持久化 authority。

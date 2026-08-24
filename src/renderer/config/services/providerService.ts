@@ -261,6 +261,14 @@ export async function loadProviderVerifyStatus(): Promise<Record<string, Provide
     return config.providerVerifyStatus ?? {};
 }
 
+/** A transient verification attempt cannot revoke an earlier credential fact. */
+export function shouldInvalidateProviderAfterVerification(result: {
+    success: boolean;
+    retryable?: boolean;
+}): boolean {
+    return !result.success && result.retryable !== true;
+}
+
 export async function deleteProviderVerifyStatus(providerId: string): Promise<void> {
     await atomicModifyConfig(c => {
         const verifyStatus = { ...c.providerVerifyStatus };

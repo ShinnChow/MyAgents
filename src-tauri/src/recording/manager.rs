@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use sysinfo::Disks;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use super::archive::{
@@ -1280,15 +1279,15 @@ fn validate_operation_id(operation_id: &str) -> Result<(), String> {
 }
 
 fn ensure_disk_budget(path: &Path) -> Result<(), String> {
-    let disks = Disks::new_with_refreshed_list();
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let available = disks
-        .list()
-        .iter()
-        .filter(|disk| canonical.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().components().count())
-        .map(|disk| disk.available_space())
-        .ok_or_else(|| "RECORDING_DISK_UNAVAILABLE".to_string())?;
+    let available = crate::filesystem_capacity::available_space(&canonical).map_err(|error| {
+        ulog_warn!(
+            "[recording] disk capacity unavailable target=record_store error_kind={:?} os_code={:?}",
+            error.kind(),
+            error.raw_os_error(),
+        );
+        "RECORDING_DISK_UNAVAILABLE".to_string()
+    })?;
     if available < MIN_RECORDING_FREE_BYTES {
         return Err("RECORDING_DISK_LOW".to_string());
     }

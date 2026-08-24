@@ -25,6 +25,7 @@ export {
     deleteApiKey,
     saveProviderVerifyStatus,
     loadProviderVerifyStatus,
+    shouldInvalidateProviderAfterVerification,
     deleteProviderVerifyStatus,
     rebuildAndPersistAvailableProviders,
     isProviderAvailable,

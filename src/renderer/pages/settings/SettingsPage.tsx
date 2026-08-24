@@ -66,6 +66,7 @@ import {
     isImageUnderstandingSelectionAvailable,
     isProviderAvailable,
     rebuildAndPersistAvailableProviders,
+    shouldInvalidateProviderAfterVerification,
 } from '@/config/configService';
 import { useConfig } from '@/hooks/useConfig';
 import { useSpaceBuildCapability } from '@/hooks/useSpaceBuildCapability';
@@ -2213,7 +2214,12 @@ export default function Settings({ mode = 'settings', initialSection, navigation
                 return;
             }
 
-            const result = await apiPostJson<{ success: boolean; error?: string; detail?: string }>('/api/provider/verify', {
+            const result = await apiPostJson<{
+                success: boolean;
+                error?: string;
+                detail?: string;
+                retryable?: boolean;
+            }>('/api/provider/verify', {
                 providerId: provider.id,
                 baseUrl: provider.config.baseUrl,
                 apiKey,
@@ -2237,7 +2243,9 @@ export default function Settings({ mode = 'settings', initialSection, navigation
             if (result.success) {
                 await saveProviderVerifyStatus(provider.id, 'valid');
             } else {
-                await saveProviderVerifyStatus(provider.id, 'invalid');
+                if (shouldInvalidateProviderAfterVerification(result)) {
+                    await saveProviderVerifyStatus(provider.id, 'invalid');
+                }
                 const errorMsg = result.error || tSettings('providers.verify.failed');
                 setVerifyError((prev) => ({ ...prev, [provider.id]: { error: errorMsg, detail: result.detail } }));
                 toastRef.current.error(`${provider.name}: ${errorMsg}`);

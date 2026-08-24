@@ -80,6 +80,7 @@ These are representative incidents that shaped the patterns below:
 - Is a path from a ZIP/manifest/archive key persisted to JSON? Store the normalized archive key with `/`, not `PathBuf::to_string_lossy()`. If legacy installed metadata already contains backslashes, accept it only at the installed-metadata read boundary, not in manifest validation.
 - Is a filesystem path crossing a `file://` URL boundary? Use `pathToFileURL` / `fileURLToPath` instead of `new URL(...).pathname`, ``file://${path}``, or manual slash replacement.
 - Is a Rust `PathBuf` crossing into Node, npm, URL, shell args, config JSON, or a child process? Strip `\\?\` via `normalize_external_path` at the boundary. Do not mutate pure path-format helpers to guess callers.
+- Is code deriving a filesystem fact such as available bytes? Query the existing target path through `filesystem_capacity::available_space`; path normalization and mount-prefix matching do not own filesystem identity.
 - Is the code using canonicalize before write? For paths that may not exist yet, use the lexical write-side resolver, not read-side canonicalization.
 - Are symlinks/junctions involved? Directory tests need the repo's junction-aware helpers, not only `Dirent.isDirectory()`.
 
@@ -90,6 +91,7 @@ These are representative incidents that shaped the patterns below:
 - `new URL(fileUrl).pathname`, ``file://${path}``, or ``file:///${path.replace(/\\/g, '/')}`` around local paths.
 - `PathBuf::to_string_lossy()` used to serialize archive members, manifest paths, or installed metadata.
 - `PathBuf::to_string_lossy()` immediately passed to Node/npm/URL/spawn without boundary normalization.
+- `sysinfo::Disks` / mount enumeration followed by `path.starts_with(mount_point)` to decide target capacity.
 
 ## Trap 3: Shell Quoting And `.cmd` Wrappers Are Not Portable Protocols
 

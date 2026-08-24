@@ -51,6 +51,8 @@ export interface ProbeOutcome {
 export interface VerifyError {
   error: string;
   detail?: string;
+  /** Ephemeral request guidance; never a persisted Provider status. */
+  retryable?: boolean;
 }
 
 /**
@@ -58,24 +60,46 @@ export interface VerifyError {
  * keeping the raw text in `detail`. `errorText` may be lowercased by the caller;
  * `originalText` preserves original casing for the detail popover.
  */
-export function parseProviderError(errorText: string, originalText?: string): VerifyError {
+export function parseProviderError(
+  errorText: string,
+  originalText?: string,
+  status?: number,
+): VerifyError {
   const raw = (originalText ?? errorText).slice(0, 300) || undefined;
   const lower = errorText.toLowerCase();
+
+  // A Bridge-projected status is the authoritative classification. The
+  // upstream message may still mention its original status (for example a
+  // permanent billing 429 projected to 402), so presentation text must not
+  // override the structured result.
+  if (status === 401) {
+    return { error: 'API Key 无效或已过期', detail: raw };
+  } else if (status === 403) {
+    return { error: '访问被拒绝，请检查 API Key 权限', detail: raw };
+  } else if (status === 404) {
+    return { error: '模型不存在或 API 地址错误', detail: raw };
+  } else if (status === 429) {
+    return { error: '请求频率限制，请稍后再试', detail: raw, retryable: true };
+  } else if (status === 402) {
+    return { error: '余额不足或账户欠费，请检查供应商账户', detail: raw };
+  }
+
   if (lower.includes('authentication') || lower.includes('unauthorized') || lower.includes('401')) {
     return { error: 'API Key 无效或已过期', detail: raw };
   } else if (lower.includes('forbidden') || lower.includes('403')) {
     return { error: '访问被拒绝，请检查 API Key 权限', detail: raw };
+  } else if (lower.includes('rate limit') || lower.includes('rate_limit') || lower.includes('429')) {
+    return { error: '请求频率限制，请稍后再试', detail: raw, retryable: true };
   } else if (
-    // 402 bucket: the OpenAI bridge remaps quota/billing 429 → 402 so it surfaces
-    // immediately (openai-bridge/translate/errors.ts isQuotaExhausted). Match the
-    // common balance/quota phrasings too so direct-protocol providers bucket here.
+    // The Bridge emits 402 only for strong permanent billing evidence. Generic
+    // "quota exceeded" text is deliberately insufficient: providers also use
+    // it for short concurrency/window limits.
     lower.includes('402') || lower.includes('payment required')
-    || lower.includes('insufficient') || lower.includes('quota')
+    || lower.includes('insufficient_quota') || lower.includes('billing_not_active')
+    || lower.includes('billing hard limit') || lower.includes('billing_hard_limit')
     || lower.includes('balance') || lower.includes('欠费') || lower.includes('余额')
   ) {
     return { error: '余额不足或账户欠费，请检查供应商账户', detail: raw };
-  } else if (lower.includes('rate limit') || lower.includes('429')) {
-    return { error: '请求频率限制，请稍后再试', detail: raw };
   } else if (lower.includes('network') || lower.includes('connect') || lower.includes('econnrefused')) {
     return { error: '网络连接失败，请检查 Base URL', detail: raw };
   } else if (lower.includes('not found') || lower.includes('404')) {
@@ -108,10 +132,9 @@ export function joinAnthropicMessagesUrl(baseUrl: string): string {
  * the SDK could verify):
  *
  * - 401 auth, 403 permission, 404 model/url, 429 rate-limit, 402 billing →
- *   definite-fail (short-circuit). NOTE 402 is produced ONLY by the bridge's
- *   quota-remap of a 429 (`translate/errors.ts` isQuotaExhausted) — a genuine
- *   billing signal that only fires after auth+routing succeeded; omitting it
- *   would leak balance errors to the 30s SDK timeout.
+ *   definite-fail for this verification attempt (short-circuit). A 429 remains
+ *   retryable and is carried to the caller as ephemeral guidance; 402 is the
+ *   Bridge projection for strongly evidenced permanent billing failure.
  * - 400 → inconclusive: the bridge maps upstream-direct-402 → 400 AND a 400
  *   often means "request shape rejected" (our probe body ≠ the SDK's). Falling
  *   through lets the SDK's REAL request decide. Billing-via-direct-402 still
