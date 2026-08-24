@@ -1,3 +1,7 @@
+use myagents_media_worker::diarization::{
+    BoundedDiarizationConfig, DiarizationError, LocalSpeakerObservation, WindowObservation,
+    WindowSpec, consolidate_diarization,
+};
 use myagents_media_worker::model_pack_source::verify_installed_pack;
 use myagents_media_worker::native_adapter::{AsrEngine, VadEngine};
 use myagents_media_worker::native_bundle::{LoadedNativeAdapter, verify_native_bundle};
@@ -12,8 +16,8 @@ use std::io::{self, BufReader, BufWriter, StdinLock, StdoutLock, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Instant;
-use zeroize::Zeroize;
+use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 fn main() {
     if let Err(code) = run() {
@@ -82,7 +86,207 @@ fn run_started(
         (WorkloadKind::RecordBackfillAsr, WorkloadInput::RecordArtifacts { inputs }) => {
             run_record_backfill(&start.identity, inputs, &adapter, &models, writer)
         }
+        (WorkloadKind::RecordDiarization, WorkloadInput::RecordArtifacts { inputs }) => {
+            run_record_diarization(&start.identity, &inputs[0], &adapter, &models, writer)
+        }
         _ => Err("SPEECH_WORKLOAD_NOT_READY"),
+    }
+}
+
+fn run_record_diarization(
+    identity: &WorkloadIdentity,
+    input: &RecordArtifactInput,
+    adapter: &LoadedNativeAdapter,
+    models: &myagents_media_worker::model_pack_source::VerifiedModelPack,
+    writer: &mut BufWriter<StdoutLock<'_>>,
+) -> Result<(), &'static str> {
+    let started_at = Instant::now();
+    let controls = start_batch_control_reader()?;
+    let mut diarizer = adapter
+        .create_diarizer(models)
+        .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+    let mut checkpoints = vec![PcmStreamCheckpoint {
+        track: input.track,
+        last_ack_sequence: None,
+        analysis_sample: 0,
+    }];
+    write_response(
+        writer,
+        WorkerResponse::Ready {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+        },
+    )?;
+
+    let config = BoundedDiarizationConfig::default();
+    let window_samples =
+        usize::try_from(config.window_samples).map_err(|_| "SPEECH_RESOURCE_LIMIT")?;
+    let step_samples = usize::try_from(config.window_samples - config.overlap_samples)
+        .map_err(|_| "SPEECH_RESOURCE_LIMIT")?;
+    let mut decoder =
+        RecordOpusDecoder::open(Path::new(&input.input_path)).map_err(map_record_decode_error)?;
+    let mut pcm = Zeroizing::new(Vec::with_capacity(window_samples));
+    let mut observations = SensitiveObservations::default();
+    let mut window_start = 0_u64;
+    let mut window_index = 0_u32;
+    let mut total_samples = 0_u64;
+    while let Some(chunk) = decoder.read_chunk().map_err(map_record_decode_error)? {
+        if poll_batch_control(identity, &controls, &checkpoints, writer)? {
+            return Ok(());
+        }
+        if chunk.start_sample() != total_samples {
+            return Err("SPEECH_CORRUPT_MEDIA");
+        }
+        let chunk_end = total_samples
+            .checked_add(chunk.samples().len() as u64)
+            .ok_or("SPEECH_RESOURCE_LIMIT")?;
+        let mut consumed = 0_usize;
+        while consumed < chunk.samples().len() {
+            let available = window_samples - pcm.len();
+            let take = available.min(chunk.samples().len() - consumed);
+            pcm.extend_from_slice(&chunk.samples()[consumed..consumed + take]);
+            consumed += take;
+            if pcm.len() == window_samples {
+                write_response(
+                    writer,
+                    WorkerResponse::Heartbeat {
+                        protocol_version: PROTOCOL_VERSION,
+                        identity: identity.clone(),
+                        stage: WorkerStage::SegmentingSpeakers,
+                        checkpoint: batch_checkpoint(&checkpoints),
+                    },
+                )?;
+                let end_sample = window_start
+                    .checked_add(config.window_samples)
+                    .ok_or("SPEECH_RESOURCE_LIMIT")?;
+                let window = WindowSpec {
+                    index: window_index,
+                    start_sample: window_start,
+                    end_sample,
+                };
+                observations.0.push(
+                    diarizer
+                        .diarize_window(window, &pcm)
+                        .map_err(|_| "SPEECH_INFERENCE_FAILED")?,
+                );
+                pcm[..step_samples].zeroize();
+                pcm.drain(..step_samples);
+                window_start = window_start
+                    .checked_add(step_samples as u64)
+                    .ok_or("SPEECH_RESOURCE_LIMIT")?;
+                window_index = window_index.checked_add(1).ok_or("SPEECH_RESOURCE_LIMIT")?;
+                checkpoints[0].analysis_sample = window_start;
+                if poll_batch_control(identity, &controls, &checkpoints, writer)? {
+                    return Ok(());
+                }
+            }
+        }
+        total_samples = chunk_end;
+    }
+    let summary = decoder.summary().ok_or("SPEECH_CORRUPT_MEDIA")?;
+    if summary.output_samples_16k != total_samples
+        || pcm.len() as u64 != total_samples.saturating_sub(window_start)
+    {
+        return Err("SPEECH_CORRUPT_MEDIA");
+    }
+    if total_samples == 0 {
+        return Err("SPEECH_NO_AUDIO_TRACK");
+    }
+    let last_observation_end = observations
+        .0
+        .last()
+        .map_or(0, |observation| observation.window.end_sample);
+    if last_observation_end < total_samples {
+        let window = WindowSpec {
+            index: window_index,
+            start_sample: window_start,
+            end_sample: total_samples,
+        };
+        write_response(
+            writer,
+            WorkerResponse::Heartbeat {
+                protocol_version: PROTOCOL_VERSION,
+                identity: identity.clone(),
+                stage: WorkerStage::EmbeddingSpeakers,
+                checkpoint: batch_checkpoint(&checkpoints),
+            },
+        )?;
+        observations.0.push(
+            diarizer
+                .diarize_window(window, &pcm)
+                .map_err(|_| "SPEECH_INFERENCE_FAILED")?,
+        );
+    }
+    pcm.zeroize();
+    checkpoints[0].analysis_sample = total_samples;
+    if poll_batch_control(identity, &controls, &checkpoints, writer)? {
+        return Ok(());
+    }
+    write_response(
+        writer,
+        WorkerResponse::Heartbeat {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            stage: WorkerStage::ClusteringSpeakers,
+            checkpoint: batch_checkpoint(&checkpoints),
+        },
+    )?;
+    let projection = consolidate_diarization(total_samples, &observations.0, config)
+        .map_err(map_diarization_error)?;
+    let turns = projection
+        .segments
+        .iter()
+        .map(|segment| myagents_media_worker::protocol::SpeakerTurn {
+            start_sample: segment.start_sample,
+            end_sample: segment.end_sample,
+            global_speaker: segment.global_speaker,
+        })
+        .collect::<Vec<_>>();
+    let batch_count = turns.len().max(1).div_ceil(1_000);
+    for batch_index in 0..batch_count {
+        if poll_batch_control(identity, &controls, &checkpoints, writer)? {
+            return Ok(());
+        }
+        let start = (batch_index * 1_000).min(turns.len());
+        let end = (start + 1_000).min(turns.len());
+        write_response(
+            writer,
+            WorkerResponse::SpeakerTurnBatch {
+                protocol_version: PROTOCOL_VERSION,
+                identity: identity.clone(),
+                revision: 1,
+                batch_index: batch_index as u32,
+                is_last: batch_index + 1 == batch_count,
+                turns: turns[start..end].to_vec(),
+            },
+        )?;
+    }
+    write_response(
+        writer,
+        WorkerResponse::Completed {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            metrics: WorkerMetrics {
+                source_samples: total_samples,
+                segments: projection.segments.len() as u32,
+                speakers: projection.speaker_count,
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+                peak_working_bytes: None,
+            },
+        },
+    )
+}
+
+#[derive(Default)]
+struct SensitiveObservations(Vec<WindowObservation>);
+
+impl Drop for SensitiveObservations {
+    fn drop(&mut self) {
+        for observation in &mut self.0 {
+            for LocalSpeakerObservation { embedding, .. } in &mut observation.speakers {
+                embedding.zeroize();
+            }
+        }
     }
 }
 
@@ -126,7 +330,7 @@ fn run_record_backfill(
         let mut vad = adapter
             .create_vad(models)
             .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
-        let mut last_heartbeat_sample = 0_u64;
+        let mut last_heartbeat_at = Instant::now();
         while let Some(chunk) = decoder.read_chunk().map_err(map_record_decode_error)? {
             if poll_batch_control(identity, &controls, &checkpoints, writer)? {
                 return Ok(());
@@ -152,12 +356,8 @@ fn run_record_backfill(
                 &mut revision,
                 writer,
             )?);
-            if checkpoints[index]
-                .analysis_sample
-                .saturating_sub(last_heartbeat_sample)
-                >= u64::from(myagents_media_worker::protocol::SAMPLE_RATE) * 5
-            {
-                last_heartbeat_sample = checkpoints[index].analysis_sample;
+            if last_heartbeat_at.elapsed() >= Duration::from_secs(2) {
+                last_heartbeat_at = Instant::now();
                 write_response(
                     writer,
                     WorkerResponse::Heartbeat {
@@ -372,6 +572,18 @@ fn map_record_decode_error(error: RecordOpusError) -> &'static str {
         }
         RecordOpusError::CorruptContainer | RecordOpusError::DecodeFailed => "SPEECH_CORRUPT_MEDIA",
         RecordOpusError::UnsupportedStream => "SPEECH_UNSUPPORTED_CODEC",
+    }
+}
+
+fn map_diarization_error(error: DiarizationError) -> &'static str {
+    match error {
+        DiarizationError::InvalidDuration => "SPEECH_NO_AUDIO_TRACK",
+        DiarizationError::ResourceLimit => "SPEECH_MEDIA_LIMIT_EXCEEDED",
+        DiarizationError::InvalidConfiguration
+        | DiarizationError::WindowPlanMismatch
+        | DiarizationError::DuplicateLocalSpeaker
+        | DiarizationError::InvalidEmbedding
+        | DiarizationError::InvalidSegment => "SPEECH_INFERENCE_FAILED",
     }
 }
 

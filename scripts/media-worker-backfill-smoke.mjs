@@ -16,10 +16,10 @@ if (
   !runtimePath ||
   !modelManifestPath ||
   !recordOpusPath ||
-  !["complete", "yield", "cancel"].includes(mode)
+  !["complete", "yield", "cancel", "diarization"].includes(mode)
 ) {
   throw new Error(
-    "Usage: node scripts/media-worker-backfill-smoke.mjs <worker> <native-manifest> <onnx-runtime> <model-manifest> <record.opus> [complete|yield|cancel]",
+    "Usage: node scripts/media-worker-backfill-smoke.mjs <worker> <native-manifest> <onnx-runtime> <model-manifest> <record.opus> [complete|yield|cancel|diarization]",
   );
 }
 
@@ -99,6 +99,23 @@ async function waitForResponse(type, predicate = () => true) {
   }
 }
 
+async function waitForTerminal() {
+  while (true) {
+    const response = responses.find((candidate) =>
+      ["completed", "failed", "yielded"].includes(candidate.type),
+    );
+    if (response) return response;
+    await Promise.race([
+      once(responseEvents, "response"),
+      childTermination.then(({ exitCode, signal }) => {
+        throw new Error(
+          `Worker exited before terminal response: exit=${exitCode}, signal=${signal}`,
+        );
+      }),
+    ]);
+  }
+}
+
 async function write(value) {
   if (!child.stdin.write(controlFrame(value))) {
     await once(child.stdin, "drain");
@@ -109,7 +126,8 @@ await write({
   type: "start",
   protocolVersion: PROTOCOL_VERSION,
   identity,
-  workloadKind: "record_backfill_asr",
+  workloadKind:
+    mode === "diarization" ? "record_diarization" : "record_backfill_asr",
   input: {
     type: "record_artifacts",
     inputs: [{ track: "microphone", inputPath: recordOpusPath }],
@@ -119,7 +137,7 @@ await write({
   modelPackManifestPath: modelManifestPath,
 });
 await waitForResponse("ready");
-if (mode === "complete") {
+if (mode === "complete" || mode === "diarization") {
   await write({
     type: "ping",
     protocolVersion: PROTOCOL_VERSION,
@@ -127,7 +145,7 @@ if (mode === "complete") {
     nonce: 42,
   });
   await waitForResponse("pong", (response) => response.nonce === 42);
-  await waitForResponse("completed");
+  await waitForTerminal();
 } else {
   await write({
     type: mode,
@@ -155,6 +173,9 @@ const transcript = responses.find(
 const completed = responses.find((response) => response.type === "completed");
 const yielded = responses.find((response) => response.type === "yielded");
 const failed = responses.find((response) => response.type === "failed");
+const speakerTurnCount = responses
+  .filter((response) => response.type === "speaker_turn_batch")
+  .reduce((count, response) => count + response.turns.length, 0);
 const result = {
   mode,
   exitCode,
@@ -163,6 +184,8 @@ const result = {
   transcriptBytes: transcript ? Buffer.byteLength(transcript.text) : 0,
   language: transcript?.language,
   completedMetrics: completed?.metrics,
+  failureCode: failed?.code,
+  speakerTurnCount,
   stderrBytes,
 };
 console.log(JSON.stringify(result));
@@ -188,15 +211,25 @@ const invalidCancel =
     failed?.code !== "SPEECH_CANCELLED" ||
     counts.completed ||
     counts.yielded);
+const invalidDiarization =
+  mode === "diarization" &&
+  (!completed ||
+    counts.ready !== 1 ||
+    counts.pong !== 1 ||
+    counts.speaker_turn_batch !== 1 ||
+    counts.transcript_segment ||
+    counts.yielded ||
+    counts.failed);
 if (
   exitCode !== 0 ||
   signal !== null ||
   stderrBytes !== 0 ||
   invalidComplete ||
   invalidYield ||
-  invalidCancel
+  invalidCancel ||
+  invalidDiarization
 ) {
   throw new Error(
-    "Media Worker Record backfill smoke did not reach the expected terminal state",
+    "Media Worker Record batch smoke did not reach the expected terminal state",
   );
 }

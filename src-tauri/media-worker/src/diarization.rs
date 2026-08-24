@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use zeroize::{Zeroize, Zeroizing};
 
 pub const SPEAKER_EMBEDDING_DIMENSION: usize = 512;
 pub const DEFAULT_SAMPLE_RATE: u32 = 16_000;
@@ -160,7 +161,7 @@ pub fn consolidate_diarization(
         return Err(DiarizationError::WindowPlanMismatch);
     }
 
-    let mut prototypes = Vec::new();
+    let mut prototypes = Zeroizing::new(Vec::new());
     let mut identities = Vec::new();
     let mut window_local_to_prototype = HashMap::new();
     let mut total_segments = 0_usize;
@@ -171,7 +172,7 @@ pub fn consolidate_diarization(
         }
         let window_length = observation.window.end_sample - observation.window.start_sample;
         let mut local_ids = BTreeMap::new();
-        let mut embeddings = Vec::with_capacity(observation.speakers.len());
+        let mut embeddings = Zeroizing::new(Vec::with_capacity(observation.speakers.len()));
         let mut window_segments = 0_usize;
         for (speaker_index, speaker) in observation.speakers.iter().enumerate() {
             if local_ids
@@ -366,9 +367,11 @@ fn complete_link_prototypes(embeddings: &[Vec<f32>], threshold: f32) -> Vec<Wind
         let Some((left, right, _)) = closest else {
             break;
         };
-        let right_cluster = clusters.remove(right);
+        let mut right_cluster = clusters.remove(right);
+        right_cluster.embedding.zeroize();
         clusters[left].members.extend(right_cluster.members);
         clusters[left].members.sort_unstable();
+        clusters[left].embedding.zeroize();
         clusters[left].embedding = normalized_centroid(&clusters[left].members, embeddings);
     }
     clusters
@@ -436,6 +439,7 @@ fn density_cluster(embeddings: &[Vec<f32>], threshold: f32, min_samples: usize) 
     }
 
     let mut assignments = vec![usize::MAX; row_count];
+    let mut sparse_rows = Vec::new();
     for row in 0..row_count {
         if neighbor_counts[row] >= min_samples {
             assignments[row] = components.find(row);
@@ -453,7 +457,36 @@ fn density_cluster(embeddings: &[Vec<f32>], threshold: f32, min_samples: usize) 
                 best = Some((candidate, distance));
             }
         }
-        assignments[row] = best.map_or(row, |(candidate, _)| components.find(candidate));
+        if let Some((candidate, _)) = best {
+            assignments[row] = components.find(candidate);
+        } else {
+            sparse_rows.push(row);
+        }
+    }
+
+    let mut sparse_clusters: Vec<Vec<usize>> = Vec::new();
+    for row in sparse_rows {
+        let mut best = None;
+        for (cluster_index, cluster) in sparse_clusters.iter().enumerate() {
+            let distance = cluster
+                .iter()
+                .map(|&member| cosine_distance(&embeddings[row], &embeddings[member]))
+                .fold(0.0_f32, f32::max);
+            if distance <= threshold
+                && best.is_none_or(|(_, best_distance)| distance < best_distance)
+            {
+                best = Some((cluster_index, distance));
+            }
+        }
+        let cluster_index = best.map_or_else(
+            || {
+                sparse_clusters.push(Vec::new());
+                sparse_clusters.len() - 1
+            },
+            |(cluster_index, _)| cluster_index,
+        );
+        sparse_clusters[cluster_index].push(row);
+        assignments[row] = row_count + cluster_index;
     }
 
     let mut compact = HashMap::new();
@@ -610,6 +643,49 @@ mod tests {
             .collect::<Vec<_>>();
         let projection = consolidate_diarization(50_000, &observations, config).unwrap();
         assert_eq!(projection.speaker_count, 1);
+    }
+
+    #[test]
+    fn two_window_recording_keeps_each_speaker_record_wide() {
+        let config = BoundedDiarizationConfig {
+            window_samples: 1_000,
+            overlap_samples: 100,
+            ..BoundedDiarizationConfig::default()
+        };
+        let plan = bounded_window_plan(1_900, config).unwrap();
+        assert_eq!(plan.len(), 2);
+        let projection =
+            consolidate_diarization(1_900, &observation_for_plan(&plan, 4), config).unwrap();
+        assert_eq!(projection.speaker_count, 4);
+        for local_speaker in 0..4 {
+            let labels = projection
+                .assignments
+                .iter()
+                .filter(|assignment| assignment.local_speaker == local_speaker)
+                .map(|assignment| assignment.global_speaker)
+                .collect::<Vec<_>>();
+            assert_eq!(labels.len(), 2);
+            assert_eq!(labels[0], labels[1]);
+        }
+    }
+
+    #[test]
+    fn sparse_speaker_observations_survive_a_silent_window() {
+        let config = BoundedDiarizationConfig {
+            window_samples: 1_000,
+            overlap_samples: 100,
+            ..BoundedDiarizationConfig::default()
+        };
+        let plan = bounded_window_plan(2_800, config).unwrap();
+        let mut observations = observation_for_plan(&plan, 1);
+        observations[2].speakers.clear();
+        let projection = consolidate_diarization(2_800, &observations, config).unwrap();
+        assert_eq!(projection.speaker_count, 1);
+        assert_eq!(projection.assignments.len(), 2);
+        assert_eq!(
+            projection.assignments[0].global_speaker,
+            projection.assignments[1].global_speaker
+        );
     }
 
     #[test]
