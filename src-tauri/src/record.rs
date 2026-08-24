@@ -25,6 +25,11 @@ const RECORD_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const TEXT_CONTENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const TEXT_ATTACHMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const LEGACY_THOUGHT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const TRANSCRIPT_SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const TRANSCRIPT_SEGMENT_LIMIT: usize = 100_000;
+const TRANSCRIPT_CHARACTER_LIMIT: usize = 5_000_000;
+const DIARIZATION_TURN_LIMIT: usize = 200_000;
+const SPEECH_SAMPLE_RATE: u64 = 16_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -291,6 +296,88 @@ pub struct ResolvedRecordMedia {
     pub size_bytes: u64,
     pub sha256: String,
     pub mime_type: &'static str,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordTranscriptSegment {
+    pub segment_id: String,
+    pub track: AudioTrackKind,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    pub revision: u64,
+}
+
+impl std::fmt::Debug for RecordTranscriptSegment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecordTranscriptSegment")
+            .field("segment_id", &self.segment_id)
+            .field("track", &self.track)
+            .field("start_sample", &self.start_sample)
+            .field("end_sample", &self.end_sample)
+            .field("text", &"[REDACTED]")
+            .field("language", &self.language.as_ref().map(|_| "[REDACTED]"))
+            .field("revision", &self.revision)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSpeechProvenance {
+    pub provider: String,
+    pub model_pack_revision: String,
+    pub onnx_runtime_version: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordTranscriptSnapshot {
+    pub schema_version: u32,
+    pub record_id: String,
+    pub projection_revision: u64,
+    pub state: String,
+    pub sample_rate: u32,
+    pub provenance: RecordSpeechProvenance,
+    pub segments: Vec<RecordTranscriptSegment>,
+}
+
+impl std::fmt::Debug for RecordTranscriptSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecordTranscriptSnapshot")
+            .field("schema_version", &self.schema_version)
+            .field("record_id", &self.record_id)
+            .field("projection_revision", &self.projection_revision)
+            .field("state", &self.state)
+            .field("sample_rate", &self.sample_rate)
+            .field("provenance", &self.provenance)
+            .field("segment_count", &self.segments.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSpeakerTurn {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub global_speaker: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordDiarizationResult {
+    pub schema_version: u32,
+    pub record_id: String,
+    pub projection_revision: u64,
+    pub sample_rate: u32,
+    pub provenance: RecordSpeechProvenance,
+    pub turns: Vec<RecordSpeakerTurn>,
 }
 
 #[derive(Debug, Clone)]
@@ -613,6 +700,281 @@ impl RecordStore {
             sha256: artifact.sha256.clone(),
             mime_type: "audio/ogg; codecs=opus",
         })
+    }
+
+    pub async fn update_audio_processing_status(
+        &self,
+        id: &str,
+        transcription_status: Option<TranscriptionStatus>,
+        diarization_status: Option<DiarizationStatus>,
+    ) -> Result<Record, String> {
+        if transcription_status.is_none() && diarization_status.is_none() {
+            return Err("audio processing status mutation is empty".to_string());
+        }
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        let mut updated = stored.record;
+        let audio = updated
+            .audio
+            .as_mut()
+            .ok_or_else(|| format!("audio Record summary missing: {id}"))?;
+        if let Some(status) = transcription_status {
+            audio.transcription_status = status;
+        }
+        if let Some(status) = diarization_status {
+            audio.diarization_status = status;
+        }
+        updated.updated_at = now_ms();
+        updated.revision = updated.revision.saturating_add(1);
+        persist_existing_record(
+            &stored.path,
+            &updated,
+            stored.legacy_thought_digest.clone(),
+            false,
+        )?;
+        inner.insert(
+            id.to_string(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(id, RecordChangeKind::Upsert);
+        Ok(updated)
+    }
+
+    pub async fn commit_recording_final_transcript(
+        &self,
+        id: &str,
+        segments: Vec<RecordTranscriptSegment>,
+        provenance: RecordSpeechProvenance,
+    ) -> Result<RecordTranscriptSnapshot, String> {
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        let audio = stored
+            .record
+            .audio
+            .as_ref()
+            .ok_or_else(|| format!("Record is not audio: {id}"))?;
+        validate_transcript_segments(audio, &segments)?;
+        validate_speech_provenance(&provenance)?;
+
+        let relative = PathBuf::from("transcript/snapshot.json");
+        let snapshot_path = stored.path.join(&relative);
+        let projection_revision = match stored
+            .record
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "transcript/recording-final+json")
+        {
+            Some(artifact) => read_owned_transcript_snapshot(id, &stored.path, audio, artifact)?
+                .projection_revision
+                .saturating_add(1)
+                .max(1),
+            None if snapshot_path.exists() => {
+                return Err("transcript snapshot exists outside Record inventory".to_string());
+            }
+            None => 1,
+        };
+        let snapshot = RecordTranscriptSnapshot {
+            schema_version: 1,
+            record_id: id.to_string(),
+            projection_revision,
+            state: "recording_final".into(),
+            sample_rate: SPEECH_SAMPLE_RATE as u32,
+            provenance,
+            segments,
+        };
+        let bytes = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|error| format!("serialize transcript snapshot: {error}"))?;
+        if bytes.is_empty() || bytes.len() as u64 > TRANSCRIPT_SNAPSHOT_MAX_BYTES {
+            return Err("transcript snapshot exceeds the fixed size limit".to_string());
+        }
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|_| "transcript snapshot serialization is not UTF-8".to_string())?;
+        crate::task::write_atomic_text(&snapshot_path, content)?;
+
+        let mut updated = stored.record;
+        replace_record_artifact(
+            &mut updated.artifacts,
+            record_artifact_from_file(
+                &snapshot_path,
+                &relative,
+                "transcript/recording-final+json",
+            )?,
+            "transcript/recording-final+json",
+        );
+        let audio = updated
+            .audio
+            .as_mut()
+            .ok_or_else(|| format!("audio Record summary missing: {id}"))?;
+        audio.transcription_status = TranscriptionStatus::Ready;
+        if audio.diarization_status == DiarizationStatus::NotApplicable {
+            audio.diarization_status = DiarizationStatus::Queued;
+        }
+        updated.updated_at = now_ms();
+        updated.revision = updated.revision.saturating_add(1);
+        persist_existing_record(
+            &stored.path,
+            &updated,
+            stored.legacy_thought_digest.clone(),
+            false,
+        )?;
+        inner.insert(
+            id.to_string(),
+            StoredRecord {
+                record: updated,
+                ..stored
+            },
+        );
+        self.emit_change(id, RecordChangeKind::Upsert);
+        Ok(snapshot)
+    }
+
+    pub async fn commit_diarization_result(
+        &self,
+        id: &str,
+        turns: Vec<RecordSpeakerTurn>,
+        provenance: RecordSpeechProvenance,
+    ) -> Result<RecordDiarizationResult, String> {
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        let audio = stored
+            .record
+            .audio
+            .as_ref()
+            .ok_or_else(|| format!("Record is not audio: {id}"))?;
+        validate_speaker_turns(audio, &turns)?;
+        validate_speech_provenance(&provenance)?;
+
+        let relative = PathBuf::from("diarization/result.json");
+        let result_path = stored.path.join(&relative);
+        let projection_revision = match stored
+            .record
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "diarization/model-projection+json")
+        {
+            Some(artifact) => read_owned_diarization_result(id, &stored.path, audio, artifact)?
+                .projection_revision
+                .saturating_add(1)
+                .max(1),
+            None if result_path.exists() => {
+                return Err("diarization result exists outside Record inventory".to_string());
+            }
+            None => 1,
+        };
+        let result = RecordDiarizationResult {
+            schema_version: 1,
+            record_id: id.to_string(),
+            projection_revision,
+            sample_rate: SPEECH_SAMPLE_RATE as u32,
+            provenance,
+            turns,
+        };
+        let bytes = serde_json::to_vec_pretty(&result)
+            .map_err(|error| format!("serialize diarization result: {error}"))?;
+        if bytes.is_empty() || bytes.len() as u64 > TRANSCRIPT_SNAPSHOT_MAX_BYTES {
+            return Err("diarization result exceeds the fixed size limit".to_string());
+        }
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|_| "diarization result serialization is not UTF-8".to_string())?;
+        crate::task::write_atomic_text(&result_path, content)?;
+
+        let mut updated = stored.record;
+        replace_record_artifact(
+            &mut updated.artifacts,
+            record_artifact_from_file(
+                &result_path,
+                &relative,
+                "diarization/model-projection+json",
+            )?,
+            "diarization/model-projection+json",
+        );
+        let audio = updated
+            .audio
+            .as_mut()
+            .ok_or_else(|| format!("audio Record summary missing: {id}"))?;
+        audio.diarization_status = DiarizationStatus::Ready;
+        updated.updated_at = now_ms();
+        updated.revision = updated.revision.saturating_add(1);
+        persist_existing_record(
+            &stored.path,
+            &updated,
+            stored.legacy_thought_digest.clone(),
+            false,
+        )?;
+        inner.insert(
+            id.to_string(),
+            StoredRecord {
+                record: updated,
+                ..stored
+            },
+        );
+        self.emit_change(id, RecordChangeKind::Upsert);
+        Ok(result)
+    }
+
+    pub async fn read_recording_final_transcript(
+        &self,
+        id: &str,
+    ) -> Result<Option<RecordTranscriptSnapshot>, String> {
+        let inner = self.inner.read().await;
+        let stored = inner
+            .get(id)
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        let Some(audio) = stored.record.audio.as_ref() else {
+            return Err(format!("audio Record summary missing: {id}"));
+        };
+        let Some(artifact) = stored
+            .record
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "transcript/recording-final+json")
+        else {
+            return Ok(None);
+        };
+        read_owned_transcript_snapshot(id, &stored.path, audio, artifact).map(Some)
+    }
+
+    pub async fn read_diarization_result(
+        &self,
+        id: &str,
+    ) -> Result<Option<RecordDiarizationResult>, String> {
+        let inner = self.inner.read().await;
+        let stored = inner
+            .get(id)
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        let Some(audio) = stored.record.audio.as_ref() else {
+            return Err(format!("audio Record summary missing: {id}"));
+        };
+        let Some(artifact) = stored
+            .record
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "diarization/model-projection+json")
+        else {
+            return Ok(None);
+        };
+        read_owned_diarization_result(id, &stored.path, audio, artifact).map(Some)
     }
 
     async fn publish_and_insert<F>(
@@ -1237,6 +1599,195 @@ fn validate_record_artifacts(
         }
     }
     Ok(())
+}
+
+fn validate_speech_provenance(provenance: &RecordSpeechProvenance) -> Result<(), String> {
+    for (label, value) in [
+        ("provider", provenance.provider.as_str()),
+        ("model revision", provenance.model_pack_revision.as_str()),
+        ("runtime version", provenance.onnx_runtime_version.as_str()),
+    ] {
+        if value.is_empty()
+            || value.len() > 256
+            || value.chars().any(char::is_control)
+            || (label == "provider" && value != "local")
+        {
+            return Err(format!("speech {label} is invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_transcript_segments(
+    audio: &AudioRecordSummary,
+    segments: &[RecordTranscriptSegment],
+) -> Result<(), String> {
+    if segments.len() > TRANSCRIPT_SEGMENT_LIMIT {
+        return Err("transcript segment count exceeds the fixed limit".to_string());
+    }
+    let max_sample = record_max_speech_sample(audio)?;
+    let mut ids = HashSet::with_capacity(segments.len());
+    let mut characters = 0_usize;
+    let mut previous_key: Option<(u64, u64, &str)> = None;
+    for segment in segments {
+        if !is_safe_id(&segment.segment_id)
+            || !ids.insert(segment.segment_id.as_str())
+            || segment.revision == 0
+            || segment.start_sample >= segment.end_sample
+            || segment.end_sample > max_sample
+            || !audio.tracks.contains(&segment.track)
+            || segment.track == AudioTrackKind::Mixed
+            || segment.text.trim().is_empty()
+            || segment.text.chars().any(|character| character == '\0')
+        {
+            return Err("transcript segment inventory is invalid".to_string());
+        }
+        if segment.language.as_deref().is_some_and(|language| {
+            language.is_empty()
+                || language.len() > 32
+                || !language
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }) {
+            return Err("transcript segment language is invalid".to_string());
+        }
+        characters = characters
+            .checked_add(segment.text.chars().count())
+            .ok_or_else(|| "transcript character count overflow".to_string())?;
+        if characters > TRANSCRIPT_CHARACTER_LIMIT {
+            return Err("transcript character count exceeds the fixed limit".to_string());
+        }
+        let key = (
+            segment.start_sample,
+            segment.end_sample,
+            segment.segment_id.as_str(),
+        );
+        if previous_key.is_some_and(|previous| previous > key) {
+            return Err("transcript segments are not in stable timeline order".to_string());
+        }
+        previous_key = Some(key);
+    }
+    Ok(())
+}
+
+fn validate_speaker_turns(
+    audio: &AudioRecordSummary,
+    turns: &[RecordSpeakerTurn],
+) -> Result<(), String> {
+    if turns.len() > DIARIZATION_TURN_LIMIT {
+        return Err("diarization turn count exceeds the fixed limit".to_string());
+    }
+    let max_sample = record_max_speech_sample(audio)?;
+    let mut previous_key: Option<(u64, u64, u32)> = None;
+    for turn in turns {
+        if turn.start_sample >= turn.end_sample || turn.end_sample > max_sample {
+            return Err("diarization turn inventory is invalid".to_string());
+        }
+        let key = (turn.start_sample, turn.end_sample, turn.global_speaker);
+        if previous_key.is_some_and(|previous| previous > key) {
+            return Err("diarization turns are not in stable timeline order".to_string());
+        }
+        previous_key = Some(key);
+    }
+    Ok(())
+}
+
+fn record_max_speech_sample(audio: &AudioRecordSummary) -> Result<u64, String> {
+    // The archive granule is the execution authority; Record metadata is a
+    // millisecond projection. One second of tolerance covers that rounding but
+    // still rejects corrupt Worker timelines far beyond the durable media.
+    audio
+        .media_duration_ms
+        .checked_mul(SPEECH_SAMPLE_RATE)
+        .and_then(|samples_x_ms| samples_x_ms.checked_div(1_000))
+        .and_then(|samples| samples.checked_add(SPEECH_SAMPLE_RATE))
+        .ok_or_else(|| "Record media duration exceeds speech timeline limits".to_string())
+}
+
+fn read_transcript_snapshot(path: &Path) -> Result<RecordTranscriptSnapshot, String> {
+    let bytes = read_bounded_regular_file(path, TRANSCRIPT_SNAPSHOT_MAX_BYTES)?;
+    let snapshot: RecordTranscriptSnapshot = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse transcript snapshot: {error}"))?;
+    if snapshot.schema_version != 1
+        || snapshot.projection_revision == 0
+        || snapshot.state != "recording_final"
+        || snapshot.sample_rate != SPEECH_SAMPLE_RATE as u32
+        || !is_safe_id(&snapshot.record_id)
+    {
+        return Err("transcript snapshot identity is invalid".to_string());
+    }
+    Ok(snapshot)
+}
+
+fn read_owned_transcript_snapshot(
+    record_id: &str,
+    record_path: &Path,
+    audio: &AudioRecordSummary,
+    artifact: &RecordArtifact,
+) -> Result<RecordTranscriptSnapshot, String> {
+    if artifact.path != "transcript/snapshot.json" {
+        return Err("transcript artifact inventory path is invalid".to_string());
+    }
+    let relative = validate_record_relative_path(&artifact.path)?;
+    let path = resolve_plain_record_artifact(record_path, &relative)?;
+    let actual = record_artifact_from_file(&path, &relative, &artifact.kind)?;
+    if &actual != artifact {
+        return Err("transcript snapshot no longer matches Record inventory".to_string());
+    }
+    let snapshot = read_transcript_snapshot(&path)?;
+    if snapshot.record_id != record_id {
+        return Err("transcript snapshot Record identity mismatch".to_string());
+    }
+    validate_speech_provenance(&snapshot.provenance)?;
+    validate_transcript_segments(audio, &snapshot.segments)?;
+    Ok(snapshot)
+}
+
+fn read_diarization_result(path: &Path) -> Result<RecordDiarizationResult, String> {
+    let bytes = read_bounded_regular_file(path, TRANSCRIPT_SNAPSHOT_MAX_BYTES)?;
+    let result: RecordDiarizationResult = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse diarization result: {error}"))?;
+    if result.schema_version != 1
+        || result.projection_revision == 0
+        || result.sample_rate != SPEECH_SAMPLE_RATE as u32
+        || !is_safe_id(&result.record_id)
+    {
+        return Err("diarization result identity is invalid".to_string());
+    }
+    Ok(result)
+}
+
+fn read_owned_diarization_result(
+    record_id: &str,
+    record_path: &Path,
+    audio: &AudioRecordSummary,
+    artifact: &RecordArtifact,
+) -> Result<RecordDiarizationResult, String> {
+    if artifact.path != "diarization/result.json" {
+        return Err("diarization artifact inventory path is invalid".to_string());
+    }
+    let relative = validate_record_relative_path(&artifact.path)?;
+    let path = resolve_plain_record_artifact(record_path, &relative)?;
+    let actual = record_artifact_from_file(&path, &relative, &artifact.kind)?;
+    if &actual != artifact {
+        return Err("diarization result no longer matches Record inventory".to_string());
+    }
+    let result = read_diarization_result(&path)?;
+    if result.record_id != record_id {
+        return Err("diarization result Record identity mismatch".to_string());
+    }
+    validate_speech_provenance(&result.provenance)?;
+    validate_speaker_turns(audio, &result.turns)?;
+    Ok(result)
+}
+
+fn replace_record_artifact(
+    artifacts: &mut Vec<RecordArtifact>,
+    replacement: RecordArtifact,
+    kind: &str,
+) {
+    artifacts.retain(|artifact| artifact.kind != kind);
+    artifacts.push(replacement);
 }
 
 fn record_artifact_from_file(
@@ -2166,6 +2717,192 @@ mod tests {
         assert_eq!(
             fs::read_to_string(month.join("conflict.md")).unwrap(),
             legacy
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_final_and_diarization_commit_through_record_authority() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Queued,
+            })
+            .await
+            .unwrap();
+        let record_root = store.audio_workspace_path(&record.id).await.unwrap();
+        fs::write(record_root.join("audio/microphone.opus"), b"record-opus").unwrap();
+        store
+            .finalize_audio_capture(
+                &record.id,
+                CaptureStatus::Ready,
+                5_000,
+                vec![AudioTrackArtifactInput {
+                    track: AudioTrackKind::Microphone,
+                    relative_path: "audio/microphone.opus".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let provenance = RecordSpeechProvenance {
+            provider: "local".into(),
+            model_pack_revision: "sensevoice-2024-07-17-v1".into(),
+            onnx_runtime_version: "1.28.0".into(),
+        };
+        let transcript = store
+            .commit_recording_final_transcript(
+                &record.id,
+                vec![RecordTranscriptSegment {
+                    segment_id: "segment-1".into(),
+                    track: AudioTrackKind::Microphone,
+                    start_sample: 1_000,
+                    end_sample: 20_000,
+                    text: "private transcript canary".into(),
+                    language: Some("zh".into()),
+                    revision: 1,
+                }],
+                provenance.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(transcript.projection_revision, 1);
+        assert_eq!(transcript.segments.len(), 1);
+        assert!(!format!("{transcript:?}").contains("private transcript canary"));
+        let after_transcript = store.get(&record.id).await.unwrap();
+        let audio = after_transcript.audio.unwrap();
+        assert_eq!(audio.transcription_status, TranscriptionStatus::Ready);
+        assert_eq!(audio.diarization_status, DiarizationStatus::Queued);
+        assert!(after_transcript.artifacts.iter().any(|artifact| {
+            artifact.kind == "transcript/recording-final+json"
+                && artifact.path == "transcript/snapshot.json"
+        }));
+
+        fs::write(
+            record_root.join("diarization/overrides.json"),
+            b"user-speaker-override-canary",
+        )
+        .unwrap();
+        for expected_revision in [1, 2] {
+            let result = store
+                .commit_diarization_result(
+                    &record.id,
+                    vec![RecordSpeakerTurn {
+                        start_sample: 1_000,
+                        end_sample: 20_000,
+                        global_speaker: 0,
+                    }],
+                    provenance.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.projection_revision, expected_revision);
+        }
+        assert_eq!(
+            fs::read(record_root.join("diarization/overrides.json")).unwrap(),
+            b"user-speaker-override-canary"
+        );
+        let after_diarization = store.get(&record.id).await.unwrap();
+        assert_eq!(
+            after_diarization.audio.unwrap().diarization_status,
+            DiarizationStatus::Ready
+        );
+        assert!(after_diarization.artifacts.iter().any(|artifact| {
+            artifact.kind == "diarization/model-projection+json"
+                && artifact.path == "diarization/result.json"
+        }));
+
+        let snapshot_path = record_root.join("transcript/snapshot.json");
+        let original_snapshot = fs::read(&snapshot_path).unwrap();
+        fs::write(&snapshot_path, b"tampered transcript canary").unwrap();
+        assert!(store
+            .read_recording_final_transcript(&record.id)
+            .await
+            .unwrap_err()
+            .contains("inventory"));
+        fs::write(&snapshot_path, original_snapshot).unwrap();
+
+        drop(store);
+        let reloaded = store_at(temp.path());
+        assert_eq!(
+            reloaded
+                .read_recording_final_transcript(&record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .segments
+                .len(),
+            1
+        );
+        assert_eq!(
+            reloaded
+                .read_diarization_result(&record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .projection_revision,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn speech_projection_rejects_track_timeline_and_content_bounds() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Queued,
+            })
+            .await
+            .unwrap();
+        let record_root = store.audio_workspace_path(&record.id).await.unwrap();
+        fs::write(record_root.join("audio/microphone.opus"), b"record-opus").unwrap();
+        store
+            .finalize_audio_capture(
+                &record.id,
+                CaptureStatus::Ready,
+                1_000,
+                vec![AudioTrackArtifactInput {
+                    track: AudioTrackKind::Microphone,
+                    relative_path: "audio/microphone.opus".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let error = store
+            .commit_recording_final_transcript(
+                &record.id,
+                vec![RecordTranscriptSegment {
+                    segment_id: "segment-1".into(),
+                    track: AudioTrackKind::System,
+                    start_sample: 0,
+                    end_sample: 32_001,
+                    text: "must not publish".into(),
+                    language: Some("zh".into()),
+                    revision: 1,
+                }],
+                RecordSpeechProvenance {
+                    provider: "local".into(),
+                    model_pack_revision: "revision".into(),
+                    onnx_runtime_version: "1.28.0".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("inventory"));
+        assert!(!record_root.join("transcript/snapshot.json").exists());
+        assert_eq!(
+            store
+                .get(&record.id)
+                .await
+                .unwrap()
+                .audio
+                .unwrap()
+                .transcription_status,
+            TranscriptionStatus::Queued
         );
     }
 }
