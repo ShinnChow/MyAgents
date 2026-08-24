@@ -89,7 +89,7 @@ pub struct AttachmentAudioDecoder {
     decoder: Box<dyn symphonia::core::codecs::audio::AudioDecoder>,
     track_id: u32,
     source_sample_rate: u32,
-    source_channels: usize,
+    source_channels: Option<usize>,
     resampler: MonoResampler,
     interleaved: Vec<f32>,
     info: AttachmentAudioInfo,
@@ -141,8 +141,14 @@ impl AttachmentAudioDecoder {
             .channels
             .as_ref()
             .map(|channels| channels.count())
-            .filter(|channels| (1..=MAX_CHANNELS).contains(channels))
-            .ok_or(AttachmentAudioError::UnsupportedCodec)?;
+            .map(|channels| {
+                if (1..=MAX_CHANNELS).contains(&channels) {
+                    Ok(channels)
+                } else {
+                    Err(AttachmentAudioError::UnsupportedCodec)
+                }
+            })
+            .transpose()?;
         let duration_ms = track_duration_ms(track, source_sample_rate)?;
         if duration_ms.is_some_and(|duration| duration > MAX_DURATION_SECONDS * 1_000) {
             return Err(AttachmentAudioError::DurationExceeded);
@@ -209,12 +215,17 @@ impl AttachmentAudioDecoder {
             if decoded.is_empty() {
                 continue;
             }
+            let decoded_channels = decoded.spec().channels().count();
             if decoded.spec().rate() != self.source_sample_rate
-                || decoded.spec().channels().count() != self.source_channels
+                || !(1..=MAX_CHANNELS).contains(&decoded_channels)
+                || self
+                    .source_channels
+                    .is_some_and(|channels| channels != decoded_channels)
                 || decoded.frames() > MAX_DECODED_FRAMES_PER_PACKET
             {
                 return Err(AttachmentAudioError::ResourceLimit);
             }
+            self.source_channels.get_or_insert(decoded_channels);
             self.source_frames = self
                 .source_frames
                 .checked_add(decoded.frames() as u64)
@@ -227,7 +238,7 @@ impl AttachmentAudioDecoder {
             decoded.copy_to_slice_interleaved(&mut self.interleaved);
             let mut samples = Vec::new();
             self.resampler
-                .process_frames(&self.interleaved, self.source_channels, &mut samples)?;
+                .process_frames(&self.interleaved, decoded_channels, &mut samples)?;
             self.interleaved.zeroize();
             if !samples.is_empty() {
                 return self.output_chunk(samples);
@@ -774,6 +785,14 @@ impl Drop for MonoResampler {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
 
     fn write_pcm_wav(path: &Path, sample_rate: u32, channels: u16, frames: u32) {
         let data_bytes = frames * u32::from(channels) * 2;
@@ -820,6 +839,78 @@ mod tests {
     }
 
     #[test]
+    fn real_container_codec_corpus_decodes_through_symphonia() {
+        for (name, media_kind, codec) in [
+            ("adpcm.wav", "wav", "adpcm"),
+            ("pcm.aiff", "aiff", "pcm"),
+            ("audio.mp3", "mp3", "mp3"),
+            ("audio.flac", "flac", "flac"),
+            ("audio.ogg", "ogg", "vorbis"),
+            ("aac.m4a", "m4a", "aac-lc"),
+            ("alac.m4a", "m4a", "alac"),
+            ("video-aac.mp4", "mp4", "aac-lc"),
+            ("alac.mp4", "mp4", "alac"),
+            ("mp3.mp4", "mp4", "mp3"),
+            ("video-pcm.mov", "mov", "pcm"),
+            ("aac.mov", "mov", "aac-lc"),
+            ("mp3.mov", "mov", "mp3"),
+        ] {
+            let mut decoder = AttachmentAudioDecoder::open(&fixture(name))
+                .unwrap_or_else(|error| panic!("probe {name}: {error:?}"));
+            let info = decoder.info();
+            assert_eq!(info.media_kind, media_kind, "container {name}");
+            assert_eq!(info.codec, codec, "codec {name}");
+            assert!(info.used_default_track, "unambiguous track {name}");
+            assert!(
+                info.duration_ms.is_none_or(|duration| duration <= 1_000),
+                "bounded fixture duration {name}"
+            );
+            let mut samples = 0_u64;
+            while let Some(chunk) = decoder
+                .read_chunk()
+                .unwrap_or_else(|error| panic!("decode {name}: {error:?}"))
+            {
+                assert_eq!(chunk.start_sample(), samples, "timeline {name}");
+                samples += chunk.samples().len() as u64;
+            }
+            assert!(samples > 0 && samples <= 16_000, "sample count {name}");
+        }
+    }
+
+    #[test]
+    fn real_corpus_rejects_missing_and_unsupported_audio_and_warns_on_fallback() {
+        assert_eq!(
+            AttachmentAudioDecoder::open(&fixture("video-only.mp4")).err(),
+            Some(AttachmentAudioError::NoAudioTrack)
+        );
+        assert_eq!(
+            AttachmentAudioDecoder::open(&fixture("unsupported-ulaw.wav")).err(),
+            Some(AttachmentAudioError::UnsupportedCodec)
+        );
+        let decoder = AttachmentAudioDecoder::open(&fixture("video-two-audio.mp4")).unwrap();
+        assert_eq!(decoder.info().media_kind, "mp4");
+        assert_eq!(decoder.info().codec, "aac-lc");
+        assert!(!decoder.info().used_default_track);
+    }
+
+    #[test]
+    fn encrypted_m4p_brand_is_rejected_before_audio_decode() {
+        let root = tempfile::tempdir().unwrap();
+        let encrypted = root.path().join("encrypted.m4a");
+        let mut bytes = fs::read(fixture("aac.m4a")).unwrap();
+        let brand = bytes
+            .windows(4)
+            .position(|window| window == b"M4A ")
+            .expect("generated M4A major brand");
+        bytes[brand..brand + 4].copy_from_slice(b"M4P ");
+        fs::write(&encrypted, bytes).unwrap();
+        assert_eq!(
+            AttachmentAudioDecoder::open(&encrypted).err(),
+            Some(AttachmentAudioError::EncryptedMedia)
+        );
+    }
+
+    #[test]
     fn unsupported_container_is_rejected_by_probe_not_extension() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("looks-like.wav");
@@ -827,6 +918,34 @@ mod tests {
         assert_eq!(
             AttachmentAudioDecoder::open(&source).err(),
             Some(AttachmentAudioError::UnsupportedContainer)
+        );
+    }
+
+    #[test]
+    fn probe_rejects_a_sparse_wav_over_eight_hours_without_decoding() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("too-long.wav");
+        let frames = 16_000_u32 * (8 * 60 * 60 + 1);
+        let data_bytes = frames * 2;
+        let mut file = File::create(&source).unwrap();
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(36 + data_bytes).to_le_bytes()).unwrap();
+        file.write_all(b"WAVEfmt ").unwrap();
+        file.write_all(&16_u32.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&1_u16.to_le_bytes()).unwrap();
+        file.write_all(&16_000_u32.to_le_bytes()).unwrap();
+        file.write_all(&32_000_u32.to_le_bytes()).unwrap();
+        file.write_all(&2_u16.to_le_bytes()).unwrap();
+        file.write_all(&16_u16.to_le_bytes()).unwrap();
+        file.write_all(b"data").unwrap();
+        file.write_all(&data_bytes.to_le_bytes()).unwrap();
+        file.set_len(44 + u64::from(data_bytes)).unwrap();
+        drop(file);
+
+        assert_eq!(
+            AttachmentAudioDecoder::open(&source).err(),
+            Some(AttachmentAudioError::DurationExceeded)
         );
     }
 

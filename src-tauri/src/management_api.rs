@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use tauri::Emitter;
 use tokio::net::TcpListener;
 
@@ -4722,14 +4722,24 @@ async fn speech_transcribe_handler(
     let Some(manager) = crate::speech_recognition::global() else {
         return no_store_json(speech_error_value("SPEECH_MANAGER_UNAVAILABLE"));
     };
-    match manager.submit_agent_attachment(
-        &caller.product_session_id,
-        &caller.workspace_path,
-        request.source_path.trim(),
-        request.output_root.as_deref(),
-    ) {
-        Ok(job) => no_store_json(serde_json::json!({ "ok": true, "job": job })),
-        Err(code) => no_store_json(speech_error_value(code)),
+    let manager = Arc::clone(manager);
+    let session_id = caller.product_session_id;
+    let workspace_path = caller.workspace_path;
+    let source_path = request.source_path.trim().to_string();
+    let output_root = request.output_root;
+    let admission = tauri::async_runtime::spawn_blocking(move || {
+        manager.submit_agent_attachment(
+            &session_id,
+            &workspace_path,
+            &source_path,
+            output_root.as_deref(),
+        )
+    })
+    .await;
+    match admission {
+        Err(_) => no_store_json(speech_error_value("SPEECH_MANAGER_UNAVAILABLE")),
+        Ok(Ok(job)) => no_store_json(serde_json::json!({ "ok": true, "job": job })),
+        Ok(Err(code)) => no_store_json(speech_error_value(code)),
     }
 }
 
@@ -4830,7 +4840,7 @@ fn speech_error_value(code: &str) -> serde_json::Value {
             "Local speech processing stopped because the Worker exceeded its deadline or heartbeat window.",
             "Retry once; if it repeats, re-export the media and inspect MyAgents diagnostics.",
         ),
-        "SPEECH_SOURCE_UNSAFE" | "SPEECH_SOURCE_PATH_INVALID" | "SPEECH_SOURCE_CHANGED" => (
+        "SPEECH_SOURCE_UNAVAILABLE" | "SPEECH_SOURCE_UNSAFE" | "SPEECH_SOURCE_PATH_INVALID" | "SPEECH_SOURCE_CHANGED" => (
             "The media source is missing, unsafe, outside the current Workspace, or changed during admission.",
             "Choose one stable regular file inside the current Workspace and retry.",
         ),

@@ -57,6 +57,7 @@ const MAX_TRANSCRIPT_CHARACTERS: usize = 5_000_000;
 const MAX_DIARIZATION_TURNS: usize = 200_000;
 const LIVE_WORKER_RESPONSE_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 const BATCH_WORKER_RESPONSE_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const ATTACHMENT_PROBE_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 const MIN_AGENT_DEADLINE: StdDuration = StdDuration::from_secs(30 * 60);
 const MAX_AGENT_DEADLINE: StdDuration = StdDuration::from_secs(16 * 60 * 60);
 const LIVE_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
@@ -297,6 +298,7 @@ struct ManagerState {
     accepting: bool,
     jobs: HashMap<String, SpeechJob>,
     queue: VecDeque<String>,
+    agent_admission_reservations: usize,
     pending_agent: HashMap<String, PendingAgentJob>,
     active_job: Option<(String, u64)>,
     running: Option<RunningWorker>,
@@ -344,6 +346,41 @@ struct AgentSourceVersion {
     ctime_nsec: i64,
     #[cfg(windows)]
     last_write_time: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentMediaProbe {
+    media_kind: String,
+    codec: String,
+    duration_ms: Option<u64>,
+    used_default_track: bool,
+}
+
+struct AgentAdmissionReservation {
+    manager: ManagedSpeechRecognition,
+    active: bool,
+}
+
+impl AgentAdmissionReservation {
+    fn release_locked(&mut self, state: &mut ManagerState) {
+        if self.active {
+            state.agent_admission_reservations =
+                state.agent_admission_reservations.saturating_sub(1);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for AgentAdmissionReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut state) = self.manager.state.lock() {
+            state.agent_admission_reservations =
+                state.agent_admission_reservations.saturating_sub(1);
+        }
+    }
 }
 
 struct LiveSessionRegistration {
@@ -547,6 +584,7 @@ impl SpeechRecognitionManager {
                 accepting: true,
                 jobs,
                 queue,
+                agent_admission_reservations: 0,
                 pending_agent: HashMap::new(),
                 active_job: None,
                 running: None,
@@ -634,6 +672,100 @@ impl SpeechRecognitionManager {
         })
     }
 
+    fn reserve_agent_admission(
+        self: &Arc<Self>,
+    ) -> Result<AgentAdmissionReservation, &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        if !state.accepting {
+            return Err("SPEECH_MANAGER_SHUTTING_DOWN");
+        }
+        if state.queue.len()
+            + state.agent_admission_reservations
+            + usize::from(state.active_job.is_some())
+            >= MAX_PENDING_JOBS
+        {
+            return Err("SPEECH_QUEUE_FULL");
+        }
+        state.agent_admission_reservations += 1;
+        Ok(AgentAdmissionReservation {
+            manager: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    fn probe_agent_source(
+        &self,
+        source_path: &Path,
+        resources: &SpeechExecutionResources,
+    ) -> Result<AgentMediaProbe, &'static str> {
+        let deadline = Instant::now() + ATTACHMENT_PROBE_TIMEOUT;
+        let lifecycle_permit = crate::sidecar::begin_lifecycle_spawn_permit()
+            .map_err(|_| "SPEECH_MANAGER_SHUTTING_DOWN")?;
+        let probe_id = format!("speech_probe_{}", Uuid::new_v4().simple());
+        let identity = WorkloadIdentity {
+            workload_id: probe_id.clone(),
+            worker_generation: 1,
+        };
+        let start = WorkerCommand::Start(StartRequest {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            workload_kind: WorkloadKind::AttachmentProbe,
+            input: WorkloadInput::Attachment {
+                input_path: path_for_protocol(source_path)?,
+            },
+            native_manifest_path: path_for_protocol(&resources.native_manifest_path)?,
+            onnx_runtime_path: path_for_protocol(&resources.onnx_runtime_path)?,
+            model_pack_manifest_path: path_for_protocol(&resources.model_pack_manifest_path)?,
+        });
+        let mut command = process_cmd::new(&resources.worker_path);
+        command
+            .current_dir(self.root.join("private"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear();
+        let mut child =
+            process_cmd::spawn_tree(&mut command).map_err(|_| "SPEECH_WORKER_START_FAILED")?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill_and_wait();
+            return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill_and_wait();
+            return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill_and_wait();
+            return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+        };
+        drain_worker_stderr(stderr, probe_id, 1);
+        let child = Arc::new(Mutex::new(child));
+        let stdin = Arc::new(Mutex::new(stdin));
+        let result = if send_worker_command(&stdin, &start).is_err() {
+            Err("SPEECH_WORKER_PROTOCOL_ERROR")
+        } else {
+            collect_agent_probe(&identity, stdout, deadline)
+        };
+        if let Err(code) = result {
+            kill_worker(&child);
+            drop(lifecycle_permit);
+            return Err(code);
+        }
+        let exit_result = wait_for_probe_exit(&child, deadline);
+        if exit_result.is_err() {
+            kill_worker(&child);
+        }
+        drop(lifecycle_permit);
+        match exit_result {
+            Ok(true) => result,
+            Ok(false) => Err("SPEECH_WORKER_CRASHED"),
+            Err(code) => Err(code),
+        }
+    }
+
     pub fn submit_agent_attachment(
         self: &Arc<Self>,
         initiator_session_id: &str,
@@ -673,10 +805,24 @@ impl SpeechRecognitionManager {
         let output_root_identity = same_file::Handle::from_file(output_directory)
             .map_err(|_| "SPEECH_OUTPUT_PATH_UNSAFE")?;
 
+        let mut admission = self.reserve_agent_admission()?;
+        let probe = self.probe_agent_source(&source_path, &resources)?;
+        if !same_file::Handle::from_path(&source_path).is_ok_and(|current| current == source)
+            || agent_source_version(
+                &source
+                    .as_file()
+                    .metadata()
+                    .map_err(|_| "SPEECH_SOURCE_CHANGED")?,
+            ) != source_version
+        {
+            return Err("SPEECH_SOURCE_CHANGED");
+        }
+
         let mut state = self
             .state
             .lock()
             .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        admission.release_locked(&mut state);
         if !state.accepting {
             return Err("SPEECH_MANAGER_SHUTTING_DOWN");
         }
@@ -737,10 +883,10 @@ impl SpeechRecognitionManager {
                 path: source_path.to_string_lossy().into_owned(),
                 size_bytes: metadata.len(),
                 sha256: None,
-                media_kind: None,
-                codec: None,
-                duration_ms: None,
-                used_default_track: None,
+                media_kind: Some(probe.media_kind),
+                codec: Some(probe.codec),
+                duration_ms: probe.duration_ms,
+                used_default_track: Some(probe.used_default_track),
             },
             output: SpeechJobOutput {
                 root_directory: Some(output_root.to_string_lossy().into_owned()),
@@ -845,7 +991,7 @@ impl SpeechRecognitionManager {
             }) {
                 return Ok(existing.clone());
             }
-            if state.queue.len() >= MAX_PENDING_JOBS {
+            if state.queue.len() + state.agent_admission_reservations >= MAX_PENDING_JOBS {
                 return Err("SPEECH_QUEUE_FULL".to_string());
             }
             self.model_pack
@@ -2308,15 +2454,13 @@ impl SpeechRecognitionManager {
                 job.kind.is_agent()
                     && job.state == SpeechJobState::Running
                     && job.worker_generation == Some(generation)
-                    && job.source.media_kind.is_none()
-                    && job.source.codec.is_none()
+                    && job.source.media_kind.as_deref() == Some(media_kind.as_str())
+                    && job.source.codec.as_deref() == Some(codec.as_str())
+                    && job.source.duration_ms == duration_ms
+                    && job.source.used_default_track == Some(used_default_track)
             })
             .ok_or("SPEECH_WORKER_PROTOCOL_ERROR")?;
         let mut snapshot = current.clone();
-        snapshot.source.media_kind = Some(media_kind);
-        snapshot.source.codec = Some(codec);
-        snapshot.source.duration_ms = duration_ms;
-        snapshot.source.used_default_track = Some(used_default_track);
         snapshot.stage = SpeechJobStage::Transcribing;
         snapshot.updated_at = Utc::now();
         persist_job(&self.root, &snapshot).map_err(|_| "SPEECH_JOB_STORE_WRITE_FAILED")?;
@@ -2699,10 +2843,13 @@ impl SpeechRecognitionManager {
             }
             let response_timeout = BATCH_WORKER_RESPONSE_TIMEOUT.min(overall_deadline - elapsed);
             let response = match responses.recv_timeout(response_timeout) {
-                Ok(Ok(response)) => response,
-                Ok(Err(_)) | Err(std_mpsc::RecvTimeoutError::Disconnected) if yield_sent => {
+                Ok(Ok(Some(response))) => response,
+                Ok(Ok(None) | Err(_)) | Err(std_mpsc::RecvTimeoutError::Disconnected)
+                    if yield_sent =>
+                {
                     return SpeechWorkerOutcome::Yielded;
                 }
+                Ok(Ok(None)) => return failed_outcome("SPEECH_WORKER_CRASHED", true),
                 Ok(Err(code)) => return failed_outcome(code, true),
                 Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                     return failed_outcome("SPEECH_WORKER_CRASHED", true);
@@ -3666,25 +3813,109 @@ fn drain_worker_stderr(mut stderr: ChildStderr, job_id: String, generation: u64)
 
 fn start_batch_response_reader(
     stdout: ChildStdout,
-) -> std_mpsc::Receiver<Result<WorkerResponse, &'static str>> {
+) -> std_mpsc::Receiver<Result<Option<WorkerResponse>, &'static str>> {
     let (sender, receiver) = std_mpsc::sync_channel(16);
     let _ = std::thread::Builder::new()
         .name("speech-worker-response".into())
         .spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                let response = match read_worker_response(&mut reader) {
-                    Ok(Some(response)) => Ok(response),
-                    Ok(None) => Err("SPEECH_WORKER_CRASHED"),
-                    Err(_) => Err("SPEECH_WORKER_PROTOCOL_ERROR"),
+                let (response, terminal) = match read_worker_response(&mut reader) {
+                    Ok(Some(response)) => (Ok(Some(response)), false),
+                    Ok(None) => (Ok(None), true),
+                    Err(_) => (Err("SPEECH_WORKER_PROTOCOL_ERROR"), true),
                 };
-                let terminal = response.is_err();
                 if sender.send(response).is_err() || terminal {
                     break;
                 }
             }
         });
     receiver
+}
+
+fn collect_agent_probe(
+    identity: &WorkloadIdentity,
+    stdout: ChildStdout,
+    deadline: Instant,
+) -> Result<AgentMediaProbe, &'static str> {
+    let responses = start_batch_response_reader(stdout);
+    let mut ready = false;
+    let mut probe = None;
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("SPEECH_WORKER_TIMEOUT");
+        };
+        match responses.recv_timeout(remaining) {
+            Ok(Ok(Some(response))) if response.identity() == identity => match response {
+                WorkerResponse::Ready { .. } if !ready && probe.is_none() => ready = true,
+                WorkerResponse::MediaProbed {
+                    media_kind,
+                    codec,
+                    duration_ms,
+                    used_default_track,
+                    ..
+                } if ready && probe.is_none() => {
+                    probe = Some(AgentMediaProbe {
+                        media_kind,
+                        codec,
+                        duration_ms,
+                        used_default_track,
+                    });
+                }
+                WorkerResponse::Failed { code, .. } => return Err(worker_error_code(code)),
+                mut response => {
+                    response.zeroize_sensitive();
+                    return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+                }
+            },
+            Ok(Ok(Some(mut response))) => {
+                response.zeroize_sensitive();
+                return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+            }
+            Ok(Ok(None)) if ready => {
+                return probe.ok_or("SPEECH_WORKER_PROTOCOL_ERROR");
+            }
+            Ok(Ok(None) | Err(_)) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                return Err("SPEECH_WORKER_TIMEOUT");
+            }
+        }
+    }
+}
+
+fn wait_for_probe_exit(
+    child: &Arc<Mutex<process_cmd::ChildTree>>,
+    deadline: Instant,
+) -> Result<bool, &'static str> {
+    loop {
+        let status = child
+            .lock()
+            .map_err(|_| "SPEECH_WORKER_CRASHED")?
+            .try_wait()
+            .map_err(|_| "SPEECH_WORKER_CRASHED")?;
+        if let Some(status) = status {
+            return Ok(status.success());
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err("SPEECH_WORKER_TIMEOUT");
+        };
+        std::thread::sleep(remaining.min(StdDuration::from_millis(10)));
+    }
+}
+
+fn worker_error_code(code: String) -> &'static str {
+    match code.as_str() {
+        "SPEECH_SOURCE_UNAVAILABLE" => "SPEECH_SOURCE_UNAVAILABLE",
+        "SPEECH_SOURCE_UNSAFE" => "SPEECH_SOURCE_UNSAFE",
+        "SPEECH_MEDIA_LIMIT_EXCEEDED" => "SPEECH_MEDIA_LIMIT_EXCEEDED",
+        "SPEECH_UNSUPPORTED_CODEC" => "SPEECH_UNSUPPORTED_CODEC",
+        "SPEECH_ENCRYPTED_MEDIA" => "SPEECH_ENCRYPTED_MEDIA",
+        "SPEECH_NO_AUDIO_TRACK" => "SPEECH_NO_AUDIO_TRACK",
+        "SPEECH_CORRUPT_MEDIA" => "SPEECH_CORRUPT_MEDIA",
+        _ => "SPEECH_WORKER_PROTOCOL_ERROR",
+    }
 }
 
 fn failed_outcome(code: &str, retryable: bool) -> SpeechWorkerOutcome {
@@ -3756,7 +3987,7 @@ fn enqueue_diarization_locked(
     }) {
         return Ok(());
     }
-    if state.queue.len() >= MAX_PENDING_JOBS {
+    if state.queue.len() + state.agent_admission_reservations >= MAX_PENDING_JOBS {
         return Err("SPEECH_QUEUE_FULL");
     }
     let now = Utc::now();
@@ -3918,7 +4149,7 @@ fn recover_agent_publish_intents(root: &Path, jobs: &mut HashMap<String, SpeechJ
                 && valid_agent_staging_token(&intent.staging_token)
                 && private_token
                     .as_deref()
-                    .is_none_or(|private| private == intent.staging_token)
+                    .map_or(true, |private| private == intent.staging_token)
         });
         let Some(token) = intent
             .as_ref()
@@ -4811,6 +5042,73 @@ mod tests {
             ),
             Err("SPEECH_SOURCE_CHANGED".into())
         );
+    }
+
+    #[test]
+    fn agent_admission_reservation_is_bounded_and_released() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(&root);
+        let mut reservation = manager.reserve_agent_admission().unwrap();
+        assert_eq!(
+            manager.state.lock().unwrap().agent_admission_reservations,
+            1
+        );
+        {
+            let mut state = manager.state.lock().unwrap();
+            reservation.release_locked(&mut state);
+            assert_eq!(state.agent_admission_reservations, 0);
+        }
+        drop(reservation);
+        assert_eq!(
+            manager.state.lock().unwrap().agent_admission_reservations,
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attachment_admission_probe_requires_exact_identity_and_clean_eof() {
+        let root = tempfile::tempdir().unwrap();
+        let worker = root.path().join("probe-worker");
+        let identity = WorkloadIdentity {
+            workload_id: "speech_probe_test".into(),
+            worker_generation: 1,
+        };
+        write_fake_worker(
+            &worker,
+            &[
+                WorkerResponse::Ready {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                },
+                WorkerResponse::MediaProbed {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    media_kind: "m4a".into(),
+                    codec: "aac-lc".into(),
+                    duration_ms: Some(60_000),
+                    used_default_track: true,
+                },
+            ],
+        );
+        let mut command = process_cmd::new(&worker);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = process_cmd::spawn_tree(&mut command).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        assert_eq!(
+            collect_agent_probe(&identity, stdout, Instant::now() + ATTACHMENT_PROBE_TIMEOUT,)
+                .unwrap(),
+            AgentMediaProbe {
+                media_kind: "m4a".into(),
+                codec: "aac-lc".into(),
+                duration_ms: Some(60_000),
+                used_default_track: true,
+            }
+        );
+        assert!(child.wait().unwrap().success());
     }
 
     #[test]

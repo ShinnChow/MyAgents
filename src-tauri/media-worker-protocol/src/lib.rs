@@ -22,6 +22,7 @@ pub enum WorkloadKind {
     RecordLiveAsr,
     RecordBackfillAsr,
     RecordDiarization,
+    AttachmentProbe,
     AttachmentAsr,
 }
 
@@ -190,7 +191,10 @@ impl StartRequest {
             ) if valid_record_artifacts(inputs, true)
         ) || matches!(
             (&self.workload_kind, &self.input),
-            (WorkloadKind::AttachmentAsr, WorkloadInput::Attachment { input_path })
+            (
+                WorkloadKind::AttachmentProbe | WorkloadKind::AttachmentAsr,
+                WorkloadInput::Attachment { input_path }
+            )
                 if !input_path.is_empty()
         )
     }
@@ -998,8 +1002,11 @@ mod tests {
             input_path: "/private/job/source.m4a".into(),
         };
         assert!(start.has_valid_shape());
+        start.workload_kind = WorkloadKind::AttachmentProbe;
+        assert!(start.has_valid_shape());
         assert!(!WorkloadKind::RecordLiveAsr.can_cooperatively_yield());
         assert!(WorkloadKind::AttachmentAsr.can_cooperatively_yield());
+        assert!(!WorkloadKind::AttachmentProbe.can_cooperatively_yield());
 
         start.workload_kind = WorkloadKind::ModelPackProbe;
         start.input = WorkloadInput::ModelPackProbe;

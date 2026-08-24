@@ -59,6 +59,11 @@ fn run_started(
     start: myagents_media_worker::protocol::StartRequest,
     writer: &mut BufWriter<StdoutLock<'_>>,
 ) -> Result<(), &'static str> {
+    if let (WorkloadKind::AttachmentProbe, WorkloadInput::Attachment { input_path }) =
+        (&start.workload_kind, &start.input)
+    {
+        return run_attachment_probe(&start.identity, input_path, writer);
+    }
     let current_worker =
         std::env::current_exe().map_err(|_| "SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
     let native = verify_native_bundle(
@@ -98,6 +103,34 @@ fn run_started(
         }
         _ => Err("SPEECH_WORKLOAD_NOT_READY"),
     }
+}
+
+fn run_attachment_probe(
+    identity: &WorkloadIdentity,
+    input_path: &str,
+    writer: &mut BufWriter<StdoutLock<'_>>,
+) -> Result<(), &'static str> {
+    let decoder =
+        AttachmentAudioDecoder::open(Path::new(input_path)).map_err(map_attachment_decode_error)?;
+    let info = decoder.info();
+    write_response(
+        writer,
+        WorkerResponse::Ready {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+        },
+    )?;
+    write_response(
+        writer,
+        WorkerResponse::MediaProbed {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            media_kind: info.media_kind.into(),
+            codec: info.codec.into(),
+            duration_ms: info.duration_ms,
+            used_default_track: info.used_default_track,
+        },
+    )
 }
 
 fn run_model_pack_probe(
