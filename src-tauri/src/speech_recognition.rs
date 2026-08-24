@@ -13,6 +13,7 @@ use crate::record::{
     AudioTrackKind, DiarizationStatus, ManagedRecordStore, RecordKind, RecordSpeakerTurn,
     RecordSpeechProvenance, RecordTranscriptSegment, TranscriptionStatus,
 };
+use crate::speech_model_pack_manager::{SpeechModelPackManager, SpeechModelPackStatus};
 use chrono::{DateTime, Duration, Utc};
 use myagents_media_worker_protocol::{
     read_worker_response, write_control_frame, RecordArtifactInput, SpeakerTurn, StartRequest,
@@ -325,7 +326,7 @@ pub struct SpeechRecognitionManager {
     root: PathBuf,
     native_manifest_path: PathBuf,
     worker_path: PathBuf,
-    model_pack_manifest_path: PathBuf,
+    model_pack: Arc<SpeechModelPackManager>,
     runtime_identity: Option<LocalInferenceRuntimeIdentity>,
     compute_coordinator: Arc<LocalComputeCoordinator>,
     record_store: ManagedRecordStore,
@@ -378,6 +379,17 @@ impl SpeechRecognitionManager {
         let runtime_identity = runtime_registry
             .identity(InferenceRuntimeKind::OnnxCpu)
             .ok();
+        let native_manifest_path = native_root.join("manifest.json");
+        let worker_path = native_root.join(worker_name);
+        let model_pack = SpeechModelPackManager::initialize(
+            root.join("models"),
+            worker_path.clone(),
+            native_manifest_path.clone(),
+            runtime_identity
+                .as_ref()
+                .map(|identity| identity.path().to_path_buf()),
+            compute_coordinator.clone(),
+        )?;
         let mut jobs = load_jobs(&root)?;
         recover_nonterminal_jobs(&root, &mut jobs);
         prune_expired_jobs(&root, &mut jobs);
@@ -385,9 +397,9 @@ impl SpeechRecognitionManager {
 
         let manager = Arc::new(Self {
             root: root.clone(),
-            native_manifest_path: native_root.join("manifest.json"),
-            worker_path: native_root.join(worker_name),
-            model_pack_manifest_path: root.join("models").join("active").join("manifest.json"),
+            native_manifest_path,
+            worker_path,
+            model_pack,
             runtime_identity,
             compute_coordinator,
             record_store,
@@ -413,7 +425,7 @@ impl SpeechRecognitionManager {
 
     pub fn capability_snapshot(&self) -> SpeechCapabilitySnapshot {
         let native_ready = plain_file(&self.worker_path) && plain_file(&self.native_manifest_path);
-        let model_pack_revision = verify_model_pack(&self.model_pack_manifest_path);
+        let model_pack_revision = self.model_pack.active_pack().map(|pack| pack.revision);
         let resource_status = if !native_ready || self.runtime_identity.is_none() {
             SpeechResourceStatus::NativeUnavailable
         } else if model_pack_revision.is_none() {
@@ -432,6 +444,27 @@ impl SpeechRecognitionManager {
     }
 
     fn execution_resources(&self) -> Result<SpeechExecutionResources, &'static str> {
+        let active = self
+            .model_pack
+            .active_pack()
+            .ok_or("SPEECH_MODEL_PACK_UNAVAILABLE")?;
+        let pipeline = SpeechPipelineSnapshot {
+            provider: "local".into(),
+            model_pack_revision: active.revision,
+            onnx_runtime_version: self
+                .runtime_identity
+                .as_ref()
+                .ok_or("SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?
+                .version()
+                .to_string(),
+        };
+        self.execution_resources_for_pipeline(&pipeline)
+    }
+
+    fn execution_resources_for_pipeline(
+        &self,
+        pipeline: &SpeechPipelineSnapshot,
+    ) -> Result<SpeechExecutionResources, &'static str> {
         if !plain_file(&self.worker_path) || !plain_file(&self.native_manifest_path) {
             return Err("SPEECH_NATIVE_RUNTIME_UNAVAILABLE");
         }
@@ -439,16 +472,20 @@ impl SpeechRecognitionManager {
             .runtime_identity
             .as_ref()
             .ok_or("SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
-        let model_pack_revision = verify_model_pack(&self.model_pack_manifest_path)
-            .ok_or("SPEECH_MODEL_PACK_UNAVAILABLE")?;
+        if pipeline.provider != "local" || pipeline.onnx_runtime_version != runtime.version() {
+            return Err("SPEECH_PIPELINE_REVISION_UNAVAILABLE");
+        }
+        let model_pack = self
+            .model_pack
+            .resolve_revision(&pipeline.model_pack_revision)?;
         Ok(SpeechExecutionResources {
             worker_path: self.worker_path.clone(),
             native_manifest_path: self.native_manifest_path.clone(),
             onnx_runtime_path: runtime.path().to_path_buf(),
-            model_pack_manifest_path: self.model_pack_manifest_path.clone(),
+            model_pack_manifest_path: model_pack.manifest_path,
             provenance: RecordSpeechProvenance {
                 provider: "local".into(),
-                model_pack_revision,
+                model_pack_revision: pipeline.model_pack_revision.clone(),
                 onnx_runtime_version: runtime.version().to_string(),
             },
         })
@@ -507,6 +544,9 @@ impl SpeechRecognitionManager {
             if state.queue.len() >= MAX_PENDING_JOBS {
                 return Err("SPEECH_QUEUE_FULL".to_string());
             }
+            self.model_pack
+                .resolve_revision(&resources.provenance.model_pack_revision)
+                .map_err(str::to_string)?;
             let now = Utc::now();
             let job = SpeechJob {
                 schema_version: JOB_SCHEMA_VERSION,
@@ -614,6 +654,7 @@ impl SpeechRecognitionManager {
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
+        self.model_pack.cancel_operation();
         let (snapshots, running) = {
             let mut state = self
                 .state
@@ -673,6 +714,25 @@ impl SpeechRecognitionManager {
             .map(|identity| identity.id)
     }
 
+    pub fn model_pack_status(&self) -> SpeechModelPackStatus {
+        self.model_pack.status()
+    }
+
+    pub async fn install_model_pack(self: &Arc<Self>) -> Result<SpeechModelPackStatus, String> {
+        self.model_pack.install().await
+    }
+
+    pub fn remove_model_pack(&self) -> Result<SpeechModelPackStatus, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        let in_use = state.jobs.values().any(|job| !job.state.is_terminal())
+            || state.running.is_some()
+            || state.active_job.is_some();
+        self.model_pack.remove(in_use)
+    }
+
     pub fn record_root(&self) -> &Path {
         self.record_store.root_dir()
     }
@@ -691,7 +751,7 @@ impl SpeechRecognitionManager {
                 let Some((job, generation)) = next else {
                     break;
                 };
-                let resources = self.execution_resources();
+                let resources = self.execution_resources_for_pipeline(&job.pipeline);
                 let compute = ComputeWorkloadIdentity {
                     kind: compute_kind(job.kind),
                     id: job.job_id.clone(),
@@ -777,10 +837,6 @@ impl SpeechRecognitionManager {
         resources: SpeechExecutionResources,
         lease: LocalComputeLease,
     ) {
-        if !self.update_generation_pipeline(job, generation, &resources.provenance) {
-            self.finish_failed(job, generation, "SPEECH_JOB_STORE_WRITE_FAILED", true);
-            return;
-        }
         if let Err(code) = self.update_record_running_status(job, generation) {
             self.finish_failed(job, generation, code, true);
             return;
@@ -1448,26 +1504,6 @@ impl SpeechRecognitionManager {
             .map_err(|_| "SPEECH_RECORD_UPDATE_FAILED")
     }
 
-    fn update_generation_pipeline(
-        &self,
-        job: &SpeechJob,
-        generation: u64,
-        provenance: &RecordSpeechProvenance,
-    ) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        if !exact_running_generation(&state, &job.job_id, generation) {
-            return false;
-        }
-        let Some(current) = state.jobs.get_mut(&job.job_id) else {
-            return false;
-        };
-        current.pipeline = pipeline_from_provenance(provenance);
-        current.updated_at = Utc::now();
-        persist_job(&self.root, current).is_ok()
-    }
-
     fn job_can_execute(&self, job_id: &str, generation: u64) -> bool {
         self.state.lock().ok().is_some_and(|state| {
             state.accepting && exact_running_generation(&state, job_id, generation)
@@ -2018,10 +2054,25 @@ fn plain_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
 }
 
-fn verify_model_pack(manifest_path: &Path) -> Option<String> {
-    crate::speech_model_pack::verify_installed_pack(manifest_path)
-        .ok()
-        .map(|pack| pack.pack_revision)
+#[tauri::command]
+pub fn cmd_speech_model_pack_status(
+    manager: tauri::State<'_, ManagedSpeechRecognition>,
+) -> SpeechModelPackStatus {
+    manager.model_pack_status()
+}
+
+#[tauri::command]
+pub async fn cmd_speech_model_pack_install(
+    manager: tauri::State<'_, ManagedSpeechRecognition>,
+) -> Result<SpeechModelPackStatus, String> {
+    manager.install_model_pack().await
+}
+
+#[tauri::command]
+pub fn cmd_speech_model_pack_remove(
+    manager: tauri::State<'_, ManagedSpeechRecognition>,
+) -> Result<SpeechModelPackStatus, String> {
+    manager.remove_model_pack()
 }
 
 #[cfg(test)]
@@ -2352,7 +2403,7 @@ mod tests {
             model_pack_manifest_path: model_manifest,
             provenance: RecordSpeechProvenance {
                 provider: "local".into(),
-                model_pack_revision: "fixture-pack".into(),
+                model_pack_revision: "revision-1".into(),
                 onnx_runtime_version: "1.28.0".into(),
             },
         };
@@ -2384,6 +2435,16 @@ mod tests {
         assert_eq!(
             state.jobs.get("speech_record_execute").unwrap().state,
             SpeechJobState::Succeeded
+        );
+        assert_eq!(
+            state
+                .jobs
+                .get("speech_record_execute")
+                .unwrap()
+                .pipeline
+                .model_pack_revision,
+            "revision-1",
+            "a running generation keeps its admission-time model revision"
         );
         assert!(state.jobs.values().any(|job| {
             job.kind == SpeechJobKind::RecordDiarization

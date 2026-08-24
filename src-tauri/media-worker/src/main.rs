@@ -71,6 +71,9 @@ fn run_started(
     let adapter =
         LoadedNativeAdapter::load(&native).map_err(|_| "SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
     match (&start.workload_kind, &start.input) {
+        (WorkloadKind::ModelPackProbe, WorkloadInput::ModelPackProbe) => {
+            run_model_pack_probe(&start.identity, &adapter, &models, writer)
+        }
         (WorkloadKind::RecordLiveAsr, WorkloadInput::LivePcm { streams }) => {
             let stdin = io::stdin();
             let mut reader = BufReader::new(stdin.lock());
@@ -91,6 +94,36 @@ fn run_started(
         }
         _ => Err("SPEECH_WORKLOAD_NOT_READY"),
     }
+}
+
+fn run_model_pack_probe(
+    identity: &WorkloadIdentity,
+    adapter: &LoadedNativeAdapter,
+    models: &myagents_media_worker::model_pack_source::VerifiedModelPack,
+    writer: &mut BufWriter<StdoutLock<'_>>,
+) -> Result<(), &'static str> {
+    {
+        let _asr = adapter
+            .create_asr(models)
+            .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+    }
+    {
+        let _vad = adapter
+            .create_vad(models)
+            .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+    }
+    {
+        let _diarizer = adapter
+            .create_diarizer(models)
+            .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+    }
+    write_response(
+        writer,
+        WorkerResponse::Ready {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+        },
+    )
 }
 
 fn run_record_diarization(

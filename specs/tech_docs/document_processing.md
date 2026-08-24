@@ -173,6 +173,8 @@ ONNX Runtime 官方 1.28 macOS arm64 archive 的最低系统版本是 macOS 14�
 
 App 启动时 Manager 校验 manifest target/pipeline、Worker 可执行位和 Worker/native/model/dictionary 的 size + SHA；资源问题只让 document admission fail closed，不阻止 MyAgents UI 启动。Worker 启动后再次校验它实际要加载的五个资源。运行时不得下载、访问 Hugging Face 或使用用户 cache。
 
+speech 的用户可移除模型权重不属于本节的 build cache，也不进入 Tauri resource projection。它们由 `SpeechRecognitionManager` 在用户显式操作后写入 App data 下的版本目录；安装前仍复用本节同一 App-owned ORT identity，但下载/签名、模型最小加载、`active.json` 切换与 busy removal 由 speech domain owner 裁决。两者只共享受信任 runtime 和 compute lease，不共享 job store 或模型 activation authority。详见 [`recording_and_speech_recognition.md`](./recording_and_speech_recognition.md)。
+
 ## Skill 与 help 防漂移
 
 - `myagents-anydoc` 必须同时存在于 TS required set、Rust system bundle、workspace required mirror，并随 `SYSTEM_SKILLS_VERSION` 同步安装。

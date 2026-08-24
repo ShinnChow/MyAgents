@@ -445,6 +445,12 @@ CLI 业务 bundle 只位于当前 app。由于 SDK 子进程与用户 shell 的 
 
 ONNX Runtime CPU、PDFium、PP-OCRv6 Small 模型/字典和 Worker 按 target 随 App 资源发布；启动时 Manager 校验 manifest 和所有文件 hash，Worker 使用同一 manifest 再校验并只从绝对资源路径加载。ONNX Runtime 是 App-owned 的共享本地推理资源：document 与 speech capability 必须消费同一 target artifact identity，speech bundle 只携带自身 Worker、sherpa adapter/C API 与 legal inventory，禁止复制第二份 ORT。构建入口统一为 `scripts/prepare-native-inference.mjs`，在同一锁和 content-addressed cache 下准备并原子投影两个 capability。运行时不联网，不依赖 GPT、API key、系统 Python/Node、GPU 或系统安装的 native runtime。详细状态机、限制、资源矩阵和排查见 [`tech_docs/document_processing.md`](./tech_docs/document_processing.md)。
 
+#### App-owned 本地语音识别
+
+`SpeechRecognitionManager` 是 Record / Agent 语音 job、Worker generation、持久恢复与结果发布的 App-global owner；它不属于 Tab、Session 或 Sidecar。可下载模型权重由其 `SpeechModelPackManager` 子模块拥有，native Worker、sherpa adapter 和共享 ONNX Runtime 仍属于随 App 发布的受信任执行层。用户安装只访问固定的第一方签名 manifest 和其中编译期锁定的四项上游资源，不接受远端路径或 inventory；五个模型文件和五份许可文件在 private staging 中完成 regular-file、非执行权限、size、SHA-256、manifest byte identity 与 App-updater Minisign trust-root 校验，再由真实 media Worker 最小加载 ASR/VAD/diarization 后发布版本目录并原子切换 `active.json`。安装不会为历史 Record 自动创建 job。
+
+模型 revision 与 ONNX Runtime revision 在 workload 接纳时写入 immutable pipeline snapshot。排队执行只解析该 snapshot，不能用届时 active 设置覆盖；Worker 启动后对 exact model/native/runtime 再校验。模型最小加载使用 `LocalComputeCoordinator` 的最低优先级 lease；出现更高优先级 Record workload 时终止 exact probe generation、释放 lease 后重试。移除仅在没有非终态语音 job / active Worker 时执行，并只删除严格命名的 App-owned pack 目录。详见 [`tech_docs/recording_and_speech_recognition.md`](./tech_docs/recording_and_speech_recognition.md)。
+
 ### 5. 定时任务系统
 
 0.3.0 起，Task 是所有新定时自动化的唯一持久权威：

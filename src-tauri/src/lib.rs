@@ -48,6 +48,7 @@ mod proxy_config;
 mod proxy_spill;
 pub mod record;
 pub mod recording;
+mod resource_signature;
 pub mod runtime_launch_guard;
 pub mod search;
 pub mod session_goal;
@@ -58,6 +59,7 @@ pub mod space_cloud;
 mod space_cloud_mock;
 #[path = "../media-worker/src/model_pack_source.rs"]
 pub mod speech_model_pack;
+mod speech_model_pack_manager;
 pub mod speech_recognition;
 mod sse_proxy;
 pub mod system_binary;
@@ -460,6 +462,9 @@ pub fn run() {
             managed_codex::cmd_managed_codex_login_status,
             managed_codex::cmd_managed_codex_login,
             managed_codex::cmd_managed_codex_logout,
+            speech_recognition::cmd_speech_model_pack_status,
+            speech_recognition::cmd_speech_model_pack_install,
+            speech_recognition::cmd_speech_model_pack_remove,
             grok_auth::cmd_grok_auth_status,
             grok_auth::cmd_grok_login_start,
             grok_auth::cmd_grok_login_status,

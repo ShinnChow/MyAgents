@@ -18,6 +18,7 @@ const MAX_WIRE_FRAME_BYTES: usize = 1 + MAX_CONTROL_FRAME_BYTES;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkloadKind {
+    ModelPackProbe,
     RecordLiveAsr,
     RecordBackfillAsr,
     RecordDiarization,
@@ -30,7 +31,10 @@ impl WorkloadKind {
     }
 
     pub fn can_cooperatively_yield(self) -> bool {
-        !matches!(self, Self::RecordLiveAsr)
+        matches!(
+            self,
+            Self::RecordBackfillAsr | Self::RecordDiarization | Self::AttachmentAsr
+        )
     }
 }
 
@@ -113,6 +117,7 @@ pub struct RecordArtifactInput {
     rename_all_fields = "camelCase"
 )]
 pub enum WorkloadInput {
+    ModelPackProbe,
     LivePcm { streams: Vec<PcmStreamStart> },
     RecordArtifacts { inputs: Vec<RecordArtifactInput> },
     Attachment { input_path: String },
@@ -121,6 +126,7 @@ pub enum WorkloadInput {
 impl std::fmt::Debug for WorkloadInput {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::ModelPackProbe => "WorkloadInput::ModelPackProbe",
             Self::LivePcm { .. } => "WorkloadInput::LivePcm",
             Self::RecordArtifacts { .. } => "WorkloadInput::RecordArtifacts([REDACTED])",
             Self::Attachment { .. } => "WorkloadInput::Attachment([REDACTED])",
@@ -164,6 +170,9 @@ impl StartRequest {
             return false;
         }
         matches!(
+            (&self.workload_kind, &self.input),
+            (WorkloadKind::ModelPackProbe, WorkloadInput::ModelPackProbe)
+        ) || matches!(
             (&self.workload_kind, &self.input),
             (WorkloadKind::RecordLiveAsr, WorkloadInput::LivePcm { streams })
                 if valid_live_streams(streams)
@@ -942,6 +951,12 @@ mod tests {
         assert!(start.has_valid_shape());
         assert!(!WorkloadKind::RecordLiveAsr.can_cooperatively_yield());
         assert!(WorkloadKind::AttachmentAsr.can_cooperatively_yield());
+
+        start.workload_kind = WorkloadKind::ModelPackProbe;
+        start.input = WorkloadInput::ModelPackProbe;
+        assert!(start.has_valid_shape());
+        assert!(!WorkloadKind::ModelPackProbe.can_cooperatively_yield());
+        assert!(!format!("{:?}", start.input).contains("/private/"));
 
         start.workload_kind = WorkloadKind::RecordDiarization;
         start.input = WorkloadInput::RecordArtifacts {

@@ -361,6 +361,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 pub enum ComputeWorkloadKind {
     DocumentOcr,
     AgentAttachmentAsr,
+    SpeechModelValidation,
     RecordDiarization,
     RecordBackfill,
     RecordLive,
@@ -369,7 +370,7 @@ pub enum ComputeWorkloadKind {
 impl ComputeWorkloadKind {
     fn priority(self) -> u8 {
         match self {
-            Self::DocumentOcr | Self::AgentAttachmentAsr => 1,
+            Self::DocumentOcr | Self::AgentAttachmentAsr | Self::SpeechModelValidation => 1,
             Self::RecordDiarization => 2,
             Self::RecordBackfill => 3,
             Self::RecordLive => 4,
@@ -380,6 +381,7 @@ impl ComputeWorkloadKind {
         match self {
             Self::DocumentOcr => "document-ocr",
             Self::AgentAttachmentAsr => "agent-attachment-asr",
+            Self::SpeechModelValidation => "speech-model-validation",
             Self::RecordDiarization => "record-diarization",
             Self::RecordBackfill => "record-backfill",
             Self::RecordLive => "record-live",

@@ -86,6 +86,11 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate-zlib"]
 ogg = "=0.9.2"
 opus2 = { version = "=0.4.0", default-features = false, features = ["backend-libopus", "bundled", "static"] }
 ringbuf = "=0.4.8"
+# Speech model packs contain two pinned tar.bz2 upstream assets. Extraction is
+# implemented in-process so installed apps never consult system tar/Python.
+# The pure-Rust decoder keeps the declared 1.81 MSRV and avoids a libbz2 ABI.
+bzip2-rs = "=0.1.2"
+tar = "=0.4.45"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 cpal = "=0.18.2"

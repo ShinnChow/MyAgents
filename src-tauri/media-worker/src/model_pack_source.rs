@@ -54,6 +54,66 @@ pub struct VerifiedModelPack {
     pub speaker_embedding_model: PathBuf,
 }
 
+/// Sanitized, immutable download/extraction plan derived from the exact source
+/// lock compiled into the App and Worker. Installers must consume this plan
+/// instead of reparsing mutable remote manifest fields into filesystem paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPackInstallPlan {
+    pub pack_id: String,
+    pub pack_revision: String,
+    pub source_download_bytes: u64,
+    pub installed_model_bytes: u64,
+    pub download_hard_limit_bytes: u64,
+    pub assets: Vec<ModelPackAsset>,
+    pub legal_artifacts: Vec<ModelPackLegalArtifact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPackAsset {
+    pub id: String,
+    pub url: String,
+    pub sha256: String,
+    pub size: u64,
+    pub format: ModelPackAssetFormat,
+    pub selected_files: Vec<ModelPackSelectedFile>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelPackAssetFormat {
+    File,
+    TarBz2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPackSelectedFile {
+    pub source_path: String,
+    pub install_path: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPackLegalArtifact {
+    pub id: String,
+    pub install_path: String,
+    pub source: ModelPackLegalSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelPackLegalSource {
+    Remote {
+        url: String,
+        sha256: String,
+        size: u64,
+    },
+    Archive {
+        asset_id: String,
+        source_path: String,
+        sha256: String,
+        size: u64,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedInstalledFile {
     path: String,
@@ -259,7 +319,7 @@ pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
         {
             return Err(SourceLockError::DuplicateIdentity);
         }
-        if legal.id.trim().is_empty()
+        if !safe_path_component(&legal.id)
             || legal.license.trim().is_empty()
             || legal.attribution.trim().is_empty()
             || !safe_relative_path(&legal.install_path)
@@ -319,6 +379,67 @@ pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
     Ok(())
 }
 
+pub fn install_plan() -> Result<ModelPackInstallPlan, SourceLockError> {
+    validate_source_lock_json(MODEL_PACK_SOURCE_LOCK)?;
+    let lock: SourceLock =
+        serde_json::from_str(MODEL_PACK_SOURCE_LOCK).map_err(|_| SourceLockError::InvalidJson)?;
+    Ok(ModelPackInstallPlan {
+        pack_id: lock.pack_id,
+        pack_revision: lock.pack_revision,
+        source_download_bytes: lock.source_download_bytes,
+        installed_model_bytes: lock.installed_model_bytes,
+        download_hard_limit_bytes: lock.download_hard_limit_bytes,
+        assets: lock
+            .assets
+            .into_iter()
+            .map(|asset| ModelPackAsset {
+                id: asset.id,
+                url: asset.url,
+                sha256: asset.sha256,
+                size: asset.size,
+                format: match asset.format {
+                    AssetFormat::File => ModelPackAssetFormat::File,
+                    AssetFormat::TarBz2 => ModelPackAssetFormat::TarBz2,
+                },
+                selected_files: asset
+                    .selected_files
+                    .into_iter()
+                    .map(|selected| ModelPackSelectedFile {
+                        source_path: selected.source_path,
+                        install_path: selected.install_path,
+                        sha256: selected.sha256,
+                        size: selected.size,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        legal_artifacts: lock
+            .legal_artifacts
+            .into_iter()
+            .map(|legal| ModelPackLegalArtifact {
+                id: legal.id,
+                install_path: legal.install_path,
+                source: match legal.source {
+                    LegalSource::Remote {
+                        url, sha256, size, ..
+                    } => ModelPackLegalSource::Remote { url, sha256, size },
+                    LegalSource::Archive {
+                        asset_id,
+                        source_path,
+                        sha256,
+                        size,
+                    } => ModelPackLegalSource::Archive {
+                        asset_id,
+                        source_path,
+                        sha256,
+                        size,
+                    },
+                },
+            })
+            .collect(),
+    })
+}
+
 /// Verifies the exact activated speech model pack without trusting mutable
 /// manifest fields. The manifest bytes must equal the source lock compiled
 /// into this worker generation; every selected model and legal notice is then
@@ -333,6 +454,7 @@ pub fn verify_installed_pack(
         fs::symlink_metadata(manifest_path).map_err(|_| InstalledPackError::ManifestUnavailable)?;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
+        || has_execute_bits(&metadata)
         || metadata.len() != MODEL_PACK_SOURCE_LOCK.len() as u64
     {
         return Err(InstalledPackError::ManifestMismatch);
@@ -415,6 +537,7 @@ fn verify_file_inventory(
         let metadata = fs::symlink_metadata(&path).map_err(|_| InstalledPackError::MissingFile)?;
         if !metadata.is_file()
             || metadata.file_type().is_symlink()
+            || has_execute_bits(&metadata)
             || metadata.len() != file.size
             || sha256_file(&path)? != file.sha256
         {
@@ -423,6 +546,19 @@ fn verify_file_inventory(
         verified.insert(file.path.clone(), path);
     }
     Ok(verified)
+}
+
+fn has_execute_bits(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        false
+    }
 }
 
 fn ensure_plain_directory(path: &Path) -> Result<(), InstalledPackError> {
@@ -493,6 +629,14 @@ fn safe_relative_path(value: &str) -> bool {
             .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
 }
 
+fn safe_path_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +645,19 @@ mod tests {
     #[test]
     fn committed_source_lock_has_exact_models_sizes_licenses_and_signature_policy() {
         validate_source_lock_json(MODEL_PACK_SOURCE_LOCK).unwrap();
+        let plan = install_plan().unwrap();
+        assert_eq!(plan.assets.len(), 4);
+        assert_eq!(
+            plan.assets
+                .iter()
+                .map(|asset| asset.selected_files.len())
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!(plan.legal_artifacts.len(), 5);
+        assert_eq!(plan.source_download_bytes, 209_767_948);
+        assert_eq!(plan.installed_model_bytes, 280_896_862);
+        assert_eq!(plan.download_hard_limit_bytes, 300 * 1024 * 1024);
     }
 
     #[test]
@@ -608,6 +765,27 @@ mod tests {
         assert_eq!(
             verify_installed_pack(&manifest),
             Err(InstalledPackError::ManifestMismatch)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_inventory_rejects_executable_data_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("models")).unwrap();
+        let path = root.path().join("models/model.onnx");
+        fs::write(&path, b"model-bytes").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let expected = vec![ExpectedInstalledFile {
+            path: "models/model.onnx".into(),
+            sha256: format!("{:x}", Sha256::digest(b"model-bytes")),
+            size: 11,
+        }];
+        assert_eq!(
+            verify_file_inventory(root.path(), &expected),
+            Err(InstalledPackError::FileMismatch)
         );
     }
 
