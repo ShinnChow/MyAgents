@@ -24,6 +24,7 @@ interface Props {
   pendingIntent?: { autofocusSearch?: boolean; nonce: number } | null;
   pendingRoute?: PendingAppRoute | null;
   onRouteConsumed?: (generation: number) => void;
+  onOpenRecord?: (recordId: string, mediaMs?: number) => void;
 }
 
 export default function TaskCenter({
@@ -32,6 +33,7 @@ export default function TaskCenter({
   currentSessionId,
   pendingRoute,
   onRouteConsumed,
+  onOpenRecord,
 }: Props) {
   const { t } = useTranslation('task');
 
@@ -44,15 +46,20 @@ export default function TaskCenter({
   // panels need to know "I just became active again" to reload. Passing
   // `isActive` straight through accomplishes that without a derived counter.
 
-  const handleDispatch = useCallback((t: Thought) => {
-    const request: TaskCreateRequest = {
-      initialMode: 'manual',
-      source: 'thought',
-      currentSessionId: currentSessionId ?? null,
-      thought: { id: t.id, content: t.content, tags: t.tags },
-    };
-    window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_TASK_CREATE, { detail: request }));
-  }, [currentSessionId]);
+  const handleDispatch = useCallback(
+    (t: Thought) => {
+      const request: TaskCreateRequest = {
+        initialMode: 'manual',
+        source: 'thought',
+        currentSessionId: currentSessionId ?? null,
+        thought: { id: t.id, content: t.content, tags: t.tags },
+      };
+      window.dispatchEvent(
+        new CustomEvent(CUSTOM_EVENTS.OPEN_TASK_CREATE, { detail: request }),
+      );
+    },
+    [currentSessionId],
+  );
 
   const handleDiscuss = useCallback((t: Thought, workspaceId: string) => {
     track('task_align_discuss', {});
@@ -77,7 +84,9 @@ export default function TaskCenter({
       source: 'task-center',
       currentSessionId: currentSessionId ?? null,
     };
-    window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_TASK_CREATE, { detail: request }));
+    window.dispatchEvent(
+      new CustomEvent(CUSTOM_EVENTS.OPEN_TASK_CREATE, { detail: request }),
+    );
   }, [currentSessionId]);
 
   // The DispatchTaskDialog returns the full Task, but for Phase 4 we only need
@@ -88,10 +97,10 @@ export default function TaskCenter({
     return (
       <div className="flex h-full items-center justify-center bg-[var(--paper)] px-8 text-center">
         <div className="max-w-md text-sm leading-relaxed text-[var(--ink-muted)]">
-          <p className="font-medium text-[var(--ink-secondary)]">{t('center.title')}</p>
-          <p className="mt-2">
-            {t('center.desktopOnly')}
+          <p className="font-medium text-[var(--ink-secondary)]">
+            {t('center.title')}
           </p>
+          <p className="mt-2">{t('center.desktopOnly')}</p>
           <p className="mt-2 text-[var(--ink-muted)]/70">
             {t('center.desktopUnavailable')}
           </p>
@@ -135,6 +144,7 @@ export default function TaskCenter({
             // wins by render order but the user sees a momentary caret
             // flicker on the thought input. (v0.1.69 cross-review W4)
             autoFocusInput={!!isActive && !pendingIntent?.autofocusSearch}
+            onOpenRecord={onOpenRecord}
           />
         </div>
 
@@ -155,7 +165,6 @@ export default function TaskCenter({
           />
         </div>
       </div>
-
     </div>
   );
 }

@@ -27,14 +27,20 @@ import {
   isPermissionModeForRuntimeIdentity,
   managedCodexProviderPermissionToRuntimePermission,
 } from '../shared/providerExecution';
-import { deriveCliToolKind, type CliToolRegistryEntry } from '../shared/types/cliTools';
+import {
+  deriveCliToolKind,
+  type CliToolRegistryEntry,
+} from '../shared/types/cliTools';
 import { workspacePathsEqual } from '../shared/workspacePath';
 import {
   IMAGE_UNDERSTANDING_TOOL_ID,
   SPEECH_RECOGNITION_TOOL_ID,
 } from '../shared/official-tools';
 import { removeProviderFromProxySettingsScope } from '../shared/proxyScope';
-import { removeCustomMcpServerCascade, McpRemovalError } from './services/mcp-removal';
+import {
+  removeCustomMcpServerCascade,
+  McpRemovalError,
+} from './services/mcp-removal';
 import { SDK_RESERVED_MCP_NAMES } from './agent-session';
 import {
   findMissingEnvKeys,
@@ -79,7 +85,10 @@ import { cancellableFetch, fetchWithGeneralProxy } from './utils/cancellation';
 import { ensureShellPath } from './utils/shell';
 import { buildCronScope } from './utils/cron-scope';
 import { readLoopbackJson } from './utils/loopback-response';
-import { ADMIN_LOOPBACK_TIMEOUT_MS, managementApi } from './utils/management-api-client';
+import {
+  ADMIN_LOOPBACK_TIMEOUT_MS,
+  managementApi,
+} from './utils/management-api-client';
 import { getCuseDiagnostics } from './utils/cuse-diagnostics';
 import { buildSessionExecutablePath } from './utils/session-executable-path';
 import { getSessionEngine } from './session-engine';
@@ -90,7 +99,10 @@ import {
   type PersistedAgentWorkspaceProjection,
 } from './utils/agent-workspace-identity';
 import { buildProactiveAgentTogglePatch } from '../shared/proactiveAgentPolicy';
-import { isReservedBuiltinBrowserMcpId, MANAGED_BROWSER_MCP_ID } from '../shared/browserTools';
+import {
+  isReservedBuiltinBrowserMcpId,
+  MANAGED_BROWSER_MCP_ID,
+} from '../shared/browserTools';
 
 // Long-running sidecar operations need their own budget. Anchored to the
 // sidecar's internal `FETCH_TIMEOUT_MS` (300s for tarball download) plus a
@@ -102,12 +114,23 @@ const SKILL_INSTALL_LOOPBACK_TIMEOUT_MS = 330_000;
 // transport outcome before Rust releases the Bridge/plugin-use registry.
 const AGENT_LIFECYCLE_LOOPBACK_TIMEOUT_MS = 300_000;
 import { resolve } from 'path';
-import { setMcpServers, setAgents, getMcpServers, getAgentState, getSidecarPort, forceReloadActiveSession } from './agent-session';
+import {
+  setMcpServers,
+  setAgents,
+  getMcpServers,
+  getAgentState,
+  getSidecarPort,
+  forceReloadActiveSession,
+} from './agent-session';
 import { loadEnabledAgents } from './agents/agent-loader';
 import { getHomeDirOrNull } from './utils/platform';
 import { join } from 'path';
 import { broadcast } from './sse';
-import { getCronTaskContext, markCronTaskExitRequested, CRON_TASK_EXIT_TEXT } from './tools/cron-tools';
+import {
+  getCronTaskContext,
+  markCronTaskExitRequested,
+  CRON_TASK_EXIT_TEXT,
+} from './tools/cron-tools';
 import { getImCronContext, getSessionCronContext } from './tools/im-cron-tool';
 import { getImMediaContext } from './tools/im-media-tool';
 import { buildReadMeContent } from './tools/generative-ui-tool';
@@ -161,7 +184,10 @@ async function sidecarSelf(
 ): Promise<{ status: number; json: Record<string, unknown> }> {
   const sidecarPort = getSidecarPort();
   if (!sidecarPort) {
-    return { status: 500, json: { success: false, error: 'Sidecar port not initialized' } };
+    return {
+      status: 500,
+      json: { success: false, error: 'Sidecar port not initialized' },
+    };
   }
   const url = `http://127.0.0.1:${sidecarPort}${path}`;
   const options: RequestInit = {
@@ -183,7 +209,10 @@ async function sidecarSelf(
     return { status: resp.status, json };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { status: 500, json: { success: false, error: `Sidecar self-call failed: ${msg}` } };
+    return {
+      status: 500,
+      json: { success: false, error: `Sidecar self-call failed: ${msg}` },
+    };
   }
 }
 
@@ -197,13 +226,17 @@ async function sidecarSelf(
  * deserve the hint propagation. Sites that already go through
  * `wrapMgmtResponse` don't need to change.
  */
-function mgmtError(resp: Record<string, unknown>, fallbackMsg: string): AdminResponse {
+function mgmtError(
+  resp: Record<string, unknown>,
+  fallbackMsg: string,
+): AdminResponse {
   const response: AdminResponse = {
     success: false,
     error: String(resp.error ?? fallbackMsg),
   };
   for (const field of ['code', 'suggestion', 'suggestedCommand'] as const) {
-    if (typeof resp[field] === 'string' && resp[field]) response[field] = resp[field];
+    if (typeof resp[field] === 'string' && resp[field])
+      response[field] = resp[field];
   }
   const hint = resp.recoveryHint;
   if (hint && typeof hint === 'object' && !Array.isArray(hint)) {
@@ -223,7 +256,8 @@ function wrapMgmtResponse(mgmt: Record<string, unknown>): AdminResponse {
     error: String(mgmt.error ?? 'Unknown error'),
   };
   for (const field of ['code', 'suggestion', 'suggestedCommand'] as const) {
-    if (typeof mgmt[field] === 'string' && mgmt[field]) response[field] = mgmt[field];
+    if (typeof mgmt[field] === 'string' && mgmt[field])
+      response[field] = mgmt[field];
   }
   // Propagate the `recoveryHint` if the Management API helper attached one
   // (currently only for unreachable-backend scenarios — see `managementApi`).
@@ -256,7 +290,11 @@ interface AdminResponse<T = unknown> {
    * this workspace" apart from "empty everywhere". Pair with `hint` (the
    * human/LLM-readable note). See `buildCronScope`.
    */
-  scope?: { workspacePath: string; source: 'explicit' | 'default'; visibility: string };
+  scope?: {
+    workspacePath: string;
+    source: 'explicit' | 'default';
+    visibility: string;
+  };
   /**
    * Structured recovery path for recoverable errors. The CLI renders this
    * under the error line as `→ Run: <command>` so the caller (AI or human)
@@ -280,7 +318,7 @@ export function handleMcpList(): AdminResponse {
   const allServers = getAllMcpServers(config);
   const enabledIds = new Set(getEnabledMcpServerIds(config));
 
-  const data = allServers.map(s => ({
+  const data = allServers.map((s) => ({
     id: s.id,
     name: s.name,
     type: s.type,
@@ -303,7 +341,9 @@ export function handleMcpList(): AdminResponse {
  * whole list. Env values are redacted so an AI transcript never leaks API keys
  * (same redaction rule the model-list endpoint already uses).
  */
-export async function handleMcpShow(payload: { id?: string }): Promise<AdminResponse> {
+export async function handleMcpShow(payload: {
+  id?: string;
+}): Promise<AdminResponse> {
   const id = payload.id;
   if (!id) {
     return {
@@ -317,7 +357,7 @@ export async function handleMcpShow(payload: { id?: string }): Promise<AdminResp
   }
   const config = loadConfig();
   const allServers = getAllMcpServers(config);
-  const server = allServers.find(s => s.id === id);
+  const server = allServers.find((s) => s.id === id);
   if (!server) {
     return {
       success: false,
@@ -334,18 +374,23 @@ export async function handleMcpShow(payload: { id?: string }): Promise<AdminResp
   let projectEnabled: boolean | null = null;
   if (workspacePath) {
     const projects = loadProjects();
-    const project = projects.find(p => workspacePathsEqual(p.path, workspacePath));
+    const project = projects.find((p) =>
+      workspacePathsEqual(p.path, workspacePath),
+    );
     projectEnabled = new Set(project?.mcpEnabledServers ?? []).has(id);
   }
 
   // Redact env values — mirrors what `model list` does for provider api keys.
-  const env = server.env ? Object.fromEntries(
-    Object.entries(server.env).map(([k, v]) => [k, redactSecret(v)]),
-  ) : undefined;
-
-  const cuseDiagnostics = server.command === '__bundled_cuse__'
-    ? await getCuseDiagnostics({ workspacePath, includeR2Latest: false })
+  const env = server.env
+    ? Object.fromEntries(
+        Object.entries(server.env).map(([k, v]) => [k, redactSecret(v)]),
+      )
     : undefined;
+
+  const cuseDiagnostics =
+    server.command === '__bundled_cuse__'
+      ? await getCuseDiagnostics({ workspacePath, includeR2Latest: false })
+      : undefined;
 
   return {
     success: true,
@@ -362,9 +407,14 @@ export async function handleMcpShow(payload: { id?: string }): Promise<AdminResp
       args: server.args,
       url: server.url,
       // Headers (for http/sse) and env (for stdio) — redacted values only.
-      headers: server.headers ? Object.fromEntries(
-        Object.entries(server.headers).map(([k, v]) => [k, redactSecret(v)]),
-      ) : undefined,
+      headers: server.headers
+        ? Object.fromEntries(
+            Object.entries(server.headers).map(([k, v]) => [
+              k,
+              redactSecret(v),
+            ]),
+          )
+        : undefined,
       env,
       enabled: {
         global: globalEnabled.has(id),
@@ -388,14 +438,20 @@ export async function handleMcpAdd(payload: {
   if (!s.id) return { success: false, error: 'Missing required field: id' };
   if (!s.type) return { success: false, error: 'Missing required field: type' };
   if (isReservedBuiltinBrowserMcpId(s.id)) {
-    return { success: false, error: `MCP ID "${s.id}" is reserved by a built-in Browser tool` };
+    return {
+      success: false,
+      error: `MCP ID "${s.id}" is reserved by a built-in Browser tool`,
+    };
   }
 
   // Reject SDK reserved MCP names — these cause the Claude Agent SDK to crash (exit code 1)
   // with "Invalid MCP configuration: X is a reserved MCP name."
   const normalizedId = s.id.replace(/[^a-zA-Z0-9_-]/g, '_');
   if (SDK_RESERVED_MCP_NAMES.includes(normalizedId)) {
-    return { success: false, error: `MCP ID "${s.id}" 与 Claude SDK 内置保留名冲突，请使用其他名称（如 "my-${s.id}"）` };
+    return {
+      success: false,
+      error: `MCP ID "${s.id}" 与 Claude SDK 内置保留名冲突，请使用其他名称（如 "my-${s.id}"）`,
+    };
   }
 
   if (s.type === 'stdio' && !s.command) {
@@ -423,15 +479,19 @@ export async function handleMcpAdd(payload: {
   };
 
   if (dryRun) {
-    if ((loadConfig().mcpServers ?? []).some(existing => existing.id === server.id)) {
+    if (
+      (loadConfig().mcpServers ?? []).some(
+        (existing) => existing.id === server.id,
+      )
+    ) {
       return mcpAlreadyExistsResponse(server.id);
     }
     return { success: true, dryRun: true, preview: server };
   }
 
   let alreadyExists = false;
-  await atomicModifyConfig(c => {
-    if ((c.mcpServers ?? []).some(existing => existing.id === server.id)) {
+  await atomicModifyConfig((c) => {
+    if ((c.mcpServers ?? []).some((existing) => existing.id === server.id)) {
       alreadyExists = true;
       return c;
     }
@@ -450,7 +510,9 @@ export async function handleMcpAdd(payload: {
   };
 }
 
-export async function handleMcpRemove(payload: { id: string }): Promise<AdminResponse> {
+export async function handleMcpRemove(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
 
@@ -463,29 +525,39 @@ export async function handleMcpRemove(payload: { id: string }): Promise<AdminRes
       success: false,
       error: err instanceof Error ? err.message : String(err),
     };
-    if (err instanceof McpRemovalError && err.recoveryHint && typeof err.recoveryHint === 'object') {
+    if (
+      err instanceof McpRemovalError &&
+      err.recoveryHint &&
+      typeof err.recoveryHint === 'object'
+    ) {
       response.recoveryHint = err.recoveryHint as RecoveryHint;
     }
     return response;
   }
 }
 
-export async function handleMcpEnable(payload: { id: string; scope?: string }): Promise<AdminResponse> {
+export async function handleMcpEnable(payload: {
+  id: string;
+  scope?: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   const scope = parseMcpScope(payload.scope);
   if (!id) return { success: false, error: 'Missing required field: id' };
   if (!scope) {
-    return { success: false, error: "Invalid scope. Use 'global', 'project', or 'both'." };
+    return {
+      success: false,
+      error: "Invalid scope. Use 'global', 'project', or 'both'.",
+    };
   }
 
   // Verify server exists
   const allServers = getAllMcpServers();
-  if (!allServers.find(s => s.id === id)) {
+  if (!allServers.find((s) => s.id === id)) {
     return { success: false, error: `MCP server '${id}' not found` };
   }
 
   if (scope === 'global' || scope === 'both') {
-    await atomicModifyConfig(c => {
+    await atomicModifyConfig((c) => {
       const enabled = new Set(c.mcpEnabledServers || []);
       enabled.add(id);
       return { ...c, mcpEnabledServers: Array.from(enabled) };
@@ -502,9 +574,10 @@ export async function handleMcpEnable(payload: { id: string; scope?: string }): 
 
   await notifyMcpChange('enable', id);
   const scopeLabel = scope === 'both' ? 'global + project' : scope;
-  const skipHint = projectMutation && projectMutation.status !== 'updated'
-    ? ` Project scope skipped: ${projectMcpMutationReason(projectMutation)}.`
-    : '';
+  const skipHint =
+    projectMutation && projectMutation.status !== 'updated'
+      ? ` Project scope skipped: ${projectMcpMutationReason(projectMutation)}.`
+      : '';
   return {
     success: true,
     data: { id, scope: scopeLabel, projectScope: projectMutation?.status },
@@ -512,16 +585,22 @@ export async function handleMcpEnable(payload: { id: string; scope?: string }): 
   };
 }
 
-export async function handleMcpDisable(payload: { id: string; scope?: string }): Promise<AdminResponse> {
+export async function handleMcpDisable(payload: {
+  id: string;
+  scope?: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   const scope = parseMcpScope(payload.scope);
   if (!id) return { success: false, error: 'Missing required field: id' };
   if (!scope) {
-    return { success: false, error: "Invalid scope. Use 'global', 'project', or 'both'." };
+    return {
+      success: false,
+      error: "Invalid scope. Use 'global', 'project', or 'both'.",
+    };
   }
 
   if (scope === 'global' || scope === 'both') {
-    await atomicModifyConfig(c => {
+    await atomicModifyConfig((c) => {
       const enabled = new Set(c.mcpEnabledServers || []);
       enabled.delete(id);
       return { ...c, mcpEnabledServers: Array.from(enabled) };
@@ -537,9 +616,10 @@ export async function handleMcpDisable(payload: { id: string; scope?: string }):
   }
 
   await notifyMcpChange('disable', id);
-  const skipHint = projectMutation && projectMutation.status !== 'updated'
-    ? ` Project scope skipped: ${projectMcpMutationReason(projectMutation)}.`
-    : '';
+  const skipHint =
+    projectMutation && projectMutation.status !== 'updated'
+      ? ` Project scope skipped: ${projectMcpMutationReason(projectMutation)}.`
+      : '';
   return {
     success: true,
     data: { id, projectScope: projectMutation?.status },
@@ -570,20 +650,24 @@ export async function handleMcpEnv(payload: {
     if (!env || Object.keys(env).length === 0) {
       return { success: false, error: 'No environment variables provided' };
     }
-    await atomicModifyConfig(c => {
+    await atomicModifyConfig((c) => {
       const mcpServerEnv = { ...(c.mcpServerEnv || {}) };
       mcpServerEnv[id] = { ...(mcpServerEnv[id] || {}), ...env };
       return { ...c, mcpServerEnv };
     });
     await notifyMcpChange('env', id);
-    return { success: true, data: { id, keys: Object.keys(env) }, hint: 'Environment variables updated.' };
+    return {
+      success: true,
+      data: { id, keys: Object.keys(env) },
+      hint: 'Environment variables updated.',
+    };
   }
 
   if (action === 'delete') {
     if (!env || Object.keys(env).length === 0) {
       return { success: false, error: 'No keys specified for deletion' };
     }
-    await atomicModifyConfig(c => {
+    await atomicModifyConfig((c) => {
       const mcpServerEnv = { ...(c.mcpServerEnv || {}) };
       if (mcpServerEnv[id]) {
         // Deep-copy per-server env to avoid mutating the original config object
@@ -603,19 +687,28 @@ export async function handleMcpEnv(payload: {
     return { success: true, data: { id, deletedKeys: Object.keys(env) } };
   }
 
-  return { success: false, error: `Unknown action: ${action}. Use 'set', 'get', or 'delete'.` };
+  return {
+    success: false,
+    error: `Unknown action: ${action}. Use 'set', 'get', or 'delete'.`,
+  };
 }
 
-export async function handleMcpTest(payload: { id: string }): Promise<AdminResponse> {
+export async function handleMcpTest(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
 
   const allServers = getAllMcpServers();
-  const server = allServers.find(s => s.id === id);
+  const server = allServers.find((s) => s.id === id);
   if (!server) return { success: false, error: `MCP server '${id}' not found` };
 
   const transportType = (server as { type?: unknown }).type;
-  if (transportType !== 'stdio' && transportType !== 'sse' && transportType !== 'http') {
+  if (
+    transportType !== 'stdio' &&
+    transportType !== 'sse' &&
+    transportType !== 'http'
+  ) {
     return {
       success: false,
       error: `MCP server '${id}' has unsupported transport type '${String(transportType)}'`,
@@ -624,10 +717,16 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
 
   // Validate config completeness
   if (server.type === 'stdio' && !server.command) {
-    return { success: false, error: `MCP server '${id}' has no command configured` };
+    return {
+      success: false,
+      error: `MCP server '${id}' has no command configured`,
+    };
   }
   if ((server.type === 'sse' || server.type === 'http') && !server.url) {
-    return { success: false, error: `MCP server '${id}' has no URL configured` };
+    return {
+      success: false,
+      error: `MCP server '${id}' has no URL configured`,
+    };
   }
 
   // Application Browser Host: __browser_host__ is a product-owned projection
@@ -635,9 +734,14 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
   // produce the misleading `spawn __browser_host__ ENOENT`. Acquiring the
   // current Session's capability is the non-disruptive readiness check: opening
   // a second MCP connection here would retire the live Session connection.
-  if (server.id === MANAGED_BROWSER_MCP_ID && server.command === '__browser_host__') {
+  if (
+    server.id === MANAGED_BROWSER_MCP_ID &&
+    server.command === '__browser_host__'
+  ) {
     try {
-      const { acquireBrowserCapability } = await import('./browser-host/capability-client');
+      const { acquireBrowserCapability } = await import(
+        './browser-host/capability-client'
+      );
       const capability = await acquireBrowserCapability();
       return {
         success: true,
@@ -662,7 +766,8 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
         },
         recoveryHint: {
           recoveryCommand: 'myagents mcp test myagents-browser',
-          message: 'Run this check from an active MyAgents Agent Session after the application Browser Host is ready.',
+          message:
+            'Run this check from an active MyAgents Agent Session after the application Browser Host is ready.',
         },
       };
     }
@@ -675,10 +780,15 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
   // import of './tools/builtin-mcp-meta', which already ran before any admin
   // handler can fire — no need to force-import META here.
   if (server.command === '__builtin__') {
-    const { getBuiltinMcpInstance } = await import('./tools/builtin-mcp-registry');
+    const { getBuiltinMcpInstance } = await import(
+      './tools/builtin-mcp-registry'
+    );
     const entryPromise = getBuiltinMcpInstance(server.id);
     if (!entryPromise) {
-      return { success: false, error: `Built-in MCP '${server.id}' not registered` };
+      return {
+        success: false,
+        error: `Built-in MCP '${server.id}' not registered`,
+      };
     }
     // Don't swallow factory/import errors — a failing `myagents mcp test` must
     // surface as "failure" so users/agents diagnose the actual issue instead of
@@ -688,7 +798,10 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
       if (entry.validate) {
         const validationError = await entry.validate(server.env || {});
         if (validationError) {
-          const errMsg = typeof validationError === 'string' ? validationError : JSON.stringify(validationError);
+          const errMsg =
+            typeof validationError === 'string'
+              ? validationError
+              : JSON.stringify(validationError);
           return { success: false, error: errMsg };
         }
       }
@@ -698,7 +811,11 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
         error: `Built-in MCP '${server.id}' load failed: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
-    return { success: true, data: { id, type: 'builtin' }, hint: 'Built-in MCP validated.' };
+    return {
+      success: true,
+      data: { id, type: 'builtin' },
+      hint: 'Built-in MCP validated.',
+    };
   }
 
   // Bundled cuse (computer-use) binary: resolve via runtime helper and skip
@@ -725,9 +842,10 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
         data: { id, type: 'stdio', cuse },
       };
     }
-    const warningHint = cuse.warnings.length > 0
-      ? `\nWarnings:\n${cuse.warnings.map(w => `- ${w}`).join('\n')}`
-      : '';
+    const warningHint =
+      cuse.warnings.length > 0
+        ? `\nWarnings:\n${cuse.warnings.map((w) => `- ${w}`).join('\n')}`
+        : '';
     return {
       success: true,
       data: { id, type: 'stdio', cuse },
@@ -747,15 +865,19 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
       testMcpServerConnection,
     } = await import('./utils/mcp-connection-test');
     const deadlineAt = Date.now() + MCP_CONNECTION_TEST_TIMEOUT_MS;
-    const operation = (async () => {
+    const operation = async () => {
       let probeServer: McpServerDefinition = server;
       if (server.type === 'sse' || server.type === 'http') {
         const { resolveAuthHeaders } = await import('./mcp-oauth');
         const configHeaders = server.headers || {};
         // Match the Session path exactly: only the two canonical spellings with
         // a non-empty value suppress stored OAuth injection.
-        const hasExplicitAuth = Boolean(configHeaders.Authorization || configHeaders.authorization);
-        const oauthHeaders = hasExplicitAuth ? {} : await resolveAuthHeaders(server.id);
+        const hasExplicitAuth = Boolean(
+          configHeaders.Authorization || configHeaders.authorization,
+        );
+        const oauthHeaders = hasExplicitAuth
+          ? {}
+          : await resolveAuthHeaders(server.id);
         usedStoredOAuth = typeof oauthHeaders.Authorization === 'string';
         probeServer = {
           ...server,
@@ -774,7 +896,7 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
         executionEnv: { [executablePath.key]: executablePath.value },
         cwd: getCurrentWorkspacePath(),
       });
-    });
+    };
     const overallDeadline = new Promise<never>((_, reject) => {
       operationTimer = setTimeout(() => {
         reject(new McpConnectionTestError('Connection timed out (15s)'));
@@ -782,7 +904,9 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
       operationTimer.unref?.();
     });
     const result = await Promise.race([operation(), overallDeadline]);
-    const identity = [result.serverName, result.serverVersion].filter(Boolean).join(' ');
+    const identity = [result.serverName, result.serverVersion]
+      .filter(Boolean)
+      .join(' ');
     return {
       success: true,
       data: {
@@ -796,14 +920,21 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
     };
   } catch (err) {
     const probeError = err as { message?: unknown; statusCode?: unknown };
-    const statusCode = typeof probeError.statusCode === 'number' ? probeError.statusCode : undefined;
+    const statusCode =
+      typeof probeError.statusCode === 'number'
+        ? probeError.statusCode
+        : undefined;
     if (statusCode === 401 || statusCode === 403) {
       const hint = usedStoredOAuth
         ? 'OAuth token may be expired or revoked. Try re-authorizing.'
         : 'This server may require OAuth authorization. Use Settings UI or `myagents mcp oauth start`.';
-      return { success: false, error: `Authentication failed (HTTP ${statusCode}). ${hint}` };
+      return {
+        success: false,
+        error: `Authentication failed (HTTP ${statusCode}). ${hint}`,
+      };
     }
-    const message = typeof probeError.message === 'string' ? probeError.message : String(err);
+    const message =
+      typeof probeError.message === 'string' ? probeError.message : String(err);
     return { success: false, error: `MCP initialize failed: ${message}` };
   } finally {
     if (operationTimer) clearTimeout(operationTimer);
@@ -817,16 +948,20 @@ export async function handleMcpTest(payload: { id: string }): Promise<AdminRespo
 /** Resolve MCP server URL from config by ID */
 function getMcpServerUrl(id: string): { url: string } | { error: string } {
   const allServers = getAllMcpServers();
-  const server = allServers.find(s => s.id === id);
+  const server = allServers.find((s) => s.id === id);
   if (!server) return { error: `MCP server '${id}' not found` };
   if (server.type !== 'sse' && server.type !== 'http') {
-    return { error: `MCP server '${id}' is type '${server.type}' — OAuth only applies to sse/http servers.` };
+    return {
+      error: `MCP server '${id}' is type '${server.type}' — OAuth only applies to sse/http servers.`,
+    };
   }
   if (!server.url) return { error: `MCP server '${id}' has no URL configured` };
   return { url: server.url };
 }
 
-export async function handleMcpOAuthDiscover(payload: { id: string }): Promise<AdminResponse> {
+export async function handleMcpOAuthDiscover(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
   const resolved = getMcpServerUrl(id);
@@ -837,7 +972,10 @@ export async function handleMcpOAuthDiscover(payload: { id: string }): Promise<A
     const result = await probeOAuthRequirement(id, resolved.url, true);
     return { success: true, data: { id, ...result } };
   } catch (err) {
-    return { success: false, error: `OAuth discovery failed: ${err instanceof Error ? err.message : String(err)}` };
+    return {
+      success: false,
+      error: `OAuth discovery failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
@@ -855,28 +993,47 @@ export async function handleMcpOAuthStart(payload: {
 
   try {
     const { authorizeServer } = await import('./mcp-oauth');
-    const manualConfig = payload.clientId ? {
-      clientId: payload.clientId,
-      clientSecret: payload.clientSecret,
-      scopes: payload.scopes ? payload.scopes.split(/[,\s]+/).filter(Boolean) : undefined,
-      callbackPort: payload.callbackPort,
-    } : undefined;
+    const manualConfig = payload.clientId
+      ? {
+          clientId: payload.clientId,
+          clientSecret: payload.clientSecret,
+          scopes: payload.scopes
+            ? payload.scopes.split(/[,\s]+/).filter(Boolean)
+            : undefined,
+          callbackPort: payload.callbackPort,
+        }
+      : undefined;
 
-    const { authUrl, waitForCompletion } = await authorizeServer(id, resolved.url, manualConfig);
+    const { authUrl, waitForCompletion } = await authorizeServer(
+      id,
+      resolved.url,
+      manualConfig,
+    );
 
     // Fire-and-forget: log completion but don't block the HTTP response.
     // CLI should poll `mcp oauth status <id>` to check completion.
-    waitForCompletion.then(ok => {
-      console.log(`[admin] OAuth ${ok ? 'completed' : 'failed/cancelled'} for MCP ${id}`);
+    waitForCompletion.then((ok) => {
+      console.log(
+        `[admin] OAuth ${ok ? 'completed' : 'failed/cancelled'} for MCP ${id}`,
+      );
     });
 
-    return { success: true, data: { id, authUrl }, hint: 'Authorization started. Complete in browser, then check with `mcp oauth status`.' };
+    return {
+      success: true,
+      data: { id, authUrl },
+      hint: 'Authorization started. Complete in browser, then check with `mcp oauth status`.',
+    };
   } catch (err) {
-    return { success: false, error: `OAuth start failed: ${err instanceof Error ? err.message : String(err)}` };
+    return {
+      success: false,
+      error: `OAuth start failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
-export async function handleMcpOAuthStatus(payload: { id: string }): Promise<AdminResponse> {
+export async function handleMcpOAuthStatus(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
 
@@ -885,20 +1042,32 @@ export async function handleMcpOAuthStatus(payload: { id: string }): Promise<Adm
     const result = getOAuthStatus(id);
     return { success: true, data: { id, ...result } };
   } catch (err) {
-    return { success: false, error: `OAuth status check failed: ${err instanceof Error ? err.message : String(err)}` };
+    return {
+      success: false,
+      error: `OAuth status check failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
-export async function handleMcpOAuthRevoke(payload: { id: string }): Promise<AdminResponse> {
+export async function handleMcpOAuthRevoke(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
 
   try {
     const { revokeAuthorization } = await import('./mcp-oauth');
     await revokeAuthorization(id);
-    return { success: true, data: { id }, hint: 'OAuth authorization revoked.' };
+    return {
+      success: true,
+      data: { id },
+      hint: 'OAuth authorization revoked.',
+    };
   } catch (err) {
-    return { success: false, error: `OAuth revoke failed: ${err instanceof Error ? err.message : String(err)}` };
+    return {
+      success: false,
+      error: `OAuth revoke failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
@@ -926,11 +1095,20 @@ export async function handleVisionAnalyze(payload: {
 }): Promise<AdminResponse> {
   const rawImages = Array.isArray(payload.images)
     ? payload.images
-    : (payload.image !== undefined ? [payload.image] : []);
-  const images = rawImages.filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
-  const prompt = typeof payload.prompt === 'string' ? payload.prompt : undefined;
-  const promptFile = typeof payload.promptFile === 'string' ? payload.promptFile : undefined;
-  const { analyzeImages, visionErrorResponse } = await import('./official-tools/vision');
+    : payload.image !== undefined
+      ? [payload.image]
+      : [];
+  const images = rawImages.filter(
+    (value): value is string =>
+      typeof value === 'string' && value.trim().length > 0,
+  );
+  const prompt =
+    typeof payload.prompt === 'string' ? payload.prompt : undefined;
+  const promptFile =
+    typeof payload.promptFile === 'string' ? payload.promptFile : undefined;
+  const { analyzeImages, visionErrorResponse } = await import(
+    './official-tools/vision'
+  );
   try {
     const sessionContext = getSessionEngine().getCurrentSessionContext();
     const result = await analyzeImages({
@@ -963,25 +1141,37 @@ export function handleModelList(): AdminResponse {
   const verifyStatus = config.providerVerifyStatus ?? {};
 
   const allProviders = getAllEffectiveProviders(config);
-  const data = allProviders.map(p => {
+  const data = allProviders.map((p) => {
     const id = String(p.id);
     const cfg = p.config as Record<string, unknown> | undefined;
-    const models = (Array.isArray(p.models) ? p.models : []).flatMap(model => {
-      if (!model || typeof model !== 'object') return [];
-      const record = model as Record<string, unknown>;
-      const modelId = typeof record.model === 'string' ? record.model.trim() : '';
-      if (!modelId) return [];
-      return [{
-        model: modelId,
-        modelName: typeof record.modelName === 'string' && record.modelName.trim()
-          ? record.modelName
-          : modelId,
-      }];
-    });
-    const configuredPrimary = (config.providerPrimaryModels as Record<string, string> | undefined)?.[id];
-    const primaryModel = configuredPrimary && models.some(model => model.model === configuredPrimary)
-      ? configuredPrimary
-      : (typeof p.primaryModel === 'string' ? p.primaryModel : models[0]?.model);
+    const models = (Array.isArray(p.models) ? p.models : []).flatMap(
+      (model) => {
+        if (!model || typeof model !== 'object') return [];
+        const record = model as Record<string, unknown>;
+        const modelId =
+          typeof record.model === 'string' ? record.model.trim() : '';
+        if (!modelId) return [];
+        return [
+          {
+            model: modelId,
+            modelName:
+              typeof record.modelName === 'string' && record.modelName.trim()
+                ? record.modelName
+                : modelId,
+          },
+        ];
+      },
+    );
+    const configuredPrimary = (
+      config.providerPrimaryModels as Record<string, string> | undefined
+    )?.[id];
+    const primaryModel =
+      configuredPrimary &&
+      models.some((model) => model.model === configuredPrimary)
+        ? configuredPrimary
+        : typeof p.primaryModel === 'string'
+          ? p.primaryModel
+          : models[0]?.model;
     return {
       id,
       name: String(p.name),
@@ -991,7 +1181,9 @@ export function handleModelList(): AdminResponse {
       protocol: p.apiProtocol ? String(p.apiProtocol) : 'anthropic',
       enabled: p.enabled !== false,
       hasApiKey: !!apiKeys[id],
-      status: (verifyStatus[id] as unknown as Record<string, unknown>)?.status ?? 'not-set',
+      status:
+        (verifyStatus[id] as unknown as Record<string, unknown>)?.status ??
+        'not-set',
       primaryModel,
       models,
     };
@@ -1023,41 +1215,62 @@ async function notifyAppConfigChanged(
   }
 }
 
-async function notifyModelConfigChanged(action: string, id: string): Promise<void> {
+async function notifyModelConfigChanged(
+  action: string,
+  id: string,
+): Promise<void> {
   await notifyAppConfigChanged('model', action, id);
 }
 
-export async function handleModelSetKey(payload: { id: string; apiKey: string }): Promise<AdminResponse> {
+export async function handleModelSetKey(payload: {
+  id: string;
+  apiKey: string;
+}): Promise<AdminResponse> {
   const { id, apiKey } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
-  if (!apiKey) return { success: false, error: 'Missing required field: apiKey' };
+  if (!apiKey)
+    return { success: false, error: 'Missing required field: apiKey' };
 
-  await atomicModifyConfig(c => withAvailableProvidersProjection({
-    ...c,
-    providerApiKeys: { ...(c.providerApiKeys || {}), [id]: apiKey },
-  }));
+  await atomicModifyConfig((c) =>
+    withAvailableProvidersProjection({
+      ...c,
+      providerApiKeys: { ...(c.providerApiKeys || {}), [id]: apiKey },
+    }),
+  );
 
   await notifyModelConfigChanged('set-key', id);
   return { success: true, data: { id }, hint: `API key saved for ${id}.` };
 }
 
-export async function handleModelSetDefault(payload: { id: string }): Promise<AdminResponse> {
+export async function handleModelSetDefault(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
   if (isProviderDisabled(id)) {
-    return { success: false, error: `Provider '${id}' is disabled. Re-enable it before setting it as default.` };
+    return {
+      success: false,
+      error: `Provider '${id}' is disabled. Re-enable it before setting it as default.`,
+    };
   }
 
-  await atomicModifyConfig(c => ({
+  await atomicModifyConfig((c) => ({
     ...c,
     defaultProviderId: id,
   }));
 
   await notifyModelConfigChanged('set-default', id);
-  return { success: true, data: { id }, hint: `Default provider set to ${id}.` };
+  return {
+    success: true,
+    data: { id },
+    hint: `Default provider set to ${id}.`,
+  };
 }
 
-export async function handleModelVerify(payload: { id: string; model?: string }): Promise<AdminResponse> {
+export async function handleModelVerify(payload: {
+  id: string;
+  model?: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
 
@@ -1068,30 +1281,47 @@ export async function handleModelVerify(payload: { id: string; model?: string })
   const config = loadConfig();
   const provider = findEffectiveProvider(id, config);
   if (!provider) {
-    return { success: false, error: `Provider '${id}' not found in presets or custom providers.` };
+    return {
+      success: false,
+      error: `Provider '${id}' not found in presets or custom providers.`,
+    };
   }
 
   const providerConfig = (provider.config ?? {}) as Record<string, unknown>;
   const baseUrl = String(providerConfig.baseUrl ?? '');
   const authType = String(provider.authType ?? 'both');
-  const apiProtocol = provider.apiProtocol as 'anthropic' | 'openai' | undefined;
-  const userPrimary = (config.providerPrimaryModels as Record<string, string> | undefined)?.[id];
-  const verifyModel = payload.model ?? userPrimary ?? String(provider.primaryModel ?? '');
+  const apiProtocol = provider.apiProtocol as
+    | 'anthropic'
+    | 'openai'
+    | undefined;
+  const userPrimary = (
+    config.providerPrimaryModels as Record<string, string> | undefined
+  )?.[id];
+  const verifyModel =
+    payload.model ?? userPrimary ?? String(provider.primaryModel ?? '');
 
   const persistVerified = async (): Promise<AdminResponse> => {
-    await atomicModifyConfig(c => withAvailableProvidersProjection({
-      ...c,
-      providerVerifyStatus: {
-        ...(c.providerVerifyStatus ?? {}),
-        [id]: { status: 'valid', verifiedAt: new Date().toISOString() },
-      },
-    }));
+    await atomicModifyConfig((c) =>
+      withAvailableProvidersProjection({
+        ...c,
+        providerVerifyStatus: {
+          ...(c.providerVerifyStatus ?? {}),
+          [id]: { status: 'valid', verifiedAt: new Date().toISOString() },
+        },
+      }),
+    );
     await notifyModelConfigChanged('verify', id);
-    return { success: true, data: { id, model: verifyModel }, hint: 'Verification successful.' };
+    return {
+      success: true,
+      data: { id, model: verifyModel },
+      hint: 'Verification successful.',
+    };
   };
 
   try {
-    const subscriptionAuth = provider.subscriptionAuth as { kind?: string } | undefined;
+    const subscriptionAuth = provider.subscriptionAuth as
+      | { kind?: string }
+      | undefined;
     if (provider.type === 'subscription') {
       if (subscriptionAuth?.kind === 'sdk-native') {
         const { verifySubscription } = await import('./provider-verify');
@@ -1109,7 +1339,8 @@ export async function handleModelVerify(payload: { id: string; model?: string })
           code: 'SUBSCRIPTION_AUTH_OWNER_REQUIRED',
           error: `Provider '${id}' is authenticated by its external runtime, not by a MyAgents API key.`,
           recoveryHint: {
-            message: 'Open Settings → Model Providers → Codex (订阅), then complete the MyAgents-managed login there.',
+            message:
+              'Open Settings → Model Providers → Codex (订阅), then complete the MyAgents-managed login there.',
           },
         };
       }
@@ -1119,23 +1350,34 @@ export async function handleModelVerify(payload: { id: string; model?: string })
         error: `Provider '${id}' uses a host-managed subscription login, not a MyAgents API key.`,
         recoveryHint: {
           recoveryCommand: 'myagents model list --json',
-          message: 'Open Settings → Model Providers, complete the subscription login there, and verify it from that screen.',
+          message:
+            'Open Settings → Model Providers, complete the subscription login there, and verify it from that screen.',
         },
       };
     }
 
     const apiKey = (config.providerApiKeys ?? {})[id];
     if (!apiKey) {
-      return { success: false, error: `No API key set for provider '${id}'. Use 'myagents model set-key' first.` };
+      return {
+        success: false,
+        error: `No API key set for provider '${id}'. Use 'myagents model set-key' first.`,
+      };
     }
 
     const { verifyProviderViaSdk } = await import('./provider-verify');
     const result = await verifyProviderViaSdk(
       id,
-      baseUrl, apiKey, authType, verifyModel,
+      baseUrl,
+      apiKey,
+      authType,
+      verifyModel,
       apiProtocol,
       provider.maxOutputTokens ? Number(provider.maxOutputTokens) : undefined,
-      provider.maxOutputTokensParamName as 'max_tokens' | 'max_completion_tokens' | 'max_output_tokens' | undefined,
+      provider.maxOutputTokensParamName as
+        | 'max_tokens'
+        | 'max_completion_tokens'
+        | 'max_output_tokens'
+        | undefined,
       provider.upstreamFormat as 'chat_completions' | 'responses' | undefined,
     );
 
@@ -1143,9 +1385,16 @@ export async function handleModelVerify(payload: { id: string; model?: string })
       return await persistVerified();
     }
 
-    return { success: false, error: result.error ?? 'Verification failed', data: { id, detail: result.detail } };
+    return {
+      success: false,
+      error: result.error ?? 'Verification failed',
+      data: { id, detail: result.detail },
+    };
   } catch (err) {
-    return { success: false, error: `Verification error: ${err instanceof Error ? err.message : String(err)}` };
+    return {
+      success: false,
+      error: `Verification error: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
@@ -1158,21 +1407,37 @@ export async function handleModelAdd(payload: {
 
   // Validate required fields
   if (!p.id) return { success: false, error: 'Missing required field: id' };
-  if (!isValidId(String(p.id))) return { success: false, error: 'Invalid id: only alphanumeric, hyphens, and underscores allowed' };
+  if (!isValidId(String(p.id)))
+    return {
+      success: false,
+      error: 'Invalid id: only alphanumeric, hyphens, and underscores allowed',
+    };
   if (!p.name) return { success: false, error: 'Missing required field: name' };
-  if (!p.baseUrl) return { success: false, error: 'Missing required field: baseUrl (API endpoint)' };
+  if (!p.baseUrl)
+    return {
+      success: false,
+      error: 'Missing required field: baseUrl (API endpoint)',
+    };
   if (!p.models || !Array.isArray(p.models) || p.models.length === 0) {
-    return { success: false, error: 'Missing required field: models (at least one model ID required)' };
+    return {
+      success: false,
+      error: 'Missing required field: models (at least one model ID required)',
+    };
   }
 
   // Build model entities
   const modelSeries = (p.modelSeries as string) || String(p.id);
-  const expandedModelIds = (p.models as unknown[]).flatMap(model => splitProviderModelInput(String(model)));
+  const expandedModelIds = (p.models as unknown[]).flatMap((model) =>
+    splitProviderModelInput(String(model)),
+  );
   if (expandedModelIds.length === 0) {
-    return { success: false, error: 'Missing required field: models (at least one model ID required)' };
+    return {
+      success: false,
+      error: 'Missing required field: models (at least one model ID required)',
+    };
   }
   const modelNameInputs = Array.isArray(p.modelNames)
-    ? (p.modelNames as unknown[]).map(name => String(name).trim())
+    ? (p.modelNames as unknown[]).map((name) => String(name).trim())
     : [];
   const seenModelIds = new Set<string>();
   const uniqueModelRefs = expandedModelIds.flatMap((model, expandedIndex) => {
@@ -1180,18 +1445,21 @@ export async function handleModelAdd(payload: {
     seenModelIds.add(model);
     return [{ model, expandedIndex }];
   });
-  const modelNamesUseExpandedIndex = modelNameInputs.length === expandedModelIds.length;
-  const models = uniqueModelRefs.map(({ model, expandedIndex }, uniqueIndex) => {
-    const modelName = modelNamesUseExpandedIndex
-      ? modelNameInputs[expandedIndex]
-      : modelNameInputs[uniqueIndex];
-    return {
-      model,
-      modelName: modelName || model,
-      modelSeries,
-    };
-  });
-  const modelIds = models.map(model => model.model);
+  const modelNamesUseExpandedIndex =
+    modelNameInputs.length === expandedModelIds.length;
+  const models = uniqueModelRefs.map(
+    ({ model, expandedIndex }, uniqueIndex) => {
+      const modelName = modelNamesUseExpandedIndex
+        ? modelNameInputs[expandedIndex]
+        : modelNameInputs[uniqueIndex];
+      return {
+        model,
+        modelName: modelName || model,
+        modelSeries,
+      };
+    },
+  );
+  const modelIds = models.map((model) => model.model);
 
   // Build aliases
   let modelAliases: Record<string, string> | undefined;
@@ -1199,17 +1467,26 @@ export async function handleModelAdd(payload: {
     modelAliases = p.aliases as Record<string, string>;
   } else if (modelIds.length > 0) {
     // Default: map fable/sonnet/opus/haiku to first model
-    modelAliases = { fable: modelIds[0], sonnet: modelIds[0], opus: modelIds[0], haiku: modelIds[0] };
+    modelAliases = {
+      fable: modelIds[0],
+      sonnet: modelIds[0],
+      opus: modelIds[0],
+      haiku: modelIds[0],
+    };
   }
 
-  const requestedPrimaryModel = p.primaryModel ? String(p.primaryModel).trim() : '';
+  const requestedPrimaryModel = p.primaryModel
+    ? String(p.primaryModel).trim()
+    : '';
   const providerObj = {
     id: String(p.id),
     name: String(p.name),
     vendor: String(p.vendor ?? p.name),
     cloudProvider: String(p.cloudProvider ?? ''),
     type: 'api' as const,
-    primaryModel: modelIds.includes(requestedPrimaryModel) ? requestedPrimaryModel : modelIds[0],
+    primaryModel: modelIds.includes(requestedPrimaryModel)
+      ? requestedPrimaryModel
+      : modelIds[0],
     isBuiltin: false,
     config: {
       baseUrl: String(p.baseUrl),
@@ -1217,12 +1494,20 @@ export async function handleModelAdd(payload: {
       ...(p.disableNonessential ? { disableNonessential: true } : {}),
     },
     authType: String(p.authType ?? 'auth_token'),
-    ...(p.protocol === 'openai' || p.apiProtocol === 'openai' ? {
-      apiProtocol: 'openai' as const,
-      ...(p.maxOutputTokens ? { maxOutputTokens: Number(p.maxOutputTokens) } : {}),
-      ...(p.maxOutputTokensParamName ? { maxOutputTokensParamName: String(p.maxOutputTokensParamName) } : {}),
-      upstreamFormat: String(p.upstreamFormat ?? 'chat_completions') as 'chat_completions' | 'responses',
-    } : {}),
+    ...(p.protocol === 'openai' || p.apiProtocol === 'openai'
+      ? {
+          apiProtocol: 'openai' as const,
+          ...(p.maxOutputTokens
+            ? { maxOutputTokens: Number(p.maxOutputTokens) }
+            : {}),
+          ...(p.maxOutputTokensParamName
+            ? { maxOutputTokensParamName: String(p.maxOutputTokensParamName) }
+            : {}),
+          upstreamFormat: String(p.upstreamFormat ?? 'chat_completions') as
+            | 'chat_completions'
+            | 'responses',
+        }
+      : {}),
     websiteUrl: p.websiteUrl ? String(p.websiteUrl) : undefined,
     models,
     modelAliases,
@@ -1235,7 +1520,7 @@ export async function handleModelAdd(payload: {
   // The provider file is the definition authority. Projection is derived and
   // this operation is idempotent, so retrying repairs a failed config commit.
   await saveCustomProviderFile(providerObj);
-  await atomicModifyConfig(c => withAvailableProvidersProjection(c));
+  await atomicModifyConfig((c) => withAvailableProvidersProjection(c));
   await notifyModelConfigChanged('add', providerObj.id);
   return {
     success: true,
@@ -1244,45 +1529,67 @@ export async function handleModelAdd(payload: {
   };
 }
 
-export async function handleModelRemove(payload: { id: string }): Promise<AdminResponse> {
+export async function handleModelRemove(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
-  if (!isValidId(id)) return { success: false, error: 'Invalid id: only alphanumeric, hyphens, and underscores allowed' };
+  if (!isValidId(id))
+    return {
+      success: false,
+      error: 'Invalid id: only alphanumeric, hyphens, and underscores allowed',
+    };
 
   // Check if it's a preset
   const provider = findProvider(id);
   if (provider?.isBuiltin) {
-    return { success: false, error: `Cannot remove built-in provider '${id}'. Only custom providers can be removed.` };
+    return {
+      success: false,
+      error: `Cannot remove built-in provider '${id}'. Only custom providers can be removed.`,
+    };
   }
 
   // Commit config cleanup first. If it fails, the provider definition remains
   // untouched and the user can retry without compensating rollback machinery.
-  await atomicModifyConfig(c => {
+  await atomicModifyConfig((c) => {
     const apiKeys = { ...(c.providerApiKeys ?? {}) };
     delete apiKeys[id];
     const verifyStatus = { ...(c.providerVerifyStatus ?? {}) };
     delete verifyStatus[id];
     // If this was the default provider, clear it
-    const defaultId = c.defaultProviderId === id ? undefined : c.defaultProviderId;
+    const defaultId =
+      c.defaultProviderId === id ? undefined : c.defaultProviderId;
     // Strip the deleted id from providerOrder / disabledProviderIds so disk
     // state doesn't grow unbounded across delete-and-re-add cycles.
-    const providerOrder = c.providerOrder?.filter(pid => pid !== id);
-    const disabledProviderIds = c.disabledProviderIds?.filter(pid => pid !== id);
-    const currentProxySettings = c.proxySettings && typeof c.proxySettings === 'object' && !Array.isArray(c.proxySettings)
-      ? c.proxySettings as ProxySettings
-      : undefined;
-    const proxySettings = removeProviderFromProxySettingsScope(currentProxySettings, id);
+    const providerOrder = c.providerOrder?.filter((pid) => pid !== id);
+    const disabledProviderIds = c.disabledProviderIds?.filter(
+      (pid) => pid !== id,
+    );
+    const currentProxySettings =
+      c.proxySettings &&
+      typeof c.proxySettings === 'object' &&
+      !Array.isArray(c.proxySettings)
+        ? (c.proxySettings as ProxySettings)
+        : undefined;
+    const proxySettings = removeProviderFromProxySettingsScope(
+      currentProxySettings,
+      id,
+    );
     return withAvailableProvidersProjection({
       ...c,
       providerApiKeys: apiKeys,
       providerVerifyStatus: verifyStatus,
       defaultProviderId: defaultId,
-      providerOrder: providerOrder && providerOrder.length > 0 ? providerOrder : undefined,
-      disabledProviderIds: disabledProviderIds && disabledProviderIds.length > 0 ? disabledProviderIds : undefined,
+      providerOrder:
+        providerOrder && providerOrder.length > 0 ? providerOrder : undefined,
+      disabledProviderIds:
+        disabledProviderIds && disabledProviderIds.length > 0
+          ? disabledProviderIds
+          : undefined,
       ...(proxySettings ? { proxySettings } : {}),
     });
   });
-  if (!await deleteCustomProviderFile(id)) {
+  if (!(await deleteCustomProviderFile(id))) {
     return { success: false, error: `Custom provider '${id}' not found.` };
   }
 
@@ -1300,17 +1607,23 @@ function findProjectForAgent(
 ): { index: number; project: ProjectSlim } | null {
   const matches = projects
     .map((project, index) => ({ project, index }))
-    .filter(entry => entry.project.agentId === agent.id);
+    .filter((entry) => entry.project.agentId === agent.id);
   if (matches.length !== 1) return null;
   const index = matches[0].index;
   return index >= 0 ? { index, project: projects[index] } : null;
 }
 
-function isProjectArchivedSlim(project: { archivedAt?: unknown } | null | undefined): boolean {
-  return typeof project?.archivedAt === 'string' && project.archivedAt.length > 0;
+function isProjectArchivedSlim(
+  project: { archivedAt?: unknown } | null | undefined,
+): boolean {
+  return (
+    typeof project?.archivedAt === 'string' && project.archivedAt.length > 0
+  );
 }
 
-function normalizeAgentLifecycleFilter(value: unknown): 'all' | 'active' | 'archived' {
+function normalizeAgentLifecycleFilter(
+  value: unknown,
+): 'all' | 'active' | 'archived' {
   if (value === 'active' || value === 'archived') return value;
   return value === 'all' ? 'all' : 'active';
 }
@@ -1319,44 +1632,56 @@ function isCurrentAgentIdentity(
   identity: PersistedAgentWorkspaceProjection,
   currentWorkspacePath: string | undefined,
 ): boolean {
-  return identity.association === 'project-linked'
-    && !!currentWorkspacePath
-    && workspacePathsEqual(identity.workspacePath, currentWorkspacePath);
+  return (
+    identity.association === 'project-linked' &&
+    !!currentWorkspacePath &&
+    workspacePathsEqual(identity.workspacePath, currentWorkspacePath)
+  );
 }
 
-export async function handleAgentList(payload: { lifecycle?: string } = {}): Promise<AdminResponse> {
+export async function handleAgentList(
+  payload: { lifecycle?: string } = {},
+): Promise<AdminResponse> {
   try {
     const registry = await resolvePersistedAgentWorkspaceRegistry();
     const lifecycle = normalizeAgentLifecycleFilter(payload.lifecycle);
     const currentWorkspacePath = getCurrentWorkspacePath();
     const agents = registry.agentProjections
-      .filter(identity => !identity.project || isProjectVisibleToUser(identity.project))
-      .filter(identity => {
-        const archived = identity.project ? isProjectArchived(identity.project) : false;
+      .filter(
+        (identity) =>
+          !identity.project || isProjectVisibleToUser(identity.project),
+      )
+      .filter((identity) => {
+        const archived = identity.project
+          ? isProjectArchived(identity.project)
+          : false;
         if (lifecycle === 'active') return !archived;
         if (lifecycle === 'archived') return archived;
         return true;
       })
-      .map(identity => {
+      .map((identity) => {
         const { agent, project, workspacePath } = identity;
-        return ({
-        agentId: agent.id,
-        name: agent.name,
-        projectId: project?.id ?? null,
-        workspacePath,
-        enabled: agent.enabled === true,
-        archived: project ? isProjectArchived(project) : false,
-        archivedAt: project && isProjectArchived(project) ? project.archivedAt ?? null : null,
-        association: identity.association,
-        isCurrent: isCurrentAgentIdentity(identity, currentWorkspacePath),
-        channelCount: (agent.channels ?? []).length,
-        channels: (agent.channels ?? []).map(channel => ({
-          id: channel.id,
-          type: channel.type,
-          name: channel.name,
-          enabled: channel.enabled,
-        })),
-      });
+        return {
+          agentId: agent.id,
+          name: agent.name,
+          projectId: project?.id ?? null,
+          workspacePath,
+          enabled: agent.enabled === true,
+          archived: project ? isProjectArchived(project) : false,
+          archivedAt:
+            project && isProjectArchived(project)
+              ? (project.archivedAt ?? null)
+              : null,
+          association: identity.association,
+          isCurrent: isCurrentAgentIdentity(identity, currentWorkspacePath),
+          channelCount: (agent.channels ?? []).length,
+          channels: (agent.channels ?? []).map((channel) => ({
+            id: channel.id,
+            type: channel.type,
+            name: channel.name,
+            enabled: channel.enabled,
+          })),
+        };
       });
     return { success: true, data: agents };
   } catch (error) {
@@ -1368,10 +1693,11 @@ export async function handleAgentCurrent(): Promise<AdminResponse> {
   try {
     const registry = await resolvePersistedAgentWorkspaceRegistry();
     const workspacePath = getCurrentWorkspacePath() ?? defaultCronWorkspace();
-    const identity = registry.agentProjections.find(item =>
-      item.association === 'project-linked'
-      && !!item.project
-      && workspacePathsEqual(item.workspacePath, workspacePath),
+    const identity = registry.agentProjections.find(
+      (item) =>
+        item.association === 'project-linked' &&
+        !!item.project &&
+        workspacePathsEqual(item.workspacePath, workspacePath),
     );
     if (!identity?.project) {
       return {
@@ -1390,7 +1716,8 @@ export async function handleAgentCurrent(): Promise<AdminResponse> {
         name: identity.agent.name,
         workspaceId: identity.project.id,
         workspacePath: identity.workspacePath,
-        sessionId: getSessionEngine().getCurrentSessionContext().sessionId ?? null,
+        sessionId:
+          getSessionEngine().getCurrentSessionContext().sessionId ?? null,
       },
     };
   } catch (error) {
@@ -1398,17 +1725,26 @@ export async function handleAgentCurrent(): Promise<AdminResponse> {
   }
 }
 
-export async function handleAgentEnable(payload: { id: string }): Promise<AdminResponse> {
+export async function handleAgentEnable(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
-  let registry: Awaited<ReturnType<typeof resolvePersistedAgentWorkspaceRegistry>>;
+  let registry: Awaited<
+    ReturnType<typeof resolvePersistedAgentWorkspaceRegistry>
+  >;
   try {
     registry = await resolvePersistedAgentWorkspaceRegistry();
   } catch (error) {
     return agentWorkspaceIdentityFailure(error);
   }
-  const diagnostic = registry.diagnostics.find(item => item.agentIds.includes(id));
-  if (diagnostic) return { success: false, error: diagnostic.message, code: diagnostic.code };
-  const projection = registry.agentProjections.find(item => item.agentId === id);
+  const diagnostic = registry.diagnostics.find((item) =>
+    item.agentIds.includes(id),
+  );
+  if (diagnostic)
+    return { success: false, error: diagnostic.message, code: diagnostic.code };
+  const projection = registry.agentProjections.find(
+    (item) => item.agentId === id,
+  );
   if (projection?.project && isProjectArchived(projection.project)) {
     const lifecycleAgentId = projection.project.agentId ?? id;
     return {
@@ -1416,48 +1752,61 @@ export async function handleAgentEnable(payload: { id: string }): Promise<AdminR
       error: `Agent '${id}' belongs to an archived workspace.`,
       recoveryHint: {
         recoveryCommand: `myagents agent unarchive ${lifecycleAgentId}`,
-        message: 'Unarchive the Agent workspace before enabling proactive capabilities.',
+        message:
+          'Unarchive the Agent workspace before enabling proactive capabilities.',
       },
     };
   }
-  return modifyAgentConfigIntent(id, agent => {
-    const patch = buildProactiveAgentTogglePatch(agent, true);
-    return {
-      ok: true,
-      agent: { ...agent, ...patch },
-      livePatch: {
-        enabled: true,
-        heartbeatConfigJson: JSON.stringify(patch.heartbeat),
-        memoryAutoUpdateConfigJson: JSON.stringify(patch.memoryAutoUpdate),
-        memoryEvolutionConfigJson: JSON.stringify(patch.memoryEvolution),
-      },
-    };
-  }, 'enable');
+  return modifyAgentConfigIntent(
+    id,
+    (agent) => {
+      const patch = buildProactiveAgentTogglePatch(agent, true);
+      return {
+        ok: true,
+        agent: { ...agent, ...patch },
+        livePatch: {
+          enabled: true,
+          heartbeatConfigJson: JSON.stringify(patch.heartbeat),
+          memoryAutoUpdateConfigJson: JSON.stringify(patch.memoryAutoUpdate),
+          memoryEvolutionConfigJson: JSON.stringify(patch.memoryEvolution),
+        },
+      };
+    },
+    'enable',
+  );
 }
 
-export async function handleAgentDisable(payload: { id: string }): Promise<AdminResponse> {
+export async function handleAgentDisable(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const { id } = payload;
-  return modifyAgentConfigIntent(id, agent => {
-    const patch = buildProactiveAgentTogglePatch(agent, false);
-    return {
-      ok: true,
-      agent: { ...agent, ...patch },
-      livePatch: {
-        enabled: false,
-        heartbeatConfigJson: JSON.stringify(patch.heartbeat),
-        memoryAutoUpdateConfigJson: JSON.stringify(patch.memoryAutoUpdate),
-        memoryEvolutionConfigJson: JSON.stringify(patch.memoryEvolution),
-      },
-    };
-  }, 'disable');
+  return modifyAgentConfigIntent(
+    id,
+    (agent) => {
+      const patch = buildProactiveAgentTogglePatch(agent, false);
+      return {
+        ok: true,
+        agent: { ...agent, ...patch },
+        livePatch: {
+          enabled: false,
+          heartbeatConfigJson: JSON.stringify(patch.heartbeat),
+          memoryAutoUpdateConfigJson: JSON.stringify(patch.memoryAutoUpdate),
+          memoryEvolutionConfigJson: JSON.stringify(patch.memoryEvolution),
+        },
+      };
+    },
+    'disable',
+  );
 }
 
-export async function handleAgentArchive(payload: { id?: string }): Promise<AdminResponse> {
+export async function handleAgentArchive(payload: {
+  id?: string;
+}): Promise<AdminResponse> {
   const id = payload.id;
   if (!id) return { success: false, error: 'Missing required field: id' };
 
   const config = loadConfig();
-  const agent = (config.agents ?? []).find(a => a.id === id);
+  const agent = (config.agents ?? []).find((a) => a.id === id);
   if (!agent) {
     return {
       success: false,
@@ -1474,7 +1823,7 @@ export async function handleAgentArchive(payload: { id?: string }): Promise<Admi
   let agentEnabledBeforeArchive = false;
   let alreadyArchived = false;
   const wasEnabled = agent.enabled === true;
-  await atomicModifyProjects(projects => {
+  await atomicModifyProjects((projects) => {
     const entry = findProjectForAgent(projects, agent);
     if (!entry) return projects;
     const next = [...projects];
@@ -1501,13 +1850,18 @@ export async function handleAgentArchive(payload: { id?: string }): Promise<Admi
       error: `Agent '${id}' has no linked workspace project.`,
       recoveryHint: {
         recoveryCommand: 'myagents agent list',
-        message: 'Archive works on Agent workspaces registered in projects.json.',
+        message:
+          'Archive works on Agent workspaces registered in projects.json.',
       },
     };
   }
 
   if (wasEnabled) {
-    await modifyAgent(id, current => ({ ...current, enabled: false }), 'archive');
+    await modifyAgent(
+      id,
+      (current) => ({ ...current, enabled: false }),
+      'archive',
+    );
   }
 
   const reloadResult = await managementApi(
@@ -1529,7 +1883,10 @@ export async function handleAgentArchive(payload: { id?: string }): Promise<Admi
   }
 
   if (reloadResult.ok !== true) {
-    const failure = mgmtError(reloadResult, 'Failed to reconcile Agent runtime');
+    const failure = mgmtError(
+      reloadResult,
+      'Failed to reconcile Agent runtime',
+    );
     failure.error = `Agent workspace '${id}' was archived, but proactive runtime or managed tasks did not converge: ${failure.error}`;
     return failure;
   }
@@ -1553,12 +1910,14 @@ export async function handleAgentArchive(payload: { id?: string }): Promise<Admi
   };
 }
 
-export async function handleAgentUnarchive(payload: { id?: string }): Promise<AdminResponse> {
+export async function handleAgentUnarchive(payload: {
+  id?: string;
+}): Promise<AdminResponse> {
   const id = payload.id;
   if (!id) return { success: false, error: 'Missing required field: id' };
 
   const config = loadConfig();
-  const agent = (config.agents ?? []).find(a => a.id === id);
+  const agent = (config.agents ?? []).find((a) => a.id === id);
   if (!agent) {
     return {
       success: false,
@@ -1572,8 +1931,10 @@ export async function handleAgentUnarchive(payload: { id?: string }): Promise<Ad
 
   const projectEntry = findProjectForAgent(loadProjects(), agent);
   const projectId = projectEntry?.project.id ?? '';
-  const alreadyActive = !!projectEntry && !isProjectArchivedSlim(projectEntry.project);
-  const shouldRestoreAgent = projectEntry?.project.archivedAgentEnabledBeforeArchive === true;
+  const alreadyActive =
+    !!projectEntry && !isProjectArchivedSlim(projectEntry.project);
+  const shouldRestoreAgent =
+    projectEntry?.project.archivedAgentEnabledBeforeArchive === true;
 
   if (!projectId) {
     return {
@@ -1581,7 +1942,8 @@ export async function handleAgentUnarchive(payload: { id?: string }): Promise<Ad
       error: `Agent '${id}' has no linked workspace project.`,
       recoveryHint: {
         recoveryCommand: 'myagents agent list --archived',
-        message: 'Unarchive works on Agent workspaces registered in projects.json.',
+        message:
+          'Unarchive works on Agent workspaces registered in projects.json.',
       },
     };
   }
@@ -1601,13 +1963,17 @@ export async function handleAgentUnarchive(payload: { id?: string }): Promise<Ad
 
   let restoredAgentConfig = false;
   if (shouldRestoreAgent) {
-    const restoreResult = await modifyAgent(id, current => ({ ...current, enabled: true }), 'unarchive');
+    const restoreResult = await modifyAgent(
+      id,
+      (current) => ({ ...current, enabled: true }),
+      'unarchive',
+    );
     if (!restoreResult.success) return restoreResult;
     restoredAgentConfig = true;
   }
 
   try {
-    await atomicModifyProjects(projects => {
+    await atomicModifyProjects((projects) => {
       const entry = findProjectForAgent(projects, agent);
       if (!entry || !isProjectArchivedSlim(entry.project)) return projects;
       const next = [...projects];
@@ -1621,7 +1987,11 @@ export async function handleAgentUnarchive(payload: { id?: string }): Promise<Ad
     });
   } catch (err) {
     if (restoredAgentConfig) {
-      await modifyAgent(id, current => ({ ...current, enabled: false }), 'unarchive-rollback');
+      await modifyAgent(
+        id,
+        (current) => ({ ...current, enabled: false }),
+        'unarchive-rollback',
+      );
     }
     throw err;
   }
@@ -1635,7 +2005,10 @@ export async function handleAgentUnarchive(payload: { id?: string }): Promise<Ad
     { timeoutMs: AGENT_LIFECYCLE_LOOPBACK_TIMEOUT_MS },
   );
   if (reloadResult.ok !== true) {
-    const failure = mgmtError(reloadResult, 'Failed to reconcile Agent runtime');
+    const failure = mgmtError(
+      reloadResult,
+      'Failed to reconcile Agent runtime',
+    );
     failure.error = `Agent workspace '${id}' was unarchived, but proactive runtime or managed tasks did not converge: ${failure.error}`;
     return failure;
   }
@@ -1660,7 +2033,11 @@ const AGENT_SET_FIELDS = [
   'permissionMode',
 ] as const;
 
-export async function handleAgentSet(payload: { id: string; key: string; value: unknown }): Promise<AdminResponse> {
+export async function handleAgentSet(payload: {
+  id: string;
+  key: string;
+  value: unknown;
+}): Promise<AdminResponse> {
   const { id, key, value } = payload;
   if (!id) return { success: false, error: 'Missing required field: id' };
   if (!key) return { success: false, error: 'Missing required field: key' };
@@ -1668,14 +2045,18 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
   // Protect sensitive/structural fields
   const protectedFields = ['id', 'channels'];
   if (protectedFields.includes(key)) {
-    return { success: false, error: `Cannot directly set field '${key}'. Use specific commands instead.` };
+    return {
+      success: false,
+      error: `Cannot directly set field '${key}'. Use specific commands instead.`,
+    };
   }
-  if (!AGENT_SET_FIELDS.includes(key as typeof AGENT_SET_FIELDS[number])) {
-    const canonicalKey = key === 'provider'
-      ? 'providerId'
-      : key === 'permission'
-        ? 'permissionMode'
-        : undefined;
+  if (!AGENT_SET_FIELDS.includes(key as (typeof AGENT_SET_FIELDS)[number])) {
+    const canonicalKey =
+      key === 'provider'
+        ? 'providerId'
+        : key === 'permission'
+          ? 'permissionMode'
+          : undefined;
     return {
       success: false,
       error: canonicalKey
@@ -1688,9 +2069,7 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
     if (typeof value !== 'boolean') {
       return { success: false, error: 'enabled must be a boolean' };
     }
-    return value
-      ? handleAgentEnable({ id })
-      : handleAgentDisable({ id });
+    return value ? handleAgentEnable({ id }) : handleAgentDisable({ id });
   }
 
   // `runtime` field has a cross-runtime scrub policy (see
@@ -1712,15 +2091,22 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
     }
     return modifyAgentConfigIntent(
       id,
-      agent => {
+      (agent) => {
         const patch = buildRuntimeChangePatch(
           agent.runtimeConfig as RuntimeConfig | undefined,
           value as RuntimeType,
         );
         return {
           ok: true,
-          agent: { ...agent, runtime: patch.runtime, runtimeConfig: patch.runtimeConfig },
-          livePatch: { runtime: patch.runtime, runtimeConfig: patch.runtimeConfig ?? null },
+          agent: {
+            ...agent,
+            runtime: patch.runtime,
+            runtimeConfig: patch.runtimeConfig,
+          },
+          livePatch: {
+            runtime: patch.runtime,
+            runtimeConfig: patch.runtimeConfig ?? null,
+          },
         };
       },
       'set',
@@ -1733,8 +2119,10 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
     }
   }
 
-  if ((key === 'providerId' || key === 'model')
-    && (typeof value !== 'string' || !value.trim())) {
+  if (
+    (key === 'providerId' || key === 'model') &&
+    (typeof value !== 'string' || !value.trim())
+  ) {
     return { success: false, error: `${key} must be a non-empty string` };
   }
 
@@ -1746,35 +2134,45 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
         if (!value || typeof value !== 'object' || Array.isArray(value)) {
           return {
             ok: false,
-            response: { success: false, error: 'runtimeConfig must be a JSON object.' },
+            response: {
+              success: false,
+              error: 'runtimeConfig must be a JSON object.',
+            },
           };
         }
         const runtimeConfig = value as RuntimeConfig;
         const targetManagedCodex = agentUsesManagedCodexProvider({
           providerId: agent.providerId,
-          runtime: typeof agent.runtime === 'string' ? agent.runtime : undefined,
+          runtime:
+            typeof agent.runtime === 'string' ? agent.runtime : undefined,
           runtimeConfig,
         });
-        if (targetManagedCodex && (
-          runtimeConfig.source !== undefined
-          || runtimeConfig.model !== undefined
-          || runtimeConfig.permissionMode !== undefined
-          || runtimeConfig.additionalArgs !== undefined
-        )) {
+        if (
+          targetManagedCodex &&
+          (runtimeConfig.source !== undefined ||
+            runtimeConfig.model !== undefined ||
+            runtimeConfig.permissionMode !== undefined ||
+            runtimeConfig.additionalArgs !== undefined)
+        ) {
           return {
             ok: false,
             response: {
               success: false,
-              error: 'Managed Codex Agent defaults keep provider/model/permission in product fields, not runtimeConfig.',
+              error:
+                'Managed Codex Agent defaults keep provider/model/permission in product fields, not runtimeConfig.',
             },
           };
         }
-        if (runtimeConfig.source === 'managed-provider' && !targetManagedCodex) {
+        if (
+          runtimeConfig.source === 'managed-provider' &&
+          !targetManagedCodex
+        ) {
           return {
             ok: false,
             response: {
               success: false,
-              error: 'runtimeConfig.source=managed-provider requires the complete managed Codex provider identity.',
+              error:
+                'runtimeConfig.source=managed-provider requires the complete managed Codex provider identity.',
             },
           };
         }
@@ -1782,11 +2180,17 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
           if (typeof runtimeConfig.permissionMode !== 'string') {
             return {
               ok: false,
-              response: { success: false, error: 'runtimeConfig.permissionMode must be a string.' },
+              response: {
+                success: false,
+                error: 'runtimeConfig.permissionMode must be a string.',
+              },
             };
           }
           const runtime = (agent.runtime ?? 'builtin') as RuntimeType;
-          if (runtime === 'builtin' || !isRuntimePermissionMode(runtimeConfig.permissionMode, runtime)) {
+          if (
+            runtime === 'builtin' ||
+            !isRuntimePermissionMode(runtimeConfig.permissionMode, runtime)
+          ) {
             return {
               ok: false,
               response: {
@@ -1799,11 +2203,16 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
       }
       if (key === 'permissionMode') {
         const requestedMode = (value as string).trim();
-        if (agentUsesManagedCodexProvider({
-          providerId: agent.providerId,
-          runtime: typeof agent.runtime === 'string' ? agent.runtime : undefined,
-          runtimeConfig: agent.runtimeConfig as { source?: string } | undefined,
-        })) {
+        if (
+          agentUsesManagedCodexProvider({
+            providerId: agent.providerId,
+            runtime:
+              typeof agent.runtime === 'string' ? agent.runtime : undefined,
+            runtimeConfig: agent.runtimeConfig as
+              | { source?: string }
+              | undefined,
+          })
+        ) {
           const validModes: PermissionMode[] = ['auto', 'plan', 'fullAgency'];
           if (!validModes.includes(requestedMode as PermissionMode)) {
             return {
@@ -1835,8 +2244,9 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
       }
 
       if (key === 'providerId') {
-        const provider = getAllEffectiveProviders(currentConfig)
-          .find(candidate => candidate.id === normalizedValue);
+        const provider = getAllEffectiveProviders(currentConfig).find(
+          (candidate) => candidate.id === normalizedValue,
+        );
         if (!provider) {
           return {
             ok: false,
@@ -1846,43 +2256,64 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
             },
           };
         }
-        const selectionError = getProviderSelectionError(provider, currentConfig);
+        const selectionError = getProviderSelectionError(
+          provider,
+          currentConfig,
+        );
         if (selectionError) {
-          return { ok: false, response: { success: false, error: selectionError } };
+          return {
+            ok: false,
+            response: { success: false, error: selectionError },
+          };
         }
       }
 
       if (key === 'model') {
-        const providerId = typeof agent.providerId === 'string'
-          ? agent.providerId
-          : currentConfig.defaultProviderId;
+        const providerId =
+          typeof agent.providerId === 'string'
+            ? agent.providerId
+            : currentConfig.defaultProviderId;
         const provider = providerId
-          ? getAllEffectiveProviders(currentConfig).find(candidate => candidate.id === providerId)
+          ? getAllEffectiveProviders(currentConfig).find(
+              (candidate) => candidate.id === providerId,
+            )
           : undefined;
         if (!provider) {
           return {
             ok: false,
             response: {
               success: false,
-              error: 'Cannot validate model without an Agent providerId. Set providerId first.',
+              error:
+                'Cannot validate model without an Agent providerId. Set providerId first.',
             },
           };
         }
-        const selectionError = getProviderSelectionError(provider, currentConfig);
+        const selectionError = getProviderSelectionError(
+          provider,
+          currentConfig,
+        );
         if (selectionError) {
-          return { ok: false, response: { success: false, error: selectionError } };
+          return {
+            ok: false,
+            response: { success: false, error: selectionError },
+          };
         }
         const registeredModels = Array.isArray(provider.models)
-          ? provider.models.flatMap(entry => {
+          ? provider.models.flatMap((entry) => {
               if (!entry || typeof entry !== 'object') return [];
               const model = (entry as Record<string, unknown>).model;
-              return typeof model === 'string' && model.trim() ? [model.trim()] : [];
+              return typeof model === 'string' && model.trim()
+                ? [model.trim()]
+                : [];
             })
           : [];
         // Runtime-backed providers discover models dynamically. An empty static
         // catalogue means validation belongs to that runtime, not that no model
         // is legal. Providers with a concrete catalogue fail closed on typos.
-        if (registeredModels.length > 0 && !registeredModels.includes(String(normalizedValue))) {
+        if (
+          registeredModels.length > 0 &&
+          !registeredModels.includes(String(normalizedValue))
+        ) {
           return {
             ok: false,
             response: {
@@ -1893,13 +2324,18 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
         }
       }
 
-      const syncExecutionDefault = key === 'providerId' || key === 'model' || key === 'permissionMode';
-      const providerEnvJson = key === 'providerId'
-        ? (() => {
-            const resolved = resolveProviderEnv(String(normalizedValue), currentConfig);
-            return resolved ? JSON.stringify(resolved) : undefined;
-          })()
-        : undefined;
+      const syncExecutionDefault =
+        key === 'providerId' || key === 'model' || key === 'permissionMode';
+      const providerEnvJson =
+        key === 'providerId'
+          ? (() => {
+              const resolved = resolveProviderEnv(
+                String(normalizedValue),
+                currentConfig,
+              );
+              return resolved ? JSON.stringify(resolved) : undefined;
+            })()
+          : undefined;
       return {
         ok: true,
         agent: {
@@ -1907,11 +2343,15 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
           [key]: normalizedValue,
           ...(key === 'providerId' ? { providerEnvJson } : {}),
         },
-        projectPatch: syncExecutionDefault ? { [key]: normalizedValue } : undefined,
+        projectPatch: syncExecutionDefault
+          ? { [key]: normalizedValue }
+          : undefined,
         livePatch: syncExecutionDefault
           ? {
               [key]: normalizedValue,
-              ...(key === 'providerId' ? { providerEnvJson: providerEnvJson ?? null } : {}),
+              ...(key === 'providerId'
+                ? { providerEnvJson: providerEnvJson ?? null }
+                : {}),
             }
           : undefined,
       };
@@ -1920,17 +2360,23 @@ export async function handleAgentSet(payload: { id: string; key: string; value: 
   );
 }
 
-export function handleAgentChannelList(payload: { agentId: string }): AdminResponse {
+export function handleAgentChannelList(payload: {
+  agentId: string;
+}): AdminResponse {
   const config = loadConfig();
-  const agent = (config.agents ?? []).find(a => a.id === payload.agentId);
-  if (!agent) return { success: false, error: `Agent '${payload.agentId}' not found` };
+  const agent = (config.agents ?? []).find((a) => a.id === payload.agentId);
+  if (!agent)
+    return { success: false, error: `Agent '${payload.agentId}' not found` };
 
-  return { success: true, data: (agent.channels ?? []).map(ch => ({
-    id: ch.id,
-    type: ch.type,
-    name: ch.name,
-    enabled: ch.enabled,
-  })) };
+  return {
+    success: true,
+    data: (agent.channels ?? []).map((ch) => ({
+      id: ch.id,
+      type: ch.type,
+      name: ch.name,
+      enabled: ch.enabled,
+    })),
+  };
 }
 
 export async function handleAgentChannelAdd(payload: {
@@ -1938,22 +2384,28 @@ export async function handleAgentChannelAdd(payload: {
   channel: Record<string, unknown>;
 }): Promise<AdminResponse> {
   const { agentId, channel } = payload;
-  if (!agentId) return { success: false, error: 'Missing required field: agentId' };
-  if (!channel.type) return { success: false, error: 'Missing required field: channel.type' };
+  if (!agentId)
+    return { success: false, error: 'Missing required field: agentId' };
+  if (!channel.type)
+    return { success: false, error: 'Missing required field: channel.type' };
 
-  const channelId = channel.id as string || crypto.randomUUID();
+  const channelId = (channel.id as string) || crypto.randomUUID();
   const newChannel: ChannelConfigSlim = {
-    ...channel,        // user-provided fields first
-    id: channelId,     // override with guaranteed values
+    ...channel, // user-provided fields first
+    id: channelId, // override with guaranteed values
     type: channel.type as string,
-    name: channel.name as string || `${channel.type} channel`,
+    name: (channel.name as string) || `${channel.type} channel`,
     enabled: channel.enabled !== undefined ? !!channel.enabled : true,
   };
 
-  const result = await modifyAgent(agentId, agent => ({
-    ...agent,
-    channels: [...(agent.channels ?? []), newChannel],
-  }), 'channel-add');
+  const result = await modifyAgent(
+    agentId,
+    (agent) => ({
+      ...agent,
+      channels: [...(agent.channels ?? []), newChannel],
+    }),
+    'channel-add',
+  );
   if (result.success) {
     trackServer('agent_channel_create', {
       source: cliSource(),
@@ -1963,10 +2415,15 @@ export async function handleAgentChannelAdd(payload: {
   return result;
 }
 
-export async function handleAgentChannelRemove(payload: { agentId: string; channelId: string }): Promise<AdminResponse> {
+export async function handleAgentChannelRemove(payload: {
+  agentId: string;
+  channelId: string;
+}): Promise<AdminResponse> {
   const { agentId, channelId } = payload;
-  if (!agentId) return { success: false, error: 'Missing required field: agentId' };
-  if (!channelId) return { success: false, error: 'Missing required field: channelId' };
+  if (!agentId)
+    return { success: false, error: 'Missing required field: agentId' };
+  if (!channelId)
+    return { success: false, error: 'Missing required field: channelId' };
 
   // Capture platform BEFORE the channel is removed — once `modifyAgent`
   // commits, the channel is gone and we can't read its type. Best-effort:
@@ -1976,17 +2433,21 @@ export async function handleAgentChannelRemove(payload: { agentId: string; chann
   let platform = 'unknown';
   try {
     const config = loadConfig();
-    const agent = (config.agents ?? []).find(a => a.id === agentId);
-    const ch = agent?.channels?.find(c => c.id === channelId);
+    const agent = (config.agents ?? []).find((a) => a.id === agentId);
+    const ch = agent?.channels?.find((c) => c.id === channelId);
     if (ch?.type) platform = ch.type;
   } catch {
     // Silent — analytics must not affect the main flow.
   }
 
-  const result = await modifyAgent(agentId, agent => ({
-    ...agent,
-    channels: (agent.channels ?? []).filter(ch => ch.id !== channelId),
-  }), 'channel-remove');
+  const result = await modifyAgent(
+    agentId,
+    (agent) => ({
+      ...agent,
+      channels: (agent.channels ?? []).filter((ch) => ch.id !== channelId),
+    }),
+    'channel-remove',
+  );
   if (!result.success) return result;
 
   trackServer('agent_channel_remove', { source: cliSource(), platform });
@@ -2023,7 +2484,11 @@ export function handleConfigGet(payload: { key: string }): AdminResponse {
   return { success: true, data: { key, value: redacted } };
 }
 
-export async function handleConfigSet(payload: { key: string; value: unknown; dryRun?: boolean }): Promise<AdminResponse> {
+export async function handleConfigSet(payload: {
+  key: string;
+  value: unknown;
+  dryRun?: boolean;
+}): Promise<AdminResponse> {
   const { key, value, dryRun } = payload;
   if (!key) return { success: false, error: 'Missing required field: key' };
 
@@ -2035,22 +2500,36 @@ export async function handleConfigSet(payload: { key: string; value: unknown; dr
   if (key.split('.')[0] === 'cliToolRegistryEnabled') {
     return {
       success: false,
-      error: "Cannot set 'cliToolRegistryEnabled' via config set. Enable it from Settings → About & Feedback → Lab.",
+      error:
+        "Cannot set 'cliToolRegistryEnabled' via config set. Enable it from Settings → About & Feedback → Lab.",
     };
   }
 
   // Protect structural/sensitive keys that have dedicated commands
-  const protectedKeys = ['providerApiKeys', 'providerVerifyStatus', 'agents', 'mcpServers', 'mcpEnabledServers', 'mcpServerEnv', 'mcpServerArgs', 'imBotConfigs', 'cliToolEnv'];
+  const protectedKeys = [
+    'providerApiKeys',
+    'providerVerifyStatus',
+    'agents',
+    'mcpServers',
+    'mcpEnabledServers',
+    'mcpServerEnv',
+    'mcpServerArgs',
+    'imBotConfigs',
+    'cliToolEnv',
+  ];
   const rootKey = key.split('.')[0];
   if (protectedKeys.includes(rootKey)) {
-    return { success: false, error: `Cannot set '${key}' via config set. Use dedicated commands (e.g., 'myagents mcp', 'myagents agent', 'myagents model set-key').` };
+    return {
+      success: false,
+      error: `Cannot set '${key}' via config set. Use dedicated commands (e.g., 'myagents mcp', 'myagents agent', 'myagents model set-key').`,
+    };
   }
 
   if (dryRun) {
     return { success: true, dryRun: true, preview: { key, value } };
   }
 
-  await atomicModifyConfig(c => setNestedValue(c, key, value));
+  await atomicModifyConfig((c) => setNestedValue(c, key, value));
   broadcast('config:changed', { section: 'config', action: 'set', key });
   return { success: true, data: { key }, hint: `Config '${key}' updated.` };
 }
@@ -2083,14 +2562,18 @@ function resolveEffectiveMcpServersForWorkspace(
 ): McpServerDefinition[] {
   const allServers = getAllMcpServers(config);
   const globalEnabled = new Set(getEnabledMcpServerIds(config));
-  const globallyEnabledServers = () => allServers.filter(s => globalEnabled.has(s.id));
+  const globallyEnabledServers = () =>
+    allServers.filter((s) => globalEnabled.has(s.id));
 
   if (!workspacePath) {
     return globallyEnabledServers();
   }
 
   const projects = loadProjects();
-  const project = projects.find(p => typeof p.path === 'string' && workspacePathsEqual(p.path, workspacePath));
+  const project = projects.find(
+    (p) =>
+      typeof p.path === 'string' && workspacePathsEqual(p.path, workspacePath),
+  );
   if (!project) {
     // Treat an unregistered workspace like the no-workspace branch. The admin
     // API should not destructively clear the active session's MCP set just
@@ -2102,7 +2585,9 @@ function resolveEffectiveMcpServersForWorkspace(
   }
 
   const projectEnabled = new Set(project.mcpEnabledServers ?? []);
-  return allServers.filter(s => globalEnabled.has(s.id) && projectEnabled.has(s.id));
+  return allServers.filter(
+    (s) => globalEnabled.has(s.id) && projectEnabled.has(s.id),
+  );
 }
 
 export function handleReload(workspacePath?: string): AdminResponse {
@@ -2112,7 +2597,11 @@ export function handleReload(workspacePath?: string): AdminResponse {
   const effectiveWorkspace = workspacePath || getCurrentWorkspacePath();
 
   const config = loadConfig();
-  const effectiveServers = resolveEffectiveMcpServersForWorkspace(config, effectiveWorkspace, 'handleReload');
+  const effectiveServers = resolveEffectiveMcpServersForWorkspace(
+    config,
+    effectiveWorkspace,
+    'handleReload',
+  );
 
   // Sub-agent reload: re-scan the .md files on disk so edits to frontmatter
   // (model, description, tools) take effect without restarting the app.
@@ -2123,7 +2612,9 @@ export function handleReload(workspacePath?: string): AdminResponse {
   // caller with a half-applied reload (MCP pushed but agents stale).
   const home = getHomeDirOrNull();
   const userAgentsBaseDir = home ? join(home, '.myagents', 'agents') : '';
-  const projAgentsDir = effectiveWorkspace ? join(effectiveWorkspace, '.claude', 'agents') : '';
+  const projAgentsDir = effectiveWorkspace
+    ? join(effectiveWorkspace, '.claude', 'agents')
+    : '';
   let agents: ReturnType<typeof loadEnabledAgents>;
   try {
     agents = loadEnabledAgents(projAgentsDir, userAgentsBaseDir);
@@ -2459,42 +2950,61 @@ ERROR RECOVERY
   'mcp/add': taskLeafHelp({
     usage: 'myagents mcp add --id <id> [connection options] [--dry-run]',
     when: 'Use when registering a new custom MCP server.',
-    effect: 'Validates the proposed server and, unless --dry-run is set, persists it in config.json.',
-    options: '  --dry-run              Validate and preview without writing config.json\n  See myagents mcp --help for transport options.',
-    mutation: '--dry-run does not write or persist configuration. Without it, this mutates app configuration.',
+    effect:
+      'Validates the proposed server and, unless --dry-run is set, persists it in config.json.',
+    options:
+      '  --dry-run              Validate and preview without writing config.json\n  See myagents mcp --help for transport options.',
+    mutation:
+      '--dry-run does not write or persist configuration. Without it, this mutates app configuration.',
     output: 'The normalized server preview or the created server ID.',
-    example: '  myagents mcp add --id docs --type http --url https://example.test/mcp --dry-run',
-    recovery: 'If validation fails, correct the reported field and repeat the same dry-run.',
+    example:
+      '  myagents mcp add --id docs --type http --url https://example.test/mcp --dry-run',
+    recovery:
+      'If validation fails, correct the reported field and repeat the same dry-run.',
   }),
   'model/add': taskLeafHelp({
-    usage: 'myagents model add --id <id> --name <name> --base-url <url> --models <model> [--dry-run]',
+    usage:
+      'myagents model add --id <id> --name <name> --base-url <url> --models <model> [--dry-run]',
     when: 'Use when registering a custom API-key-backed model provider.',
-    effect: 'Validates the provider and, unless --dry-run is set, persists its provider definition.',
-    options: '  --dry-run              Validate and preview without persisting provider files or config\n  See myagents model --help for protocol and model options.',
-    mutation: '--dry-run does not write or persist provider configuration. Without it, this mutates app configuration.',
+    effect:
+      'Validates the provider and, unless --dry-run is set, persists its provider definition.',
+    options:
+      '  --dry-run              Validate and preview without persisting provider files or config\n  See myagents model --help for protocol and model options.',
+    mutation:
+      '--dry-run does not write or persist provider configuration. Without it, this mutates app configuration.',
     output: 'The normalized provider preview or the created provider ID.',
-    example: '  myagents model add --id acme --name Acme --base-url https://api.example.test --models acme-chat --dry-run',
-    recovery: 'Resolve the validation error and repeat the dry-run before applying the mutation.',
+    example:
+      '  myagents model add --id acme --name Acme --base-url https://api.example.test --models acme-chat --dry-run',
+    recovery:
+      'Resolve the validation error and repeat the dry-run before applying the mutation.',
   }),
   'model/verify': taskLeafHelp({
     usage: 'myagents model verify <provider-id> [--model <model>]',
     when: 'Use to verify an API-key provider or an SDK-native subscription.',
-    effect: 'API-key providers send a minimal provider probe. SDK-native subscriptions use their SDK login; host/runtime-managed subscriptions redirect to their credential owner.',
-    options: '  --model <model>         Override the provider default for this verification',
-    mutation: 'A successful verification persists only verification status and time; it never copies subscription credentials.',
+    effect:
+      'API-key providers send a minimal provider probe. SDK-native subscriptions use their SDK login; host/runtime-managed subscriptions redirect to their credential owner.',
+    options:
+      '  --model <model>         Override the provider default for this verification',
+    mutation:
+      'A successful verification persists only verification status and time; it never copies subscription credentials.',
     output: 'Verification success, or an actionable credential-owner error.',
     example: '  myagents model verify anthropic-sub --model claude-sonnet-5',
-    recovery: 'For subscription authentication errors, follow the returned Settings or runtime recovery hint.',
+    recovery:
+      'For subscription authentication errors, follow the returned Settings or runtime recovery hint.',
   }),
   'config/set': taskLeafHelp({
     usage: 'myagents config set <key> <value> [--dry-run]',
     when: 'Use when changing one supported application configuration key.',
-    effect: 'Parses and validates the value, then persists it unless --dry-run is set.',
-    options: '  --dry-run              Preview the parsed value without writing config.json',
-    mutation: '--dry-run does not write or persist config.json. Without it, this mutates application configuration.',
+    effect:
+      'Parses and validates the value, then persists it unless --dry-run is set.',
+    options:
+      '  --dry-run              Preview the parsed value without writing config.json',
+    mutation:
+      '--dry-run does not write or persist config.json. Without it, this mutates application configuration.',
     output: 'The parsed key/value preview or the persisted value.',
     example: '  myagents config set locale en-US --dry-run',
-    recovery: 'Run myagents config --help to inspect supported keys and value shapes.',
+    recovery:
+      'Run myagents config --help to inspect supported keys and value shapes.',
   }),
   mcp: `myagents mcp — Manage MCP tool servers
 
@@ -3375,228 +3885,319 @@ Related:
   'task/list': taskLeafHelp({
     usage: 'myagents task list — Discover Tasks in the current workspace',
     when: 'Before creating a possible duplicate, or when the Task id is unknown.',
-    effect: 'Read-only. Defaults to the current workspace and returns a compact projection; task get owns full detail.',
-    options: '  --query <text>       Match id, name, description, or tag\n  --limit <1..200>     Bound returned rows\n  --status / --tag     Existing lifecycle/tag filters\n  --workspaceId <id>   Explicit cross-workspace scope',
-    mutation: 'None; never starts AI. JSON omits expanded sessionIds and returns sessionCount.',
-    output: 'Compact identity, status, schedule, detector type, counters, nextExecutionAt, and execution health.',
+    effect:
+      'Read-only. Defaults to the current workspace and returns a compact projection; task get owns full detail.',
+    options:
+      '  --query <text>       Match id, name, description, or tag\n  --limit <1..200>     Bound returned rows\n  --status / --tag     Existing lifecycle/tag filters\n  --workspaceId <id>   Explicit cross-workspace scope',
+    mutation:
+      'None; never starts AI. JSON omits expanded sessionIds and returns sessionCount.',
+    output:
+      'Compact identity, status, schedule, detector type, counters, nextExecutionAt, and execution health.',
     example: 'myagents task list --query "release" --limit 20 --json',
-    recovery: 'Use myagents agent current --json when current workspace resolution fails; use task get <id> for full data.',
+    recovery:
+      'Use myagents agent current --json when current workspace resolution fails; use task get <id> for full data.',
   }),
 
   'task/get': taskLeafHelp({
     usage: 'myagents task get <taskId> — Read one authoritative Task',
     when: 'After creation/mutation or whenever full configuration, docs, sessions, or Detector health is needed.',
-    effect: 'Read-only. Returns the full ordinary Task plus docs paths, runtime health, and computed nextExecutionAt.',
-    options: '  <taskId>             Required Task id\n  --json               Machine-readable full record',
+    effect:
+      'Read-only. Returns the full ordinary Task plus docs paths, runtime health, and computed nextExecutionAt.',
+    options:
+      '  <taskId>             Required Task id\n  --json               Machine-readable full record',
     mutation: 'None; never starts AI.',
-    output: 'Full Task record. Unlike task list, sessionIds and detailed Trigger state are intentionally included.',
+    output:
+      'Full Task record. Unlike task list, sessionIds and detailed Trigger state are intentionally included.',
     example: 'myagents task get <taskId> --json',
     recovery: 'Run task list --query <name> if the id is unknown.',
   }),
 
   'task/create-direct': taskLeafHelp({
-    usage: 'myagents task create-direct --name <name> --taskMdFile <path> — Create a Task',
+    usage:
+      'myagents task create-direct --name <name> --taskMdFile <path> — Create a Task',
     when: 'When work must persist beyond this turn and run once in the future, on a schedule, or after a conditional check.',
-    effect: 'Creates a Todo Task in the current workspace. Omit workspace flags normally; pass both only for explicit cross-workspace creation.',
-    options: '  --taskMdFile <path>  Preferred action body (or --taskMdContent)\n  --executionMode once|scheduled|recurring\n  --dispatchAt <ISO>    Scheduled one-shot time\n  --intervalMinutes <n> Fixed interval; --startAt controls the first tick\n  --cronExpression / --cronTimezone for wall-clock recurrence\n  --trigger-file <path> Optional command Detector\n  --providerId <id> --model <id>  Optional builtin route pair',
-    mutation: 'Persists Todo only; does not start AI. A recurring interval without startAt gets its first tick about 2 seconds after task run.',
-    output: 'Persisted Task, caller audit provenance, docs path, overrides, nextExecutionAt, and next-step commands.',
-    example: 'myagents task create-direct --name "daily review" --taskMdFile task-action.md --executionMode recurring --cronExpression "0 9 * * *" --json',
-    recovery: 'Run task get <id> to verify. agent current is diagnostic, not a prerequisite.',
+    effect:
+      'Creates a Todo Task in the current workspace. Omit workspace flags normally; pass both only for explicit cross-workspace creation.',
+    options:
+      '  --taskMdFile <path>  Preferred action body (or --taskMdContent)\n  --executionMode once|scheduled|recurring\n  --dispatchAt <ISO>    Scheduled one-shot time\n  --intervalMinutes <n> Fixed interval; --startAt controls the first tick\n  --cronExpression / --cronTimezone for wall-clock recurrence\n  --trigger-file <path> Optional command Detector\n  --providerId <id> --model <id>  Optional builtin route pair',
+    mutation:
+      'Persists Todo only; does not start AI. A recurring interval without startAt gets its first tick about 2 seconds after task run.',
+    output:
+      'Persisted Task, caller audit provenance, docs path, overrides, nextExecutionAt, and next-step commands.',
+    example:
+      'myagents task create-direct --name "daily review" --taskMdFile task-action.md --executionMode recurring --cronExpression "0 9 * * *" --json',
+    recovery:
+      'Run task get <id> to verify. agent current is diagnostic, not a prerequisite.',
   }),
 
   'task/create-attached': taskLeafHelp({
-    usage: 'myagents task create-attached --name <name> --sourceIssueId <id> — Attach current Session work',
+    usage:
+      'myagents task create-attached --name <name> --sourceIssueId <id> — Attach current Session work',
     when: 'Only for a claimed Space Issue already executing in the current MyAgents Session.',
-    effect: 'Creates a Running attached-session Task linked to the Space Issue and current canonical Session.',
-    options: '  --name / --sourceIssueId / workspace identity are required\n  --taskMdFile <path>   Preferred action body\n  --source space-issue  Only supported source',
+    effect:
+      'Creates a Running attached-session Task linked to the Space Issue and current canonical Session.',
+    options:
+      '  --name / --sourceIssueId / workspace identity are required\n  --taskMdFile <path>   Preferred action body\n  --source space-issue  Only supported source',
     mutation: 'Creates lifecycle state but does not start a second AI turn.',
     output: 'Attached Task, docs, and current Session linkage.',
-    example: 'myagents task create-attached --name "Issue" --sourceIssueId <id> --taskMdFile task.md --workspaceId <id> --workspacePath <abs> --json',
-    recovery: 'Run only inside a Session with MYAGENTS_SESSION_ID; use the Space claim recovery command on partial failure.',
+    example:
+      'myagents task create-attached --name "Issue" --sourceIssueId <id> --taskMdFile task.md --workspaceId <id> --workspacePath <abs> --json',
+    recovery:
+      'Run only inside a Session with MYAGENTS_SESSION_ID; use the Space claim recovery command on partial failure.',
   }),
 
   'task/update': taskLeafHelp({
     usage: 'myagents task update <taskId> [fields] — Patch Task configuration',
     when: 'When a non-running Task schedule, action, Trigger, notification, or runtime override must change.',
-    effect: 'Updates the existing Task under its authoritative lock; omitted fields stay unchanged.',
-    options: '  <taskId>             Required Task id\n  Use create-direct schedule/runtime flags; --clear-trigger restores always\n  --clearProviderOverride / --clearRuntimeOverride / --clearMcpOverride',
+    effect:
+      'Updates the existing Task under its authoritative lock; omitted fields stay unchanged.',
+    options:
+      '  <taskId>             Required Task id\n  Use create-direct schedule/runtime flags; --clear-trigger restores always\n  --clearProviderOverride / --clearRuntimeOverride / --clearMcpOverride',
     mutation: 'Rejected while Running/Verifying; does not start AI.',
     output: 'Authoritative updated Task and docs.',
     example: 'myagents task update <taskId> --intervalMinutes 30 --json',
-    recovery: 'Stop first when a running Task must be edited; inspect task get after failure.',
+    recovery:
+      'Stop first when a running Task must be edited; inspect task get after failure.',
   }),
 
   'task/run': taskLeafHelp({
     usage: 'myagents task run <taskId> — Enable a Todo Task',
     when: 'Immediately after a Todo Task has been created and verified.',
     effect: 'Moves Todo to Running and arms the existing scheduler.',
-    options: '  <taskId>             Required Todo Task id\n  --json               Return the authoritative post-mutation state',
-    mutation: 'Does not wait for an AI result. Interval recurrence without startAt gets a tick in about 2 seconds; Cron waits for its next wall-clock tick; scheduled waits for dispatchAt.',
-    output: 'Current Task, attemptOrdinal, and scheduler-computed nextExecutionAt.',
+    options:
+      '  <taskId>             Required Todo Task id\n  --json               Return the authoritative post-mutation state',
+    mutation:
+      'Does not wait for an AI result. Interval recurrence without startAt gets a tick in about 2 seconds; Cron waits for its next wall-clock tick; scheduled waits for dispatchAt.',
+    output:
+      'Current Task, attemptOrdinal, and scheduler-computed nextExecutionAt.',
     example: 'myagents task run <taskId> --json',
-    recovery: 'Use task rerun for a terminal/stopped Task, or task get to inspect a schedule error.',
+    recovery:
+      'Use task rerun for a terminal/stopped Task, or task get to inspect a schedule error.',
   }),
 
   'task/start': taskLeafHelp({
     usage: 'myagents task start <taskId> — Resume a stopped schedule',
     when: 'When a previously stopped scheduled/recurring Task should continue.',
-    effect: 'Re-arms the existing schedule through the Cron compatibility adapter; it does not bypass the Detector.',
-    options: '  <taskId>             Required Task id\n  --json               Return the authoritative post-mutation state',
-    mutation: 'May schedule the next tick near now when the preserved interval anchor is overdue; returned nextExecutionAt is authoritative.',
-    output: 'Current Task status and nextExecutionAt; never an empty success object.',
+    effect:
+      'Re-arms the existing schedule through the Cron compatibility adapter; it does not bypass the Detector.',
+    options:
+      '  <taskId>             Required Task id\n  --json               Return the authoritative post-mutation state',
+    mutation:
+      'May schedule the next tick near now when the preserved interval anchor is overdue; returned nextExecutionAt is authoritative.',
+    output:
+      'Current Task status and nextExecutionAt; never an empty success object.',
     example: 'myagents task start <taskId> --json',
-    recovery: 'Use task get for schedule/Trigger health, or task rerun when the Task is terminal.',
+    recovery:
+      'Use task get for schedule/Trigger health, or task rerun when the Task is terminal.',
   }),
 
   'task/rerun': taskLeafHelp({
     usage: 'myagents task rerun <taskId> — Re-dispatch a terminal Task',
     when: 'When blocked, stopped, done, or archived work should start again from Todo.',
-    effect: 'Writes the audited rerun transition and arms the same Task scheduler.',
-    options: '  <taskId>             Required Task id\n  --json               Authoritative post-mutation state',
-    mutation: 'May start AI asynchronously according to the Task schedule; attached-session Tasks cannot rerun.',
+    effect:
+      'Writes the audited rerun transition and arms the same Task scheduler.',
+    options:
+      '  <taskId>             Required Task id\n  --json               Authoritative post-mutation state',
+    mutation:
+      'May start AI asynchronously according to the Task schedule; attached-session Tasks cannot rerun.',
     output: 'Current Task, attemptOrdinal, and nextExecutionAt.',
     example: 'myagents task rerun <taskId> --json',
-    recovery: 'Use task get when the current state or unresolved execution blocks rerun.',
+    recovery:
+      'Use task get when the current state or unresolved execution blocks rerun.',
   }),
 
   'task/stop': taskLeafHelp({
     usage: 'myagents task stop <taskId> — Pause a Task',
     when: 'When future ticks and any active execution must stop.',
-    effect: 'Stops the scheduler/execution and preserves command Detector checkpoint state.',
-    options: '  <taskId>             Required Task id\n  --json               Return the authoritative post-mutation state',
-    mutation: 'Mutates lifecycle; does not delete the Task or its workspace script.',
+    effect:
+      'Stops the scheduler/execution and preserves command Detector checkpoint state.',
+    options:
+      '  <taskId>             Required Task id\n  --json               Return the authoritative post-mutation state',
+    mutation:
+      'Mutates lifecycle; does not delete the Task or its workspace script.',
     output: 'Current stopped state and nextExecutionAt=null.',
     example: 'myagents task stop <taskId> --json',
-    recovery: 'Use task start to resume or reset-checkpoint only when the managed cursor must be cleared.',
+    recovery:
+      'Use task start to resume or reset-checkpoint only when the managed cursor must be cleared.',
   }),
 
   'task/runs': taskLeafHelp({
-    usage: 'myagents task runs <taskId> [--limit N] — Read recent AI execution history',
+    usage:
+      'myagents task runs <taskId> [--limit N] — Read recent AI execution history',
     when: 'To inspect settled AI outputs/errors after asynchronous admission.',
-    effect: 'Read-only compatibility projection over the existing Task run history.',
-    options: '  <taskId>             Required Task id\n  --limit <n>           Positive row limit\n  --full                Do not truncate human output',
+    effect:
+      'Read-only compatibility projection over the existing Task run history.',
+    options:
+      '  <taskId>             Required Task id\n  --limit <n>           Positive row limit\n  --full                Do not truncate human output',
     mutation: 'None; never waits, retries, or starts AI.',
-    output: 'Recent settled run rows; no new execution-receipt protocol is added.',
+    output:
+      'Recent settled run rows; no new execution-receipt protocol is added.',
     example: 'myagents task runs <taskId> --limit 5 --json',
-    recovery: 'Use task get for current executionState when no settled row exists yet.',
+    recovery:
+      'Use task get for current executionState when no settled row exists yet.',
   }),
 
   'task/update-status': taskLeafHelp({
-    usage: 'myagents task update-status <taskId> <status> — Write an ordinary lifecycle transition',
+    usage:
+      'myagents task update-status <taskId> <status> — Write an ordinary lifecycle transition',
     when: 'When the current actor legitimately advances running work to verifying/done/blocked/stopped.',
-    effect: 'Applies the existing Task state machine with caller actor/source audit.',
-    options: '  <taskId> <status>    Required\n  --message <text>      Optional audit reason',
-    mutation: 'Mutates lifecycle; illegal transitions and Agent archive attempts fail closed.',
+    effect:
+      'Applies the existing Task state machine with caller actor/source audit.',
+    options:
+      '  <taskId> <status>    Required\n  --message <text>      Optional audit reason',
+    mutation:
+      'Mutates lifecycle; illegal transitions and Agent archive attempts fail closed.',
     output: 'Authoritative Task, transition, and nextExecutionAt.',
-    example: 'myagents task update-status <taskId> done --message "shipped" --json',
-    recovery: 'Read task get and choose a legal next state; do not forge actor/source flags.',
+    example:
+      'myagents task update-status <taskId> done --message "shipped" --json',
+    recovery:
+      'Read task get and choose a legal next state; do not forge actor/source flags.',
   }),
 
   'task/append-session': taskLeafHelp({
-    usage: 'myagents task append-session <taskId> <sessionId> — Link an existing Session',
+    usage:
+      'myagents task append-session <taskId> <sessionId> — Link an existing Session',
     when: 'When work moved into another Session and the Task history should reference it.',
     effect: 'Adds the canonical Session id once to the existing Task.',
     options: '  <taskId> <sessionId> Both required',
-    mutation: 'Mutates Task metadata only; does not message or start that Session.',
+    mutation:
+      'Mutates Task metadata only; does not message or start that Session.',
     output: 'Authoritative Task with updated sessionIds.',
     example: 'myagents task append-session <taskId> <sessionId> --json',
-    recovery: 'Use session discovery to obtain a real id; never use a workspace path as Session identity.',
+    recovery:
+      'Use session discovery to obtain a real id; never use a workspace path as Session identity.',
   }),
 
   'task/exit': taskLeafHelp({
-    usage: 'myagents task exit --reason <text> — End the currently executing eligible Task',
+    usage:
+      'myagents task exit --reason <text> — End the currently executing eligible Task',
     when: 'Only from inside that Task run when aiCanExit is enabled and the recurring goal is genuinely finished.',
     effect: 'Requests terminal settlement for the active Task-owned turn.',
     options: '  --reason <text>      Concise completion reason',
-    mutation: 'Mutates only the active authorized Task run; rejected outside Task context.',
+    mutation:
+      'Mutates only the active authorized Task run; rejected outside Task context.',
     output: 'Accepted Task exit request.',
     example: 'myagents task exit --reason "goal achieved" --json',
-    recovery: 'Use ordinary error handling for transient failures; do not exit a Task that still serves user intent.',
+    recovery:
+      'Use ordinary error handling for transient failures; do not exit a Task that still serves user intent.',
   }),
 
   'task/run-now': taskLeafHelp({
     usage: 'myagents task run-now <taskId> — Force one AI turn',
     when: 'For an explicit manual execution that must bypass activation filtering.',
     effect: 'Dispatches one AI execution without running the Detector.',
-    options: '  <taskId>             Required Running ordinary Task id\n  --json               Machine-readable admission result',
-    mutation: 'Starts AI asynchronously; schedule anchor and Detector checkpoint are unchanged.',
-    output: 'Admission data including taskId and sessionId. It is not a terminal execution receipt.',
+    options:
+      '  <taskId>             Required Running ordinary Task id\n  --json               Machine-readable admission result',
+    mutation:
+      'Starts AI asynchronously; schedule anchor and Detector checkpoint are unchanged.',
+    output:
+      'Admission data including taskId and sessionId. It is not a terminal execution receipt.',
     example: 'myagents task run-now <taskId> --json',
-    recovery: 'Use task runs <id> and task get <id> to inspect the eventual result.',
+    recovery:
+      'Use task runs <id> and task get <id> to inspect the eventual result.',
   }),
 
   'task/check-now': taskLeafHelp({
     usage: 'myagents task check-now <taskId> — Run the persisted Detector now',
     when: 'After a production Detector is deployed or repaired and a real stateful check is intended.',
-    effect: 'Runs the Detector with persisted checkpoint, commits checkpoint/health, and activates AI only on activate.',
-    options: '  <taskId>             Required Running command-Detector Task id\n  --json               Structured decision/admission data',
-    mutation: 'quiet commits state without AI; activate starts AI asynchronously; failure commits health/backoff and is not a decision.',
-    output: 'Detector result and, on activate, durable admission identity. It is not a terminal execution receipt.',
+    effect:
+      'Runs the Detector with persisted checkpoint, commits checkpoint/health, and activates AI only on activate.',
+    options:
+      '  <taskId>             Required Running command-Detector Task id\n  --json               Structured decision/admission data',
+    mutation:
+      'quiet commits state without AI; activate starts AI asynchronously; failure commits health/backoff and is not a decision.',
+    output:
+      'Detector result and, on activate, durable admission identity. It is not a terminal execution receipt.',
     example: 'myagents task check-now <taskId> --json',
-    recovery: 'Use trigger test first for no-commit diagnosis, then task get for health and checkpoint.',
+    recovery:
+      'Use trigger test first for no-commit diagnosis, then task get for health and checkpoint.',
   }),
 
   'task/trigger/validate': taskLeafHelp({
-    usage: 'myagents task trigger validate --spec-file <json> — Validate a Trigger',
+    usage:
+      'myagents task trigger validate --spec-file <json> — Validate a Trigger',
     when: 'Before running or attaching a command Detector spec.',
-    effect: 'Parses and validates strict Trigger v1 JSON without executing the command.',
-    options: '  --spec-file <path>   Required regular non-symlink UTF-8 JSON file\n  --json               Return normalized Trigger JSON',
+    effect:
+      'Parses and validates strict Trigger v1 JSON without executing the command.',
+    options:
+      '  --spec-file <path>   Required regular non-symlink UTF-8 JSON file\n  --json               Return normalized Trigger JSON',
     mutation: 'None; never runs a process or AI.',
     output: 'Normalized Trigger on success; precise schema error on failure.',
-    example: 'myagents task trigger validate --spec-file trigger.production.json --json',
-    recovery: 'Read myagents-task-automation/references/command-detector.md and correct the strict schema.',
+    example:
+      'myagents task trigger validate --spec-file trigger.production.json --json',
+    recovery:
+      'Read myagents-task-automation/references/command-detector.md and correct the strict schema.',
   }),
 
   'task/trigger/test': taskLeafHelp({
-    usage: 'myagents task trigger test <taskId>|--spec-file <json> — Execute a Detector without committing MyAgents state',
+    usage:
+      'myagents task trigger test <taskId>|--spec-file <json> — Execute a Detector without committing MyAgents state',
     when: 'During fixture validation or diagnosis before a real check-now.',
-    effect: 'Really executes the command using a snapshot/fixture checkpoint but does not commit MyAgents checkpoint, health, events, or AI activation.',
-    options: '  <taskId>             Test the persisted Trigger\n  --spec-file <path>   Or test an unpersisted Trigger with --workspacePath\n  --checkpoint-file    Optional checkpoint fixture\n  --expect quiet|activate',
-    mutation: 'No MyAgents state or AI mutation. Script file/network/database side effects are real and are not rolled back.',
+    effect:
+      'Really executes the command using a snapshot/fixture checkpoint but does not commit MyAgents checkpoint, health, events, or AI activation.',
+    options:
+      '  <taskId>             Test the persisted Trigger\n  --spec-file <path>   Or test an unpersisted Trigger with --workspacePath\n  --checkpoint-file    Optional checkpoint fixture\n  --expect quiet|activate',
+    mutation:
+      'No MyAgents state or AI mutation. Script file/network/database side effects are real and are not rolled back.',
     output: 'Structured quiet/activate result or harness failure diagnostics.',
-    example: 'myagents task trigger test --spec-file trigger.test.json --workspacePath /abs/workspace --expect quiet --json',
-    recovery: 'Isolate fixtures; a failure is a program/harness error, not a third decision.',
+    example:
+      'myagents task trigger test --spec-file trigger.test.json --workspacePath /abs/workspace --expect quiet --json',
+    recovery:
+      'Isolate fixtures; a failure is a program/harness error, not a third decision.',
   }),
 
   'task/reset-checkpoint': taskLeafHelp({
-    usage: 'myagents task reset-checkpoint <taskId> — Clear MyAgents-managed Detector checkpoint',
+    usage:
+      'myagents task reset-checkpoint <taskId> — Clear MyAgents-managed Detector checkpoint',
     when: 'Only when the persisted cursor must intentionally restart from null.',
-    effect: 'Clears the platform checkpoint and advances its revision; preserves check history and script-owned state.',
-    options: '  <taskId>             Required command-Detector Task id\n  --json               Return the new state',
+    effect:
+      'Clears the platform checkpoint and advances its revision; preserves check history and script-owned state.',
+    options:
+      '  <taskId>             Required command-Detector Task id\n  --json               Return the new state',
     mutation: 'Mutates checkpoint only; does not run the Detector or AI.',
     output: 'Authoritative Trigger runtime state after reset.',
     example: 'myagents task reset-checkpoint <taskId> --json',
-    recovery: 'Use task get first; do not reset merely to hide a Detector failure.',
+    recovery:
+      'Use task get first; do not reset merely to hide a Detector failure.',
   }),
 
   'task/archive': taskLeafHelp({
-    usage: 'myagents task archive <taskId> — Move a completed Task to long-lived archive',
+    usage:
+      'myagents task archive <taskId> — Move a completed Task to long-lived archive',
     when: 'When a completed Task should leave active views but remain recoverable and auditable.',
     effect: 'Transitions Done to Archived. This is a user-only product action.',
-    options: '  <taskId>             Required Done Task id\n  --message <text>      Optional audit message',
-    mutation: 'Mutates lifecycle; Agent callers are rejected by the Task authority.',
+    options:
+      '  <taskId>             Required Done Task id\n  --message <text>      Optional audit message',
+    mutation:
+      'Mutates lifecycle; Agent callers are rejected by the Task authority.',
     output: 'Authoritative archived Task and nextExecutionAt=null.',
     example: 'myagents task archive <taskId> --message "shipped" --json',
     recovery: 'A user can use task rerun to reactivate an archived Task.',
   }),
 
   'task/delete': taskLeafHelp({
-    usage: 'myagents task delete <taskId> — Irreversibly remove a Task from product use',
+    usage:
+      'myagents task delete <taskId> — Irreversibly remove a Task from product use',
     when: 'Only after the user confirms the exact Task to remove.',
-    effect: 'Stops execution, removes Trigger runtime state/pending activation, and hides the Task from ordinary surfaces. An internal tombstone/audit remains for authority and migration safety.',
-    options: '  <taskId>             Required Task id (remove is a compatibility alias)',
-    mutation: 'Irreversible product deletion. It does not delete workspace-owned scripts, databases, or external state.',
+    effect:
+      'Stops execution, removes Trigger runtime state/pending activation, and hides the Task from ordinary surfaces. An internal tombstone/audit remains for authority and migration safety.',
+    options:
+      '  <taskId>             Required Task id (remove is a compatibility alias)',
+    mutation:
+      'Irreversible product deletion. It does not delete workspace-owned scripts, databases, or external state.',
     output: 'Deletion receipt with status=deleted and nextExecutionAt=null.',
     example: 'myagents task delete <taskId> --json',
-    recovery: 'There is no undelete command. Recreate a Task if deletion was a mistake; clean scripts only under separate explicit user intent.',
+    recovery:
+      'There is no undelete command. Recreate a Task if deletion was a mistake; clean scripts only under separate explicit user intent.',
   }),
 
   'task/readme': taskLeafHelp({
     usage: 'myagents task readme — Read the compact Task automation contract',
     when: 'When the Task product model or canonical lifecycle is unclear before choosing a leaf command.',
-    effect: 'Read-only. Explains action, schedule, activation, Session routing, lifecycle, and safety boundaries.',
-    options: '  --json               Return the readme text in a machine-readable response',
+    effect:
+      'Read-only. Explains action, schedule, activation, Session routing, lifecycle, and safety boundaries.',
+    options:
+      '  --json               Return the readme text in a machine-readable response',
     mutation: 'None; never creates a Task, runs a Detector, or starts AI.',
     output: 'Current Task command model and links to exact leaf help.',
     example: 'myagents task readme',
@@ -3954,10 +4555,11 @@ RECOVERY
 };
 
 export function handleHelp(payload: { path?: string[] }): AdminResponse {
-  const path = (payload.path ?? []).map(part => part.trim()).filter(Boolean);
-  const lookupPath = path[0] === 'space' && path[1] === 'issue' && path[2] === 'view'
-    ? [...path.slice(0, 2), 'get', ...path.slice(3)]
-    : path;
+  const path = (payload.path ?? []).map((part) => part.trim()).filter(Boolean);
+  const lookupPath =
+    path[0] === 'space' && path[1] === 'issue' && path[2] === 'view'
+      ? [...path.slice(0, 2), 'get', ...path.slice(3)]
+      : path;
   const group = path[0];
   let matchedKey: string | undefined;
   for (let length = lookupPath.length; length > 0; length -= 1) {
@@ -3981,7 +4583,9 @@ export function handleHelp(payload: { path?: string[] }): AdminResponse {
   // turning `myagents im --help` into a misleading "use one of these
   // unrelated groups" message). Append the leaf commands that aren't in
   // HELP_TEXTS but are still valid top-level invocations.
-  const groups = [...new Set(Object.keys(HELP_TEXTS).map(key => key.split('/')[0]))].sort();
+  const groups = [
+    ...new Set(Object.keys(HELP_TEXTS).map((key) => key.split('/')[0])),
+  ].sort();
   const leafCommands = ['status', 'reload', 'version'];
   const header = group
     ? `Unknown command group "${group}".`
@@ -4014,18 +4618,30 @@ export async function handleAnydocConvert(payload: {
   return wrapMgmtResponse(response);
 }
 
-export async function handleAnydocStatus(payload: { jobId?: string }): Promise<AdminResponse> {
-  const response = await managementApi(`/api/document/status${qsFrom({ jobId: payload.jobId })}`);
+export async function handleAnydocStatus(payload: {
+  jobId?: string;
+}): Promise<AdminResponse> {
+  const response = await managementApi(
+    `/api/document/status${qsFrom({ jobId: payload.jobId })}`,
+  );
   return wrapMgmtResponse(response);
 }
 
-export async function handleAnydocCancel(payload: { jobId?: string }): Promise<AdminResponse> {
-  const response = await managementApi('/api/document/cancel', 'POST', { jobId: payload.jobId });
+export async function handleAnydocCancel(payload: {
+  jobId?: string;
+}): Promise<AdminResponse> {
+  const response = await managementApi('/api/document/cancel', 'POST', {
+    jobId: payload.jobId,
+  });
   return wrapMgmtResponse(response);
 }
 
-export async function handleAnydocList(payload: { limit?: number }): Promise<AdminResponse> {
-  const response = await managementApi(`/api/document/list${qsFrom({ limit: payload.limit })}`);
+export async function handleAnydocList(payload: {
+  limit?: number;
+}): Promise<AdminResponse> {
+  const response = await managementApi(
+    `/api/document/list${qsFrom({ limit: payload.limit })}`,
+  );
   return wrapMgmtResponse(response);
 }
 
@@ -4036,12 +4652,18 @@ type SpeechAdminCaller = {
 function resolveSpeechAdminCaller(): SpeechAdminCaller | AdminResponse {
   const context = getSessionEngine().getCurrentSessionContext();
   const sidecarId = process.env.MYAGENTS_SIDECAR_ID?.trim();
-  if (!context.sessionId?.trim() || !context.workspacePath?.trim() || !sidecarId) {
+  if (
+    !context.sessionId?.trim() ||
+    !context.workspacePath?.trim() ||
+    !sidecarId
+  ) {
     return {
       success: false,
       code: 'SPEECH_SESSION_REQUIRED',
-      error: 'Speech recognition requires an active MyAgents Session with an authoritative Workspace.',
-      suggestion: 'Run the command from the MyAgents chat Session that should own the job.',
+      error:
+        'Speech recognition requires an active MyAgents Session with an authoritative Workspace.',
+      suggestion:
+        'Run the command from the MyAgents chat Session that should own the job.',
       suggestedCommand: 'myagents speech --help',
     };
   }
@@ -4054,7 +4676,8 @@ function resolveSpeechAdminCaller(): SpeechAdminCaller | AdminResponse {
       success: false,
       code: 'SPEECH_TOOL_DISABLED',
       error: 'Speech recognition is not enabled for the current Session.',
-      suggestion: 'Enable Speech Recognition for this Agent or Workspace, then start a new Session.',
+      suggestion:
+        'Enable Speech Recognition for this Agent or Workspace, then start a new Session.',
       suggestedCommand: 'myagents speech --help',
     };
   }
@@ -4073,38 +4696,52 @@ export async function handleSpeechTranscribe(payload: {
 }): Promise<AdminResponse> {
   const caller = resolveSpeechAdminCaller();
   if (speechCallerIsError(caller)) return caller;
-  return wrapMgmtResponse(await managementApi('/api/speech/transcribe', 'POST', {
-    sidecarId: caller.sidecarId,
-    sourcePath: payload.sourcePath,
-    outputRoot: payload.outputRoot,
-  }));
+  return wrapMgmtResponse(
+    await managementApi('/api/speech/transcribe', 'POST', {
+      sidecarId: caller.sidecarId,
+      sourcePath: payload.sourcePath,
+      outputRoot: payload.outputRoot,
+    }),
+  );
 }
 
-export async function handleSpeechStatus(payload: { jobId?: string }): Promise<AdminResponse> {
+export async function handleSpeechStatus(payload: {
+  jobId?: string;
+}): Promise<AdminResponse> {
   const caller = resolveSpeechAdminCaller();
   if (speechCallerIsError(caller)) return caller;
-  return wrapMgmtResponse(await managementApi('/api/speech/status', 'POST', {
-    sidecarId: caller.sidecarId,
-    jobId: payload.jobId,
-  }));
+  return wrapMgmtResponse(
+    await managementApi('/api/speech/status', 'POST', {
+      sidecarId: caller.sidecarId,
+      jobId: payload.jobId,
+    }),
+  );
 }
 
-export async function handleSpeechCancel(payload: { jobId?: string }): Promise<AdminResponse> {
+export async function handleSpeechCancel(payload: {
+  jobId?: string;
+}): Promise<AdminResponse> {
   const caller = resolveSpeechAdminCaller();
   if (speechCallerIsError(caller)) return caller;
-  return wrapMgmtResponse(await managementApi('/api/speech/cancel', 'POST', {
-    sidecarId: caller.sidecarId,
-    jobId: payload.jobId,
-  }));
+  return wrapMgmtResponse(
+    await managementApi('/api/speech/cancel', 'POST', {
+      sidecarId: caller.sidecarId,
+      jobId: payload.jobId,
+    }),
+  );
 }
 
-export async function handleSpeechList(payload: { limit?: number }): Promise<AdminResponse> {
+export async function handleSpeechList(payload: {
+  limit?: number;
+}): Promise<AdminResponse> {
   const caller = resolveSpeechAdminCaller();
   if (speechCallerIsError(caller)) return caller;
-  return wrapMgmtResponse(await managementApi('/api/speech/list', 'POST', {
-    sidecarId: caller.sidecarId,
-    limit: payload.limit,
-  }));
+  return wrapMgmtResponse(
+    await managementApi('/api/speech/list', 'POST', {
+      sidecarId: caller.sidecarId,
+      limit: payload.limit,
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -4127,10 +4764,13 @@ export function handleVersion(): AdminResponse {
   //      installed (issue #149: users had no way to tell whether the dmg they
   //      reinstalled actually contained the patched CLI/sidecar — the old
   //      hardcoded '0.1.70' fallback shipped in every release).
-  const version = (typeof __MYAGENTS_VERSION__ !== 'undefined' ? __MYAGENTS_VERSION__ : undefined)
-    ?? process.env.npm_package_version
-    ?? process.env.MYAGENTS_VERSION
-    ?? 'dev';
+  const version =
+    (typeof __MYAGENTS_VERSION__ !== 'undefined'
+      ? __MYAGENTS_VERSION__
+      : undefined) ??
+    process.env.npm_package_version ??
+    process.env.MYAGENTS_VERSION ??
+    'dev';
   return { success: true, data: { version } };
 }
 
@@ -4191,15 +4831,20 @@ function defaultCronWorkspace(): string {
  * membership. The list endpoint returns up to ~100s of rows; for our scale
  * this is cheaper than adding a new owner-check Rust endpoint.
  */
-async function verifyCronTaskOwnership(taskId: string): Promise<AdminResponse | null> {
+async function verifyCronTaskOwnership(
+  taskId: string,
+): Promise<AdminResponse | null> {
   const workspacePath = defaultCronWorkspace();
   const qs = `?workspacePath=${encodeURIComponent(workspacePath)}`;
   const resp = await managementApi(`/api/cron/list${qs}`);
   if (!resp.ok) {
     return mgmtError(resp, 'Failed to verify task ownership');
   }
-  const tasks = ((resp as Record<string, unknown>).tasks as Array<{ id?: string }> | undefined) ?? [];
-  const owned = tasks.some(t => t.id === taskId);
+  const tasks =
+    ((resp as Record<string, unknown>).tasks as
+      | Array<{ id?: string }>
+      | undefined) ?? [];
+  const owned = tasks.some((t) => t.id === taskId);
   if (!owned) {
     return {
       success: false,
@@ -4209,7 +4854,9 @@ async function verifyCronTaskOwnership(taskId: string): Promise<AdminResponse | 
   return null;
 }
 
-export async function handleCronList(payload: { workspacePath?: string }): Promise<AdminResponse> {
+export async function handleCronList(payload: {
+  workspacePath?: string;
+}): Promise<AdminResponse> {
   // Default to current sidecar's workspace if caller didn't specify. Without
   // this, `myagents cron list` from an IM bot returns tasks across every
   // workspace on the system — see ownership-guard rationale above.
@@ -4219,18 +4866,26 @@ export async function handleCronList(payload: { workspacePath?: string }): Promi
   const resp = await managementApi(`/api/cron/list${qs}`);
   if (resp.ok) {
     const { scope, hint } = buildCronScope(workspacePath, explicit);
-    return { success: true, data: (resp as Record<string, unknown>).tasks ?? [], scope, hint };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).tasks ?? [],
+      scope,
+      hint,
+    };
   }
   return mgmtError(resp, 'Failed to list cron tasks');
 }
 
-export async function handleCronCreate(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleCronCreate(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   // Default workspacePath if caller didn't supply one. Rust requires the
   // field; without this default, every AI-issued `myagents cron add` would
   // 400 because the prompt examples (intentionally) don't mention --workspace.
-  const resolvedWorkspacePath = (payload.workspacePath as string | undefined)
-    || (payload.workspace_path as string | undefined)
-    || defaultCronWorkspace();
+  const resolvedWorkspacePath =
+    (payload.workspacePath as string | undefined) ||
+    (payload.workspace_path as string | undefined) ||
+    defaultCronWorkspace();
   const finalPayload: Record<string, unknown> = payload.workspacePath
     ? payload
     : { ...payload, workspacePath: resolvedWorkspacePath };
@@ -4238,7 +4893,8 @@ export async function handleCronCreate(payload: Record<string, unknown>): Promis
   if (schedule?.kind === 'loop') {
     return {
       success: false,
-      error: 'Loop schedules are Goal Mode tasks. Use myagents goal create --objective-file <path> after writing the objective to that file; do not use myagents cron add.',
+      error:
+        'Loop schedules are Goal Mode tasks. Use myagents goal create --objective-file <path> after writing the objective to that file; do not use myagents cron add.',
     };
   }
 
@@ -4257,7 +4913,10 @@ export async function handleCronCreate(payload: Record<string, unknown>): Promis
   if (finalPayload.dryRun) {
     // Strip the flag itself from the preview body so the user sees only
     // the task fields they're actually requesting.
-    const { dryRun: _dryRun, ...preview } = finalPayload as Record<string, unknown>;
+    const { dryRun: _dryRun, ...preview } = finalPayload as Record<
+      string,
+      unknown
+    >;
     return { success: true, dryRun: true, preview };
   }
 
@@ -4265,14 +4924,18 @@ export async function handleCronCreate(payload: Record<string, unknown>): Promis
   return wrapMgmtResponse(resp);
 }
 
-export async function handleCronStop(payload: { taskId: string }): Promise<AdminResponse> {
+export async function handleCronStop(payload: {
+  taskId: string;
+}): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
   const resp = await managementApi('/api/cron/stop', 'POST', payload);
   return wrapMgmtResponse(resp);
 }
 
-export async function handleCronStart(payload: { taskId: string }): Promise<AdminResponse> {
+export async function handleCronStart(payload: {
+  taskId: string;
+}): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
   const resp = await managementApi('/api/cron/run', 'POST', payload);
@@ -4282,7 +4945,9 @@ export async function handleCronStart(payload: { taskId: string }): Promise<Admi
 /// PRD 0.2.5 R4 — fire one immediate execution without changing schedule.
 /// Returns { taskId, sessionId, dispatchedAt } on success; { error, code } on
 /// conflict (task currently executing).
-export async function handleCronRunNow(payload: { taskId: string }): Promise<AdminResponse> {
+export async function handleCronRunNow(payload: {
+  taskId: string;
+}): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
   const resp = await managementApi('/api/cron/trigger', 'POST', payload);
@@ -4299,14 +4964,19 @@ export async function handleCronRunNow(payload: { taskId: string }): Promise<Adm
   return mgmtError(resp, 'Failed to trigger cron');
 }
 
-export async function handleCronDelete(payload: { taskId: string }): Promise<AdminResponse> {
+export async function handleCronDelete(payload: {
+  taskId: string;
+}): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
   const resp = await managementApi('/api/cron/delete', 'POST', payload);
   return wrapMgmtResponse(resp);
 }
 
-export async function handleCronUpdate(payload: { taskId: string; patch: Record<string, unknown> }): Promise<AdminResponse> {
+export async function handleCronUpdate(payload: {
+  taskId: string;
+  patch: Record<string, unknown>;
+}): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
   let validationPayload: Record<string, unknown> = {
@@ -4316,8 +4986,15 @@ export async function handleCronUpdate(payload: { taskId: string; patch: Record<
   if (hasTaskRuntimeOverride(payload.patch)) {
     const current = await handleTaskGet({ id: payload.taskId });
     if (!current.success) return current;
-    if (!current.data || typeof current.data !== 'object' || Array.isArray(current.data)) {
-      return { success: false, error: `Task '${payload.taskId}' returned invalid persisted data.` };
+    if (
+      !current.data ||
+      typeof current.data !== 'object' ||
+      Array.isArray(current.data)
+    ) {
+      return {
+        success: false,
+        error: `Task '${payload.taskId}' returned invalid persisted data.`,
+      };
     }
     // Runtime updates are patches. Validate against the persisted complete
     // identity so changing runtimeConfig/model alone cannot inherit an
@@ -4336,23 +5013,34 @@ export async function handleCronUpdate(payload: { taskId: string; patch: Record<
     // the "I just changed schedule, why does the next run show +1h" UX
     // confusion that strict-after-now causes when the user re-checks
     // later via `cron list`.
-    return { success: true, data: (resp as Record<string, unknown>).task ?? null };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).task ?? null,
+    };
   }
   return mgmtError(resp, 'Failed to update cron task');
 }
 
-export async function handleCronRuns(payload: { taskId: string; limit?: number }): Promise<AdminResponse> {
+export async function handleCronRuns(payload: {
+  taskId: string;
+  limit?: number;
+}): Promise<AdminResponse> {
   const reject = await verifyCronTaskOwnership(payload.taskId);
   if (reject) return reject;
   const qs = `?taskId=${encodeURIComponent(payload.taskId)}${payload.limit ? `&limit=${payload.limit}` : ''}`;
   const resp = await managementApi(`/api/cron/runs${qs}`);
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).runs ?? [] };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).runs ?? [],
+    };
   }
   return mgmtError(resp, 'Failed to get cron runs');
 }
 
-export async function handleCronStatus(payload: { workspacePath?: string }): Promise<AdminResponse> {
+export async function handleCronStatus(payload: {
+  workspacePath?: string;
+}): Promise<AdminResponse> {
   const explicit = Boolean(payload.workspacePath);
   const workspacePath = payload.workspacePath ?? defaultCronWorkspace();
   const qs = `?workspacePath=${encodeURIComponent(workspacePath)}`;
@@ -4368,13 +5056,18 @@ export async function handleCronStatus(payload: { workspacePath?: string }): Pro
   return wrapped;
 }
 
-function currentGoalContext(): { sessionId?: string; workspacePath: string; error?: string } {
+function currentGoalContext(): {
+  sessionId?: string;
+  workspacePath: string;
+  error?: string;
+} {
   const sessionContext = getSessionEngine().getCurrentSessionContext();
   const sessionId = sessionContext.sessionId ?? process.env.MYAGENTS_SESSION_ID;
   if (!sessionId) {
     return {
       workspacePath: sessionContext.workspacePath ?? defaultCronWorkspace(),
-      error: 'No current session. Run this command from inside a MyAgents AI session.',
+      error:
+        'No current session. Run this command from inside a MyAgents AI session.',
     };
   }
   return {
@@ -4386,12 +5079,17 @@ function currentGoalContext(): { sessionId?: string; workspacePath: string; erro
 export async function handleGoalGet(): Promise<AdminResponse> {
   const ctx = currentGoalContext();
   if (ctx.error || !ctx.sessionId) return { success: false, error: ctx.error };
-  const resp = await managementApi(`/api/goal/get${qsFrom({
-    sessionId: ctx.sessionId,
-    workspacePath: ctx.workspacePath,
-  })}`);
+  const resp = await managementApi(
+    `/api/goal/get${qsFrom({
+      sessionId: ctx.sessionId,
+      workspacePath: ctx.workspacePath,
+    })}`,
+  );
   if (resp.ok) {
-    return { success: true, data: { goal: (resp as Record<string, unknown>).goal ?? null } };
+    return {
+      success: true,
+      data: { goal: (resp as Record<string, unknown>).goal ?? null },
+    };
   }
   return mgmtError(resp, 'Failed to get Goal');
 }
@@ -4405,7 +5103,8 @@ export async function handleGoalCreate(payload: {
   };
 }): Promise<AdminResponse> {
   const objective = payload.objective?.trim();
-  if (!objective) return { success: false, error: 'Missing required field: objective' };
+  if (!objective)
+    return { success: false, error: 'Missing required field: objective' };
   const ctx = currentGoalContext();
   if (ctx.error || !ctx.sessionId) return { success: false, error: ctx.error };
   const resp = await managementApi('/api/goal/create', 'POST', {
@@ -4415,7 +5114,10 @@ export async function handleGoalCreate(payload: {
     ...(payload.endConditions ? { endConditions: payload.endConditions } : {}),
   });
   if (resp.ok) {
-    return { success: true, data: { goal: (resp as Record<string, unknown>).goal } };
+    return {
+      success: true,
+      data: { goal: (resp as Record<string, unknown>).goal },
+    };
   }
   return mgmtError(resp, 'Failed to create Goal');
 }
@@ -4432,9 +5134,14 @@ export async function handleGoalUpdate(payload: {
   if (ctx.error || !ctx.sessionId) return { success: false, error: ctx.error };
   const turn = getSessionEngine().getCurrentTurnIdentity();
   if (!turn || turn.owner.kind !== 'goal') {
-    return { success: false, error: 'Goal terminal update requires the active Goal turn authority' };
+    return {
+      success: false,
+      error: 'Goal terminal update requires the active Goal turn authority',
+    };
   }
-  const reason = payload.reason?.trim() || (status === 'complete' ? 'Goal achieved' : 'Goal blocked');
+  const reason =
+    payload.reason?.trim() ||
+    (status === 'complete' ? 'Goal achieved' : 'Goal blocked');
   const resp = await managementApi('/api/goal/update', 'POST', {
     sessionId: ctx.sessionId,
     workspacePath: ctx.workspacePath,
@@ -4444,7 +5151,10 @@ export async function handleGoalUpdate(payload: {
     reason,
   });
   if (resp.ok) {
-    return { success: true, data: { goal: (resp as Record<string, unknown>).goal } };
+    return {
+      success: true,
+      data: { goal: (resp as Record<string, unknown>).goal },
+    };
   }
   return mgmtError(resp, 'Failed to update Goal');
 }
@@ -4461,7 +5171,9 @@ export async function handleGoalUpdate(payload: {
 // `cmd_task_update_status` in Rust which stamps `user/ui` authoritatively.
 // ---------------------------------------------------------------------------
 
-function qsFrom(params: Record<string, string | number | boolean | undefined>): string {
+function qsFrom(
+  params: Record<string, string | number | boolean | undefined>,
+): string {
   const parts: string[] = [];
   for (const [k, v] of Object.entries(params)) {
     if (v === undefined) continue;
@@ -4475,7 +5187,9 @@ type TaskCliCaller = {
   source?: 'cli';
 };
 
-function normalizedTaskCliCaller(payload: TaskCliCaller): Required<TaskCliCaller> {
+function normalizedTaskCliCaller(
+  payload: TaskCliCaller,
+): Required<TaskCliCaller> {
   return {
     actor: payload.actor === 'agent' ? 'agent' : 'user',
     source: 'cli',
@@ -4489,25 +5203,37 @@ function taskCliAnalyticsSource(payload: TaskCliCaller): 'cli' | 'cli_agent' {
 function resolveTaskWorkspace(
   payload: Record<string, unknown>,
 ): { payload: Record<string, unknown> } | { response: AdminResponse } {
-  const explicitId = typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
-    ? payload.workspaceId.trim()
-    : undefined;
-  const explicitPath = typeof payload.workspacePath === 'string' && payload.workspacePath.trim()
-    ? payload.workspacePath.trim()
-    : undefined;
+  const explicitId =
+    typeof payload.workspaceId === 'string' && payload.workspaceId.trim()
+      ? payload.workspaceId.trim()
+      : undefined;
+  const explicitPath =
+    typeof payload.workspacePath === 'string' && payload.workspacePath.trim()
+      ? payload.workspacePath.trim()
+      : undefined;
   if (payload.workspaceId !== undefined && !explicitId) {
-    return { response: { success: false, error: 'workspaceId must be a non-empty string' } };
+    return {
+      response: {
+        success: false,
+        error: 'workspaceId must be a non-empty string',
+      },
+    };
   }
   if (payload.workspacePath !== undefined && !explicitPath) {
-    return { response: { success: false, error: 'workspacePath must be a non-empty string' } };
+    return {
+      response: {
+        success: false,
+        error: 'workspacePath must be a non-empty string',
+      },
+    };
   }
 
   const projects = loadProjects();
   const currentPath = getCurrentWorkspacePath() ?? defaultCronWorkspace();
   const projectById = explicitId
-    ? projects.find(item => item.id === explicitId)
+    ? projects.find((item) => item.id === explicitId)
     : undefined;
-  const projectByPath = projects.find(item =>
+  const projectByPath = projects.find((item) =>
     workspacePathsEqual(item.path, explicitPath ?? currentPath),
   );
   if (explicitId && !projectById) {
@@ -4522,14 +5248,19 @@ function resolveTaskWorkspace(
       },
     };
   }
-  if (explicitId && explicitPath && !workspacePathsEqual(projectById!.path, explicitPath)) {
+  if (
+    explicitId &&
+    explicitPath &&
+    !workspacePathsEqual(projectById!.path, explicitPath)
+  ) {
     return {
       response: {
         success: false,
         error: `workspaceId '${explicitId}' does not own workspacePath '${explicitPath}'.`,
         recoveryHint: {
           recoveryCommand: 'myagents agent current --json',
-          message: 'Use the id and path from the same Project-backed Agent workspace.',
+          message:
+            'Use the id and path from the same Project-backed Agent workspace.',
         },
       },
     };
@@ -4544,7 +5275,8 @@ function resolveTaskWorkspace(
         error: 'Current workspace could not be resolved to a Task project.',
         recoveryHint: {
           recoveryCommand: 'myagents agent current --json',
-          message: 'Pass both --workspaceId and --workspacePath only for an explicit cross-workspace operation.',
+          message:
+            'Pass both --workspaceId and --workspacePath only for an explicit cross-workspace operation.',
         },
       },
     };
@@ -4552,7 +5284,9 @@ function resolveTaskWorkspace(
   return { payload: { ...payload, workspaceId, workspacePath } };
 }
 
-function compactTaskForAgent(task: Record<string, unknown>): Record<string, unknown> {
+function compactTaskForAgent(
+  task: Record<string, unknown>,
+): Record<string, unknown> {
   const trigger = task.trigger as { detector?: { type?: unknown } } | undefined;
   return {
     id: task.id,
@@ -4581,7 +5315,10 @@ function compactTaskForAgent(task: Record<string, unknown>): Record<string, unkn
 
 type TaskAgentReceiptOperation = 'create' | 'get' | 'run' | 'rerun';
 
-function taskStatusMeaning(status: string | null, executionState: string | null): string {
+function taskStatusMeaning(
+  status: string | null,
+  executionState: string | null,
+): string {
   switch (status) {
     case 'todo':
       return 'The Task is saved but its scheduler is not enabled. Run it when it should start.';
@@ -4616,41 +5353,53 @@ function withTaskAgentReceipt(
   operation: TaskAgentReceiptOperation,
   options: { changed: boolean; taskId?: string },
 ): AdminResponse {
-  if (!response.success || !response.data || typeof response.data !== 'object' || Array.isArray(response.data)) {
+  if (
+    !response.success ||
+    !response.data ||
+    typeof response.data !== 'object' ||
+    Array.isArray(response.data)
+  ) {
     return response;
   }
   const data = response.data as Record<string, unknown>;
-  const task = data.task && typeof data.task === 'object' && !Array.isArray(data.task)
-    ? data.task as Record<string, unknown>
-    : data;
-  const taskId = typeof task.id === 'string'
-    ? task.id
-    : typeof data.taskId === 'string'
-      ? data.taskId
-      : typeof data.task_id === 'string'
-        ? data.task_id
-        : options.taskId;
+  const task =
+    data.task && typeof data.task === 'object' && !Array.isArray(data.task)
+      ? (data.task as Record<string, unknown>)
+      : data;
+  const taskId =
+    typeof task.id === 'string'
+      ? task.id
+      : typeof data.taskId === 'string'
+        ? data.taskId
+        : typeof data.task_id === 'string'
+          ? data.task_id
+          : options.taskId;
   if (!taskId) return response;
 
-  const rawStatus = typeof data.status === 'string'
-    ? data.status
-    : typeof task.status === 'string'
-      ? task.status
-      : null;
+  const rawStatus =
+    typeof data.status === 'string'
+      ? data.status
+      : typeof task.status === 'string'
+        ? task.status
+        : null;
   const status = rawStatus?.toLowerCase() ?? null;
-  const executionState = typeof task.executionState === 'string'
-    ? task.executionState
-    : typeof data.executionState === 'string'
-      ? data.executionState
-      : null;
-  const nextExecutionAt = typeof data.nextExecutionAt === 'number'
-    ? data.nextExecutionAt
-    : typeof task.nextExecutionAt === 'number'
-      ? task.nextExecutionAt
-      : null;
-  const changed = typeof data.changed === 'boolean' ? data.changed : options.changed;
-  const boundSession = task.runMode === 'single-session'
-    || task.dispatchOrigin === 'attached-session';
+  const executionState =
+    typeof task.executionState === 'string'
+      ? task.executionState
+      : typeof data.executionState === 'string'
+        ? data.executionState
+        : null;
+  const nextExecutionAt =
+    typeof data.nextExecutionAt === 'number'
+      ? data.nextExecutionAt
+      : typeof task.nextExecutionAt === 'number'
+        ? task.nextExecutionAt
+        : null;
+  const changed =
+    typeof data.changed === 'boolean' ? data.changed : options.changed;
+  const boundSession =
+    task.runMode === 'single-session' ||
+    task.dispatchOrigin === 'attached-session';
 
   return {
     ...response,
@@ -4689,31 +5438,46 @@ export async function handleTaskList(payload: {
 }): Promise<AdminResponse> {
   const resolved = resolveTaskWorkspace(payload);
   if ('response' in resolved) return resolved.response;
-  const { query, limit, workspacePath: _workspacePath, ...filters } = resolved.payload;
-  if (limit !== undefined && (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 200)) {
+  const {
+    query,
+    limit,
+    workspacePath: _workspacePath,
+    ...filters
+  } = resolved.payload;
+  if (
+    limit !== undefined &&
+    (!Number.isSafeInteger(limit) || Number(limit) < 1 || Number(limit) > 200)
+  ) {
     return { success: false, error: 'limit must be an integer from 1 to 200' };
   }
-  const resp = await managementApi(`/api/task/list${qsFrom(filters as Record<string, string | number | boolean | undefined>)}`);
+  const resp = await managementApi(
+    `/api/task/list${qsFrom(filters as Record<string, string | number | boolean | undefined>)}`,
+  );
   if (resp.ok) {
     const tasks = Array.isArray((resp as Record<string, unknown>).tasks)
-      ? ((resp as Record<string, unknown>).tasks as Array<Record<string, unknown>>)
+      ? ((resp as Record<string, unknown>).tasks as Array<
+          Record<string, unknown>
+        >)
       : [];
-    const needle = typeof query === 'string' ? query.trim().toLocaleLowerCase() : '';
+    const needle =
+      typeof query === 'string' ? query.trim().toLocaleLowerCase() : '';
     const matched = needle
-      ? tasks.filter(task => {
+      ? tasks.filter((task) => {
           const tags = Array.isArray(task.tags) ? task.tags.join(' ') : '';
           return [task.id, task.name, task.description, tags]
-            .map(value => String(value ?? '').toLocaleLowerCase())
-            .some(value => value.includes(needle));
+            .map((value) => String(value ?? '').toLocaleLowerCase())
+            .some((value) => value.includes(needle));
         })
       : tasks;
-    const limited = limit === undefined ? matched : matched.slice(0, Number(limit));
+    const limited =
+      limit === undefined ? matched : matched.slice(0, Number(limit));
     return {
       success: true,
       data: limited.map(compactTaskForAgent),
       scope: {
         workspacePath: String(resolved.payload.workspacePath),
-        source: payload.workspaceId || payload.workspacePath ? 'explicit' : 'default',
+        source:
+          payload.workspaceId || payload.workspacePath ? 'explicit' : 'default',
         visibility: 'current Task workspace',
       },
     };
@@ -4721,8 +5485,12 @@ export async function handleTaskList(payload: {
   return mgmtError(resp, 'Failed to list tasks');
 }
 
-export async function handleTaskGet(payload: { id: string }): Promise<AdminResponse> {
-  const resp = await managementApi(`/api/task/get${qsFrom({ id: payload.id })}`);
+export async function handleTaskGet(payload: {
+  id: string;
+}): Promise<AdminResponse> {
+  const resp = await managementApi(
+    `/api/task/get${qsFrom({ id: payload.id })}`,
+  );
   if (resp.ok) {
     return withTaskAgentReceipt(
       { success: true, data: (resp as Record<string, unknown>).task },
@@ -4757,14 +5525,16 @@ export async function handleTaskComment(payload: {
   if (!sessionId) {
     return {
       success: false,
-      error: 'Task Agent comments require MYAGENTS_SESSION_ID; run this command inside the associated Task Session.',
+      error:
+        'Task Agent comments require MYAGENTS_SESSION_ID; run this command inside the associated Task Session.',
     };
   }
   const taskId = payload.id?.trim() || getCronTaskContext(sessionId).taskId;
   if (!taskId) {
     return {
       success: false,
-      error: 'Task ID is required outside an active Task turn. Pass <taskId> from the Task comment reminder.',
+      error:
+        'Task ID is required outside an active Task turn. Pass <taskId> from the Task comment reminder.',
     };
   }
   const resp = await managementApi('/api/task/comment', 'POST', {
@@ -4811,26 +5581,40 @@ export async function handleTaskCreateDirect(
 export async function handleTaskCreateAttached(
   payload: Record<string, unknown>,
 ): Promise<AdminResponse> {
-  if (typeof payload.currentSessionId !== 'string' || payload.currentSessionId.trim().length === 0) {
+  if (
+    typeof payload.currentSessionId !== 'string' ||
+    payload.currentSessionId.trim().length === 0
+  ) {
     return {
       success: false,
-      error: 'currentSessionId is required; run this command from inside a MyAgents AI session',
+      error:
+        'currentSessionId is required; run this command from inside a MyAgents AI session',
     };
   }
-  const resp = await managementApi('/api/task/create-attached', 'POST', payload);
+  const resp = await managementApi(
+    '/api/task/create-attached',
+    'POST',
+    payload,
+  );
   const wrapped = wrapMgmtResponse(resp);
-  const enriched = enrichTaskCreateResponse(wrapped, payload, [], { attached: true });
+  const enriched = enrichTaskCreateResponse(wrapped, payload, [], {
+    attached: true,
+  });
   if (enriched.success) {
     trackServer('task_create', {
       source: cliSource(),
       origin: 'space_issue_attached',
-      has_workspace: typeof payload.workspacePath === 'string' && payload.workspacePath.length > 0,
+      has_workspace:
+        typeof payload.workspacePath === 'string' &&
+        payload.workspacePath.length > 0,
     });
   }
   return enriched;
 }
 
-export async function handleTaskRun(payload: { id: string }): Promise<AdminResponse> {
+export async function handleTaskRun(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/run', 'POST', payload);
   const wrapped = withTaskAgentReceipt(wrapMgmtResponse(resp), 'run', {
     changed: resp.changed !== false,
@@ -4851,7 +5635,9 @@ export async function handleTaskRun(payload: { id: string }): Promise<AdminRespo
   return wrapped;
 }
 
-export async function handleTaskRerun(payload: { id: string }): Promise<AdminResponse> {
+export async function handleTaskRerun(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/rerun', 'POST', payload);
   const wrapped = withTaskAgentReceipt(wrapMgmtResponse(resp), 'rerun', {
     changed: true,
@@ -4869,15 +5655,21 @@ export async function handleTaskRerun(payload: { id: string }): Promise<AdminRes
   return wrapped;
 }
 
-export async function handleTaskRunNow(payload: { id: string }): Promise<AdminResponse> {
+export async function handleTaskRunNow(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/run-now', 'POST', payload);
   return wrapMgmtResponse(resp);
 }
 
-export async function handleTaskTriggerValidate(
-  payload: { trigger?: unknown },
-): Promise<AdminResponse> {
-  const resp = await managementApi('/api/task/trigger/validate', 'POST', payload);
+export async function handleTaskTriggerValidate(payload: {
+  trigger?: unknown;
+}): Promise<AdminResponse> {
+  const resp = await managementApi(
+    '/api/task/trigger/validate',
+    'POST',
+    payload,
+  );
   return wrapMgmtResponse(resp);
 }
 
@@ -4910,7 +5702,9 @@ export async function handleTaskTriggerTest(
   return wrapped;
 }
 
-export async function handleTaskCheckNow(payload: { id: string }): Promise<AdminResponse> {
+export async function handleTaskCheckNow(payload: {
+  id: string;
+}): Promise<AdminResponse> {
   const resp = await managementApi('/api/task/check-now', 'POST', payload, {
     timeoutMs: 310_000,
   });
@@ -4921,8 +5715,14 @@ export async function handleTaskCheckNow(payload: { id: string }): Promise<Admin
   return wrapped;
 }
 
-export async function handleTaskResetCheckpoint(payload: { id: string }): Promise<AdminResponse> {
-  const resp = await managementApi('/api/task/reset-checkpoint', 'POST', payload);
+export async function handleTaskResetCheckpoint(payload: {
+  id: string;
+}): Promise<AdminResponse> {
+  const resp = await managementApi(
+    '/api/task/reset-checkpoint',
+    'POST',
+    payload,
+  );
   return wrapMgmtResponse(resp);
 }
 
@@ -4950,8 +5750,7 @@ function enrichTaskCreateResponse(
   // Rust returns `{ task: {...} }` for task creation — unwrap so we can read
   // the authoritative persisted values.
   const persistedTask =
-    (existing.task as Record<string, unknown> | undefined)
-    ?? existing; // fallback for older Rust shapes that returned the task inline
+    (existing.task as Record<string, unknown> | undefined) ?? existing; // fallback for older Rust shapes that returned the task inline
   const taskId =
     typeof persistedTask.id === 'string'
       ? persistedTask.id
@@ -4967,7 +5766,8 @@ function enrichTaskCreateResponse(
     runtime: (persistedTask.runtime as string | undefined) ?? null,
     providerId: (persistedTask.providerId as string | undefined) ?? null,
     model: (persistedTask.model as string | undefined) ?? null,
-    permissionMode: (persistedTask.permissionMode as string | undefined) ?? null,
+    permissionMode:
+      (persistedTask.permissionMode as string | undefined) ?? null,
     runtimeConfig: persistedTask.runtimeConfig ?? null,
   };
 
@@ -4986,8 +5786,12 @@ function enrichTaskCreateResponse(
     // drift (a diff between these two arrays means "server silently dropped
     // a field you sent").
     overridesRequested: requestedOverrides,
-    inheritedFromWorkspace:
-      ['runtime', 'providerId', 'model', 'permissionMode'].filter(f => !fieldsWithValue.includes(f)),
+    inheritedFromWorkspace: [
+      'runtime',
+      'providerId',
+      'model',
+      'permissionMode',
+    ].filter((f) => !fieldsWithValue.includes(f)),
   };
   if (taskId) {
     enriched.nextSteps = options.attached
@@ -5000,11 +5804,10 @@ function enrichTaskCreateResponse(
           inspect: `myagents task get ${taskId}`,
         };
   }
-  return withTaskAgentReceipt(
-    { ...response, data: enriched },
-    'create',
-    { changed: true, taskId },
-  );
+  return withTaskAgentReceipt({ ...response, data: enriched }, 'create', {
+    changed: true,
+    taskId,
+  });
 }
 
 /**
@@ -5029,8 +5832,15 @@ export async function handleTaskUpdate(
   if (hasTaskRuntimeOverride(payload)) {
     const current = await handleTaskGet({ id: payload.id });
     if (!current.success) return current;
-    if (!current.data || typeof current.data !== 'object' || Array.isArray(current.data)) {
-      return { success: false, error: `Task '${payload.id}' returned invalid persisted data.` };
+    if (
+      !current.data ||
+      typeof current.data !== 'object' ||
+      Array.isArray(current.data)
+    ) {
+      return {
+        success: false,
+        error: `Task '${payload.id}' returned invalid persisted data.`,
+      };
     }
     validationPayload = mergeTaskRuntimeValidationPayload(
       current.data as Record<string, unknown>,
@@ -5046,14 +5856,19 @@ export async function handleTaskUpdate(
 export async function handleTaskUpdateStatus(
   payload: Record<string, unknown>,
 ): Promise<AdminResponse> {
-  const request = { ...payload, ...normalizedTaskCliCaller(payload as TaskCliCaller) };
+  const request = {
+    ...payload,
+    ...normalizedTaskCliCaller(payload as TaskCliCaller),
+  };
   const resp = await managementApi('/api/task/update-status', 'POST', request);
   const wrapped = wrapMgmtResponse(resp);
   // Only `stopped` counts as a "stop" event in analytics terms — other
   // status transitions (running/done/blocked/etc) flow through the same
   // endpoint but aren't user-initiated stops.
   if (wrapped.success && payload.status === 'stopped') {
-    trackServer('task_stop', { source: taskCliAnalyticsSource(request as TaskCliCaller) });
+    trackServer('task_stop', {
+      source: taskCliAnalyticsSource(request as TaskCliCaller),
+    });
   }
   return wrapped;
 }
@@ -5092,7 +5907,9 @@ export async function handleTaskDelete(payload: {
   // what users are pruning (orphan todos vs. completed work etc.).
   let status = 'unknown';
   try {
-    const fetched = await managementApi(`/api/task/get${qsFrom({ id: payload.id })}`);
+    const fetched = await managementApi(
+      `/api/task/get${qsFrom({ id: payload.id })}`,
+    );
     if (fetched.ok) {
       const task = (fetched as Record<string, unknown>).task as
         | Record<string, unknown>
@@ -5110,7 +5927,10 @@ export async function handleTaskDelete(payload: {
   });
   const wrapped = wrapMgmtResponse(resp);
   if (wrapped.success) {
-    trackServer('task_delete', { source: taskCliAnalyticsSource(payload), status });
+    trackServer('task_delete', {
+      source: taskCliAnalyticsSource(payload),
+      status,
+    });
   }
   return wrapped;
 }
@@ -5126,11 +5946,12 @@ export async function handleTaskReadDoc(payload: {
   id: string;
   doc: string;
 }): Promise<AdminResponse> {
-  const resp = await managementApi(
-    `/api/task/read-doc${qsFrom(payload)}`,
-  );
+  const resp = await managementApi(`/api/task/read-doc${qsFrom(payload)}`);
   if (resp.ok) {
-    return { success: true, data: { content: (resp as Record<string, unknown>).content ?? '' } };
+    return {
+      success: true,
+      data: { content: (resp as Record<string, unknown>).content ?? '' },
+    };
   }
   return mgmtError(resp, 'Failed to read task doc');
 }
@@ -5155,7 +5976,10 @@ export async function handleThoughtList(payload: {
 }): Promise<AdminResponse> {
   const resp = await managementApi(`/api/thought/list${qsFrom(payload)}`);
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).thoughts ?? [] };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).thoughts ?? [],
+    };
   }
   return mgmtError(resp, 'Failed to list thoughts');
 }
@@ -5165,13 +5989,7 @@ export async function handleThoughtCreate(payload: {
   images?: string[];
 }): Promise<AdminResponse> {
   const resp = await managementApi('/api/thought/create', 'POST', payload);
-  const wrapped = wrapMgmtResponse(resp);
-  if (wrapped.success) {
-    // No `location` for CLI — the field is GUI-specific (launcher vs
-    // task_center surface). Set to null so the column type stays uniform.
-    trackServer('thought_create', { source: cliSource(), location: null });
-  }
-  return wrapped;
+  return wrapMgmtResponse(resp);
 }
 
 export async function handleRecordList(payload: {
@@ -5183,7 +6001,10 @@ export async function handleRecordList(payload: {
 }): Promise<AdminResponse> {
   const resp = await managementApi(`/api/record/list${qsFrom(payload)}`);
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).records ?? [] };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).records ?? [],
+    };
   }
   return mgmtError(resp, 'Failed to list records');
 }
@@ -5212,10 +6033,18 @@ export async function handleRecordCreate(payload: {
 export function handleCronExit(payload: { reason?: string }): AdminResponse {
   const ctx = getCronTaskContext();
   if (!ctx.taskId) {
-    return { success: false, error: 'No active scheduled Task in this session. This command only works inside a scheduled Task run.' };
+    return {
+      success: false,
+      error:
+        'No active scheduled Task in this session. This command only works inside a scheduled Task run.',
+    };
   }
   if (!ctx.canExit) {
-    return { success: false, error: 'This Task has "Allow AI to exit" disabled — only the user can stop it from the UI.' };
+    return {
+      success: false,
+      error:
+        'This Task has "Allow AI to exit" disabled — only the user can stop it from the UI.',
+    };
   }
   const reason = payload.reason?.trim() || 'AI requested task exit';
   const request = markCronTaskExitRequested(reason) ?? {
@@ -5238,12 +6067,15 @@ export function handleCronExit(payload: { reason?: string }): AdminResponse {
  * Only meaningful inside an IM session — there is no "current bot" outside
  * one, so we reject early instead of silently no-oping.
  */
-export async function handleImWake(payload: { text?: string }): Promise<AdminResponse> {
+export async function handleImWake(payload: {
+  text?: string;
+}): Promise<AdminResponse> {
   const ctx = getImMediaContext();
   if (!ctx) {
     return {
       success: false,
-      error: 'No IM context in this session. `myagents im wake` only works inside an IM Bot / Agent Channel session.',
+      error:
+        'No IM context in this session. `myagents im wake` only works inside an IM Bot / Agent Channel session.',
     };
   }
   const resp = await managementApi('/api/im/wake', 'POST', {
@@ -5277,19 +6109,30 @@ export async function handleImChannels(): Promise<AdminResponse> {
   return {
     success: true,
     data: { channels },
-    hint: channels.length === 0
-      ? 'No IM channels configured. The user needs to set up an Agent channel (Telegram/Feishu/DingTalk) in Settings first.'
-      : `${channels.length} IM channel${channels.length === 1 ? '' : 's'} configured.`,
+    hint:
+      channels.length === 0
+        ? 'No IM channels configured. The user needs to set up an Agent channel (Telegram/Feishu/DingTalk) in Settings first.'
+        : `${channels.length} IM channel${channels.length === 1 ? '' : 's'} configured.`,
   };
 }
 
-export async function handleImSendMedia(payload: { filePath?: string; caption?: string }): Promise<AdminResponse> {
+export async function handleImSendMedia(payload: {
+  filePath?: string;
+  caption?: string;
+}): Promise<AdminResponse> {
   if (!payload.filePath) {
-    return { success: false, error: 'Missing required field: --file <absolute-path>' };
+    return {
+      success: false,
+      error: 'Missing required field: --file <absolute-path>',
+    };
   }
   const ctx = getImMediaContext();
   if (!ctx) {
-    return { success: false, error: 'No IM context in this session. This command only works inside an IM Bot / Agent Channel session.' };
+    return {
+      success: false,
+      error:
+        'No IM context in this session. This command only works inside an IM Bot / Agent Channel session.',
+    };
   }
   // Path traversal guard: prompt-injected AI on an external runtime could be
   // steered into `myagents im send-media --file ~/.ssh/id_rsa` and exfiltrate
@@ -5299,9 +6142,14 @@ export async function handleImSendMedia(payload: { filePath?: string; caption?: 
   const { agentDir } = getAgentState();
   let safePath: string;
   try {
-    safePath = assertSafeFilePath(payload.filePath, { workspacePath: agentDir });
+    safePath = assertSafeFilePath(payload.filePath, {
+      workspacePath: agentDir,
+    });
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : String(err) };
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
   const resp = await managementApi('/api/im/send-media', 'POST', {
     botId: ctx.botId,
@@ -5637,32 +6485,49 @@ WHEN TO CALL
   content for later ("记一下", "帮我记", "记下来", "remember this", etc.).
   Do not file FYI remarks, brainstorming, or unsolicited ideas.`;
 
-async function spaceManagementResponse(path: string, payload: Record<string, unknown>, hint?: string): Promise<AdminResponse> {
-  const resp = await managementApi(path, 'POST', await enrichSpaceWorkspaceContext(payload));
+async function spaceManagementResponse(
+  path: string,
+  payload: Record<string, unknown>,
+  hint?: string,
+): Promise<AdminResponse> {
+  const resp = await managementApi(
+    path,
+    'POST',
+    await enrichSpaceWorkspaceContext(payload),
+  );
   if (!resp.ok) return mgmtError(resp, 'Space command failed');
   return { success: true, data: resp.data, ...(hint ? { hint } : {}) };
 }
 
-async function enrichSpaceWorkspaceContext(payload: Record<string, unknown>): Promise<Record<string, unknown>> {
-  const requestedPath = typeof payload.workspacePath === 'string' && payload.workspacePath.trim()
-    ? payload.workspacePath.trim()
-    : undefined;
+async function enrichSpaceWorkspaceContext(
+  payload: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  const requestedPath =
+    typeof payload.workspacePath === 'string' && payload.workspacePath.trim()
+      ? payload.workspacePath.trim()
+      : undefined;
   const currentPath = getCurrentWorkspacePath();
   const workspacePath = requestedPath ?? currentPath;
-  const sessionId = typeof payload.sessionId === 'string' && payload.sessionId.trim()
-    ? payload.sessionId.trim()
+  const sessionId =
+    typeof payload.sessionId === 'string' && payload.sessionId.trim()
+      ? payload.sessionId.trim()
+      : undefined;
+  const origin = sessionId
+    ? getSessionEngine().getSessionOrigin(sessionId)
     : undefined;
-  const origin = sessionId ? getSessionEngine().getSessionOrigin(sessionId) : undefined;
-  const sessionOrigin = origin?.kind === 'registered-agent'
-    ? {
-        spaceId: origin.context.spaceId,
-        registeredAgentId: origin.context.registeredAgentId,
-      }
-    : undefined;
+  const sessionOrigin =
+    origin?.kind === 'registered-agent'
+      ? {
+          spaceId: origin.context.spaceId,
+          registeredAgentId: origin.context.registeredAgentId,
+        }
+      : undefined;
   if (!workspacePath) {
     return { ...payload, ...(sessionOrigin ? { sessionOrigin } : {}) };
   }
-  const project = loadProjects().find(item => workspacePathsEqual(item.path, workspacePath));
+  const project = loadProjects().find((item) =>
+    workspacePathsEqual(item.path, workspacePath),
+  );
   return {
     ...payload,
     workspacePath,
@@ -5678,15 +6543,21 @@ export async function handleSpaceList(): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/list', {});
 }
 
-export async function handleSpaceWhoami(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceWhoami(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/whoami', payload);
 }
 
-export async function handleSpaceAssigneeList(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceAssigneeList(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/assignee-list', payload);
 }
 
-export async function handleSpaceGoalList(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceGoalList(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse(
     '/api/space/goal-list',
     payload,
@@ -5694,11 +6565,19 @@ export async function handleSpaceGoalList(payload: Record<string, unknown>): Pro
   );
 }
 
-export async function handleSpaceIssueCreate(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/issue-create', payload, 'Issue created in MyAgents Space.');
+export async function handleSpaceIssueCreate(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/issue-create',
+    payload,
+    'Issue created in MyAgents Space.',
+  );
 }
 
-export async function handleSpaceIssueUpdate(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceIssueUpdate(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse(
     '/api/space/issue-update',
     payload,
@@ -5706,63 +6585,126 @@ export async function handleSpaceIssueUpdate(payload: Record<string, unknown>): 
   );
 }
 
-export async function handleSpaceIssueGet(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceIssueGet(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/issue-get', payload);
 }
 
-export async function handleSpaceIssueList(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceIssueList(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/issue-list', payload);
 }
 
-export async function handleSpaceIssueComment(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/issue-comment', payload, 'Comment posted to MyAgents Space.');
+export async function handleSpaceIssueComment(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/issue-comment',
+    payload,
+    'Comment posted to MyAgents Space.',
+  );
 }
 
-export async function handleSpaceIssueComments(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceIssueComments(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/issue-comments', payload);
 }
 
-export async function handleSpaceIssueCommentGet(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceIssueCommentGet(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/issue-comment-get', payload);
 }
 
-export async function handleSpaceIssueStatus(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/issue-status', payload, 'Issue status updated.');
+export async function handleSpaceIssueStatus(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/issue-status',
+    payload,
+    'Issue status updated.',
+  );
 }
 
-export async function handleSpaceIssueClaim(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/issue-claim', payload, 'Issue claimed.');
+export async function handleSpaceIssueClaim(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/issue-claim',
+    payload,
+    'Issue claimed.',
+  );
 }
 
-export async function handleSpaceIssueClose(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/issue-close', payload, 'Issue closed.');
+export async function handleSpaceIssueClose(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/issue-close',
+    payload,
+    'Issue closed.',
+  );
 }
 
-export async function handleSpaceIssueComplete(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/issue-complete', payload, 'Issue completed.');
+export async function handleSpaceIssueComplete(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/issue-complete',
+    payload,
+    'Issue completed.',
+  );
 }
 
-export async function handleSpaceIssueCancelClaim(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/issue-cancel-claim', payload, 'Issue claim cancelled.');
+export async function handleSpaceIssueCancelClaim(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/issue-cancel-claim',
+    payload,
+    'Issue claim cancelled.',
+  );
 }
 
-export async function handleSpaceClaimLocalTask(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/claim-local-task', payload, 'Claim linked to local task.');
+export async function handleSpaceClaimLocalTask(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/claim-local-task',
+    payload,
+    'Claim linked to local task.',
+  );
 }
 
-export async function handleSpaceAttachmentDownload(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceAttachmentDownload(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/attachment-download', payload);
 }
 
-export async function handleSpaceAttachmentAdd(payload: Record<string, unknown>): Promise<AdminResponse> {
-  return spaceManagementResponse('/api/space/attachment-add', payload, 'Issue attachments added.');
+export async function handleSpaceAttachmentAdd(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
+  return spaceManagementResponse(
+    '/api/space/attachment-add',
+    payload,
+    'Issue attachments added.',
+  );
 }
 
-export async function handleSpaceAttachmentInspect(payload: Record<string, unknown>): Promise<AdminResponse> {
+export async function handleSpaceAttachmentInspect(
+  payload: Record<string, unknown>,
+): Promise<AdminResponse> {
   return spaceManagementResponse('/api/space/attachment-inspect', payload);
 }
 
-export function handleReadme(payload: { topic?: string; modules?: string[] }): AdminResponse {
+export function handleReadme(payload: {
+  topic?: string;
+  modules?: string[];
+}): AdminResponse {
   const topic = (payload.topic ?? '').toLowerCase();
   if (topic === 'task') {
     return { success: true, data: { text: README_TASK_AUTOMATION } };
@@ -5777,7 +6719,9 @@ export function handleReadme(payload: { topic?: string; modules?: string[] }): A
     return { success: true, data: { text: README_THOUGHT } };
   }
   if (topic === 'widget' || topic === 'generative-ui' || topic === 'ui') {
-    const modules = (payload.modules ?? []).filter(m => typeof m === 'string' && m.length > 0);
+    const modules = (payload.modules ?? []).filter(
+      (m) => typeof m === 'string' && m.length > 0,
+    );
     if (modules.length === 0) {
       // No modules passed → return the meta-readme describing modules
       return { success: true, data: { text: README_WIDGET } };
@@ -5804,20 +6748,31 @@ export function handleReadme(payload: { topic?: string; modules?: string[] }): A
 export async function handlePluginList(): Promise<AdminResponse> {
   const resp = await managementApi('/api/plugin/list');
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).plugins ?? [] };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).plugins ?? [],
+    };
   }
   return mgmtError(resp, 'Failed to list plugins');
 }
 
-export async function handlePluginInstall(payload: { npmSpec: string }): Promise<AdminResponse> {
+export async function handlePluginInstall(payload: {
+  npmSpec: string;
+}): Promise<AdminResponse> {
   const resp = await managementApi('/api/plugin/install', 'POST', payload);
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).plugin, hint: 'Plugin installed successfully.' };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).plugin,
+      hint: 'Plugin installed successfully.',
+    };
   }
   return mgmtError(resp, 'Failed to install plugin');
 }
 
-export async function handlePluginUninstall(payload: { pluginId: string }): Promise<AdminResponse> {
+export async function handlePluginUninstall(payload: {
+  pluginId: string;
+}): Promise<AdminResponse> {
   const resp = await managementApi('/api/plugin/uninstall', 'POST', payload);
   return wrapMgmtResponse(resp);
 }
@@ -5845,11 +6800,16 @@ export async function handleCcPluginList(): Promise<AdminResponse> {
   return { success: true, data: listInstalledPlugins() };
 }
 
-export async function handleCcPluginShow(payload: { id?: string; name?: string }): Promise<AdminResponse> {
-  const { listInstalledPlugins, getPluginDetail } = await import('./plugins/store');
+export async function handleCcPluginShow(payload: {
+  id?: string;
+  name?: string;
+}): Promise<AdminResponse> {
+  const { listInstalledPlugins, getPluginDetail } = await import(
+    './plugins/store'
+  );
   let id = payload.id;
   if (!id && payload.name) {
-    const found = listInstalledPlugins().find(p => p.name === payload.name);
+    const found = listInstalledPlugins().find((p) => p.name === payload.name);
     if (found) id = found.id;
   }
   if (!id) return { success: false, error: 'id or name is required' };
@@ -5858,7 +6818,10 @@ export async function handleCcPluginShow(payload: { id?: string; name?: string }
   return { success: true, data: item };
 }
 
-export async function handleCcPluginInstall(payload: { sourceUrl?: string; url?: string }): Promise<AdminResponse> {
+export async function handleCcPluginInstall(payload: {
+  sourceUrl?: string;
+  url?: string;
+}): Promise<AdminResponse> {
   const sourceUrl = payload.sourceUrl ?? payload.url;
   if (!sourceUrl) return { success: false, error: 'sourceUrl is required' };
   const { json } = await sidecarSelf(
@@ -5868,16 +6831,28 @@ export async function handleCcPluginInstall(payload: { sourceUrl?: string; url?:
     { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS },
   );
   if (json.success) {
-    return { success: true, data: json.entry, hint: 'Plugin installed. Active after the next session pre-warm.' };
+    return {
+      success: true,
+      data: json.entry,
+      hint: 'Plugin installed. Active after the next session pre-warm.',
+    };
   }
-  return { success: false, error: typeof json.error === 'string' ? json.error : 'Failed to install plugin' };
+  return {
+    success: false,
+    error:
+      typeof json.error === 'string' ? json.error : 'Failed to install plugin',
+  };
 }
 
-export async function handleCcPluginUninstall(payload: { id?: string; name?: string; purgeData?: boolean }): Promise<AdminResponse> {
+export async function handleCcPluginUninstall(payload: {
+  id?: string;
+  name?: string;
+  purgeData?: boolean;
+}): Promise<AdminResponse> {
   const { listInstalledPlugins } = await import('./plugins/store');
   let id = payload.id;
   if (!id && payload.name) {
-    const found = listInstalledPlugins().find(p => p.name === payload.name);
+    const found = listInstalledPlugins().find((p) => p.name === payload.name);
     if (found) id = found.id;
   }
   if (!id) return { success: false, error: 'id or name is required' };
@@ -5892,22 +6867,43 @@ export async function handleCcPluginUninstall(payload: { id?: string; name?: str
   if (json.success) {
     return { success: true, data: json.removed, hint: 'Plugin removed.' };
   }
-  return { success: false, error: typeof json.error === 'string' ? json.error : 'Failed to uninstall plugin' };
+  return {
+    success: false,
+    error:
+      typeof json.error === 'string'
+        ? json.error
+        : 'Failed to uninstall plugin',
+  };
 }
 
-export async function handleCcPluginToggle(payload: { id?: string; name?: string; enabled: boolean }): Promise<AdminResponse> {
+export async function handleCcPluginToggle(payload: {
+  id?: string;
+  name?: string;
+  enabled: boolean;
+}): Promise<AdminResponse> {
   const { listInstalledPlugins } = await import('./plugins/store');
   let id = payload.id;
   if (!id && payload.name) {
-    const found = listInstalledPlugins().find(p => p.name === payload.name);
+    const found = listInstalledPlugins().find((p) => p.name === payload.name);
     if (found) id = found.id;
   }
   if (!id) return { success: false, error: 'id or name is required' };
-  const { json } = await sidecarSelf('/api/cc-plugin/toggle', 'POST', { id, enabled: payload.enabled });
+  const { json } = await sidecarSelf('/api/cc-plugin/toggle', 'POST', {
+    id,
+    enabled: payload.enabled,
+  });
   if (json.success) {
-    return { success: true, data: json.entry, hint: payload.enabled ? 'Plugin enabled.' : 'Plugin disabled.' };
+    return {
+      success: true,
+      data: json.entry,
+      hint: payload.enabled ? 'Plugin enabled.' : 'Plugin disabled.',
+    };
   }
-  return { success: false, error: typeof json.error === 'string' ? json.error : 'Failed to toggle plugin' };
+  return {
+    success: false,
+    error:
+      typeof json.error === 'string' ? json.error : 'Failed to toggle plugin',
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -5919,13 +6915,21 @@ export async function handleSkillList(): Promise<AdminResponse> {
   if (json.success) {
     return { success: true, data: json.skills ?? [] };
   }
-  return { success: false, error: String(json.error ?? 'Failed to list skills') };
+  return {
+    success: false,
+    error: String(json.error ?? 'Failed to list skills'),
+  };
 }
 
-export async function handleSkillInfo(payload: { name: string; scope?: 'user' | 'project' }): Promise<AdminResponse> {
+export async function handleSkillInfo(payload: {
+  name: string;
+  scope?: 'user' | 'project';
+}): Promise<AdminResponse> {
   if (!payload.name) return { success: false, error: 'name is required' };
   const scope = payload.scope ?? 'user';
-  const { json } = await sidecarSelf(`/api/skill/${encodeURIComponent(payload.name)}?scope=${scope}`);
+  const { json } = await sidecarSelf(
+    `/api/skill/${encodeURIComponent(payload.name)}?scope=${scope}`,
+  );
   if (json.success) {
     return { success: true, data: json.skill ?? null };
   }
@@ -5945,13 +6949,21 @@ export async function handleSkillAdd(payload: {
   // Step 1: a probe must be explicitly non-mutating. Without previewOnly the
   // route intentionally auto-installs an unambiguous single Skill.
   const scope = payload.scope ?? 'user';
-  const probe = await sidecarSelf('/api/skill/install-from-url', 'POST', {
-    url: payload.url,
-    scope,
-    previewOnly: true,
-  }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
+  const probe = await sidecarSelf(
+    '/api/skill/install-from-url',
+    'POST',
+    {
+      url: payload.url,
+      scope,
+      previewOnly: true,
+    },
+    { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS },
+  );
   if (!probe.json.success) {
-    return { success: false, error: String(probe.json.error ?? 'Install probe failed') };
+    return {
+      success: false,
+      error: String(probe.json.error ?? 'Install probe failed'),
+    };
   }
 
   const mode = probe.json.mode as string | undefined;
@@ -5960,7 +6972,11 @@ export async function handleSkillAdd(payload: {
   // as every other CLI mode so probe and dry-run are guaranteed write-free.
   if (mode === 'single') {
     const preview = probe.json.preview as {
-      skill: { suggestedFolderName: string; name: string; description?: string };
+      skill: {
+        suggestedFolderName: string;
+        name: string;
+        description?: string;
+      };
     };
     if (payload.dryRun) {
       return {
@@ -5974,15 +6990,23 @@ export async function handleSkillAdd(payload: {
         },
       };
     }
-    const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
-      url: payload.url,
-      scope,
-      confirmedSelection: {
-        folderNames: [preview.skill.suggestedFolderName],
+    const commit = await sidecarSelf(
+      '/api/skill/install-from-url',
+      'POST',
+      {
+        url: payload.url,
+        scope,
+        confirmedSelection: {
+          folderNames: [preview.skill.suggestedFolderName],
+        },
       },
-    }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
+      { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS },
+    );
     if (!commit.json.success) {
-      return { success: false, error: String(commit.json.error ?? 'Install failed') };
+      return {
+        success: false,
+        error: String(commit.json.error ?? 'Install failed'),
+      };
     }
     return {
       success: true,
@@ -5997,21 +7021,34 @@ export async function handleSkillAdd(payload: {
       plugins: Array<{
         name: string;
         description: string;
-        skills: Array<{ suggestedFolderName: string; name: string; conflict?: boolean }>;
+        skills: Array<{
+          suggestedFolderName: string;
+          name: string;
+          conflict?: boolean;
+        }>;
       }>;
     };
     if (!payload.plugin) {
       return {
         success: false,
-        error: '该仓库是 Claude Plugins 市场，请用 --plugin <name> 指定要安装的 plugin 合集',
-        data: { availablePlugins: preview.plugins.map(p => ({ name: p.name, description: p.description, skillCount: p.skills.length })) },
+        error:
+          '该仓库是 Claude Plugins 市场，请用 --plugin <name> 指定要安装的 plugin 合集',
+        data: {
+          availablePlugins: preview.plugins.map((p) => ({
+            name: p.name,
+            description: p.description,
+            skillCount: p.skills.length,
+          })),
+        },
       };
     }
-    const plugin = preview.plugins.find(p => p.name === payload.plugin);
+    const plugin = preview.plugins.find((p) => p.name === payload.plugin);
     if (!plugin) {
       return { success: false, error: `plugin "${payload.plugin}" 不存在` };
     }
-    const conflicts = plugin.skills.filter(s => s.conflict).map(s => s.suggestedFolderName);
+    const conflicts = plugin.skills
+      .filter((s) => s.conflict)
+      .map((s) => s.suggestedFolderName);
     if (conflicts.length > 0 && !payload.force) {
       return {
         success: false,
@@ -6027,21 +7064,29 @@ export async function handleSkillAdd(payload: {
           scope,
           source: payload.url,
           plugin: plugin.name,
-          skills: plugin.skills.map(s => s.suggestedFolderName),
+          skills: plugin.skills.map((s) => s.suggestedFolderName),
         },
       };
     }
-    const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
-      url: payload.url,
-      scope,
-      confirmedSelection: {
-        pluginName: plugin.name,
-        folderNames: plugin.skills.map(s => s.suggestedFolderName),
-        overwrite: payload.force ? conflicts : [],
+    const commit = await sidecarSelf(
+      '/api/skill/install-from-url',
+      'POST',
+      {
+        url: payload.url,
+        scope,
+        confirmedSelection: {
+          pluginName: plugin.name,
+          folderNames: plugin.skills.map((s) => s.suggestedFolderName),
+          overwrite: payload.force ? conflicts : [],
+        },
       },
-    }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
+      { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS },
+    );
     if (!commit.json.success) {
-      return { success: false, error: String(commit.json.error ?? 'Install failed') };
+      return {
+        success: false,
+        error: String(commit.json.error ?? 'Install failed'),
+      };
     }
     return {
       success: true,
@@ -6053,23 +7098,33 @@ export async function handleSkillAdd(payload: {
   // Multi — require --skill or install all
   if (mode === 'multi') {
     const preview = probe.json.preview as {
-      candidates: Array<{ suggestedFolderName: string; name: string; conflict?: boolean }>;
+      candidates: Array<{
+        suggestedFolderName: string;
+        name: string;
+        conflict?: boolean;
+      }>;
     };
     let wanted = preview.candidates;
     if (payload.skill) {
       wanted = preview.candidates.filter(
-        c => c.name === payload.skill || c.suggestedFolderName === payload.skill,
+        (c) =>
+          c.name === payload.skill || c.suggestedFolderName === payload.skill,
       );
       if (wanted.length === 0) {
         return {
           success: false,
-          error: `未找到 skill "${payload.skill}"。可用：${preview.candidates.map(c => c.suggestedFolderName).join(', ')}`,
+          error: `未找到 skill "${payload.skill}"。可用：${preview.candidates.map((c) => c.suggestedFolderName).join(', ')}`,
         };
       }
     }
-    const conflicts = wanted.filter(c => c.conflict).map(c => c.suggestedFolderName);
+    const conflicts = wanted
+      .filter((c) => c.conflict)
+      .map((c) => c.suggestedFolderName);
     if (conflicts.length > 0 && !payload.force) {
-      return { success: false, error: `已存在：${conflicts.join(', ')}。使用 --force 覆盖。` };
+      return {
+        success: false,
+        error: `已存在：${conflicts.join(', ')}。使用 --force 覆盖。`,
+      };
     }
     if (payload.dryRun) {
       return {
@@ -6079,20 +7134,28 @@ export async function handleSkillAdd(payload: {
           action: conflicts.length > 0 ? 'overwrite' : 'install',
           scope,
           source: payload.url,
-          skills: wanted.map(c => c.suggestedFolderName),
+          skills: wanted.map((c) => c.suggestedFolderName),
         },
       };
     }
-    const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
-      url: payload.url,
-      scope,
-      confirmedSelection: {
-        folderNames: wanted.map(c => c.suggestedFolderName),
-        overwrite: payload.force ? conflicts : [],
+    const commit = await sidecarSelf(
+      '/api/skill/install-from-url',
+      'POST',
+      {
+        url: payload.url,
+        scope,
+        confirmedSelection: {
+          folderNames: wanted.map((c) => c.suggestedFolderName),
+          overwrite: payload.force ? conflicts : [],
+        },
       },
-    }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
+      { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS },
+    );
     if (!commit.json.success) {
-      return { success: false, error: String(commit.json.error ?? 'Install failed') };
+      return {
+        success: false,
+        error: String(commit.json.error ?? 'Install failed'),
+      };
     }
     return {
       success: true,
@@ -6103,7 +7166,9 @@ export async function handleSkillAdd(payload: {
 
   // single-conflict — need --force to overwrite
   if (mode === 'single-conflict') {
-    const preview = probe.json.preview as { skill: { suggestedFolderName: string; name: string } };
+    const preview = probe.json.preview as {
+      skill: { suggestedFolderName: string; name: string };
+    };
     if (!payload.force) {
       return {
         success: false,
@@ -6122,24 +7187,39 @@ export async function handleSkillAdd(payload: {
         },
       };
     }
-    const commit = await sidecarSelf('/api/skill/install-from-url', 'POST', {
-      url: payload.url,
-      scope,
-      confirmedSelection: {
-        folderNames: [preview.skill.suggestedFolderName],
-        overwrite: [preview.skill.suggestedFolderName],
+    const commit = await sidecarSelf(
+      '/api/skill/install-from-url',
+      'POST',
+      {
+        url: payload.url,
+        scope,
+        confirmedSelection: {
+          folderNames: [preview.skill.suggestedFolderName],
+          overwrite: [preview.skill.suggestedFolderName],
+        },
       },
-    }, { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS });
+      { timeoutMs: SKILL_INSTALL_LOOPBACK_TIMEOUT_MS },
+    );
     if (!commit.json.success) {
-      return { success: false, error: String(commit.json.error ?? 'Install failed') };
+      return {
+        success: false,
+        error: String(commit.json.error ?? 'Install failed'),
+      };
     }
-    return { success: true, data: commit.json, hint: `Overwrote "${preview.skill.suggestedFolderName}"` };
+    return {
+      success: true,
+      data: commit.json,
+      hint: `Overwrote "${preview.skill.suggestedFolderName}"`,
+    };
   }
 
   return { success: false, error: `未知的 install mode: ${mode}` };
 }
 
-export async function handleSkillRemove(payload: { name: string; scope?: 'user' | 'project' }): Promise<AdminResponse> {
+export async function handleSkillRemove(payload: {
+  name: string;
+  scope?: 'user' | 'project';
+}): Promise<AdminResponse> {
   if (!payload.name) return { success: false, error: 'name is required' };
   const scope = payload.scope ?? 'user';
   const { json } = await sidecarSelf(
@@ -6147,17 +7227,30 @@ export async function handleSkillRemove(payload: { name: string; scope?: 'user' 
     'DELETE',
   );
   if (json.success) return { success: true, data: { name: payload.name } };
-  return { success: false, error: String(json.error ?? 'Failed to remove skill') };
+  return {
+    success: false,
+    error: String(json.error ?? 'Failed to remove skill'),
+  };
 }
 
-export async function handleSkillToggle(payload: { name: string; enabled: boolean }): Promise<AdminResponse> {
+export async function handleSkillToggle(payload: {
+  name: string;
+  enabled: boolean;
+}): Promise<AdminResponse> {
   if (!payload.name) return { success: false, error: 'name is required' };
   const { json } = await sidecarSelf('/api/skill/toggle-enable', 'POST', {
     folderName: payload.name,
     enabled: payload.enabled,
   });
-  if (json.success) return { success: true, data: { name: payload.name, enabled: payload.enabled } };
-  return { success: false, error: String(json.error ?? 'Failed to toggle skill') };
+  if (json.success)
+    return {
+      success: true,
+      data: { name: payload.name, enabled: payload.enabled },
+    };
+  return {
+    success: false,
+    error: String(json.error ?? 'Failed to toggle skill'),
+  };
 }
 
 export async function handleSkillSync(): Promise<AdminResponse> {
@@ -6179,7 +7272,10 @@ export async function handleSkillSync(): Promise<AdminResponse> {
 export async function handleAgentRuntimeStatus(): Promise<AdminResponse> {
   const resp = await managementApi('/api/agent/runtime-status');
   if (resp.ok) {
-    return { success: true, data: (resp as Record<string, unknown>).agents ?? {} };
+    return {
+      success: true,
+      data: (resp as Record<string, unknown>).agents ?? {},
+    };
   }
   return mgmtError(resp, 'Failed to get agent runtime status');
 }
@@ -6231,7 +7327,7 @@ async function raceWithTimeout<T>(
   fallback: T,
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<T>(resolve => {
+  const timeout = new Promise<T>((resolve) => {
     timer = setTimeout(() => resolve(fallback), ms);
   });
   try {
@@ -6265,7 +7361,11 @@ export async function handleRuntimeList(): Promise<AdminResponse> {
     let detection: RuntimeDetection = { installed: false };
     try {
       const rt = getExternalRuntime(runtime);
-      detection = await raceWithTimeout(rt.detect(), RUNTIME_DETECT_TIMEOUT_MS, { installed: false });
+      detection = await raceWithTimeout(
+        rt.detect(),
+        RUNTIME_DETECT_TIMEOUT_MS,
+        { installed: false },
+      );
     } catch {
       // Runtime not supported in this build (should not happen given
       // VALID_RUNTIMES ⊆ supported types, but keep defensive).
@@ -6290,9 +7390,12 @@ export async function handleRuntimeList(): Promise<AdminResponse> {
  * permission modes. This is the command the AI is supposed to consult
  * *before* choosing values for `--model` / `--permissionMode`.
  */
-export async function handleRuntimeDescribe(payload: {
-  runtime?: string;
-}, signal?: AbortSignal): Promise<AdminResponse> {
+export async function handleRuntimeDescribe(
+  payload: {
+    runtime?: string;
+  },
+  signal?: AbortSignal,
+): Promise<AdminResponse> {
   const runtimeArg = payload.runtime;
   if (!runtimeArg) {
     return {
@@ -6330,9 +7433,9 @@ export async function handleRuntimeDescribe(payload: {
         permissionModes: getRuntimePermissionModes('builtin'),
         defaultPermissionMode: getDefaultRuntimePermissionMode('builtin'),
         note:
-          'Built-in runtime uses the configured provider + model from `myagents model list`. '
-          + 'It does not have a runtime-specific model catalogue — override `--model` with any '
-          + 'model id supported by the active provider.',
+          'Built-in runtime uses the configured provider + model from `myagents model list`. ' +
+          'It does not have a runtime-specific model catalogue — override `--model` with any ' +
+          'model id supported by the active provider.',
       } satisfies RuntimeDescribeResult & { note: string },
     };
   }
@@ -6364,15 +7467,18 @@ export async function handleRuntimeDescribe(payload: {
         success: false,
         code: 'RUNTIME_MODEL_DISCOVERY_FAILED',
         error: `Failed to discover ${RUNTIME_DISPLAY_NAMES[runtimeArg]} models: ${detail}`,
-        recoveryHint: runtimeArg === 'gemini'
-          ? {
-              recoveryCommand: 'gemini',
-              message: 'Authenticate Gemini in a normal terminal, then retry `myagents runtime describe gemini`.',
-            }
-          : {
-              recoveryCommand: `myagents runtime diagnose ${runtimeArg} --json`,
-              message: 'Inspect runtime installation and authentication, then retry.',
-            },
+        recoveryHint:
+          runtimeArg === 'gemini'
+            ? {
+                recoveryCommand: 'gemini',
+                message:
+                  'Authenticate Gemini in a normal terminal, then retry `myagents runtime describe gemini`.',
+              }
+            : {
+                recoveryCommand: `myagents runtime diagnose ${runtimeArg} --json`,
+                message:
+                  'Inspect runtime installation and authentication, then retry.',
+              },
       };
     }
   }
@@ -6444,7 +7550,9 @@ export async function handleRuntimeDiagnose(payload: {
       RUNTIME_DETECT_TIMEOUT_MS,
       { installed: false },
     );
-  } catch { /* falls through to installed:false */ }
+  } catch {
+    /* falls through to installed:false */
+  }
 
   if (!detection.installed) {
     return {
@@ -6471,18 +7579,24 @@ export async function handleRuntimeDiagnose(payload: {
   try {
     const rt = getExternalRuntime('codex');
     // Type-check the optional method — only CodexRuntime implements it today.
-    if (typeof (rt as { runStandaloneDiagnostics?: unknown }).runStandaloneDiagnostics !== 'function') {
+    if (
+      typeof (rt as { runStandaloneDiagnostics?: unknown })
+        .runStandaloneDiagnostics !== 'function'
+    ) {
       return {
         success: false,
-        error: 'Codex runtime adapter does not expose runStandaloneDiagnostics. Build is out of date.',
+        error:
+          'Codex runtime adapter does not expose runStandaloneDiagnostics. Build is out of date.',
       };
     }
-    const diagnose = (rt as unknown as {
-      runStandaloneDiagnostics: (
-        wp?: string,
-        policy?: import('../shared/types/runtime').RuntimeEnvPolicy,
-      ) => Promise<unknown>;
-    }).runStandaloneDiagnostics;
+    const diagnose = (
+      rt as unknown as {
+        runStandaloneDiagnostics: (
+          wp?: string,
+          policy?: import('../shared/types/runtime').RuntimeEnvPolicy,
+        ) => Promise<unknown>;
+      }
+    ).runStandaloneDiagnostics;
     const diagnostics = await diagnose(payload.workspacePath, envPolicy);
     return {
       success: true,
@@ -6506,7 +7620,10 @@ export async function handleRuntimeDiagnose(payload: {
  * Show one agent's effective defaults so the AI can decide whether a given
  * task override is a no-op (same as workspace default) or meaningful.
  */
-export async function handleAgentShow(payload: { id?: string; agentId?: string }): Promise<AdminResponse> {
+export async function handleAgentShow(payload: {
+  id?: string;
+  agentId?: string;
+}): Promise<AdminResponse> {
   const id = payload.agentId ?? payload.id;
   if (!id) {
     return {
@@ -6518,16 +7635,26 @@ export async function handleAgentShow(payload: { id?: string; agentId?: string }
       },
     };
   }
-  let registry: Awaited<ReturnType<typeof resolvePersistedAgentWorkspaceRegistry>>;
+  let registry: Awaited<
+    ReturnType<typeof resolvePersistedAgentWorkspaceRegistry>
+  >;
   try {
     registry = await resolvePersistedAgentWorkspaceRegistry();
   } catch (error) {
     return agentWorkspaceIdentityFailure(error);
   }
-  const diagnostic = registry.diagnostics.find(item => item.agentIds.includes(id));
-  if (diagnostic) return { success: false, error: diagnostic.message, code: diagnostic.code };
-  const identity = registry.agentProjections.find(item => item.agentId === id);
-  if (!identity || (identity.project && !isProjectVisibleToUser(identity.project))) {
+  const diagnostic = registry.diagnostics.find((item) =>
+    item.agentIds.includes(id),
+  );
+  if (diagnostic)
+    return { success: false, error: diagnostic.message, code: diagnostic.code };
+  const identity = registry.agentProjections.find(
+    (item) => item.agentId === id,
+  );
+  if (
+    !identity ||
+    (identity.project && !isProjectVisibleToUser(identity.project))
+  ) {
     return {
       success: false,
       error: `Agent '${id}' not found.`,
@@ -6549,8 +7676,10 @@ export async function handleAgentShow(payload: { id?: string; agentId?: string }
     runtimeConfig: agent.runtimeConfig as { source?: string } | undefined,
   });
   const runtime: RuntimeType = usesManagedCodex ? 'codex' : storedRuntime;
-  const agentPermissionMode = (agent.permissionMode as string | undefined) ?? '';
-  const runtimeConfig = (agent.runtimeConfig as Record<string, unknown> | undefined) ?? undefined;
+  const agentPermissionMode =
+    (agent.permissionMode as string | undefined) ?? '';
+  const runtimeConfig =
+    (agent.runtimeConfig as Record<string, unknown> | undefined) ?? undefined;
 
   // Per-runtime resolution of "effective" model / permissionMode
   // (cross-review fix, v0.1.69):
@@ -6564,7 +7693,9 @@ export async function handleAgentShow(payload: { id?: string; agentId?: string }
   // value for a Codex agent would be actively misleading — the dispatch
   // path never consults that field.
   const isExternal = runtime !== 'builtin';
-  const rcModel = isExternal ? (runtimeConfig?.model as string | undefined) : undefined;
+  const rcModel = isExternal
+    ? (runtimeConfig?.model as string | undefined)
+    : undefined;
   const rcPermissionMode = isExternal
     ? (runtimeConfig?.permissionMode as string | undefined)
     : undefined;
@@ -6572,11 +7703,12 @@ export async function handleAgentShow(payload: { id?: string; agentId?: string }
     ? (agent.model as string | undefined)
     : (rcModel ?? (agent.model as string | undefined));
   const effectivePermissionMode = usesManagedCodex
-    ? (managedCodexProviderPermissionToRuntimePermission(agentPermissionMode) ?? 'auto-edit')
-    : (isExternal
-      ? (projectPermissionModeForRuntime(rcPermissionMode, runtime)
-        ?? getDefaultRuntimePermissionMode(runtime))
-      : agentPermissionMode);
+    ? (managedCodexProviderPermissionToRuntimePermission(agentPermissionMode) ??
+      'auto-edit')
+    : isExternal
+      ? (projectPermissionModeForRuntime(rcPermissionMode, runtime) ??
+        getDefaultRuntimePermissionMode(runtime))
+      : agentPermissionMode;
 
   return {
     success: true,
@@ -6587,20 +7719,31 @@ export async function handleAgentShow(payload: { id?: string; agentId?: string }
       projectId: project?.id ?? null,
       workspacePath,
       archived: project ? isProjectArchived(project) : false,
-      archivedAt: project && isProjectArchived(project) ? project.archivedAt ?? null : null,
+      archivedAt:
+        project && isProjectArchived(project)
+          ? (project.archivedAt ?? null)
+          : null,
       association: identity.association,
       isCurrent: isCurrentAgentIdentity(identity, getCurrentWorkspacePath()),
       effectiveDefaults: {
         runtime,
         ...(runtime !== 'builtin'
-          ? { runtimeSource: usesManagedCodex ? 'managed-provider' : 'system-cli' }
+          ? {
+              runtimeSource: usesManagedCodex
+                ? 'managed-provider'
+                : 'system-cli',
+            }
           : {}),
         model: effectiveModel || null,
         permissionMode: effectivePermissionMode || null,
         providerId: agent.providerId ?? null,
         runtimeConfig: runtimeConfig ?? {},
-        mcpEnabledServers: Array.isArray(agent.mcpEnabledServers) ? agent.mcpEnabledServers : [],
-        enabledPluginIds: Array.isArray(agent.enabledPluginIds) ? agent.enabledPluginIds : [],
+        mcpEnabledServers: Array.isArray(agent.mcpEnabledServers)
+          ? agent.mcpEnabledServers
+          : [],
+        enabledPluginIds: Array.isArray(agent.enabledPluginIds)
+          ? agent.enabledPluginIds
+          : [],
         enabledOfficialToolIds: Array.isArray(agent.enabledOfficialToolIds)
           ? agent.enabledOfficialToolIds
           : [],
@@ -6614,7 +7757,8 @@ export async function handleSessionList(payload: {
   agentId?: unknown;
   limit?: unknown;
 }): Promise<AdminResponse> {
-  const agentId = typeof payload.agentId === 'string' ? payload.agentId.trim() : '';
+  const agentId =
+    typeof payload.agentId === 'string' ? payload.agentId.trim() : '';
   if (!agentId) {
     return {
       success: false,
@@ -6627,25 +7771,39 @@ export async function handleSessionList(payload: {
   }
   const limit = payload.limit === undefined ? 5 : Number(payload.limit);
   if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
-    return { success: false, error: '--limit must be an integer from 1 to 50.' };
+    return {
+      success: false,
+      error: '--limit must be an integer from 1 to 50.',
+    };
   }
 
-  let registry: Awaited<ReturnType<typeof resolvePersistedAgentWorkspaceRegistry>>;
+  let registry: Awaited<
+    ReturnType<typeof resolvePersistedAgentWorkspaceRegistry>
+  >;
   try {
     registry = await resolvePersistedAgentWorkspaceRegistry();
   } catch (error) {
     return agentWorkspaceIdentityFailure(error);
   }
-  const diagnostic = registry.diagnostics.find(item => item.agentIds.includes(agentId));
-  if (diagnostic) return { success: false, error: diagnostic.message, code: diagnostic.code };
-  const identity = registry.agentProjections.find(item => item.agentId === agentId);
-  if (!identity || (identity.project && !isProjectVisibleToUser(identity.project))) {
+  const diagnostic = registry.diagnostics.find((item) =>
+    item.agentIds.includes(agentId),
+  );
+  if (diagnostic)
+    return { success: false, error: diagnostic.message, code: diagnostic.code };
+  const identity = registry.agentProjections.find(
+    (item) => item.agentId === agentId,
+  );
+  if (
+    !identity ||
+    (identity.project && !isProjectVisibleToUser(identity.project))
+  ) {
     return {
       success: false,
       error: `Agent '${agentId}' not found.`,
       recoveryHint: {
         recoveryCommand: 'myagents agent list',
-        message: 'See visible active Agent ids; use --archived for archived workspaces.',
+        message:
+          'See visible active Agent ids; use --archived for archived workspaces.',
       },
     };
   }
@@ -6653,15 +7811,16 @@ export async function handleSessionList(payload: {
   const sessions = getSessionsByAgentDir(identity.workspacePath)
     .filter(isHistoryVisibleSession)
     .slice(0, limit)
-    .map(session => ({
+    .map((session) => ({
       sessionId: session.id,
       title: session.title,
       lastActiveAt: session.lastActiveAt,
       lastMessagePreview: session.lastMessagePreview ?? null,
       runtime: session.runtime ?? 'builtin',
-      runtimeSource: session.runtime && session.runtime !== 'builtin'
-        ? session.runtimeSource ?? 'system-cli'
-        : null,
+      runtimeSource:
+        session.runtime && session.runtime !== 'builtin'
+          ? (session.runtimeSource ?? 'system-cli')
+          : null,
       model: session.model ?? null,
       origin: session.origin ?? null,
     }));
@@ -6677,7 +7836,10 @@ export async function handleSessionList(payload: {
 
 /** Type guard for `runtime` string coming from CLI payloads. */
 function isValidRuntimeType(runtime: unknown): runtime is RuntimeType {
-  return typeof runtime === 'string' && (VALID_RUNTIMES as readonly string[]).includes(runtime);
+  return (
+    typeof runtime === 'string' &&
+    (VALID_RUNTIMES as readonly string[]).includes(runtime)
+  );
 }
 
 /** Install guidance keyed by runtime. Shown when a runtime is NOT installed. */
@@ -6730,8 +7892,12 @@ function hasTaskRuntimeOverride(payload: Record<string, unknown>): boolean {
     'permissionMode',
     'clearProviderOverride',
     'clearRuntimeOverride',
-  ]
-    .some(field => payload[field] !== undefined && payload[field] !== null && payload[field] !== '');
+  ].some(
+    (field) =>
+      payload[field] !== undefined &&
+      payload[field] !== null &&
+      payload[field] !== '',
+  );
 }
 
 /** Project TaskUpdateInput clear semantics before validating a merged patch. */
@@ -6771,40 +7937,53 @@ async function validateTaskOverrides(
   payload: TaskOverrideFields,
 ): Promise<AdminResponse | null> {
   if (
-    payload.providerId !== undefined
-    && payload.providerId !== null
-    && (typeof payload.providerId !== 'string' || payload.providerId.trim() === '')
+    payload.providerId !== undefined &&
+    payload.providerId !== null &&
+    (typeof payload.providerId !== 'string' || payload.providerId.trim() === '')
   ) {
-    return { success: false, error: '--providerId must be a non-empty string.' };
+    return {
+      success: false,
+      error: '--providerId must be a non-empty string.',
+    };
   }
   if (
-    payload.model !== undefined
-    && payload.model !== null
-    && typeof payload.model !== 'string'
+    payload.model !== undefined &&
+    payload.model !== null &&
+    typeof payload.model !== 'string'
   ) {
     return { success: false, error: '--model must be a string.' };
   }
   if (
-    payload.runtimeConfig !== undefined
-    && payload.runtimeConfig !== null
-    && (typeof payload.runtimeConfig !== 'object' || Array.isArray(payload.runtimeConfig))
+    payload.runtimeConfig !== undefined &&
+    payload.runtimeConfig !== null &&
+    (typeof payload.runtimeConfig !== 'object' ||
+      Array.isArray(payload.runtimeConfig))
   ) {
     return { success: false, error: '--runtimeConfig must be a JSON object.' };
   }
-  const runtimeConfigModel = taskRuntimeConfigField(payload.runtimeConfig, 'model');
-  const rawRuntimeSource = taskRuntimeConfigField(payload.runtimeConfig, 'source');
-  const hasProviderOverride = typeof payload.providerId === 'string' && payload.providerId.trim() !== '';
-  const hasModelOverride = typeof payload.model === 'string' && payload.model.trim() !== '';
+  const runtimeConfigModel = taskRuntimeConfigField(
+    payload.runtimeConfig,
+    'model',
+  );
+  const rawRuntimeSource = taskRuntimeConfigField(
+    payload.runtimeConfig,
+    'source',
+  );
+  const hasProviderOverride =
+    typeof payload.providerId === 'string' && payload.providerId.trim() !== '';
+  const hasModelOverride =
+    typeof payload.model === 'string' && payload.model.trim() !== '';
   if (hasProviderOverride && !hasModelOverride) {
     return {
       success: false,
-      error: '--providerId requires --model so the Task cannot cross-route a provider to an inherited model.',
+      error:
+        '--providerId requires --model so the Task cannot cross-route a provider to an inherited model.',
     };
   }
   if (
-    hasProviderOverride
-    && typeof payload.runtime === 'string'
-    && ['claude-code', 'codex', 'gemini'].includes(payload.runtime)
+    hasProviderOverride &&
+    typeof payload.runtime === 'string' &&
+    ['claude-code', 'codex', 'gemini'].includes(payload.runtime)
   ) {
     return {
       success: false,
@@ -6812,9 +7991,9 @@ async function validateTaskOverrides(
     };
   }
   if (
-    rawRuntimeSource !== undefined
-    && rawRuntimeSource !== 'system-cli'
-    && rawRuntimeSource !== 'managed-provider'
+    rawRuntimeSource !== undefined &&
+    rawRuntimeSource !== 'system-cli' &&
+    rawRuntimeSource !== 'managed-provider'
   ) {
     return {
       success: false,
@@ -6823,9 +8002,18 @@ async function validateTaskOverrides(
   }
   const runtimeConfigSource = rawRuntimeSource as RuntimeSource | undefined;
   // Step 1: resolve the complete runtime identity that downstream checks use.
-  let effectiveRuntimeIdentity: { runtime: RuntimeType; runtimeSource?: RuntimeSource } | undefined;
-  if (payload.runtime !== undefined && payload.runtime !== null && payload.runtime !== '') {
-    if (typeof payload.runtime !== 'string' || !isValidRuntimeType(payload.runtime)) {
+  let effectiveRuntimeIdentity:
+    | { runtime: RuntimeType; runtimeSource?: RuntimeSource }
+    | undefined;
+  if (
+    payload.runtime !== undefined &&
+    payload.runtime !== null &&
+    payload.runtime !== ''
+  ) {
+    if (
+      typeof payload.runtime !== 'string' ||
+      !isValidRuntimeType(payload.runtime)
+    ) {
       return {
         success: false,
         error: `Invalid --runtime value: '${String(payload.runtime)}'. Valid: ${VALID_RUNTIMES.join(', ')}.`,
@@ -6842,13 +8030,23 @@ async function validateTaskOverrides(
         ? { runtimeSource: runtimeConfigSource ?? 'system-cli' }
         : {}),
     };
-  } else if (payload.providerId !== undefined && payload.providerId !== null && payload.providerId !== '') {
+  } else if (
+    payload.providerId !== undefined &&
+    payload.providerId !== null &&
+    payload.providerId !== ''
+  ) {
     effectiveRuntimeIdentity = { runtime: 'builtin' };
   } else if (
-    (payload.model !== undefined && payload.model !== null && payload.model !== '')
-    || (runtimeConfigModel !== undefined && runtimeConfigModel !== null && runtimeConfigModel !== '')
-    || runtimeConfigSource !== undefined
-    || (payload.permissionMode !== undefined && payload.permissionMode !== null && payload.permissionMode !== '')
+    (payload.model !== undefined &&
+      payload.model !== null &&
+      payload.model !== '') ||
+    (runtimeConfigModel !== undefined &&
+      runtimeConfigModel !== null &&
+      runtimeConfigModel !== '') ||
+    runtimeConfigSource !== undefined ||
+    (payload.permissionMode !== undefined &&
+      payload.permissionMode !== null &&
+      payload.permissionMode !== '')
   ) {
     // --model / --permissionMode passed without --runtime: try to resolve the
     // workspace's agent default so we can still validate against the correct
@@ -6858,11 +8056,12 @@ async function validateTaskOverrides(
       return {
         success: false,
         error:
-          '--model / --permissionMode requires either an explicit --runtime, '
-          + 'or a resolvable workspace (via --workspacePath / --workspaceId matching an agent).',
+          '--model / --permissionMode requires either an explicit --runtime, ' +
+          'or a resolvable workspace (via --workspacePath / --workspaceId matching an agent).',
         recoveryHint: {
           recoveryCommand: 'myagents agent list',
-          message: 'Find your agent, then `myagents agent show <id>` to see its default runtime.',
+          message:
+            'Find your agent, then `myagents agent show <id>` to see its default runtime.',
         },
       };
     }
@@ -6871,8 +8070,12 @@ async function validateTaskOverrides(
     // No overrides at all — nothing to validate.
     return null;
   }
-  const { runtime: effectiveRuntime, runtimeSource: effectiveRuntimeSource } = effectiveRuntimeIdentity;
-  if (runtimeConfigSource === 'managed-provider' && effectiveRuntime !== 'codex') {
+  const { runtime: effectiveRuntime, runtimeSource: effectiveRuntimeSource } =
+    effectiveRuntimeIdentity;
+  if (
+    runtimeConfigSource === 'managed-provider' &&
+    effectiveRuntime !== 'codex'
+  ) {
     return {
       success: false,
       error: 'runtimeConfig.source=managed-provider requires runtime=codex.',
@@ -6880,10 +8083,11 @@ async function validateTaskOverrides(
   }
   if (effectiveRuntime !== 'builtin' && isRuntimeSupported(effectiveRuntime)) {
     try {
-      const installed = effectiveRuntime === 'codex'
-        && effectiveRuntimeSource === 'managed-provider'
-        ? isManagedCodexRuntimeInstalled()
-        : (await getExternalRuntime(effectiveRuntime).detect()).installed;
+      const installed =
+        effectiveRuntime === 'codex' &&
+        effectiveRuntimeSource === 'managed-provider'
+          ? isManagedCodexRuntimeInstalled()
+          : (await getExternalRuntime(effectiveRuntime).detect()).installed;
       if (!installed) {
         return {
           success: false,
@@ -6915,9 +8119,9 @@ async function validateTaskOverrides(
   // `Option<String>` with no enum constraint, so a typo like `--permissionMode
   // fulAgency` would land silently.
   if (
-    payload.permissionMode !== undefined
-    && payload.permissionMode !== null
-    && payload.permissionMode !== ''
+    payload.permissionMode !== undefined &&
+    payload.permissionMode !== null &&
+    payload.permissionMode !== ''
   ) {
     if (typeof payload.permissionMode !== 'string') {
       return {
@@ -6929,20 +8133,23 @@ async function validateTaskOverrides(
         },
       };
     }
-    const modes = getRuntimePermissionModes(effectiveRuntime)
-      .filter(mode => isPermissionModeForRuntimeIdentity(
+    const modes = getRuntimePermissionModes(effectiveRuntime).filter((mode) =>
+      isPermissionModeForRuntimeIdentity(
         mode.value,
         effectiveRuntime,
         effectiveRuntimeSource,
-      ));
-    if (!isPermissionModeForRuntimeIdentity(
-      payload.permissionMode,
-      effectiveRuntime,
-      effectiveRuntimeSource,
-    )) {
+      ),
+    );
+    if (
+      !isPermissionModeForRuntimeIdentity(
+        payload.permissionMode,
+        effectiveRuntime,
+        effectiveRuntimeSource,
+      )
+    ) {
       return {
         success: false,
-        error: `--permissionMode '${payload.permissionMode}' is not valid for runtime '${effectiveRuntime}'. Valid: ${modes.map(m => m.value).join(', ')}.`,
+        error: `--permissionMode '${payload.permissionMode}' is not valid for runtime '${effectiveRuntime}'. Valid: ${modes.map((m) => m.value).join(', ')}.`,
         recoveryHint: {
           recoveryCommand: `myagents runtime describe ${effectiveRuntime}`,
           message: 'See valid permission modes for this runtime.',
@@ -6956,14 +8163,15 @@ async function validateTaskOverrides(
   // server to discover them) so an empty list is treated as "can't validate,
   // trust the caller". builtin runtime model ids depend on the active
   // provider — out of scope for this validator.
-  const modelOverride = effectiveRuntime === 'builtin' || runtimeConfigModel === undefined
-    ? payload.model
-    : runtimeConfigModel;
+  const modelOverride =
+    effectiveRuntime === 'builtin' || runtimeConfigModel === undefined
+      ? payload.model
+      : runtimeConfigModel;
   if (
-    modelOverride !== undefined
-    && modelOverride !== null
-    && modelOverride !== ''
-    && effectiveRuntime !== 'builtin'
+    modelOverride !== undefined &&
+    modelOverride !== null &&
+    modelOverride !== '' &&
+    effectiveRuntime !== 'builtin'
   ) {
     if (typeof modelOverride !== 'string') {
       return {
@@ -6982,8 +8190,12 @@ async function validateTaskOverrides(
       // Empty list means either "runtime is not installed" (handled above)
       // or "discovery failed transiently" — in both cases, don't block the
       // write. The Rust side will surface the real dispatch error if any.
-      if (models.length > 0 && !models.some(m => m.value === modelOverride)) {
-        const examples = models.slice(0, 5).map(m => m.value).filter(Boolean).join(', ');
+      if (models.length > 0 && !models.some((m) => m.value === modelOverride)) {
+        const examples = models
+          .slice(0, 5)
+          .map((m) => m.value)
+          .filter(Boolean)
+          .join(', ');
         return {
           success: false,
           error: `--model '${modelOverride}' is not available for runtime '${effectiveRuntime}'. Examples: ${examples || '(none found)'}.`,
@@ -7007,8 +8219,14 @@ async function validateTaskOverrides(
  * effect (vs. silently falling back to the workspace default).
  */
 function computeOverriddenFields(payload: Record<string, unknown>): string[] {
-  const fields = ['runtime', 'providerId', 'model', 'permissionMode', 'runtimeConfig'];
-  return fields.filter(f => {
+  const fields = [
+    'runtime',
+    'providerId',
+    'model',
+    'permissionMode',
+    'runtimeConfig',
+  ];
+  return fields.filter((f) => {
     const v = payload[f];
     return v !== undefined && v !== null && v !== '';
   });
@@ -7023,31 +8241,48 @@ function computeOverriddenFields(payload: Record<string, unknown>): string[] {
  * Returns `undefined` when neither `workspacePath` nor `workspaceId` matches
  * an agent — forces the validator to reject rather than guess.
  */
-function resolveAgentRuntimeIdentityFromWorkspace(
-  payload: { workspacePath?: unknown; workspaceId?: unknown },
-): { runtime: RuntimeType; runtimeSource?: RuntimeSource } | undefined {
-  const wsPath = typeof payload.workspacePath === 'string' ? payload.workspacePath : undefined;
-  const wsId = typeof payload.workspaceId === 'string' ? payload.workspaceId : undefined;
+function resolveAgentRuntimeIdentityFromWorkspace(payload: {
+  workspacePath?: unknown;
+  workspaceId?: unknown;
+}): { runtime: RuntimeType; runtimeSource?: RuntimeSource } | undefined {
+  const wsPath =
+    typeof payload.workspacePath === 'string'
+      ? payload.workspacePath
+      : undefined;
+  const wsId =
+    typeof payload.workspaceId === 'string' ? payload.workspaceId : undefined;
   if (!wsPath && !wsId) return undefined;
 
   const config = loadConfig();
   const agents = config.agents ?? [];
   const projects = loadProjects();
-  const project = (wsPath
-    ? projects.find(candidate => workspacePathsEqual(candidate.path, wsPath))
-    : undefined)
-    ?? (wsId ? projects.find(candidate => candidate.id === wsId) : undefined);
-  const agentId = project?.agentId ?? (wsId && agents.some(candidate => candidate.id === wsId) ? wsId : undefined);
-  const agent = agentId ? agents.find(candidate => candidate.id === agentId) : undefined;
+  const project =
+    (wsPath
+      ? projects.find((candidate) =>
+          workspacePathsEqual(candidate.path, wsPath),
+        )
+      : undefined) ??
+    (wsId ? projects.find((candidate) => candidate.id === wsId) : undefined);
+  const agentId =
+    project?.agentId ??
+    (wsId && agents.some((candidate) => candidate.id === wsId)
+      ? wsId
+      : undefined);
+  const agent = agentId
+    ? agents.find((candidate) => candidate.id === agentId)
+    : undefined;
   if (!agent) return undefined;
 
   const raw = agent.runtime as unknown;
-  const runtime = typeof raw === 'string' && isValidRuntimeType(raw) ? raw : 'builtin';
-  if (agentUsesManagedCodexProvider({
-    providerId: agent.providerId,
-    runtime,
-    runtimeConfig: agent.runtimeConfig as { source?: string } | undefined,
-  })) {
+  const runtime =
+    typeof raw === 'string' && isValidRuntimeType(raw) ? raw : 'builtin';
+  if (
+    agentUsesManagedCodexProvider({
+      providerId: agent.providerId,
+      runtime,
+      runtimeConfig: agent.runtimeConfig as { source?: string } | undefined,
+    })
+  ) {
     return { runtime: 'codex', runtimeSource: 'managed-provider' };
   }
   return runtime === 'codex'
@@ -7055,8 +8290,15 @@ function resolveAgentRuntimeIdentityFromWorkspace(
     : { runtime };
 }
 
-function taskRuntimeConfigField(runtimeConfig: unknown, field: string): unknown {
-  if (!runtimeConfig || typeof runtimeConfig !== 'object' || Array.isArray(runtimeConfig)) {
+function taskRuntimeConfigField(
+  runtimeConfig: unknown,
+  field: string,
+): unknown {
+  if (
+    !runtimeConfig ||
+    typeof runtimeConfig !== 'object' ||
+    Array.isArray(runtimeConfig)
+  ) {
     return undefined;
   }
   return (runtimeConfig as Record<string, unknown>)[field];
@@ -7073,7 +8315,9 @@ function isValidId(id: string): boolean {
 
 /** Reject dangerous property names to prevent prototype pollution */
 function hasDangerousKeySegment(key: string): boolean {
-  return key.split('.').some(p => p === '__proto__' || p === 'constructor' || p === 'prototype');
+  return key
+    .split('.')
+    .some((p) => p === '__proto__' || p === 'constructor' || p === 'prototype');
 }
 
 // ---------------------------------------------------------------------------
@@ -7084,7 +8328,8 @@ type McpScope = 'global' | 'project' | 'both';
 
 function parseMcpScope(scope: string | undefined): McpScope | null {
   if (scope === undefined || scope === '') return 'both';
-  if (scope === 'global' || scope === 'project' || scope === 'both') return scope;
+  if (scope === 'global' || scope === 'project' || scope === 'both')
+    return scope;
   return null;
 }
 
@@ -7097,7 +8342,8 @@ function mcpAlreadyExistsResponse(id: string): AdminResponse {
     error: `MCP server '${id}' already exists; mcp add only creates new servers`,
     recoveryHint: {
       recoveryCommand: `myagents mcp show ${id}`,
-      message: 'Inspect the existing definition. Remove it first if you intend to replace it.',
+      message:
+        'Inspect the existing definition. Remove it first if you intend to replace it.',
     },
   };
 }
@@ -7105,7 +8351,11 @@ function mcpAlreadyExistsResponse(id: string): AdminResponse {
 async function notifyMcpChange(action: string, id: string): Promise<void> {
   const workspacePath = getCurrentWorkspacePath();
   const config = loadConfig();
-  const effectiveServers = resolveEffectiveMcpServersForWorkspace(config, workspacePath, 'notifyMcpChange');
+  const effectiveServers = resolveEffectiveMcpServersForWorkspace(
+    config,
+    workspacePath,
+    'notifyMcpChange',
+  );
 
   setMcpServers(effectiveServers);
   await notifyAppConfigChanged('mcp', action, id);
@@ -7117,7 +8367,8 @@ type ProjectMcpMutationResult =
   | { status: 'project-not-found'; workspacePath: string };
 
 function projectMcpMutationReason(result: ProjectMcpMutationResult): string {
-  if (result.status === 'no-workspace') return 'current session has no workspace';
+  if (result.status === 'no-workspace')
+    return 'current session has no workspace';
   if (result.status === 'project-not-found') {
     return `current workspace is not registered (${result.workspacePath})`;
   }
@@ -7134,20 +8385,30 @@ function projectMcpMutationFailure(
     error: `Cannot ${action} MCP server '${id}' for project scope: ${projectMcpMutationReason(result)}.`,
     recoveryHint: {
       recoveryCommand: `myagents mcp ${action} ${id} --scope global`,
-      message: 'Use global scope, or open/register the target workspace before changing project-scoped MCP settings.',
+      message:
+        'Use global scope, or open/register the target workspace before changing project-scoped MCP settings.',
     },
   };
 }
 
 /** Enable MCP for the current workspace project */
-async function enableMcpForCurrentProject(serverId: string): Promise<ProjectMcpMutationResult> {
+async function enableMcpForCurrentProject(
+  serverId: string,
+): Promise<ProjectMcpMutationResult> {
   // The workspace path is set via process-global; use it to find the project
   const workspacePath = getCurrentWorkspacePath();
   if (!workspacePath) return { status: 'no-workspace' };
 
-  let result: ProjectMcpMutationResult = { status: 'project-not-found', workspacePath };
-  await atomicModifyProjects(projects => {
-    const idx = projects.findIndex(p => typeof p.path === 'string' && workspacePathsEqual(p.path, workspacePath));
+  let result: ProjectMcpMutationResult = {
+    status: 'project-not-found',
+    workspacePath,
+  };
+  await atomicModifyProjects((projects) => {
+    const idx = projects.findIndex(
+      (p) =>
+        typeof p.path === 'string' &&
+        workspacePathsEqual(p.path, workspacePath),
+    );
     if (idx < 0) return projects;
 
     const project = projects[idx];
@@ -7162,13 +8423,22 @@ async function enableMcpForCurrentProject(serverId: string): Promise<ProjectMcpM
 }
 
 /** Disable MCP for the current workspace project */
-async function disableMcpForCurrentProject(serverId: string): Promise<ProjectMcpMutationResult> {
+async function disableMcpForCurrentProject(
+  serverId: string,
+): Promise<ProjectMcpMutationResult> {
   const workspacePath = getCurrentWorkspacePath();
   if (!workspacePath) return { status: 'no-workspace' };
 
-  let result: ProjectMcpMutationResult = { status: 'project-not-found', workspacePath };
-  await atomicModifyProjects(projects => {
-    const idx = projects.findIndex(p => typeof p.path === 'string' && workspacePathsEqual(p.path, workspacePath));
+  let result: ProjectMcpMutationResult = {
+    status: 'project-not-found',
+    workspacePath,
+  };
+  await atomicModifyProjects((projects) => {
+    const idx = projects.findIndex(
+      (p) =>
+        typeof p.path === 'string' &&
+        workspacePathsEqual(p.path, workspacePath),
+    );
     if (idx < 0) return projects;
 
     const project = projects[idx];
@@ -7196,14 +8466,14 @@ async function modifyAgent(
 ): Promise<AdminResponse> {
   // Pre-check existence (fast-fail before acquiring write)
   const config = loadConfig();
-  if (!(config.agents ?? []).some(a => a.id === id)) {
+  if (!(config.agents ?? []).some((a) => a.id === id)) {
     return { success: false, error: `Agent '${id}' not found` };
   }
 
   // Find by ID inside the modifier to avoid TOCTOU stale-index bugs
-  await atomicModifyConfig(c => {
+  await atomicModifyConfig((c) => {
     const updated = [...(c.agents ?? [])];
-    const freshIdx = updated.findIndex(a => a.id === id);
+    const freshIdx = updated.findIndex((a) => a.id === id);
     if (freshIdx < 0) return c; // agent disappeared between reads — no-op
     updated[freshIdx] = modifier(updated[freshIdx]);
     return { ...c, agents: updated };
@@ -7230,84 +8500,96 @@ type AgentConfigIntentResolution =
 
 async function modifyAgentConfigIntent(
   id: string,
-  resolveIntent: (agent: AgentConfigSlim, config: AdminAppConfig) => AgentConfigIntentResolution,
+  resolveIntent: (
+    agent: AgentConfigSlim,
+    config: AdminAppConfig,
+  ) => AgentConfigIntentResolution,
   action: string,
 ): Promise<AdminResponse> {
   let committedLivePatch: Record<string, unknown> | undefined;
-  const commitResult = await withAgentConfigIntentLock(async (): Promise<AdminResponse | null> => {
-    let previousAgent: AgentConfigSlim | undefined;
-    let updatedAgent: AgentConfigSlim | undefined;
-    let projectPatch: Record<string, unknown> | undefined;
-    let rejected: AdminResponse | undefined;
-    await atomicModifyConfig(current => {
-      const agents = [...(current.agents ?? [])];
-      const index = agents.findIndex(agent => agent.id === id);
-      if (index < 0) return current;
-      const resolution = resolveIntent(agents[index], current);
-      if (!resolution.ok) {
-        rejected = resolution.response;
-        return current;
+  const commitResult = await withAgentConfigIntentLock(
+    async (): Promise<AdminResponse | null> => {
+      let previousAgent: AgentConfigSlim | undefined;
+      let updatedAgent: AgentConfigSlim | undefined;
+      let projectPatch: Record<string, unknown> | undefined;
+      let rejected: AdminResponse | undefined;
+      await atomicModifyConfig((current) => {
+        const agents = [...(current.agents ?? [])];
+        const index = agents.findIndex((agent) => agent.id === id);
+        if (index < 0) return current;
+        const resolution = resolveIntent(agents[index], current);
+        if (!resolution.ok) {
+          rejected = resolution.response;
+          return current;
+        }
+        previousAgent = agents[index];
+        updatedAgent = resolution.agent;
+        projectPatch = resolution.projectPatch;
+        committedLivePatch = resolution.livePatch;
+        agents[index] = updatedAgent;
+        return { ...current, agents };
+      });
+
+      if (rejected) return rejected;
+      if (!previousAgent || !updatedAgent) {
+        return { success: false, error: `Agent '${id}' not found` };
       }
-      previousAgent = agents[index];
-      updatedAgent = resolution.agent;
-      projectPatch = resolution.projectPatch;
-      committedLivePatch = resolution.livePatch;
-      agents[index] = updatedAgent;
-      return { ...current, agents };
-    });
 
-    if (rejected) return rejected;
-    if (!previousAgent || !updatedAgent) {
-      return { success: false, error: `Agent '${id}' not found` };
-    }
-
-    if (projectPatch) {
-      try {
-        await atomicModifyProjects(projects => {
-          const entry = findProjectForAgent(projects, updatedAgent!);
-          if (!entry) return projects;
-          const next = [...projects];
-          next[entry.index] = { ...entry.project, ...projectPatch };
-          return next;
-        });
-      } catch (error) {
-        // The Agent record is authoritative, but this command promises a
-        // composite Agent+Project intent. Roll back only if the current record
-        // still equals our commit so an unrelated concurrent writer is never
-        // clobbered. The outer cross-process lock prevents other CLI Sidecars
-        // from reaching this branch concurrently.
-        let rolledBack = false;
+      if (projectPatch) {
         try {
-          await atomicModifyConfig(current => {
-            const agents = [...(current.agents ?? [])];
-            const index = agents.findIndex(agent => agent.id === id);
-            if (index < 0 || JSON.stringify(agents[index]) !== JSON.stringify(updatedAgent)) {
-              return current;
-            }
-            agents[index] = previousAgent!;
-            rolledBack = true;
-            return { ...current, agents };
+          await atomicModifyProjects((projects) => {
+            const entry = findProjectForAgent(projects, updatedAgent!);
+            if (!entry) return projects;
+            const next = [...projects];
+            next[entry.index] = { ...entry.project, ...projectPatch };
+            return next;
           });
-        } catch (rollbackError) {
-          const rollbackReason = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+        } catch (error) {
+          // The Agent record is authoritative, but this command promises a
+          // composite Agent+Project intent. Roll back only if the current record
+          // still equals our commit so an unrelated concurrent writer is never
+          // clobbered. The outer cross-process lock prevents other CLI Sidecars
+          // from reaching this branch concurrently.
+          let rolledBack = false;
+          try {
+            await atomicModifyConfig((current) => {
+              const agents = [...(current.agents ?? [])];
+              const index = agents.findIndex((agent) => agent.id === id);
+              if (
+                index < 0 ||
+                JSON.stringify(agents[index]) !== JSON.stringify(updatedAgent)
+              ) {
+                return current;
+              }
+              agents[index] = previousAgent!;
+              rolledBack = true;
+              return { ...current, agents };
+            });
+          } catch (rollbackError) {
+            const rollbackReason =
+              rollbackError instanceof Error
+                ? rollbackError.message
+                : String(rollbackError);
+            const reason =
+              error instanceof Error ? error.message : String(error);
+            return {
+              success: false,
+              error: `Project mirror save failed (${reason}) and Agent rollback also failed (${rollbackReason}). Retry the same command to reconcile from Agent authority.`,
+            };
+          }
           const reason = error instanceof Error ? error.message : String(error);
           return {
             success: false,
-            error: `Project mirror save failed (${reason}) and Agent rollback also failed (${rollbackReason}). Retry the same command to reconcile from Agent authority.`,
+            error: rolledBack
+              ? `Agent configuration was not changed because its Project mirror could not be saved: ${reason}`
+              : `Project mirror save failed after Agent configuration changed: ${reason}`,
           };
         }
-        const reason = error instanceof Error ? error.message : String(error);
-        return {
-          success: false,
-          error: rolledBack
-            ? `Agent configuration was not changed because its Project mirror could not be saved: ${reason}`
-            : `Project mirror save failed after Agent configuration changed: ${reason}`,
-        };
       }
-    }
 
-    return null;
-  });
+      return null;
+    },
+  );
 
   if (commitResult) return commitResult;
 
@@ -7341,14 +8623,22 @@ async function modifyAgentConfigIntent(
 
 /** Keys and patterns that contain secrets and must be redacted in config get */
 const SENSITIVE_KEY_PATTERNS = /apikey|api_key|secret|token|password/i;
-const SENSITIVE_TOP_KEYS = new Set(['providerApiKeys', 'mcpServerEnv', 'cliToolEnv']);
+const SENSITIVE_TOP_KEYS = new Set([
+  'providerApiKeys',
+  'mcpServerEnv',
+  'cliToolEnv',
+]);
 
 /** Recursively redact sensitive values in config output */
 function redactSensitiveValues(key: string, value: unknown): unknown {
   const rootKey = key.split('.')[0];
 
   // Top-level known sensitive maps
-  if (SENSITIVE_TOP_KEYS.has(rootKey) && typeof value === 'object' && value !== null) {
+  if (
+    SENSITIVE_TOP_KEYS.has(rootKey) &&
+    typeof value === 'object' &&
+    value !== null
+  ) {
     return deepRedact(value);
   }
 
@@ -7369,7 +8659,7 @@ function redactSensitiveValues(key: string, value: unknown): unknown {
 function deepRedact(obj: unknown): unknown {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj === 'string') return obj;
-  if (Array.isArray(obj)) return obj.map(item => deepRedact(item));
+  if (Array.isArray(obj)) return obj.map((item) => deepRedact(item));
   if (typeof obj === 'object') {
     const result: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
@@ -7391,21 +8681,33 @@ function getNestedValue(obj: Record<string, unknown>, key: string): unknown {
   const parts = key.split('.');
   let current: unknown = obj;
   for (const part of parts) {
-    if (current === null || current === undefined || typeof current !== 'object') return undefined;
+    if (
+      current === null ||
+      current === undefined ||
+      typeof current !== 'object'
+    )
+      return undefined;
     current = (current as Record<string, unknown>)[part];
   }
   return current;
 }
 
 /** Set nested value in object by dot-separated key */
-function setNestedValue(obj: AdminAppConfig, key: string, value: unknown): AdminAppConfig {
+function setNestedValue(
+  obj: AdminAppConfig,
+  key: string,
+  value: unknown,
+): AdminAppConfig {
   const parts = key.split('.');
   if (parts.length === 1) {
     return { ...obj, [key]: value };
   }
   const [first, ...rest] = parts;
   const child = (obj[first] ?? {}) as Record<string, unknown>;
-  return { ...obj, [first]: setNestedValue(child as AdminAppConfig, rest.join('.'), value) };
+  return {
+    ...obj,
+    [first]: setNestedValue(child as AdminAppConfig, rest.join('.'), value),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -7424,9 +8726,11 @@ function requireCliToolRegistryEnabled(): AdminResponse | null {
   if (isCliToolRegistryEnabled()) return null;
   return {
     success: false,
-    error: 'CLI tool registry is disabled. Enable it in Settings → About & Feedback → Lab first.',
+    error:
+      'CLI tool registry is disabled. Enable it in Settings → About & Feedback → Lab first.',
     recoveryHint: {
-      message: '打开「设置 → 关于&反馈 → 实验室 → CLI 工具注册表」后再使用 myagents tool。',
+      message:
+        '打开「设置 → 关于&反馈 → 实验室 → CLI 工具注册表」后再使用 myagents tool。',
     },
   };
 }
@@ -7449,9 +8753,10 @@ export function handleToolList(): AdminResponse {
   return {
     success: true,
     data: { tools: registry.tools.map((t) => enrichCliTool(t, config)) },
-    hint: registry.tools.length === 0
-      ? 'No CLI tools registered yet. Create one with the tool-creator skill, then `myagents tool add <dir>`.'
-      : undefined,
+    hint:
+      registry.tools.length === 0
+        ? 'No CLI tools registered yet. Create one with the tool-creator skill, then `myagents tool add <dir>`.'
+        : undefined,
   };
 }
 
@@ -7465,23 +8770,31 @@ export function handleToolInfo(payload: { name?: string }): AdminResponse {
     return {
       success: false,
       error: `CLI tool '${name}' is not registered`,
-      recoveryHint: { recoveryCommand: 'myagents tool list', message: 'See registered tools.' },
+      recoveryHint: {
+        recoveryCommand: 'myagents tool list',
+        message: 'See registered tools.',
+      },
     };
   }
   return { success: true, data: { tool: enrichCliTool(entry) } };
 }
 
-export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean }): Promise<AdminResponse> {
+export async function handleToolAdd(payload: {
+  dir?: string;
+  dryRun?: boolean;
+}): Promise<AdminResponse> {
   const gate = requireCliToolRegistryEnabled();
   if (gate) return gate;
   const { dir, dryRun } = payload;
   if (!dir) {
     return {
       success: false,
-      error: 'Missing required field: dir (path to the tool directory containing tool.json)',
+      error:
+        'Missing required field: dir (path to the tool directory containing tool.json)',
       recoveryHint: {
         recoveryCommand: 'myagents tool add ~/.myagents/tools/<name>',
-        message: 'The dir must contain tool.json + the entry script (see the tool-creator skill).',
+        message:
+          'The dir must contain tool.json + the entry script (see the tool-creator skill).',
       },
     };
   }
@@ -7502,7 +8815,10 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
     return {
       success: false,
       error: `[TOOL_DIR_NOT_SELF_CONTAINED] ${(e as Error).message}`,
-      recoveryHint: { message: 'Replace symlinks with real files inside the tool directory, then re-run tool add.' },
+      recoveryHint: {
+        message:
+          'Replace symlinks with real files inside the tool directory, then re-run tool add.',
+      },
     };
   }
   const destDir = resolve(join(getCliToolsDir(), manifest.name));
@@ -7515,7 +8831,9 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
   // keep enabled + registeredAt + cliToolEnv, rewrite the shim. This is the
   // edit-then-re-add flow; without it the only path was remove→add, which by
   // design drops the tool's stored API keys.
-  const existing = readCliToolsRegistry().tools.find((t) => t.name === manifest.name);
+  const existing = readCliToolsRegistry().tools.find(
+    (t) => t.name === manifest.name,
+  );
   if (existing) {
     if (srcDir !== destDir && srcDir !== resolve(existing.dir)) {
       return {
@@ -7528,7 +8846,11 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
       };
     }
     if (dryRun) {
-      return { success: true, dryRun: true, preview: { name: manifest.name, action: 'refresh', dir: existing.dir } };
+      return {
+        success: true,
+        dryRun: true,
+        preview: { name: manifest.name, action: 'refresh', dir: existing.dir },
+      };
     }
     let refreshed: CliToolRegistryEntry | undefined;
     await modifyCliToolsRegistry((reg) => {
@@ -7549,7 +8871,14 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
       return { ...reg, tools };
     });
     if (!refreshed) {
-      return { success: false, error: `CLI tool '${manifest.name}' disappeared during refresh (concurrent remove?)`, recoveryHint: { recoveryCommand: 'myagents tool add ' + srcDir, message: 'Re-run to register it fresh.' } };
+      return {
+        success: false,
+        error: `CLI tool '${manifest.name}' disappeared during refresh (concurrent remove?)`,
+        recoveryHint: {
+          recoveryCommand: 'myagents tool add ' + srcDir,
+          message: 'Re-run to register it fresh.',
+        },
+      };
     }
     return {
       success: true,
@@ -7568,7 +8897,10 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
     return {
       success: false,
       error: `[NAME_SHADOWS] Tool name '${manifest.name}' collides with an existing executable (${collision}); registering it would shadow that command in every agent session and terminal`,
-      recoveryHint: { message: 'Rename the tool with a domain prefix (update tool.json "name") and re-run tool add.' },
+      recoveryHint: {
+        message:
+          'Rename the tool with a domain prefix (update tool.json "name") and re-run tool add.',
+      },
     };
   }
 
@@ -7586,7 +8918,9 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
       return {
         success: false,
         error: `[DEST_OCCUPIED] ${destDir} already exists but '${manifest.name}' is not registered (leftover from a failed add?)`,
-        recoveryHint: { message: `Inspect/remove ${destDir} manually, or register in place by running tool add on that directory.` },
+        recoveryHint: {
+          message: `Inspect/remove ${destDir} manually, or register in place by running tool add on that directory.`,
+        },
       };
     }
   }
@@ -7599,7 +8933,10 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
         name: manifest.name,
         dir: toolDir,
         wouldCopy: needsCopy,
-        shim: join(getCliToolsBinDir(), process.platform === 'win32' ? `${manifest.name}.cmd` : manifest.name),
+        shim: join(
+          getCliToolsBinDir(),
+          process.platform === 'win32' ? `${manifest.name}.cmd` : manifest.name,
+        ),
         envKeys: manifest.envKeys ?? [],
       },
     };
@@ -7619,7 +8956,10 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
 
   let tempDir: string | null = null;
   if (needsCopy) {
-    tempDir = join(getCliToolsDir(), `.import-${manifest.name}-${Date.now()}-${crypto.randomUUID()}`);
+    tempDir = join(
+      getCliToolsDir(),
+      `.import-${manifest.name}-${Date.now()}-${crypto.randomUUID()}`,
+    );
     try {
       mkdirSync(getCliToolsDir(), { recursive: true });
       await fsCp(srcDir, tempDir, {
@@ -7636,7 +8976,10 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
       return {
         success: false,
         error: `[COPY_FAILED] Failed to stage tool dir for ${destDir}: ${(e as Error).message}`,
-        recoveryHint: { message: 'Check the source dir is readable and contains no symlinks, then re-run tool add.' },
+        recoveryHint: {
+          message:
+            'Check the source dir is readable and contains no symlinks, then re-run tool add.',
+        },
       };
     }
   }
@@ -7657,7 +9000,9 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
         if (needsCopy) {
           try {
             lstatSync(destDir);
-            publishError = new Error(`${destDir} already exists but '${manifest.name}' is not registered`);
+            publishError = new Error(
+              `${destDir} already exists but '${manifest.name}' is not registered`,
+            );
             return null;
           } catch {
             // Absent is the expected publish path.
@@ -7681,7 +9026,10 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
     return {
       success: false,
       error: `CLI tool '${manifest.name}' is already registered`,
-      recoveryHint: { recoveryCommand: `myagents tool info ${manifest.name}`, message: 'Remove it first if you want to re-register.' },
+      recoveryHint: {
+        recoveryCommand: `myagents tool info ${manifest.name}`,
+        message: 'Remove it first if you want to re-register.',
+      },
     };
   }
   if (publishError) {
@@ -7692,13 +9040,16 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
       error: publishError.message.startsWith('[')
         ? publishError.message
         : `[PUBLISH_FAILED] Failed to publish tool '${manifest.name}': ${publishError.message}`,
-      recoveryHint: { message: 'Re-run tool add after inspecting the destination directory.' },
+      recoveryHint: {
+        message: 'Re-run tool add after inspecting the destination directory.',
+      },
     };
   }
 
-  const envHint = (manifest.envKeys ?? []).length > 0
-    ? ` It declares env keys [${(manifest.envKeys ?? []).join(', ')}] — set them via \`myagents tool env ${manifest.name} set KEY=value\`.`
-    : '';
+  const envHint =
+    (manifest.envKeys ?? []).length > 0
+      ? ` It declares env keys [${(manifest.envKeys ?? []).join(', ')}] — set them via \`myagents tool env ${manifest.name} set KEY=value\`.`
+      : '';
   return {
     success: true,
     data: { tool: enrichCliTool(entry) },
@@ -7706,7 +9057,10 @@ export async function handleToolAdd(payload: { dir?: string; dryRun?: boolean })
   };
 }
 
-export async function handleToolRemove(payload: { name?: string; purge?: boolean }): Promise<AdminResponse> {
+export async function handleToolRemove(payload: {
+  name?: string;
+  purge?: boolean;
+}): Promise<AdminResponse> {
   const gate = requireCliToolRegistryEnabled();
   if (gate) return gate;
   const { name, purge } = payload;
@@ -7724,7 +9078,10 @@ export async function handleToolRemove(payload: { name?: string; purge?: boolean
     return {
       success: false,
       error: `CLI tool '${name}' is not registered`,
-      recoveryHint: { recoveryCommand: 'myagents tool list', message: 'See registered tools.' },
+      recoveryHint: {
+        recoveryCommand: 'myagents tool list',
+        message: 'See registered tools.',
+      },
     };
   }
   // Drop stored env values with the registration — no stale secrets in config.
@@ -7746,12 +9103,17 @@ export async function handleToolRemove(payload: { name?: string; purge?: boolean
     success: true,
     data: { name, purged: Boolean(purge && purgeable) },
     hint: purge
-      ? (purgeable ? undefined : `Tool dir ${removed.dir} is outside ~/.myagents/tools — not deleted; remove it manually if intended.`)
+      ? purgeable
+        ? undefined
+        : `Tool dir ${removed.dir} is outside ~/.myagents/tools — not deleted; remove it manually if intended.`
       : `Tool dir kept at ${removed.dir} (pass --purge to delete it too).`,
   };
 }
 
-async function setToolEnabled(name: string | undefined, enabled: boolean): Promise<AdminResponse> {
+async function setToolEnabled(
+  name: string | undefined,
+  enabled: boolean,
+): Promise<AdminResponse> {
   const gate = requireCliToolRegistryEnabled();
   if (gate) return gate;
   if (!name) return { success: false, error: 'Missing required field: name' };
@@ -7769,23 +9131,30 @@ async function setToolEnabled(name: string | undefined, enabled: boolean): Promi
     return {
       success: false,
       error: `CLI tool '${name}' is not registered`,
-      recoveryHint: { recoveryCommand: 'myagents tool list', message: 'See registered tools.' },
+      recoveryHint: {
+        recoveryCommand: 'myagents tool list',
+        message: 'See registered tools.',
+      },
     };
   }
   return {
     success: true,
     data: { name, enabled },
     hint: enabled
-      ? 'Tool will appear in new sessions\' context. (It was on PATH the whole time.)'
-      : 'Tool hidden from new sessions\' context; the shim stays on PATH for manual use.',
+      ? "Tool will appear in new sessions' context. (It was on PATH the whole time.)"
+      : "Tool hidden from new sessions' context; the shim stays on PATH for manual use.",
   };
 }
 
-export async function handleToolEnable(payload: { name?: string }): Promise<AdminResponse> {
+export async function handleToolEnable(payload: {
+  name?: string;
+}): Promise<AdminResponse> {
   return setToolEnabled(payload.name, true);
 }
 
-export async function handleToolDisable(payload: { name?: string }): Promise<AdminResponse> {
+export async function handleToolDisable(payload: {
+  name?: string;
+}): Promise<AdminResponse> {
   return setToolEnabled(payload.name, false);
 }
 
@@ -7794,7 +9163,9 @@ export async function handleToolDisable(payload: { name?: string }): Promise<Adm
  * view so humans read the exact doc the AI reads. Async execFile (never a sync
  * spawn: this runs on the sidecar event loop) with a hard timeout.
  */
-export async function handleToolReadme(payload: { name?: string }): Promise<AdminResponse> {
+export async function handleToolReadme(payload: {
+  name?: string;
+}): Promise<AdminResponse> {
   const gate = requireCliToolRegistryEnabled();
   if (gate) return gate;
   const { name } = payload;
@@ -7804,21 +9175,31 @@ export async function handleToolReadme(payload: { name?: string }): Promise<Admi
     return {
       success: false,
       error: `CLI tool '${name}' is not registered`,
-      recoveryHint: { recoveryCommand: 'myagents tool list', message: 'See registered tools.' },
+      recoveryHint: {
+        recoveryCommand: 'myagents tool list',
+        message: 'See registered tools.',
+      },
     };
   }
   try {
-    const { stdout } = await execFileAsync(process.execPath, [entry.entryPath, 'readme'], {
-      timeout: 10_000,
-      maxBuffer: 512 * 1024,
-    });
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [entry.entryPath, 'readme'],
+      {
+        timeout: 10_000,
+        maxBuffer: 512 * 1024,
+      },
+    );
     return { success: true, data: { name, readme: stdout } };
   } catch (e) {
     const err = e as { stderr?: string; message?: string };
     return {
       success: false,
       error: `Failed to run '${name} readme': ${(err.stderr || err.message || 'unknown error').slice(0, 500)}`,
-      recoveryHint: { message: 'The tool may be broken — check its entry script, or remove and re-register it.' },
+      recoveryHint: {
+        message:
+          'The tool may be broken — check its entry script, or remove and re-register it.',
+      },
     };
   }
 }
@@ -7838,7 +9219,10 @@ export async function handleToolEnv(payload: {
     return {
       success: false,
       error: `CLI tool '${name}' is not registered`,
-      recoveryHint: { recoveryCommand: 'myagents tool list', message: 'See registered tools.' },
+      recoveryHint: {
+        recoveryCommand: 'myagents tool list',
+        message: 'See registered tools.',
+      },
     };
   }
 
@@ -7851,7 +9235,12 @@ export async function handleToolEnv(payload: {
     }
     return {
       success: true,
-      data: { name, env: redacted, declaredKeys: entry.envKeys ?? [], missingKeys: findMissingEnvKeys(entry, config.cliToolEnv) },
+      data: {
+        name,
+        env: redacted,
+        declaredKeys: entry.envKeys ?? [],
+        missingKeys: findMissingEnvKeys(entry, config.cliToolEnv),
+      },
     };
   }
 
@@ -7862,12 +9251,17 @@ export async function handleToolEnv(payload: {
     // The launcher merges these over process.env — overriding process-level
     // vars would confusingly break the tool's own subprocesses (PATH) or its
     // Node runtime (NODE_OPTIONS). No legitimate tool config needs them.
-    const forbidden = Object.keys(env).filter((k) => ['PATH', 'NODE_OPTIONS', 'HOME', 'USERPROFILE'].includes(k.toUpperCase()));
+    const forbidden = Object.keys(env).filter((k) =>
+      ['PATH', 'NODE_OPTIONS', 'HOME', 'USERPROFILE'].includes(k.toUpperCase()),
+    );
     if (forbidden.length > 0) {
       return {
         success: false,
         error: `Refusing to set process-level variables for a tool: ${forbidden.join(', ')}`,
-        recoveryHint: { message: 'Tool env is for API keys and tool-specific config declared in tool.json envKeys.' },
+        recoveryHint: {
+          message:
+            'Tool env is for API keys and tool-specific config declared in tool.json envKeys.',
+        },
       };
     }
     await atomicModifyConfig((c) => {
@@ -7904,5 +9298,8 @@ export async function handleToolEnv(payload: {
     return { success: true, data: { name, deletedKeys: Object.keys(env) } };
   }
 
-  return { success: false, error: `Unknown action: ${String(action)}. Use 'set', 'get', or 'delete'.` };
+  return {
+    success: false,
+    error: `Unknown action: ${String(action)}. Use 'set', 'get', or 'delete'.`,
+  };
 }

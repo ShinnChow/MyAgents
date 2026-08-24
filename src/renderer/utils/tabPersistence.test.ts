@@ -24,6 +24,19 @@ function chatTab(over: Partial<Tab> = {}): Tab {
     };
 }
 
+function recordTab(over: Partial<Tab> = {}): Tab {
+    return {
+        id: `record-${Math.random().toString(36).slice(2, 8)}`,
+        agentDir: null,
+        sessionId: null,
+        view: 'record',
+        title: 'Weekly sync',
+        recordId: 'record-1',
+        sidecarConfigDisposition: 'push',
+        ...over,
+    };
+}
+
 describe('serializeTabs', () => {
     it('keeps only chat tabs with a real session + workspace', () => {
         const tabs: Tab[] = [
@@ -50,6 +63,7 @@ describe('serializeTabs', () => {
         });
         const state = serializeTabs([tab], 'a')!;
         expect(state.tabs[0]).toEqual({
+            view: 'chat',
             id: 'a',
             agentDir: '/ws/a',
             sessionId: 'sid-a',
@@ -57,6 +71,23 @@ describe('serializeTabs', () => {
         });
         expect(Object.keys(state.tabs[0])).not.toContain('isGenerating');
         expect(Object.keys(state.tabs[0])).not.toContain('initialMessage');
+    });
+
+    it('persists Record identity without runtime recording or seek projections', () => {
+        const state = serializeTabs([
+            recordTab({
+                id: 'record-tab',
+                recordingStatus: 'recording',
+                recordingMediaDurationMs: 12_000,
+                recordSeekMediaMs: 4_000,
+            }),
+        ], 'record-tab')!;
+        expect(state.tabs).toEqual([{
+            view: 'record',
+            id: 'record-tab',
+            recordId: 'record-1',
+            title: 'Weekly sync',
+        }]);
     });
 
     it('de-dupes by sessionId (first occurrence wins)', () => {
@@ -90,7 +121,16 @@ describe('serializeTabs', () => {
         ];
         const state = serializeTabs(tabs, 'same')!;
         expect(state.tabs).toHaveLength(1);
-        expect(state.tabs[0].sessionId).toBe('s1');
+        expect(state.tabs[0]).toEqual(expect.objectContaining({ view: 'chat', sessionId: 's1' }));
+    });
+
+    it('de-dupes Record tabs by recordId', () => {
+        const state = serializeTabs([
+            recordTab({ id: 'record-a', recordId: 'same-record' }),
+            recordTab({ id: 'record-b', recordId: 'same-record' }),
+        ], 'record-b')!;
+        expect(state.tabs.map((tab) => tab.id)).toEqual(['record-a']);
+        expect(state.activeTabId).toBe('record-a');
     });
 
     it('caps at MAX_TABS', () => {
@@ -134,6 +174,22 @@ describe('deserializeTabs', () => {
         });
         const back = deserializeTabs(raw)!;
         expect(back.tabs.map((t) => t.id)).toEqual(['a']);
+    });
+
+    it('accepts tagged Record entries and rejects incomplete ones', () => {
+        const raw = JSON.stringify({
+            version: 1,
+            tabs: [
+                { view: 'record', id: 'record-tab', recordId: 'record-1', title: 'Meeting' },
+                { view: 'record', id: 'missing-record-id', title: 'Invalid' },
+            ],
+            activeTabId: 'record-tab',
+        });
+        expect(deserializeTabs(raw)).toEqual({
+            version: 1,
+            tabs: [{ view: 'record', id: 'record-tab', recordId: 'record-1', title: 'Meeting' }],
+            activeTabId: 'record-tab',
+        });
     });
 
     it('re-dedups and re-caps defensively', () => {
@@ -181,18 +237,18 @@ describe('hydratePersistedState', () => {
     const state: PersistedTabState = {
         version: 1,
         tabs: [
-            { id: 'a', agentDir: '/ws/a', sessionId: 's-a', title: 'A' },
-            { id: 'b', agentDir: '/ws/b', sessionId: 's-b', title: 'B' },
+            { view: 'chat', id: 'a', agentDir: '/ws/a', sessionId: 's-a', title: 'A' },
+            { view: 'record', id: 'b', recordId: 'record-b', title: 'B' },
         ],
         activeTabId: 'b',
     };
 
-    it('hydrates each persisted tab as a live pending chat tab', () => {
+    it('hydrates Chat with pending Sidecar disposition and Record without a Session', () => {
         const { tabs, activeTabId } = hydratePersistedState(state);
         expect(activeTabId).toBe('b');
         expect(tabs).toEqual([
             { id: 'a', agentDir: '/ws/a', sessionId: 's-a', view: 'chat', title: 'A', sidecarConfigDisposition: 'pending' },
-            { id: 'b', agentDir: '/ws/b', sessionId: 's-b', view: 'chat', title: 'B', sidecarConfigDisposition: 'pending' },
+            { id: 'b', agentDir: null, sessionId: null, view: 'record', title: 'B', recordId: 'record-b', sidecarConfigDisposition: 'push' },
         ]);
     });
 });
@@ -200,7 +256,7 @@ describe('hydratePersistedState', () => {
 describe('pickDurableOverride', () => {
     const durable: PersistedTabState = {
         version: 1,
-        tabs: [{ id: 'a', agentDir: '/ws/a', sessionId: 's-a', title: 'A' }],
+        tabs: [{ view: 'chat', id: 'a', agentDir: '/ws/a', sessionId: 's-a', title: 'A' }],
         activeTabId: 'a',
     };
 
@@ -279,6 +335,20 @@ describe('planRestoreTabs (Issue #309 — pill restore merge)', () => {
         expect(plan!.tabs.map(t => t.id)).toEqual(['open-1', 'r1', 'r3']);
         // candidate active (r2) was deduped out → falls back to first restored in list.
         expect(plan!.activeTabId).toBe('r1');
+    });
+
+    it('restores Record tabs and de-dupes an already-open Record by recordId', () => {
+        const openRecord = recordTab({ id: 'open-record', recordId: 'record-1' });
+        const candidateWithRecords = {
+            tabs: [
+                recordTab({ id: 'duplicate-record', recordId: 'record-1' }),
+                recordTab({ id: 'new-record', recordId: 'record-2' }),
+            ],
+            activeTabId: 'duplicate-record',
+        };
+        const plan = planRestoreTabs([openRecord], candidateWithRecords);
+        expect(plan!.tabs.map((tab) => tab.id)).toEqual(['open-record', 'new-record']);
+        expect(plan!.activeTabId).toBe('new-record');
     });
 
     it('never lets activeTabId point outside the list when the cap slices it off', () => {

@@ -7,7 +7,7 @@
   },
   "toasts": {
     "workspaceAttachmentsCleared": "已切换工作区，已清理上一工作区的附件草稿",
-    "thoughtSaved": "想法已记录，可在任务中心查看",
+    "thoughtSaved": "记录已保存，可在任务中心查看",
     "runtimeNeedsAgent": "该工作区未配置 Agent，无法切换 Runtime",
     "runtimeSwitchFailed": "切换 Runtime 失败，请重试",
     "setDefaultFailed": "设为默认失败，请重试",
@@ -89,9 +89,9 @@
     "remove": "移除"
   },
   "recentThoughts": {
-    "openTaskCenterTitle": "打开任务中心查看全部想法",
+    "openTaskCenterTitle": "打开任务中心查看全部记录",
     "more": "更多",
-    "emptyThought": "（空想法）"
+    "emptyThought": "（空记录）"
   },
   "addWorkspaceMenu": {
     "add": "添加",

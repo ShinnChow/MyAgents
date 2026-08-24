@@ -1492,6 +1492,38 @@
         "unsupported": "This platform is not supported"
       }
     },
+    "speechResource": {
+      "capabilities": "Speech recognition capabilities",
+      "diarization": "Speaker separation",
+      "install": "Install models",
+      "retry": "Retry installation",
+      "remove": "Remove",
+      "downloading": "Securely downloading and verifying models…",
+      "removing": "Removing models…",
+      "size": "{{download}} download · {{installed}} installed",
+      "authorizationHint": "The switch above only controls Agent access. Local recordings can always use installed speech capabilities.",
+      "operationFailed": "Speech model installation failed. Resources that did not pass verification were not activated.",
+      "removeFailed": "The speech models could not be removed. A job may still be using them.",
+      "activationWarning": "The models are installed, but directory synchronization could not be confirmed. They are usable now and may need reinstalling after a sudden power loss.",
+      "states": {
+        "checking": "Checking local models…",
+        "not_installed": "Local models are not installed",
+        "installing": "Installing local models",
+        "removing": "Removing local models",
+        "ready": "Local models are ready"
+      },
+      "errors": {
+        "default": "Local speech resources are unavailable. Check the network and disk space, then try again.",
+        "SPEECH_RESOURCE_MANIFEST_DOWNLOAD_FAILED": "The official model manifest could not be downloaded. Check the network or proxy and try again.",
+        "SPEECH_RESOURCE_MANIFEST_SIGNATURE_INVALID": "The official model manifest signature is invalid. No untrusted resources were installed.",
+        "SPEECH_RESOURCE_DOWNLOAD_FAILED": "The model download failed. Check the network or proxy and try again.",
+        "SPEECH_RESOURCE_SHA256_MISMATCH": "Model integrity verification failed. Corrupted resources were not installed.",
+        "SPEECH_RESOURCE_DISK_FULL": "There is not enough disk space. Free some space and try again.",
+        "SPEECH_NATIVE_RUNTIME_UNAVAILABLE": "This app build does not include the local speech runtime, so models cannot be installed.",
+        "SPEECH_RESOURCE_CORRUPT": "The installed models are incomplete or corrupted. Install them again.",
+        "SPEECH_RESOURCE_BUSY": "Speech resources are in use by a job. Try again later."
+      }
+    },
     "dialogs": {
       "vision": {
         "title": "Image Understanding Settings",

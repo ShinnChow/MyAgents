@@ -43,7 +43,13 @@ export interface BaseEventParams {
  *   - `cron`        定时任务调度器
  *   - `im`          IM Bot（飞书 / Telegram / 钉钉）
  */
-export type Source = 'desktop' | 'floating_ball' | 'cli' | 'cli_agent' | 'cron' | 'im';
+export type Source =
+  | 'desktop'
+  | 'floating_ball'
+  | 'cli'
+  | 'cli_agent'
+  | 'cron'
+  | 'im';
 
 /**
  * UI 入口面 —— `source` 维度内"desktop 渠道"的二级细分。
@@ -73,6 +79,8 @@ export type Surface =
   | 'history_click'
   | 'new_chat_button'
   | 'task_center'
+  | 'record_detail'
+  | 'speech_tool_card'
   | 'bug_report'
   | 'space_tools'
   | 'agent_setup'
@@ -224,9 +232,17 @@ export type EventName =
   | 'task_stop'
   | 'task_delete'
   | 'task_align_discuss'
-  // 启动页 / 想法输入
+  // 启动页 / Record 输入
   | 'launcher_mode_switch'
-  | 'thought_create'
+  // Record/Recording/Speech authoritative product milestones.
+  | 'record_create'
+  | 'recording_start_result'
+  | 'recording_finish'
+  | 'recording_recovery'
+  | 'speech_processing_finish'
+  | 'record_use'
+  | 'speech_resource_mutation'
+  | 'speech_attachment_job'
   // 桌面悬浮球（PRD 0.2.35 §11.2 球生命周期事件）
   | 'floating_ball_toggle'
   | 'floating_ball_summon'
@@ -326,12 +342,12 @@ export interface MessageSendParams {
    *  (`resolveEffectiveRuntime`). See analyticsMetaRef in TabProvider. */
   runtime: AnalyticsRuntime;
   runtime_source: AnalyticsRuntimeSource;
-  mode: string;           // 权限模式: auto | confirm | deny
-  model: string;          // 当前模型
-  skill?: string | null;  // 技能/指令名称
-  has_image: boolean;     // 是否含图片
-  has_file: boolean;      // 是否含文件
-  is_cron: boolean;       // 是否为心跳循环任务发送
+  mode: string; // 权限模式: auto | confirm | deny
+  model: string; // 当前模型
+  skill?: string | null; // 技能/指令名称
+  has_image: boolean; // 是否含图片
+  has_file: boolean; // 是否含文件
+  is_cron: boolean; // 是否为心跳循环任务发送
   // session_id 由 Active Context 自动注入
 }
 
@@ -343,13 +359,13 @@ export interface MessageCompleteParams {
    *  see MessageSendParams.runtime. */
   runtime: AnalyticsRuntime;
   runtime_source: AnalyticsRuntimeSource;
-  model?: string;                // 主模型名称
-  input_tokens: number;          // 输入 tokens
-  output_tokens: number;         // 输出 tokens
-  cache_read_tokens: number;     // 缓存读取 tokens
+  model?: string; // 主模型名称
+  input_tokens: number; // 输入 tokens
+  output_tokens: number; // 输出 tokens
+  cache_read_tokens: number; // 缓存读取 tokens
   cache_creation_tokens: number; // 缓存创建 tokens
-  tool_count: number;            // 工具调用次数
-  duration_ms: number;           // 响应耗时（毫秒）
+  tool_count: number; // 工具调用次数
+  duration_ms: number; // 响应耗时（毫秒）
 }
 
 /**
@@ -439,26 +455,175 @@ export interface AgentChannelToggleParams {
  * GUI 独有 —— CLI 没有 launcher 概念，所以不带 `source` 字段。
  */
 export interface LauncherModeSwitchParams {
-  to: 'task' | 'thought';
+  to: 'chat' | 'record';
   via: 'click' | 'shortcut';
 }
 
-/**
- * thought_create 事件参数
- */
-export interface ThoughtCreateParams {
+export interface RecordUseParams {
+  event_schema_version: 1;
+  record_hash?: string;
+  record_kind: 'text' | 'audio';
+  operation:
+    | 'open'
+    | 'play'
+    | 'export_audio'
+    | 'export_transcript'
+    | 'archive'
+    | 'delete'
+    | 'speaker_rename'
+    | 'speaker_merge'
+    | 'speaker_reassign';
   source: Source;
-  /**
-   * UI 上的入口位置 —— 仅在 `source === 'desktop'` 时有意义；
-   * CLI 触发时为 `null`。
-   */
-  location: 'launcher' | 'task_center' | null;
+  surface: Surface;
+}
+
+export type RecordAnalyticsOutcome =
+  | 'success'
+  | 'partial'
+  | 'failed'
+  | 'canceled'
+  | 'interrupted'
+  | 'rejected';
+export type MediaDurationBucket =
+  | 'lt_1m'
+  | '1_5m'
+  | '5_15m'
+  | '15_30m'
+  | '30_60m'
+  | '1_2h'
+  | '2_4h'
+  | '4_8h';
+export type SmallCountBucket = '0' | '1' | '2_5' | '6_20' | 'gt_20';
+export type SegmentCountBucket = '0' | '1_20' | '21_100' | '101_500' | 'gt_500';
+export type SpeakerCountBucket = '0' | '1' | '2' | '3_4' | 'gte_5';
+export type MediaBytesBucket =
+  | 'lt_10mb'
+  | '10_50mb'
+  | '50_200mb'
+  | '200_500mb'
+  | '500mb_1gb'
+  | '1_4gb'
+  | 'gte_4gb';
+export type TranscriptCoverageBucket =
+  | 'none'
+  | 'lt_50'
+  | '50_90'
+  | '90_99'
+  | 'complete';
+export type SegmentLatencyBucket =
+  | 'lt_500ms'
+  | '500_1000ms'
+  | '1_2s'
+  | '2_5s'
+  | 'gte_5s';
+export type RecordingFinishReason =
+  | 'user_stop'
+  | 'app_exit'
+  | 'device_open_failed'
+  | 'device_fatal'
+  | 'low_disk'
+  | 'recording_state_commit_failed'
+  | 'recording_journal_commit_failed'
+  | 'pause_resume_failed'
+  | 'pause_resume_state_commit_failed'
+  | 'pause_resume_journal_failed';
+
+export interface RecordCreateParams {
+  event_schema_version: 1;
+  record_hash?: string;
+  record_kind: 'text' | 'audio';
+  source: Source;
+  surface: Surface;
+}
+
+export interface RecordingStartResultParams {
+  event_schema_version: 1;
+  record_hash?: string;
+  ok: boolean;
+  capture_sources: 'none' | 'microphone' | 'system' | 'microphone_system';
+  transcription_mode: 'unavailable' | 'live';
+  resource_state: 'ready' | 'not_installed' | 'native_unavailable';
+  system_audio_capability: 'available' | 'unavailable' | 'not_requested';
+  error_code?: string;
+}
+
+export interface RecordingFinishParams {
+  event_schema_version: 1;
+  record_hash?: string;
+  outcome: Extract<RecordAnalyticsOutcome, 'success' | 'partial' | 'failed'>;
+  finish_reason: RecordingFinishReason;
+  media_duration_bucket: MediaDurationBucket;
+  pause_count_bucket: SmallCountBucket;
+  note_count_bucket: SmallCountBucket;
+  mark_count_bucket: SmallCountBucket;
+  audio_bytes_bucket: MediaBytesBucket;
+  live_transcript_coverage: TranscriptCoverageBucket;
+  segment_latency_p50_bucket?: SegmentLatencyBucket;
+  segment_latency_p95_bucket?: SegmentLatencyBucket;
+}
+
+export interface RecordingRecoveryParams {
+  event_schema_version: 1;
+  record_hash?: string;
+  outcome: 'repaired' | 'partial' | 'unrecoverable';
+  error_code?: string;
+}
+
+export interface SpeechProcessingFinishParams {
+  event_schema_version: 1;
+  record_hash?: string;
+  stage: 'backfill' | 'diarization';
+  outcome: RecordAnalyticsOutcome;
+  provider: string;
+  model_revision: string;
+  duration_ms: number;
+  media_duration_bucket: MediaDurationBucket;
+  segment_count_bucket: SegmentCountBucket;
+  speaker_count_bucket: SpeakerCountBucket;
+  error_code?: string;
+}
+
+export interface SpeechResourceMutationParams {
+  event_schema_version: 1;
+  operation: 'download' | 'update' | 'retry' | 'remove';
+  outcome: Extract<RecordAnalyticsOutcome, 'success' | 'partial' | 'failed'>;
+  pack_revision: string;
+  resource_bytes: number;
+  duration_ms: number;
+  error_code?: string;
+}
+
+export interface SpeechAttachmentJobParams {
+  event_schema_version: 1;
+  job_hash?: string;
+  operation: 'submit' | 'finish' | 'cancel';
+  source: Source;
+  media_kind:
+    | 'wav'
+    | 'aiff'
+    | 'mp3'
+    | 'flac'
+    | 'ogg'
+    | 'm4a'
+    | 'mp4'
+    | 'mov'
+    | 'unknown';
+  outcome: RecordAnalyticsOutcome;
+  file_bytes_bucket?: MediaBytesBucket;
+  media_duration_bucket?: MediaDurationBucket;
+  provider?: string;
+  model_revision?: string;
+  duration_ms: number;
+  error_code?: string;
 }
 
 /**
  * 通用事件参数类型
  */
-export type EventParams = Record<string, string | number | boolean | null | undefined>;
+export type EventParams = Record<
+  string,
+  string | number | boolean | null | undefined
+>;
 
 /**
  * 待发送的事件

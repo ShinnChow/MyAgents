@@ -42,11 +42,15 @@ const pending = new Set<string>();
 function getOrCreatePepper(): string {
   if (cachedPepper) return cachedPepper;
   try {
-    let p = typeof localStorage !== 'undefined' ? localStorage.getItem(PEPPER_KEY) : null;
+    let p =
+      typeof localStorage !== 'undefined'
+        ? localStorage.getItem(PEPPER_KEY)
+        : null;
     if (!p) {
       p = crypto.randomUUID();
       try {
-        if (typeof localStorage !== 'undefined') localStorage.setItem(PEPPER_KEY, p);
+        if (typeof localStorage !== 'undefined')
+          localStorage.setItem(PEPPER_KEY, p);
       } catch {
         // ignore — non-persistent pepper still works for this session
       }
@@ -61,7 +65,9 @@ function getOrCreatePepper(): string {
 /**
  * Async：SHA-256(pepper + name) → 前 16 字节 hex
  */
-export async function hashAgentName(name: string | null | undefined): Promise<string | null> {
+export async function hashAgentName(
+  name: string | null | undefined,
+): Promise<string | null> {
   if (!name) return null;
   const cached = cache.get(name);
   if (cached !== undefined) {
@@ -104,7 +110,9 @@ export async function hashAgentName(name: string | null | undefined): Promise<st
  * 分析端将其视为 "首次出现该 agent" 的尾部。预热通过 App.tsx 的 useEffect
  * 在 config.agents 加载后批量调 hashAgentName 完成。
  */
-export function hashAgentNameSync(name: string | null | undefined): string | null {
+export function hashAgentNameSync(
+  name: string | null | undefined,
+): string | null {
   if (!name) return null;
   const cached = cache.get(name);
   if (cached !== undefined) {
@@ -120,6 +128,27 @@ export function hashAgentNameSync(name: string | null | undefined): string | nul
     });
   }
   return null;
+}
+
+export type PrivateIdentityDomain = 'record' | 'speech-job';
+
+/**
+ * Domain-separated identity hashing for product analytics. This deliberately
+ * reuses the established local pepper, SHA-256 implementation, and bounded
+ * cache instead of introducing a second privacy-identity owner.
+ */
+export function hashPrivateIdentity(
+  domain: PrivateIdentityDomain,
+  identity: string | null | undefined,
+): Promise<string | null> {
+  return hashAgentName(identity ? `${domain}:${identity}` : identity);
+}
+
+export function hashPrivateIdentitySync(
+  domain: PrivateIdentityDomain,
+  identity: string | null | undefined,
+): string | null {
+  return hashAgentNameSync(identity ? `${domain}:${identity}` : identity);
 }
 
 /**

@@ -83,27 +83,26 @@ impl LifecycleJournal {
             event: entry.event,
         })
     }
-}
 
-#[cfg(test)]
-fn recover_and_read(path: &Path, record_id: &str) -> Result<Vec<LifecycleEntry>, String> {
-    crate::durable_journal::recover_and_read::<LifecycleEvent>(
-        path,
-        record_id,
-        LIFECYCLE_SCHEMA_VERSION,
-        MAX_JOURNAL_LINE_BYTES,
-    )
-    .map(|entries| {
-        entries
-            .into_iter()
-            .map(|entry| LifecycleEntry {
-                seq: entry.seq,
-                wall_time_ms: entry.wall_time_ms,
-                media_ms: entry.media_ms,
-                event: entry.event,
-            })
-            .collect()
-    })
+    pub fn read_entries(record_dir: &Path, record_id: &str) -> Result<Vec<LifecycleEntry>, String> {
+        crate::durable_journal::recover_and_read::<LifecycleEvent>(
+            &record_dir.join("lifecycle.jsonl"),
+            record_id,
+            LIFECYCLE_SCHEMA_VERSION,
+            MAX_JOURNAL_LINE_BYTES,
+        )
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| LifecycleEntry {
+                    seq: entry.seq,
+                    wall_time_ms: entry.wall_time_ms,
+                    media_ms: entry.media_ms,
+                    event: entry.event,
+                })
+                .collect()
+        })
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +147,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(second.seq, 2);
-        let entries = recover_and_read(&path, "record-1").unwrap();
+        let entries = LifecycleJournal::read_entries(root.path(), "record-1").unwrap();
         assert_eq!(entries.len(), 2);
     }
 
@@ -167,7 +166,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(recover_and_read(&path, "record-2").is_err());
+        assert!(LifecycleJournal::read_entries(root.path(), "record-2").is_err());
         assert!(path.metadata().unwrap().len() > 0);
     }
 
@@ -183,7 +182,7 @@ mod tests {
         );
         std::fs::write(&path, legacy_line).unwrap();
 
-        let entries = recover_and_read(&path, "record-1").unwrap();
+        let entries = LifecycleJournal::read_entries(root.path(), "record-1").unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].event,

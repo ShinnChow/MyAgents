@@ -14,6 +14,10 @@ use crate::record::{
     RecordSpeakerTurn, RecordSpeechProvenance, RecordTranscriptSegment,
     RecordTranscriptTrackOffset, TranscriptionStatus,
 };
+use crate::record_analytics::{
+    self, AnalyticsMediaKind, AnalyticsOutcome, AnalyticsSource, RecordAnalyticsMilestone,
+    SpeechAttachmentOperation, SpeechProcessingStage, SpeechResourceOperation,
+};
 use crate::recording::analysis::{cleanup_analysis_spool, AnalysisSpoolSource};
 use crate::speech_model_pack_manager::{SpeechModelPackManager, SpeechModelPackStatus};
 use crate::workspace_files::path_safety::{
@@ -767,6 +771,48 @@ impl SpeechRecognitionManager {
     }
 
     pub fn submit_agent_attachment(
+        self: &Arc<Self>,
+        initiator_session_id: &str,
+        workspace_identity: &Path,
+        source_path: &str,
+        output_root: Option<&str>,
+    ) -> Result<SpeechJob, &'static str> {
+        let admission_started = Instant::now();
+        let result = self.submit_agent_attachment_inner(
+            initiator_session_id,
+            workspace_identity,
+            source_path,
+            output_root,
+        );
+        match &result {
+            Ok(job) => emit_attachment_job(
+                job,
+                SpeechAttachmentOperation::Submit,
+                AnalyticsOutcome::Success,
+                elapsed_ms(admission_started),
+            ),
+            Err(code) => {
+                let capability = self.capability_snapshot();
+                record_analytics::emit(RecordAnalyticsMilestone::SpeechAttachmentJob {
+                    event_schema_version: 1,
+                    job_id: None,
+                    operation: SpeechAttachmentOperation::Submit,
+                    source: AnalyticsSource::CliAgent,
+                    media_kind: AnalyticsMediaKind::Unknown,
+                    outcome: AnalyticsOutcome::Rejected,
+                    file_bytes_bucket: None,
+                    media_duration_bucket: None,
+                    provider: Some("local".to_string()),
+                    model_revision: capability.model_pack_revision,
+                    duration_ms: elapsed_ms(admission_started),
+                    error_code: Some((*code).to_string()),
+                });
+            }
+        }
+        result
+    }
+
+    fn submit_agent_attachment_inner(
         self: &Arc<Self>,
         initiator_session_id: &str,
         workspace_identity: &Path,
@@ -1837,6 +1883,12 @@ impl SpeechRecognitionManager {
                 if let Some(pending) = pending {
                     cleanup_pending_agent(&pending);
                 }
+                emit_attachment_job(
+                    &job,
+                    SpeechAttachmentOperation::Cancel,
+                    AnalyticsOutcome::Canceled,
+                    0,
+                );
                 Ok(job)
             }
             SpeechJobState::Running => {
@@ -1977,7 +2029,20 @@ impl SpeechRecognitionManager {
     }
 
     pub async fn install_model_pack(self: &Arc<Self>) -> Result<SpeechModelPackStatus, String> {
-        self.model_pack.install().await
+        let before = self.model_pack.status();
+        let operation = if before.last_error_code.is_some() {
+            SpeechResourceOperation::Retry
+        } else if before.usable
+            && before.active_revision.as_deref() != Some(before.available_revision.as_str())
+        {
+            SpeechResourceOperation::Update
+        } else {
+            SpeechResourceOperation::Download
+        };
+        let started = Instant::now();
+        let result = self.model_pack.install().await;
+        emit_resource_mutation(operation, &before, &result, elapsed_ms(started));
+        result
     }
 
     pub fn remove_model_pack(&self) -> Result<SpeechModelPackStatus, String> {
@@ -1990,7 +2055,16 @@ impl SpeechRecognitionManager {
             || state.active_job.is_some()
             || !state.live_sessions.is_empty()
             || state.live_running.is_some();
-        self.model_pack.remove(in_use)
+        let before = self.model_pack.status();
+        let started = Instant::now();
+        let result = self.model_pack.remove(in_use);
+        emit_resource_mutation(
+            SpeechResourceOperation::Remove,
+            &before,
+            &result,
+            elapsed_ms(started),
+        );
+        result
     }
 
     pub fn record_root(&self) -> &Path {
@@ -2672,6 +2746,7 @@ impl SpeechRecognitionManager {
             );
             return false;
         }
+        emit_speech_terminal(&terminal_job);
         state.jobs.insert(source_job.job_id.clone(), terminal_job);
 
         let cleanup_durable = validate_agent_directory(
@@ -3939,6 +4014,150 @@ fn worker_code_retryable(code: &str) -> bool {
     )
 }
 
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn analytics_outcome(state: SpeechJobState) -> Option<AnalyticsOutcome> {
+    match state {
+        SpeechJobState::Succeeded => Some(AnalyticsOutcome::Success),
+        SpeechJobState::SucceededWithWarnings => Some(AnalyticsOutcome::Partial),
+        SpeechJobState::Failed => Some(AnalyticsOutcome::Failed),
+        SpeechJobState::Cancelled => Some(AnalyticsOutcome::Canceled),
+        SpeechJobState::Interrupted => Some(AnalyticsOutcome::Interrupted),
+        SpeechJobState::Queued | SpeechJobState::Running | SpeechJobState::Cancelling => None,
+    }
+}
+
+fn analytics_media_kind(value: Option<&str>) -> AnalyticsMediaKind {
+    match value {
+        Some("wav") => AnalyticsMediaKind::Wav,
+        Some("aiff") => AnalyticsMediaKind::Aiff,
+        Some("mp3") => AnalyticsMediaKind::Mp3,
+        Some("flac") => AnalyticsMediaKind::Flac,
+        Some("ogg") => AnalyticsMediaKind::Ogg,
+        Some("m4a") => AnalyticsMediaKind::M4a,
+        Some("mp4") => AnalyticsMediaKind::Mp4,
+        Some("mov") => AnalyticsMediaKind::Mov,
+        _ => AnalyticsMediaKind::Unknown,
+    }
+}
+
+fn emit_attachment_job(
+    job: &SpeechJob,
+    operation: SpeechAttachmentOperation,
+    outcome: AnalyticsOutcome,
+    duration_ms: u64,
+) {
+    record_analytics::emit(RecordAnalyticsMilestone::SpeechAttachmentJob {
+        event_schema_version: 1,
+        job_id: Some(job.job_id.clone()),
+        operation,
+        source: AnalyticsSource::CliAgent,
+        media_kind: analytics_media_kind(job.source.media_kind.as_deref()),
+        outcome,
+        file_bytes_bucket: Some(record_analytics::media_bytes_bucket(job.source.size_bytes)),
+        media_duration_bucket: Some(record_analytics::media_duration_bucket(
+            job.source.duration_ms.unwrap_or(0),
+        )),
+        provider: Some(job.pipeline.provider.clone()),
+        model_revision: Some(job.pipeline.model_pack_revision.clone()),
+        duration_ms,
+        error_code: job.error.as_ref().map(|error| error.code.clone()),
+    });
+}
+
+fn emit_speech_terminal(job: &SpeechJob) {
+    let Some(outcome) = analytics_outcome(job.state) else {
+        return;
+    };
+    let duration_ms = job.metrics.as_ref().map_or_else(
+        || {
+            job.finished_at
+                .zip(job.started_at)
+                .and_then(|(finished, started)| {
+                    u64::try_from((finished - started).num_milliseconds().max(0)).ok()
+                })
+                .unwrap_or(0)
+        },
+        |metrics| metrics.elapsed_ms,
+    );
+    match (&job.origin, job.kind) {
+        (SpeechJobOrigin::Agent { .. }, SpeechJobKind::AgentAttachmentAsr) => {
+            emit_attachment_job(
+                job,
+                if job.state == SpeechJobState::Cancelled {
+                    SpeechAttachmentOperation::Cancel
+                } else {
+                    SpeechAttachmentOperation::Finish
+                },
+                outcome,
+                duration_ms,
+            );
+        }
+        (SpeechJobOrigin::Record { record_id }, kind) => {
+            let stage = match kind {
+                SpeechJobKind::RecordBackfillAsr => SpeechProcessingStage::Backfill,
+                SpeechJobKind::RecordDiarization => SpeechProcessingStage::Diarization,
+                SpeechJobKind::AgentAttachmentAsr => return,
+            };
+            let metrics = job.metrics.as_ref();
+            let source_duration_ms = job.source.duration_ms.unwrap_or_else(|| {
+                metrics
+                    .map(|metrics| metrics.source_samples.saturating_mul(1_000) / 16_000)
+                    .unwrap_or(0)
+            });
+            record_analytics::emit(RecordAnalyticsMilestone::SpeechProcessingFinish {
+                event_schema_version: 1,
+                record_id: record_id.clone(),
+                stage,
+                outcome,
+                provider: job.pipeline.provider.clone(),
+                model_revision: job.pipeline.model_pack_revision.clone(),
+                duration_ms,
+                media_duration_bucket: record_analytics::media_duration_bucket(source_duration_ms),
+                segment_count_bucket: record_analytics::segment_count_bucket(
+                    metrics.map_or(0, |metrics| metrics.segments as usize),
+                ),
+                speaker_count_bucket: record_analytics::speaker_count_bucket(
+                    metrics.map_or(0, |metrics| metrics.speakers as usize),
+                ),
+                error_code: job.error.as_ref().map(|error| error.code.clone()),
+            });
+        }
+        _ => {}
+    }
+}
+
+fn emit_resource_mutation(
+    operation: SpeechResourceOperation,
+    before: &SpeechModelPackStatus,
+    result: &Result<SpeechModelPackStatus, String>,
+    duration_ms: u64,
+) {
+    let (outcome, status, error_code) = match result {
+        Ok(status) => (
+            if status.last_error_code.is_some() {
+                AnalyticsOutcome::Partial
+            } else {
+                AnalyticsOutcome::Success
+            },
+            status,
+            status.last_error_code.clone(),
+        ),
+        Err(code) => (AnalyticsOutcome::Failed, before, Some(code.clone())),
+    };
+    record_analytics::emit(RecordAnalyticsMilestone::SpeechResourceMutation {
+        event_schema_version: 1,
+        operation,
+        outcome,
+        pack_revision: status.available_revision.clone(),
+        resource_bytes: status.installed_model_bytes,
+        duration_ms,
+        error_code,
+    });
+}
+
 fn finish_job_locked(
     root: &Path,
     state: &mut ManagerState,
@@ -3963,7 +4182,9 @@ fn finish_job_locked(
             terminal,
             SpeechJobState::Succeeded | SpeechJobState::SucceededWithWarnings
         );
-        let _ = persist_job(root, job);
+        if persist_job(root, job).is_ok() {
+            emit_speech_terminal(job);
+        }
     }
 }
 
@@ -4814,6 +5035,14 @@ pub fn cmd_speech_model_pack_remove(
     manager: tauri::State<'_, ManagedSpeechRecognition>,
 ) -> Result<SpeechModelPackStatus, String> {
     manager.remove_model_pack()
+}
+
+#[tauri::command]
+pub async fn cmd_speech_record_transcribe(
+    manager: tauri::State<'_, ManagedSpeechRecognition>,
+    record_id: String,
+) -> Result<SpeechJob, String> {
+    manager.inner().submit_record_backfill(&record_id).await
 }
 
 #[cfg(test)]

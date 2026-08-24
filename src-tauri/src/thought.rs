@@ -11,6 +11,7 @@ use crate::record::{
     ManagedRecordStore, Record, RecordArchiveFilter, RecordDeleteFailure, RecordKind,
     RecordListFilter, RecordMergeResult, TextRecordCreateInput, TextRecordUpdateInput,
 };
+use crate::record_analytics::{self, AnalyticsSource, AnalyticsSurface, RecordUseOperation};
 
 pub use crate::record::parse_tags;
 
@@ -151,14 +152,20 @@ pub type ManagedThoughtStore = ManagedRecordStore;
 pub async fn cmd_thought_create(
     state: tauri::State<'_, ManagedRecordStore>,
     input: ThoughtCreateInput,
+    surface: Option<AnalyticsSurface>,
 ) -> Result<Thought, String> {
-    state
+    let record = state
         .create_text(TextRecordCreateInput {
             content: input.content,
             images: input.images,
         })
-        .await?
-        .try_into()
+        .await?;
+    record_analytics::emit_record_create(
+        &record,
+        AnalyticsSource::Desktop,
+        surface.unwrap_or(AnalyticsSurface::Unknown),
+    );
+    record.try_into()
 }
 
 #[tauri::command]
@@ -202,8 +209,20 @@ pub async fn cmd_thought_update(
 pub async fn cmd_thought_delete(
     state: tauri::State<'_, ManagedRecordStore>,
     id: String,
+    surface: Option<AnalyticsSurface>,
 ) -> Result<(), String> {
-    state.delete(&id).await
+    let record = state
+        .get(&id)
+        .await
+        .ok_or_else(|| format!("Record not found: {id}"))?;
+    state.delete(&id).await?;
+    record_analytics::emit_record_use(
+        &record,
+        RecordUseOperation::Delete,
+        AnalyticsSource::Desktop,
+        surface.unwrap_or(AnalyticsSurface::Unknown),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -211,8 +230,18 @@ pub async fn cmd_thought_set_archived(
     state: tauri::State<'_, ManagedRecordStore>,
     id: String,
     archived: bool,
+    surface: Option<AnalyticsSurface>,
 ) -> Result<Thought, String> {
-    state.set_archived(&id, archived).await?.try_into()
+    let record = state.set_archived(&id, archived).await?;
+    if archived {
+        record_analytics::emit_record_use(
+            &record,
+            RecordUseOperation::Archive,
+            AnalyticsSource::Desktop,
+            surface.unwrap_or(AnalyticsSurface::Unknown),
+        );
+    }
+    record.try_into()
 }
 
 #[tauri::command]
@@ -220,7 +249,13 @@ pub async fn cmd_thought_merge(
     state: tauri::State<'_, ManagedRecordStore>,
     source_ids: Vec<String>,
 ) -> Result<MergeResult, String> {
-    map_merge_result(state.merge_text(source_ids).await?)
+    let result = state.merge_text(source_ids).await?;
+    record_analytics::emit_record_create(
+        &result.merged,
+        AnalyticsSource::Desktop,
+        AnalyticsSurface::TaskCenter,
+    );
+    map_merge_result(result)
 }
 
 #[tauri::command]

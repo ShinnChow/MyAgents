@@ -58,48 +58,51 @@ impl RealtimeTrackSink {
         let _ = self.wake.try_send(());
     }
 
-    pub fn push_f32(&self, samples: &[f32]) {
-        self.push_converted(samples.iter().copied());
+    pub fn push_f32(&self, samples: &[f32]) -> u8 {
+        self.push_converted(samples.iter().copied())
     }
 
-    pub fn push_i16(&self, samples: &[i16]) {
+    pub fn push_i16(&self, samples: &[i16]) -> u8 {
         self.push_converted(
             samples
                 .iter()
                 .map(|sample| *sample as f32 / i16::MAX as f32),
-        );
+        )
     }
 
-    pub fn push_i32(&self, samples: &[i32]) {
+    pub fn push_i32(&self, samples: &[i32]) -> u8 {
         self.push_converted(
             samples
                 .iter()
                 .map(|sample| *sample as f32 / i32::MAX as f32),
-        );
+        )
     }
 
-    pub fn push_i8(&self, samples: &[i8]) {
-        self.push_converted(samples.iter().map(|sample| *sample as f32 / i8::MAX as f32));
+    pub fn push_i8(&self, samples: &[i8]) -> u8 {
+        self.push_converted(samples.iter().map(|sample| *sample as f32 / i8::MAX as f32))
     }
 
-    pub fn push_planar_f32(&self, planes: &[&[f32]]) {
+    pub fn push_planar_f32(&self, planes: &[&[f32]]) -> u8 {
         if !self.accepting.load(Ordering::Acquire)
             || planes.len() != self.channels as usize
             || planes.is_empty()
         {
-            return;
+            return 0;
         }
         let frames = planes.iter().map(|plane| plane.len()).min().unwrap_or(0);
         let Ok(mut producer) = self.producer.try_lock() else {
             self.overrun_samples
                 .fetch_add((frames * self.channels as usize) as u64, Ordering::Relaxed);
-            return;
+            return 0;
         };
         let channels = self.channels as usize;
         let accepted_frames = frames.min(producer.vacant_len() / channels);
+        let mut peak = 0.0_f32;
         for frame in 0..accepted_frames {
             for plane in planes {
-                let pushed = producer.try_push(plane[frame].clamp(-1.0, 1.0));
+                let sample = plane[frame].clamp(-1.0, 1.0);
+                peak = peak.max(sample.abs());
+                let pushed = producer.try_push(sample);
                 debug_assert!(pushed.is_ok());
             }
         }
@@ -109,24 +112,28 @@ impl RealtimeTrackSink {
             self.overrun_samples.fetch_add(dropped, Ordering::Relaxed);
         }
         self.wake_worker();
+        peak_percent(peak)
     }
 
-    fn push_converted(&self, samples: impl ExactSizeIterator<Item = f32>) {
+    fn push_converted(&self, samples: impl ExactSizeIterator<Item = f32>) -> u8 {
         if !self.accepting.load(Ordering::Acquire) {
-            return;
+            return 0;
         }
         let sample_count = samples.len();
         let Ok(mut producer) = self.producer.try_lock() else {
             self.overrun_samples
                 .fetch_add(sample_count as u64, Ordering::Relaxed);
-            return;
+            return 0;
         };
         let channels = self.channels as usize;
         let aligned_samples = sample_count - sample_count % channels;
         let accepted_samples = aligned_samples.min(producer.vacant_len() / channels * channels);
+        let mut peak = 0.0_f32;
         for (index, sample) in samples.enumerate() {
             if index < accepted_samples {
-                let pushed = producer.try_push(sample.clamp(-1.0, 1.0));
+                let sample = sample.clamp(-1.0, 1.0);
+                peak = peak.max(sample.abs());
+                let pushed = producer.try_push(sample);
                 debug_assert!(pushed.is_ok());
             }
         }
@@ -136,7 +143,12 @@ impl RealtimeTrackSink {
             self.overrun_samples.fetch_add(dropped, Ordering::Relaxed);
         }
         self.wake_worker();
+        peak_percent(peak)
     }
+}
+
+fn peak_percent(peak: f32) -> u8 {
+    (peak.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 pub(super) struct RealtimeRingParts {
@@ -466,7 +478,8 @@ mod tests {
         )
         .unwrap();
         let oversized = vec![0.1; 8_002];
-        parts.sink.push_f32(&oversized);
+        let peak = parts.sink.push_f32(&oversized);
+        assert_eq!(peak, 10);
         assert_eq!(parts.overrun_samples.load(Ordering::Relaxed), 2);
     }
 
@@ -479,7 +492,8 @@ mod tests {
         let parts = create_realtime_ring(format, 1).unwrap();
         let mut source = vec![0.1; 16_002];
         source[16_001] = 0.2;
-        parts.sink.push_f32(&source);
+        let peak = parts.sink.push_f32(&source);
+        assert_eq!(peak, 10, "dropped samples must not affect activity");
         assert_eq!(parts.overrun_samples.load(Ordering::Relaxed), 2);
         assert_eq!(parts.consumer.occupied_len() % 2, 0);
     }

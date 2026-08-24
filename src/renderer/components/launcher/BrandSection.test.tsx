@@ -21,7 +21,10 @@ const simpleInputHandle = vi.hoisted(() => ({
   setValue: vi.fn(),
   setImages: vi.fn(),
   focus: vi.fn(),
-  clearWorkspaceBoundDraft: vi.fn(() => ({ strippedReferences: 0, clearedImages: 0 })),
+  clearWorkspaceBoundDraft: vi.fn(() => ({
+    strippedReferences: 0,
+    clearedImages: 0,
+  })),
   getCurrentValue: vi.fn(() => ''),
   getImages: vi.fn(() => []),
 }));
@@ -31,26 +34,31 @@ const nativeFileDrop = vi.hoisted(() => ({
   zoneId: undefined as string | undefined,
   zoneElement: null as HTMLElement | null,
   zoneDrop: undefined as ((paths: string[]) => void) | undefined,
-  registerZone: vi.fn((
-    id: string,
-    element: HTMLElement | null,
-    onDrop: (paths: string[]) => void,
-  ) => {
-    nativeFileDrop.zoneId = id;
-    nativeFileDrop.zoneElement = element;
-    nativeFileDrop.zoneDrop = onDrop;
-  }),
+  registerZone: vi.fn(
+    (
+      id: string,
+      element: HTMLElement | null,
+      onDrop: (paths: string[]) => void,
+    ) => {
+      nativeFileDrop.zoneId = id;
+      nativeFileDrop.zoneElement = element;
+      nativeFileDrop.zoneDrop = onDrop;
+    },
+  ),
   unregisterZone: vi.fn(),
 }));
 
 const taskCenterMock = vi.hoisted(() => ({ available: false }));
 
 vi.mock('@/components/SimpleChatInput', () => ({
-  default: forwardRef<SimpleChatInputHandle, {
-    active?: boolean;
-    onSlashAction?: (name: string) => void;
-    showBuiltinSdkSlashCommands?: boolean;
-  }>(function SimpleChatInputMock(
+  default: forwardRef<
+    SimpleChatInputHandle,
+    {
+      active?: boolean;
+      onSlashAction?: (name: string) => void;
+      showBuiltinSdkSlashCommands?: boolean;
+    }
+  >(function SimpleChatInputMock(
     { active, onSlashAction, showBuiltinSdkSlashCommands },
     _ref,
   ) {
@@ -62,7 +70,9 @@ vi.mock('@/components/SimpleChatInput', () => ({
         data-show-builtin-sdk-commands={String(showBuiltinSdkSlashCommands)}
       >
         input
-        <button type="button" onClick={() => onSlashAction?.('goal')}>open goal</button>
+        <button type="button" onClick={() => onSlashAction?.('goal')}>
+          open goal
+        </button>
       </div>
     );
   }),
@@ -91,9 +101,19 @@ vi.mock('@/components/cron/CronTaskSettingsModal', () => ({
     schedule: { kind: 'loop' },
     executionTarget: 'current_session',
   },
-  default: ({ isOpen, initialConfig }: { isOpen: boolean; initialConfig?: { taskKind?: string } }) => (
-    isOpen ? <div data-testid="cron-settings" data-task-kind={initialConfig?.taskKind} /> : null
-  ),
+  default: ({
+    isOpen,
+    initialConfig,
+  }: {
+    isOpen: boolean;
+    initialConfig?: { taskKind?: string };
+  }) =>
+    isOpen ? (
+      <div
+        data-testid="cron-settings"
+        data-task-kind={initialConfig?.taskKind}
+      />
+    ) : null,
 }));
 
 vi.mock('./LauncherInputContextRow', () => ({
@@ -102,7 +122,9 @@ vi.mock('./LauncherInputContextRow', () => ({
 
 vi.mock('@/components/task-center/ModeSegment', () => ({
   default: ({ onChange }: { onChange: (mode: 'task' | 'thought') => void }) => (
-    <button type="button" onClick={() => onChange('thought')}>thought mode</button>
+    <button type="button" onClick={() => onChange('thought')}>
+      thought mode
+    </button>
   ),
 }));
 
@@ -153,6 +175,8 @@ function renderBrandSection(
       onSelectWorkspace={vi.fn()}
       onAddFolder={vi.fn()}
       onSend={vi.fn()}
+      onStartRecording={vi.fn()}
+      onOpenRecord={vi.fn()}
       isActive={true}
       providers={[]}
       apiKeys={{}}
@@ -164,10 +188,13 @@ function renderBrandSection(
   const view = render(
     <ThemeRuntimeProvider
       registry={new ThemeRegistry([myAgentsDefaultTheme, syntheticTheme])}
-      selection={{ themeId: themeId ?? 'myagents-default', appearanceMode: 'light' }}
+      selection={{
+        themeId: themeId ?? 'myagents-default',
+        appearanceMode: 'light',
+      }}
     >
       {content}
-    </ThemeRuntimeProvider>
+    </ThemeRuntimeProvider>,
   );
   return { ...view, onGoToSettings };
 }
@@ -195,12 +222,16 @@ describe('BrandSection', () => {
 
     nativeFileDrop.zoneDrop?.(['/tmp/report.pdf']);
 
-    expect(simpleInputHandle.processDroppedFilePaths).toHaveBeenCalledWith(['/tmp/report.pdf']);
+    expect(simpleInputHandle.processDroppedFilePaths).toHaveBeenCalledWith([
+      '/tmp/report.pdf',
+    ]);
   });
 
   it('routes browser file drops to the existing File import pipeline', () => {
     renderBrandSection({ isActive: true });
-    const file = new File(['report'], 'report.pdf', { type: 'application/pdf' });
+    const file = new File(['report'], 'report.pdf', {
+      type: 'application/pdf',
+    });
 
     fireEvent.drop(screen.getByTestId('launcher-input'), {
       dataTransfer: { files: [file] },
@@ -212,7 +243,9 @@ describe('BrandSection', () => {
   it('gates both native and browser file drops when the Launcher tab is inactive', () => {
     renderBrandSection({ isActive: false });
     const input = screen.getByTestId('launcher-input');
-    const file = new File(['report'], 'report.pdf', { type: 'application/pdf' });
+    const file = new File(['report'], 'report.pdf', {
+      type: 'application/pdf',
+    });
 
     expect(nativeFileDrop.options?.enabled).toBe(false);
     expect(input).toHaveAttribute('data-active', 'false');
@@ -225,7 +258,9 @@ describe('BrandSection', () => {
     taskCenterMock.available = true;
     renderBrandSection({ isActive: true });
     const input = screen.getByTestId('launcher-input');
-    const file = new File(['report'], 'report.pdf', { type: 'application/pdf' });
+    const file = new File(['report'], 'report.pdf', {
+      type: 'application/pdf',
+    });
 
     fireEvent.click(screen.getByRole('button', { name: 'thought mode' }));
 
@@ -244,8 +279,12 @@ describe('BrandSection', () => {
     expect(stack).not.toBeNull();
     expect(stack).toHaveClass('mt-2');
     expect(screen.getByTestId('launcher-context-row')).toBeInTheDocument();
-    expect(stack as HTMLElement).toContainElement(screen.getByTestId('launcher-context-row'));
-    expect(stack as HTMLElement).toContainElement(screen.getByRole('button', { name: /配置模型供应商/ }));
+    expect(stack as HTMLElement).toContainElement(
+      screen.getByTestId('launcher-context-row'),
+    );
+    expect(stack as HTMLElement).toContainElement(
+      screen.getByRole('button', { name: /配置模型供应商/ }),
+    );
   });
 
   it('opens provider settings from the no-provider CTA', () => {
@@ -261,7 +300,10 @@ describe('BrandSection', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'open goal' }));
 
-    expect(screen.getByTestId('cron-settings')).toHaveAttribute('data-task-kind', 'goal');
+    expect(screen.getByTestId('cron-settings')).toHaveAttribute(
+      'data-task-kind',
+      'goal',
+    );
   });
 
   it.each([
@@ -271,11 +313,13 @@ describe('BrandSection', () => {
         provider: {
           ...MANAGED_CODEX_PROVIDER,
           primaryModel: 'gpt-5.6-sol',
-          models: [{
-            model: 'gpt-5.6-sol',
-            modelName: 'GPT-5.6-Sol',
-            modelSeries: 'codex',
-          }],
+          models: [
+            {
+              model: 'gpt-5.6-sol',
+              modelName: 'GPT-5.6-Sol',
+              modelSeries: 'codex',
+            },
+          ],
         },
       },
       expected: 'false',
@@ -304,15 +348,23 @@ describe('BrandSection', () => {
 
     renderBrandSection();
 
-    expect(screen.getByText(/One step to start your AI journey/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Configure a model provider/ })).toBeInTheDocument();
+    expect(
+      screen.getByText(/One step to start your AI journey/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /Configure a model provider/ }),
+    ).toBeInTheDocument();
   });
 
   it('renders product name and localized slogan from the resolved Theme Hero', () => {
     const { container } = renderBrandSection({}, syntheticTheme.id);
 
-    expect(screen.getByRole('heading', { name: 'Synthetic Agents' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { name: 'Synthetic Agents' }),
+    ).toBeInTheDocument();
     expect(screen.getByText('合成主题标记')).toBeInTheDocument();
-    expect(container.querySelector('[data-theme-hero="synthetic-test-theme"]')).not.toBeNull();
+    expect(
+      container.querySelector('[data-theme-hero="synthetic-test-theme"]'),
+    ).not.toBeNull();
   });
 });

@@ -7,7 +7,8 @@
 use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -19,6 +20,7 @@ use zeroize::Zeroize;
 
 use crate::durable_fs::{rename_directory_noreplace, sync_directory};
 use crate::durable_journal::{recover_and_read, DurableRecordJournal};
+use crate::record_analytics::{self, AnalyticsSource, AnalyticsSurface, RecordUseOperation};
 use crate::utils::file_lock::{with_file_lock_blocking, FileLockError, FileLockOptions};
 use crate::{ulog_info, ulog_warn};
 
@@ -35,7 +37,14 @@ const TRANSCRIPT_REVISION_MAX_LINE_BYTES: usize = 256 * 1024;
 const TRANSCRIPT_REVISION_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const LIVE_TRANSCRIPT_MAX_SAMPLES: u64 = SPEECH_SAMPLE_RATE * 60 * 60 * 8;
 const DIARIZATION_TURN_LIMIT: usize = 200_000;
+const DIARIZATION_OVERRIDES_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SPEAKER_DISPLAY_NAME_MAX_BYTES: usize = 256;
 const SPEECH_SAMPLE_RATE: u64 = 16_000;
+const TIMELINE_SCHEMA_VERSION: u32 = 1;
+const TIMELINE_MAX_LINE_BYTES: usize = 128 * 1024;
+const TIMELINE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const TIMELINE_ITEM_LIMIT: usize = 100_000;
+const TIMELINE_TEXT_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -266,6 +275,139 @@ pub struct TextRecordUpdateInput {
     pub converted_task_ids: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioRecordMetadataUpdateInput {
+    pub id: String,
+    pub expected_revision: u64,
+    pub title: String,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordNoteCreateInput {
+    pub record_id: String,
+    pub operation_id: String,
+    pub anchor_media_ms: u64,
+    pub started_at_wall_time: i64,
+    pub submitted_at_wall_time: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordMarkCreateInput {
+    pub record_id: String,
+    pub operation_id: String,
+    pub media_ms: u64,
+    pub wall_time: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordNoteUpdateInput {
+    pub record_id: String,
+    pub operation_id: String,
+    pub note_id: String,
+    pub updated_at_wall_time: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordTimelineDeleteInput {
+    pub record_id: String,
+    pub operation_id: String,
+    pub item_id: String,
+    pub item_type: String,
+    pub deleted_at_wall_time: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum RecordTimelineEvent {
+    NoteCreated {
+        operation_id: String,
+        note_id: String,
+        anchor_media_ms: u64,
+        started_at_wall_time: i64,
+        submitted_at_wall_time: i64,
+        text: String,
+    },
+    MarkCreated {
+        operation_id: String,
+        mark_id: String,
+        media_ms: u64,
+        wall_time: i64,
+        kind: String,
+    },
+    NoteUpdated {
+        operation_id: String,
+        note_id: String,
+        updated_at_wall_time: i64,
+        text: String,
+    },
+    NoteDeleted {
+        operation_id: String,
+        note_id: String,
+        deleted_at_wall_time: i64,
+    },
+    MarkDeleted {
+        operation_id: String,
+        mark_id: String,
+        deleted_at_wall_time: i64,
+    },
+}
+
+impl RecordTimelineEvent {
+    fn operation_id(&self) -> &str {
+        match self {
+            Self::NoteCreated { operation_id, .. }
+            | Self::MarkCreated { operation_id, .. }
+            | Self::NoteUpdated { operation_id, .. }
+            | Self::NoteDeleted { operation_id, .. }
+            | Self::MarkDeleted { operation_id, .. } => operation_id,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum RecordTimelineItem {
+    Note {
+        seq: u64,
+        note_id: String,
+        anchor_media_ms: u64,
+        started_at_wall_time: i64,
+        submitted_at_wall_time: i64,
+        text: String,
+    },
+    Mark {
+        seq: u64,
+        mark_id: String,
+        media_ms: u64,
+        wall_time: i64,
+        kind: String,
+    },
+}
+
+#[derive(Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordTimelineProjection {
+    pub record_id: String,
+    pub revision: u64,
+    pub items: Vec<RecordTimelineItem>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordDeleteFailure {
@@ -315,6 +457,12 @@ pub struct RecordTranscriptSegment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecordSegmentFinalization {
+    pub wall_time_ms: i64,
+    pub media_ms: u64,
 }
 
 impl std::fmt::Debug for RecordTranscriptSegment {
@@ -749,6 +897,133 @@ pub struct RecordDiarizationResult {
     pub turns: Vec<RecordSpeakerTurn>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSpeakerProjection {
+    pub speaker_id: u32,
+    pub custom_name: Option<String>,
+    pub merged_into: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSpeakerOverrideConflict {
+    pub kind: String,
+    pub target_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordDiarizationProjection {
+    pub schema_version: u32,
+    pub record_id: String,
+    pub projection_revision: u64,
+    pub sample_rate: u32,
+    pub provenance: RecordSpeechProvenance,
+    pub turns: Vec<RecordSpeakerTurn>,
+    pub override_revision: u64,
+    pub speakers: Vec<RecordSpeakerProjection>,
+    pub segment_speaker_overrides: BTreeMap<String, u32>,
+    pub conflicts: Vec<RecordSpeakerOverrideConflict>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordSpeakerOverrides {
+    schema_version: u32,
+    record_id: String,
+    revision: u64,
+    updated_at_wall_time: i64,
+    renames: BTreeMap<u32, String>,
+    merges: BTreeMap<u32, u32>,
+    reassignments: BTreeMap<String, u32>,
+}
+
+impl RecordSpeakerOverrides {
+    fn empty(record_id: &str) -> Self {
+        Self {
+            schema_version: 1,
+            record_id: record_id.to_string(),
+            revision: 0,
+            updated_at_wall_time: 0,
+            renames: BTreeMap::new(),
+            merges: BTreeMap::new(),
+            reassignments: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSpeakerRenameInput {
+    pub record_id: String,
+    pub expected_override_revision: u64,
+    pub speaker_id: u32,
+    pub name: String,
+    pub updated_at_wall_time: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSpeakerMergeInput {
+    pub record_id: String,
+    pub expected_override_revision: u64,
+    pub source_speaker_id: u32,
+    pub target_speaker_id: u32,
+    pub updated_at_wall_time: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSegmentSpeakerReassignInput {
+    pub record_id: String,
+    pub expected_override_revision: u64,
+    pub segment_id: String,
+    pub speaker_id: u32,
+    pub updated_at_wall_time: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordAudioExportInput {
+    pub record_id: String,
+    pub track: AudioTrackKind,
+    pub destination_path: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordTextExportFormat {
+    Markdown,
+    Text,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordTextExportInput {
+    pub record_id: String,
+    pub format: RecordTextExportFormat,
+    pub destination_path: String,
+    pub locale: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordExportResult {
+    pub destination_path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordSearchDocument {
+    pub record_id: String,
+    pub kind: RecordKind,
+    pub title: String,
+    pub tags: Vec<String>,
+    pub content: String,
+    pub media_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct StoredRecord {
     record: Record,
@@ -756,13 +1031,15 @@ struct StoredRecord {
     legacy_thought_digest: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum RecordChangeKind {
     Upsert,
     Delete,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordChange {
     pub sequence: u64,
     pub id: String,
@@ -1138,6 +1415,52 @@ impl RecordStore {
         project_live_transcript(id, entries).map(Some)
     }
 
+    pub(crate) async fn read_live_segment_finalizations(
+        &self,
+        id: &str,
+    ) -> Result<Vec<RecordSegmentFinalization>, String> {
+        let stored = self
+            .inner
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        let path = stored.path.join("transcript/revisions.jsonl");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(format!("inspect live transcript journal: {error}")),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > TRANSCRIPT_REVISION_MAX_BYTES
+        {
+            return Err("live transcript revision journal is invalid".to_string());
+        }
+        let entries = recover_and_read::<RecordTranscriptRevisionEvent>(
+            &path,
+            id,
+            TRANSCRIPT_REVISION_SCHEMA_VERSION,
+            TRANSCRIPT_REVISION_MAX_LINE_BYTES,
+        )?;
+        let mut finalizations = HashMap::<String, RecordSegmentFinalization>::new();
+        for entry in entries {
+            if let RecordTranscriptRevisionEvent::SegmentUpsert { segment } = entry.event {
+                finalizations.insert(
+                    segment.segment_id,
+                    RecordSegmentFinalization {
+                        wall_time_ms: entry.wall_time_ms,
+                        media_ms: entry.media_ms,
+                    },
+                );
+            }
+        }
+        let mut finalizations = finalizations.into_values().collect::<Vec<_>>();
+        finalizations.sort_by_key(|item| (item.media_ms, item.wall_time_ms));
+        Ok(finalizations)
+    }
+
     pub async fn update_audio_processing_status(
         &self,
         id: &str,
@@ -1422,6 +1745,435 @@ impl RecordStore {
         read_owned_diarization_result(id, &stored.path, audio, artifact).map(Some)
     }
 
+    pub async fn read_diarization_projection(
+        &self,
+        id: &str,
+    ) -> Result<Option<RecordDiarizationProjection>, String> {
+        let inner = self.inner.read().await;
+        let stored = inner
+            .get(id)
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        read_diarization_projection_for_stored(stored)
+    }
+
+    pub async fn rename_speaker(
+        &self,
+        input: RecordSpeakerRenameInput,
+    ) -> Result<RecordDiarizationProjection, String> {
+        let name = input.name.trim().to_string();
+        if name.is_empty()
+            || name.as_bytes().len() > SPEAKER_DISPLAY_NAME_MAX_BYTES
+            || name.contains('\0')
+        {
+            return Err("Speaker display name is invalid".to_string());
+        }
+        self.mutate_speaker_overrides(
+            &input.record_id,
+            input.expected_override_revision,
+            input.updated_at_wall_time,
+            move |_stored, model, overrides| {
+                let speakers = model_speaker_ids(model);
+                if !speakers.contains(&input.speaker_id) {
+                    return Err("Speaker not found".to_string());
+                }
+                let speaker_id = resolve_merged_speaker(input.speaker_id, &overrides.merges)?;
+                overrides.renames.insert(speaker_id, name);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    pub async fn merge_speakers(
+        &self,
+        input: RecordSpeakerMergeInput,
+    ) -> Result<RecordDiarizationProjection, String> {
+        self.mutate_speaker_overrides(
+            &input.record_id,
+            input.expected_override_revision,
+            input.updated_at_wall_time,
+            move |_stored, model, overrides| {
+                let speakers = model_speaker_ids(model);
+                if !speakers.contains(&input.source_speaker_id)
+                    || !speakers.contains(&input.target_speaker_id)
+                {
+                    return Err("Speaker not found".to_string());
+                }
+                let source = resolve_merged_speaker(input.source_speaker_id, &overrides.merges)?;
+                let target = resolve_merged_speaker(input.target_speaker_id, &overrides.merges)?;
+                if source == target {
+                    return Err("Speakers are already merged".to_string());
+                }
+                for merged_target in overrides.merges.values_mut() {
+                    if *merged_target == source {
+                        *merged_target = target;
+                    }
+                }
+                overrides.merges.insert(source, target);
+                overrides.renames.remove(&source);
+                for reassigned in overrides.reassignments.values_mut() {
+                    if *reassigned == source {
+                        *reassigned = target;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    pub async fn reassign_segment_speaker(
+        &self,
+        input: RecordSegmentSpeakerReassignInput,
+    ) -> Result<RecordDiarizationProjection, String> {
+        if input.segment_id.trim().is_empty() {
+            return Err("Transcript segment ID is invalid".to_string());
+        }
+        self.mutate_speaker_overrides(
+            &input.record_id,
+            input.expected_override_revision,
+            input.updated_at_wall_time,
+            move |stored, model, overrides| {
+                let speakers = model_speaker_ids(model);
+                if !speakers.contains(&input.speaker_id) {
+                    return Err("Speaker not found".to_string());
+                }
+                let transcript = read_current_transcript(stored)?
+                    .ok_or_else(|| "Record transcript is not available".to_string())?;
+                if !transcript
+                    .segments
+                    .iter()
+                    .any(|segment| segment.segment_id == input.segment_id)
+                {
+                    return Err("Transcript segment not found".to_string());
+                }
+                let speaker_id = resolve_merged_speaker(input.speaker_id, &overrides.merges)?;
+                overrides.reassignments.insert(input.segment_id, speaker_id);
+                Ok(())
+            },
+        )
+        .await
+    }
+
+    async fn mutate_speaker_overrides<F>(
+        &self,
+        record_id: &str,
+        expected_override_revision: u64,
+        updated_at_wall_time: i64,
+        mutate: F,
+    ) -> Result<RecordDiarizationProjection, String>
+    where
+        F: FnOnce(
+            &StoredRecord,
+            &RecordDiarizationResult,
+            &mut RecordSpeakerOverrides,
+        ) -> Result<(), String>,
+    {
+        if updated_at_wall_time <= 0 {
+            return Err("Speaker override wall time is invalid".to_string());
+        }
+        let inner = self.inner.write().await;
+        let stored = inner
+            .get(record_id)
+            .ok_or_else(|| format!("Record not found: {record_id}"))?;
+        let audio = stored
+            .record
+            .audio
+            .as_ref()
+            .ok_or_else(|| format!("Record is not audio: {record_id}"))?;
+        let artifact = stored
+            .record
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "diarization/model-projection+json")
+            .ok_or_else(|| "Record diarization is not available".to_string())?;
+        let model = read_owned_diarization_result(record_id, &stored.path, audio, artifact)?;
+        let mut overrides = read_speaker_overrides(stored)?;
+        if overrides.revision != expected_override_revision {
+            return Err("RECORD_SPEAKER_OVERRIDE_REVISION_CONFLICT".to_string());
+        }
+        mutate(stored, &model, &mut overrides)?;
+        overrides.revision = overrides.revision.saturating_add(1);
+        overrides.updated_at_wall_time = updated_at_wall_time;
+        write_speaker_overrides(stored, &overrides)?;
+        let projection = project_diarization(stored, model, overrides)?;
+        drop(inner);
+        self.emit_change(record_id, RecordChangeKind::Upsert);
+        Ok(projection)
+    }
+
+    pub async fn read_transcript_projection(
+        &self,
+        id: &str,
+    ) -> Result<Option<RecordTranscriptSnapshot>, String> {
+        if let Some(snapshot) = self.read_recording_final_transcript(id).await? {
+            return Ok(Some(snapshot));
+        }
+        self.read_live_transcript_revisions(id).await
+    }
+
+    pub async fn read_timeline(&self, id: &str) -> Result<RecordTimelineProjection, String> {
+        let stored = self
+            .inner
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        ensure_audio_record(&stored, id)?;
+        read_timeline_projection(&stored)
+    }
+
+    pub async fn add_note(
+        &self,
+        input: RecordNoteCreateInput,
+    ) -> Result<RecordTimelineProjection, String> {
+        validate_timeline_operation_id(&input.operation_id)?;
+        validate_timeline_media_ms(input.anchor_media_ms)?;
+        if input.started_at_wall_time <= 0
+            || input.submitted_at_wall_time < input.started_at_wall_time
+            || input.text.trim().is_empty()
+            || input.text.as_bytes().len() > TIMELINE_TEXT_MAX_BYTES
+            || input.text.contains('\0')
+        {
+            return Err("Record note is invalid".to_string());
+        }
+
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(&input.record_id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {}", input.record_id))?;
+        ensure_audio_record(&stored, &input.record_id)?;
+        let path = stored.path.join("timeline.jsonl");
+        let mut entries = read_timeline_entries(&stored)?;
+        if entries
+            .iter()
+            .any(|entry| entry.event.operation_id() == input.operation_id)
+        {
+            return project_timeline(&stored.record, entries);
+        }
+        ensure_timeline_append_budget(&path, entries.len())?;
+        let mut journal = DurableRecordJournal::open(
+            path,
+            &input.record_id,
+            TIMELINE_SCHEMA_VERSION,
+            TIMELINE_MAX_LINE_BYTES,
+        )?;
+        let entry = journal.append(
+            input.submitted_at_wall_time,
+            input.anchor_media_ms,
+            RecordTimelineEvent::NoteCreated {
+                operation_id: input.operation_id,
+                note_id: Uuid::new_v4().to_string(),
+                anchor_media_ms: input.anchor_media_ms,
+                started_at_wall_time: input.started_at_wall_time,
+                submitted_at_wall_time: input.submitted_at_wall_time,
+                text: input.text,
+            },
+        )?;
+        entries.push(entry);
+        let updated = touch_timeline_record(&stored)?;
+        inner.insert(
+            input.record_id.clone(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(&input.record_id, RecordChangeKind::Upsert);
+        project_timeline(&updated, entries)
+    }
+
+    pub async fn add_mark(
+        &self,
+        input: RecordMarkCreateInput,
+    ) -> Result<RecordTimelineProjection, String> {
+        validate_timeline_operation_id(&input.operation_id)?;
+        validate_timeline_media_ms(input.media_ms)?;
+        if input.wall_time <= 0 {
+            return Err("Record mark wall time is invalid".to_string());
+        }
+
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(&input.record_id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {}", input.record_id))?;
+        ensure_audio_record(&stored, &input.record_id)?;
+        let path = stored.path.join("timeline.jsonl");
+        let mut entries = read_timeline_entries(&stored)?;
+        if entries
+            .iter()
+            .any(|entry| entry.event.operation_id() == input.operation_id)
+        {
+            return project_timeline(&stored.record, entries);
+        }
+        ensure_timeline_append_budget(&path, entries.len())?;
+        let mut journal = DurableRecordJournal::open(
+            path,
+            &input.record_id,
+            TIMELINE_SCHEMA_VERSION,
+            TIMELINE_MAX_LINE_BYTES,
+        )?;
+        let entry = journal.append(
+            input.wall_time,
+            input.media_ms,
+            RecordTimelineEvent::MarkCreated {
+                operation_id: input.operation_id,
+                mark_id: Uuid::new_v4().to_string(),
+                media_ms: input.media_ms,
+                wall_time: input.wall_time,
+                kind: "highlight".to_string(),
+            },
+        )?;
+        entries.push(entry);
+        let updated = touch_timeline_record(&stored)?;
+        inner.insert(
+            input.record_id.clone(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(&input.record_id, RecordChangeKind::Upsert);
+        project_timeline(&updated, entries)
+    }
+
+    pub async fn update_note(
+        &self,
+        input: RecordNoteUpdateInput,
+    ) -> Result<RecordTimelineProjection, String> {
+        validate_timeline_operation_id(&input.operation_id)?;
+        if Uuid::parse_str(&input.note_id).is_err()
+            || input.updated_at_wall_time <= 0
+            || input.text.trim().is_empty()
+            || input.text.as_bytes().len() > TIMELINE_TEXT_MAX_BYTES
+            || input.text.contains('\0')
+        {
+            return Err("Record note update is invalid".to_string());
+        }
+
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(&input.record_id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {}", input.record_id))?;
+        ensure_audio_record(&stored, &input.record_id)?;
+        let path = stored.path.join("timeline.jsonl");
+        let mut entries = read_timeline_entries(&stored)?;
+        if entries
+            .iter()
+            .any(|entry| entry.event.operation_id() == input.operation_id)
+        {
+            return project_timeline(&stored.record, entries);
+        }
+        let current = project_timeline(&stored.record, entries.clone())?;
+        if !current.items.iter().any(|item| {
+            matches!(item, RecordTimelineItem::Note { note_id, .. } if note_id == &input.note_id)
+        }) {
+            return Err("Record note not found".to_string());
+        }
+        ensure_timeline_append_budget(&path, entries.len())?;
+        let mut journal = DurableRecordJournal::open(
+            path,
+            &input.record_id,
+            TIMELINE_SCHEMA_VERSION,
+            TIMELINE_MAX_LINE_BYTES,
+        )?;
+        entries.push(journal.append(
+            input.updated_at_wall_time,
+            0,
+            RecordTimelineEvent::NoteUpdated {
+                operation_id: input.operation_id,
+                note_id: input.note_id,
+                updated_at_wall_time: input.updated_at_wall_time,
+                text: input.text,
+            },
+        )?);
+        let updated = touch_timeline_record(&stored)?;
+        inner.insert(
+            input.record_id.clone(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(&input.record_id, RecordChangeKind::Upsert);
+        project_timeline(&updated, entries)
+    }
+
+    pub async fn delete_timeline_item(
+        &self,
+        input: RecordTimelineDeleteInput,
+    ) -> Result<RecordTimelineProjection, String> {
+        validate_timeline_operation_id(&input.operation_id)?;
+        if Uuid::parse_str(&input.item_id).is_err()
+            || input.deleted_at_wall_time <= 0
+            || !matches!(input.item_type.as_str(), "note" | "mark")
+        {
+            return Err("Record timeline delete is invalid".to_string());
+        }
+
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(&input.record_id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {}", input.record_id))?;
+        ensure_audio_record(&stored, &input.record_id)?;
+        let path = stored.path.join("timeline.jsonl");
+        let mut entries = read_timeline_entries(&stored)?;
+        if entries
+            .iter()
+            .any(|entry| entry.event.operation_id() == input.operation_id)
+        {
+            return project_timeline(&stored.record, entries);
+        }
+        let current = project_timeline(&stored.record, entries.clone())?;
+        let exists = current.items.iter().any(|item| match item {
+            RecordTimelineItem::Note { note_id, .. } => {
+                input.item_type == "note" && note_id == &input.item_id
+            }
+            RecordTimelineItem::Mark { mark_id, .. } => {
+                input.item_type == "mark" && mark_id == &input.item_id
+            }
+        });
+        if !exists {
+            return Err("Record timeline item not found".to_string());
+        }
+        ensure_timeline_append_budget(&path, entries.len())?;
+        let mut journal = DurableRecordJournal::open(
+            path,
+            &input.record_id,
+            TIMELINE_SCHEMA_VERSION,
+            TIMELINE_MAX_LINE_BYTES,
+        )?;
+        let event = if input.item_type == "note" {
+            RecordTimelineEvent::NoteDeleted {
+                operation_id: input.operation_id,
+                note_id: input.item_id,
+                deleted_at_wall_time: input.deleted_at_wall_time,
+            }
+        } else {
+            RecordTimelineEvent::MarkDeleted {
+                operation_id: input.operation_id,
+                mark_id: input.item_id,
+                deleted_at_wall_time: input.deleted_at_wall_time,
+            }
+        };
+        entries.push(journal.append(input.deleted_at_wall_time, 0, event)?);
+        let updated = touch_timeline_record(&stored)?;
+        inner.insert(
+            input.record_id.clone(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(&input.record_id, RecordChangeKind::Upsert);
+        project_timeline(&updated, entries)
+    }
+
     async fn publish_and_insert<F>(
         &self,
         record: Record,
@@ -1516,6 +2268,50 @@ impl RecordStore {
             .map(|stored| stored.record.clone())
     }
 
+    pub async fn search_documents(&self, id: &str) -> Result<Vec<RecordSearchDocument>, String> {
+        let stored = self
+            .inner
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        tokio::task::spawn_blocking(move || build_record_search_documents(&stored))
+            .await
+            .map_err(|error| format!("Record search projection panicked: {error}"))?
+    }
+
+    pub async fn all_search_documents(&self) -> Vec<RecordSearchDocument> {
+        let stored = self
+            .inner
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tokio::task::spawn_blocking(move || {
+            stored
+                .iter()
+                .flat_map(|record| match build_record_search_documents(record) {
+                    Ok(documents) => documents,
+                    Err(error) => {
+                        ulog_warn!(
+                            "[record-search] skipped derived content recordId={} error={}",
+                            record.record.id,
+                            error
+                        );
+                        vec![base_record_search_document(record)]
+                    }
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_else(|error| {
+            ulog_warn!("[record-search] baseline projection panicked: {error}");
+            Vec::new()
+        })
+    }
+
     pub async fn update_text(&self, input: TextRecordUpdateInput) -> Result<Record, String> {
         let mut inner = self.inner.write().await;
         let stored = inner
@@ -1563,6 +2359,91 @@ impl RecordStore {
         );
         self.emit_change(&updated.id, RecordChangeKind::Upsert);
         Ok(updated)
+    }
+
+    pub async fn update_audio_metadata(
+        &self,
+        input: AudioRecordMetadataUpdateInput,
+    ) -> Result<Record, String> {
+        let title = input.title.trim();
+        if title.is_empty() || title.chars().count() > 80 || title.contains('\0') {
+            return Err("audio Record title is invalid".to_string());
+        }
+        let tags = normalize_audio_tags(input.tags)?;
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(&input.id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {}", input.id))?;
+        ensure_audio_record(&stored, &input.id)?;
+        if stored.record.revision != input.expected_revision {
+            return Err("RECORD_REVISION_CONFLICT".to_string());
+        }
+        if stored.record.title == title && stored.record.tags == tags {
+            return Ok(stored.record);
+        }
+        let mut updated = stored.record;
+        updated.title = title.to_string();
+        updated.tags = tags;
+        updated.updated_at = now_ms();
+        updated.revision = updated.revision.saturating_add(1);
+        persist_existing_record(
+            &stored.path,
+            &updated,
+            stored.legacy_thought_digest.clone(),
+            false,
+        )?;
+        inner.insert(
+            input.id.clone(),
+            StoredRecord {
+                record: updated.clone(),
+                ..stored
+            },
+        );
+        self.emit_change(&input.id, RecordChangeKind::Upsert);
+        Ok(updated)
+    }
+
+    pub async fn export_audio(
+        &self,
+        input: RecordAudioExportInput,
+    ) -> Result<RecordExportResult, String> {
+        let media = self
+            .resolve_record_media_for_processing(&input.record_id, input.track)
+            .await?;
+        let destination = validate_new_export_destination(&input.destination_path, "opus")?;
+        let bytes = copy_regular_file_noreplace(&media.path, &destination, media.size_bytes)?;
+        Ok(RecordExportResult {
+            destination_path: destination.to_string_lossy().to_string(),
+            bytes,
+        })
+    }
+
+    pub async fn export_text(
+        &self,
+        input: RecordTextExportInput,
+    ) -> Result<RecordExportResult, String> {
+        if !matches!(input.locale.as_str(), "zh-CN" | "en-US") {
+            return Err("Record export locale is invalid".to_string());
+        }
+        let extension = match input.format {
+            RecordTextExportFormat::Markdown => "md",
+            RecordTextExportFormat::Text => "txt",
+        };
+        let destination = validate_new_export_destination(&input.destination_path, extension)?;
+        let rendered = {
+            let inner = self.inner.read().await;
+            let stored = inner
+                .get(&input.record_id)
+                .ok_or_else(|| format!("Record not found: {}", input.record_id))?;
+            ensure_audio_record(stored, &input.record_id)?;
+            render_record_text_export(stored, input.format, &input.locale)?
+        };
+        let bytes = write_bytes_noreplace(&destination, rendered.as_bytes())?;
+        Ok(RecordExportResult {
+            destination_path: destination.to_string_lossy().to_string(),
+            bytes,
+        })
     }
 
     pub async fn set_archived(&self, id: &str, archived: bool) -> Result<Record, String> {
@@ -2378,6 +3259,264 @@ fn read_diarization_result(path: &Path) -> Result<RecordDiarizationResult, Strin
     Ok(result)
 }
 
+fn model_speaker_ids(model: &RecordDiarizationResult) -> BTreeSet<u32> {
+    model.turns.iter().map(|turn| turn.global_speaker).collect()
+}
+
+fn resolve_merged_speaker(speaker_id: u32, merges: &BTreeMap<u32, u32>) -> Result<u32, String> {
+    let mut current = speaker_id;
+    let mut visited = BTreeSet::new();
+    while let Some(next) = merges.get(&current).copied() {
+        if !visited.insert(current) {
+            return Err("Speaker overrides contain a merge cycle".to_string());
+        }
+        current = next;
+    }
+    Ok(current)
+}
+
+fn read_speaker_overrides(stored: &StoredRecord) -> Result<RecordSpeakerOverrides, String> {
+    let path = stored.path.join("diarization/overrides.json");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecordSpeakerOverrides::empty(&stored.record.id));
+        }
+        Err(error) => return Err(format!("inspect speaker overrides: {error}")),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > DIARIZATION_OVERRIDES_MAX_BYTES
+    {
+        return Err("Record speaker overrides are invalid".to_string());
+    }
+    let bytes = fs::read(&path).map_err(|error| format!("read speaker overrides: {error}"))?;
+    let overrides: RecordSpeakerOverrides = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse speaker overrides: {error}"))?;
+    if overrides.schema_version != 1 || overrides.record_id != stored.record.id {
+        return Err("Record speaker override identity mismatch".to_string());
+    }
+    Ok(overrides)
+}
+
+fn write_speaker_overrides(
+    stored: &StoredRecord,
+    overrides: &RecordSpeakerOverrides,
+) -> Result<(), String> {
+    if overrides.record_id != stored.record.id || overrides.schema_version != 1 {
+        return Err("Record speaker override identity mismatch".to_string());
+    }
+    let bytes = serde_json::to_vec_pretty(overrides)
+        .map_err(|error| format!("serialize speaker overrides: {error}"))?;
+    if bytes.is_empty() || bytes.len() as u64 > DIARIZATION_OVERRIDES_MAX_BYTES {
+        return Err("Record speaker overrides exceed the fixed size limit".to_string());
+    }
+    let content = std::str::from_utf8(&bytes)
+        .map_err(|_| "speaker override serialization is not UTF-8".to_string())?;
+    crate::task::write_atomic_text(&stored.path.join("diarization/overrides.json"), content)
+}
+
+fn read_current_transcript(
+    stored: &StoredRecord,
+) -> Result<Option<RecordTranscriptSnapshot>, String> {
+    let Some(audio) = stored.record.audio.as_ref() else {
+        return Err(format!("Record is not audio: {}", stored.record.id));
+    };
+    let Some(artifact) = stored
+        .record
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "transcript/recording-final+json")
+    else {
+        return Ok(None);
+    };
+    read_owned_transcript_snapshot(&stored.record.id, &stored.path, audio, artifact).map(Some)
+}
+
+fn read_diarization_projection_for_stored(
+    stored: &StoredRecord,
+) -> Result<Option<RecordDiarizationProjection>, String> {
+    if stored.record.kind != RecordKind::Audio {
+        return Err(format!("Record is not audio: {}", stored.record.id));
+    }
+    let audio = stored
+        .record
+        .audio
+        .as_ref()
+        .ok_or_else(|| format!("audio Record summary missing: {}", stored.record.id))?;
+    let Some(artifact) = stored
+        .record
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == "diarization/model-projection+json")
+    else {
+        return Ok(None);
+    };
+    let model = read_owned_diarization_result(&stored.record.id, &stored.path, audio, artifact)?;
+    let overrides = read_speaker_overrides(stored)?;
+    project_diarization(stored, model, overrides).map(Some)
+}
+
+fn base_record_search_document(stored: &StoredRecord) -> RecordSearchDocument {
+    let mut content = stored.record.content.clone().unwrap_or_default();
+    for image in &stored.record.images {
+        content = content.replace(image, "");
+    }
+    RecordSearchDocument {
+        record_id: stored.record.id.clone(),
+        kind: stored.record.kind,
+        title: stored.record.title.clone(),
+        tags: stored.record.tags.clone(),
+        content,
+        media_ms: None,
+    }
+}
+
+fn build_record_search_documents(
+    stored: &StoredRecord,
+) -> Result<Vec<RecordSearchDocument>, String> {
+    let mut documents = vec![base_record_search_document(stored)];
+    if stored.record.kind != RecordKind::Audio {
+        return Ok(documents);
+    }
+    let audio = stored
+        .record
+        .audio
+        .as_ref()
+        .ok_or_else(|| format!("audio Record summary missing: {}", stored.record.id))?;
+    let transcript = read_current_transcript(stored)?;
+    let diarization = read_diarization_projection_for_stored(stored)?;
+    if let Some(transcript) = transcript.as_ref() {
+        for segment in &transcript.segments {
+            let speaker = export_speaker_label(segment, diarization.as_ref(), &audio.tracks, false);
+            let speaker_terms = if speaker == "Me" {
+                "我\nMe".to_string()
+            } else {
+                speaker
+            };
+            documents.push(RecordSearchDocument {
+                record_id: stored.record.id.clone(),
+                kind: RecordKind::Audio,
+                title: stored.record.title.clone(),
+                tags: stored.record.tags.clone(),
+                content: format!("{speaker_terms}\n{}", segment.text),
+                media_ms: Some(
+                    segment.start_sample.saturating_mul(1_000) / transcript.sample_rate as u64,
+                ),
+            });
+        }
+    }
+    for item in read_timeline_projection(stored)?.items {
+        if let RecordTimelineItem::Note {
+            anchor_media_ms,
+            text,
+            ..
+        } = item
+        {
+            documents.push(RecordSearchDocument {
+                record_id: stored.record.id.clone(),
+                kind: RecordKind::Audio,
+                title: stored.record.title.clone(),
+                tags: stored.record.tags.clone(),
+                content: text,
+                media_ms: Some(anchor_media_ms),
+            });
+        }
+    }
+    Ok(documents)
+}
+
+fn project_diarization(
+    stored: &StoredRecord,
+    model: RecordDiarizationResult,
+    overrides: RecordSpeakerOverrides,
+) -> Result<RecordDiarizationProjection, String> {
+    let speaker_ids = model_speaker_ids(&model);
+    let transcript_segment_ids = read_current_transcript(stored)?
+        .map(|snapshot| {
+            snapshot
+                .segments
+                .iter()
+                .map(|segment| segment.segment_id.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut conflicts = Vec::new();
+    let mut speakers = Vec::with_capacity(speaker_ids.len());
+    for speaker_id in speaker_ids.iter().copied() {
+        let custom_name = overrides.renames.get(&speaker_id).cloned();
+        let merged_into = match overrides.merges.get(&speaker_id).copied() {
+            Some(target) if speaker_ids.contains(&target) => {
+                match resolve_merged_speaker(target, &overrides.merges) {
+                    Ok(canonical) if speaker_ids.contains(&canonical) => Some(canonical),
+                    _ => {
+                        conflicts.push(RecordSpeakerOverrideConflict {
+                            kind: "merge".to_string(),
+                            target_id: speaker_id.to_string(),
+                        });
+                        None
+                    }
+                }
+            }
+            Some(_) => {
+                conflicts.push(RecordSpeakerOverrideConflict {
+                    kind: "merge".to_string(),
+                    target_id: speaker_id.to_string(),
+                });
+                None
+            }
+            None => None,
+        };
+        speakers.push(RecordSpeakerProjection {
+            speaker_id,
+            custom_name,
+            merged_into,
+        });
+    }
+    for speaker_id in overrides.renames.keys() {
+        if !speaker_ids.contains(speaker_id) {
+            conflicts.push(RecordSpeakerOverrideConflict {
+                kind: "rename".to_string(),
+                target_id: speaker_id.to_string(),
+            });
+        }
+    }
+    let mut segment_speaker_overrides = BTreeMap::new();
+    for (segment_id, speaker_id) in &overrides.reassignments {
+        let resolved = resolve_merged_speaker(*speaker_id, &overrides.merges);
+        match resolved {
+            Ok(resolved)
+                if transcript_segment_ids.contains(segment_id)
+                    && speaker_ids.contains(&resolved) =>
+            {
+                segment_speaker_overrides.insert(segment_id.clone(), resolved);
+            }
+            _ => conflicts.push(RecordSpeakerOverrideConflict {
+                kind: "reassign".to_string(),
+                target_id: segment_id.clone(),
+            }),
+        }
+    }
+    conflicts.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.target_id.cmp(&right.target_id))
+    });
+    Ok(RecordDiarizationProjection {
+        schema_version: model.schema_version,
+        record_id: model.record_id,
+        projection_revision: model.projection_revision,
+        sample_rate: model.sample_rate,
+        provenance: model.provenance,
+        turns: model.turns,
+        override_revision: overrides.revision,
+        speakers,
+        segment_speaker_overrides,
+        conflicts,
+    })
+}
+
 fn read_owned_diarization_result(
     record_id: &str,
     record_path: &Path,
@@ -2561,6 +3700,490 @@ fn record_path(root: &Path, record: &Record) -> PathBuf {
     let date = DateTime::<Utc>::from_timestamp_millis(record.created_at).unwrap_or_else(Utc::now);
     root.join(format!("{:04}-{:02}", date.year(), date.month()))
         .join(&record.id)
+}
+
+fn ensure_audio_record(stored: &StoredRecord, id: &str) -> Result<(), String> {
+    if stored.record.kind != RecordKind::Audio || stored.record.audio.is_none() {
+        return Err(format!("Record is not audio: {id}"));
+    }
+    ensure_plain_directory(&stored.path)
+}
+
+fn validate_timeline_operation_id(operation_id: &str) -> Result<(), String> {
+    Uuid::parse_str(operation_id)
+        .map(|_| ())
+        .map_err(|_| "Record timeline operation ID is invalid".to_string())
+}
+
+fn validate_timeline_media_ms(media_ms: u64) -> Result<(), String> {
+    let max_media_ms = LIVE_TRANSCRIPT_MAX_SAMPLES
+        .saturating_mul(1_000)
+        .checked_div(SPEECH_SAMPLE_RATE)
+        .unwrap_or(0);
+    if media_ms > max_media_ms {
+        return Err("Record timeline media time exceeds limit".to_string());
+    }
+    Ok(())
+}
+
+fn read_timeline_entries(
+    stored: &StoredRecord,
+) -> Result<Vec<crate::durable_journal::DurableJournalEntry<RecordTimelineEvent>>, String> {
+    let path = stored.path.join("timeline.jsonl");
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|error| format!("inspect Record timeline: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > TIMELINE_MAX_BYTES
+    {
+        return Err("Record timeline is invalid".to_string());
+    }
+    recover_and_read(
+        &path,
+        &stored.record.id,
+        TIMELINE_SCHEMA_VERSION,
+        TIMELINE_MAX_LINE_BYTES,
+    )
+}
+
+fn ensure_timeline_append_budget(path: &Path, entry_count: usize) -> Result<(), String> {
+    if entry_count >= TIMELINE_ITEM_LIMIT {
+        return Err("Record timeline item limit exceeded".to_string());
+    }
+    let size = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect Record timeline: {error}"))?
+        .len();
+    if size > TIMELINE_MAX_BYTES.saturating_sub(TIMELINE_MAX_LINE_BYTES as u64) {
+        return Err("Record timeline size limit exceeded".to_string());
+    }
+    Ok(())
+}
+
+fn read_timeline_projection(stored: &StoredRecord) -> Result<RecordTimelineProjection, String> {
+    project_timeline(&stored.record, read_timeline_entries(stored)?)
+}
+
+fn project_timeline(
+    record: &Record,
+    entries: Vec<crate::durable_journal::DurableJournalEntry<RecordTimelineEvent>>,
+) -> Result<RecordTimelineProjection, String> {
+    if entries.len() > TIMELINE_ITEM_LIMIT {
+        return Err("Record timeline item limit exceeded".to_string());
+    }
+    let mut notes = HashMap::<String, RecordTimelineItem>::new();
+    let mut marks = HashMap::<String, RecordTimelineItem>::new();
+    for entry in entries {
+        match entry.event {
+            RecordTimelineEvent::NoteCreated {
+                note_id,
+                anchor_media_ms,
+                started_at_wall_time,
+                submitted_at_wall_time,
+                text,
+                ..
+            } => {
+                if notes.contains_key(&note_id) {
+                    return Err("Record timeline contains a duplicate note".to_string());
+                }
+                notes.insert(
+                    note_id.clone(),
+                    RecordTimelineItem::Note {
+                        seq: entry.seq,
+                        note_id,
+                        anchor_media_ms,
+                        started_at_wall_time,
+                        submitted_at_wall_time,
+                        text,
+                    },
+                );
+            }
+            RecordTimelineEvent::MarkCreated {
+                mark_id,
+                media_ms,
+                wall_time,
+                kind,
+                ..
+            } => {
+                if marks.contains_key(&mark_id) {
+                    return Err("Record timeline contains a duplicate mark".to_string());
+                }
+                marks.insert(
+                    mark_id.clone(),
+                    RecordTimelineItem::Mark {
+                        seq: entry.seq,
+                        mark_id,
+                        media_ms,
+                        wall_time,
+                        kind,
+                    },
+                );
+            }
+            RecordTimelineEvent::NoteUpdated { note_id, text, .. } => {
+                let Some(RecordTimelineItem::Note {
+                    text: current_text, ..
+                }) = notes.get_mut(&note_id)
+                else {
+                    return Err("Record timeline updates an unknown note".to_string());
+                };
+                *current_text = text;
+            }
+            RecordTimelineEvent::NoteDeleted { note_id, .. } => {
+                if notes.remove(&note_id).is_none() {
+                    return Err("Record timeline deletes an unknown note".to_string());
+                }
+            }
+            RecordTimelineEvent::MarkDeleted { mark_id, .. } => {
+                if marks.remove(&mark_id).is_none() {
+                    return Err("Record timeline deletes an unknown mark".to_string());
+                }
+            }
+        }
+    }
+    let mut items = Vec::with_capacity(notes.len() + marks.len());
+    items.extend(notes.into_values());
+    items.extend(marks.into_values());
+    items.sort_by_key(|item| match item {
+        RecordTimelineItem::Note {
+            seq,
+            anchor_media_ms,
+            ..
+        } => (*anchor_media_ms, *seq),
+        RecordTimelineItem::Mark { seq, media_ms, .. } => (*media_ms, *seq),
+    });
+    Ok(RecordTimelineProjection {
+        record_id: record.id.clone(),
+        revision: record.revision,
+        items,
+    })
+}
+
+fn touch_timeline_record(stored: &StoredRecord) -> Result<Record, String> {
+    let mut updated = stored.record.clone();
+    updated.updated_at = now_ms();
+    updated.revision = updated.revision.saturating_add(1);
+    persist_existing_record(
+        &stored.path,
+        &updated,
+        stored.legacy_thought_digest.clone(),
+        false,
+    )?;
+    Ok(updated)
+}
+
+fn validate_new_export_destination(raw: &str, extension: &str) -> Result<PathBuf, String> {
+    let destination = crate::workspace_files::attachment_export::validate_export_destination(raw)?;
+    if destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .map_or(true, |value| !value.eq_ignore_ascii_case(extension))
+    {
+        return Err(format!(
+            "Record export destination must end with .{extension}"
+        ));
+    }
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => Err("RECORD_EXPORT_DESTINATION_EXISTS".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(destination),
+        Err(error) => Err(format!("inspect Record export destination: {error}")),
+    }
+}
+
+fn write_bytes_noreplace(destination: &Path, bytes: &[u8]) -> Result<u64, String> {
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "RECORD_EXPORT_DESTINATION_EXISTS".to_string()
+            } else {
+                format!("create Record export: {error}")
+            }
+        })?;
+    if let Err(error) = destination_file
+        .write_all(bytes)
+        .and_then(|()| destination_file.flush())
+        .and_then(|()| destination_file.sync_all())
+    {
+        drop(destination_file);
+        let _ = fs::remove_file(destination);
+        return Err(format!("write Record export: {error}"));
+    }
+    drop(destination_file);
+    if let Some(parent) = destination.parent() {
+        sync_directory(parent).map_err(|error| format!("sync Record export directory: {error}"))?;
+    }
+    Ok(bytes.len() as u64)
+}
+
+fn copy_regular_file_noreplace(
+    source: &Path,
+    destination: &Path,
+    expected_bytes: u64,
+) -> Result<u64, String> {
+    let mut source_file =
+        File::open(source).map_err(|error| format!("open Record audio: {error}"))?;
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "RECORD_EXPORT_DESTINATION_EXISTS".to_string()
+            } else {
+                format!("create Record audio export: {error}")
+            }
+        })?;
+    let result = std::io::copy(
+        &mut std::io::Read::by_ref(&mut source_file).take(expected_bytes.saturating_add(1)),
+        &mut destination_file,
+    )
+    .and_then(|bytes| {
+        if bytes != expected_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Record audio size changed during export",
+            ));
+        }
+        destination_file.flush()?;
+        destination_file.sync_all()?;
+        Ok(bytes)
+    });
+    let bytes = match result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            drop(destination_file);
+            let _ = fs::remove_file(destination);
+            return Err(format!("copy Record audio export: {error}"));
+        }
+    };
+    drop(destination_file);
+    if let Some(parent) = destination.parent() {
+        sync_directory(parent).map_err(|error| format!("sync Record export directory: {error}"))?;
+    }
+    Ok(bytes)
+}
+
+fn export_duration(media_ms: u64) -> String {
+    let total_seconds = media_ms / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn export_speaker_label(
+    segment: &RecordTranscriptSegment,
+    diarization: Option<&RecordDiarizationProjection>,
+    tracks: &[AudioTrackKind],
+    zh: bool,
+) -> String {
+    if segment.track == AudioTrackKind::Microphone && tracks.contains(&AudioTrackKind::System) {
+        return if zh { "我" } else { "Me" }.to_string();
+    }
+    let middle = segment
+        .start_sample
+        .saturating_add(segment.end_sample.saturating_sub(segment.start_sample) / 2);
+    let mut speaker_id = diarization
+        .and_then(|projection| {
+            projection
+                .segment_speaker_overrides
+                .get(&segment.segment_id)
+                .copied()
+        })
+        .or_else(|| {
+            diarization.and_then(|projection| {
+                projection
+                    .turns
+                    .iter()
+                    .find(|turn| turn.start_sample <= middle && turn.end_sample >= middle)
+                    .map(|turn| turn.global_speaker)
+            })
+        })
+        .unwrap_or(0);
+    if let Some(projection) = diarization {
+        let mut visited = BTreeSet::new();
+        while visited.insert(speaker_id) {
+            let Some(next) = projection
+                .speakers
+                .iter()
+                .find(|speaker| speaker.speaker_id == speaker_id)
+                .and_then(|speaker| speaker.merged_into)
+            else {
+                break;
+            };
+            speaker_id = next;
+        }
+        if let Some(name) = projection
+            .speakers
+            .iter()
+            .find(|speaker| speaker.speaker_id == speaker_id)
+            .and_then(|speaker| speaker.custom_name.as_ref())
+        {
+            return name.clone();
+        }
+    }
+    format!("Speaker {}", speaker_letter_for_export(speaker_id))
+}
+
+fn speaker_letter_for_export(mut index: u32) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        bytes.push(b'A' + (index % 26) as u8);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    bytes.reverse();
+    String::from_utf8(bytes).unwrap_or_else(|_| "A".to_string())
+}
+
+fn render_record_text_export(
+    stored: &StoredRecord,
+    format: RecordTextExportFormat,
+    locale: &str,
+) -> Result<String, String> {
+    let zh = locale == "zh-CN";
+    let transcript = read_current_transcript(stored)?;
+    let diarization = read_diarization_projection_for_stored(stored)?;
+    let timeline = read_timeline_projection(stored)?;
+    let audio = stored
+        .record
+        .audio
+        .as_ref()
+        .ok_or_else(|| format!("Record is not audio: {}", stored.record.id))?;
+    let title = stored.record.title.replace('\r', " ").replace('\n', " ");
+    let created = DateTime::<Utc>::from_timestamp_millis(stored.record.created_at)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| stored.record.created_at.to_string());
+    let tracks = audio
+        .tracks
+        .iter()
+        .map(|track| match track {
+            AudioTrackKind::Microphone => {
+                if zh {
+                    "麦克风"
+                } else {
+                    "Microphone"
+                }
+            }
+            AudioTrackKind::System => {
+                if zh {
+                    "系统声音"
+                } else {
+                    "System audio"
+                }
+            }
+            AudioTrackKind::Mixed => {
+                if zh {
+                    "混合"
+                } else {
+                    "Mixed"
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let mut output = String::new();
+    match format {
+        RecordTextExportFormat::Markdown => {
+            writeln!(output, "# {title}\n").map_err(|error| error.to_string())?;
+            writeln!(output, "- {}: {created}", if zh { "日期" } else { "Date" })
+                .map_err(|error| error.to_string())?;
+            writeln!(
+                output,
+                "- {}: {tracks}\n",
+                if zh { "音轨" } else { "Tracks" }
+            )
+            .map_err(|error| error.to_string())?;
+            writeln!(output, "## {}\n", if zh { "转写" } else { "Transcript" })
+                .map_err(|error| error.to_string())?;
+        }
+        RecordTextExportFormat::Text => {
+            writeln!(output, "{title}").map_err(|error| error.to_string())?;
+            writeln!(output, "{}: {created}", if zh { "日期" } else { "Date" })
+                .map_err(|error| error.to_string())?;
+            writeln!(output, "{}: {tracks}\n", if zh { "音轨" } else { "Tracks" })
+                .map_err(|error| error.to_string())?;
+            writeln!(output, "{}", if zh { "转写" } else { "Transcript" })
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if let Some(transcript) = transcript.as_ref() {
+        for segment in &transcript.segments {
+            let media_ms =
+                segment.start_sample.saturating_mul(1_000) / transcript.sample_rate as u64;
+            let speaker = export_speaker_label(segment, diarization.as_ref(), &audio.tracks, zh);
+            match format {
+                RecordTextExportFormat::Markdown => writeln!(
+                    output,
+                    "- [{}] **{}**: {}",
+                    export_duration(media_ms),
+                    speaker,
+                    segment.text
+                ),
+                RecordTextExportFormat::Text => writeln!(
+                    output,
+                    "[{}] {}: {}",
+                    export_duration(media_ms),
+                    speaker,
+                    segment.text
+                ),
+            }
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    let notes_heading = if zh {
+        "笔记与重点"
+    } else {
+        "Notes and highlights"
+    };
+    match format {
+        RecordTextExportFormat::Markdown => {
+            writeln!(output, "\n## {notes_heading}\n").map_err(|error| error.to_string())?;
+        }
+        RecordTextExportFormat::Text => {
+            writeln!(output, "\n{notes_heading}").map_err(|error| error.to_string())?;
+        }
+    }
+    for item in timeline.items {
+        let (media_ms, text) = match item {
+            RecordTimelineItem::Note {
+                anchor_media_ms,
+                text,
+                ..
+            } => (anchor_media_ms, text),
+            RecordTimelineItem::Mark { media_ms, .. } => (
+                media_ms,
+                if zh { "标记重点" } else { "Highlight" }.to_string(),
+            ),
+        };
+        writeln!(output, "- [{}] {}", export_duration(media_ms), text)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(output)
+}
+
+fn normalize_audio_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
+    if tags.len() > 32 {
+        return Err("audio Record tag limit exceeded".to_string());
+    }
+    let mut normalized = Vec::new();
+    for raw in tags {
+        let tag = raw.trim().trim_start_matches('#');
+        if tag.is_empty() || tag.chars().count() > 32 || !tag.chars().all(is_tag_char) {
+            return Err("audio Record tag is invalid".to_string());
+        }
+        if !normalized.iter().any(|existing| existing == tag) {
+            normalized.push(tag.to_string());
+        }
+    }
+    Ok(normalized)
 }
 
 pub fn derive_text_title(content: &str) -> String {
@@ -3051,8 +4674,15 @@ pub fn get_record_store() -> Option<&'static Arc<RecordStore>> {
 pub async fn cmd_record_create(
     state: tauri::State<'_, ManagedRecordStore>,
     input: TextRecordCreateInput,
+    surface: Option<AnalyticsSurface>,
 ) -> Result<Record, String> {
-    state.create_text(input).await
+    let record = state.create_text(input).await?;
+    record_analytics::emit_record_create(
+        &record,
+        AnalyticsSource::Desktop,
+        surface.unwrap_or(AnalyticsSurface::Unknown),
+    );
+    Ok(record)
 }
 
 #[tauri::command]
@@ -3072,6 +4702,116 @@ pub async fn cmd_record_get(
 }
 
 #[tauri::command]
+pub async fn cmd_record_transcript(
+    state: tauri::State<'_, ManagedRecordStore>,
+    id: String,
+) -> Result<Option<RecordTranscriptSnapshot>, String> {
+    state.read_transcript_projection(&id).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_diarization(
+    state: tauri::State<'_, ManagedRecordStore>,
+    id: String,
+) -> Result<Option<RecordDiarizationProjection>, String> {
+    state.read_diarization_projection(&id).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_rename_speaker(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordSpeakerRenameInput,
+) -> Result<RecordDiarizationProjection, String> {
+    let record_id = input.record_id.clone();
+    let projection = state.rename_speaker(input).await?;
+    if let Some(record) = state.get(&record_id).await {
+        record_analytics::emit_record_use(
+            &record,
+            RecordUseOperation::SpeakerRename,
+            AnalyticsSource::Desktop,
+            AnalyticsSurface::RecordDetail,
+        );
+    }
+    Ok(projection)
+}
+
+#[tauri::command]
+pub async fn cmd_record_merge_speakers(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordSpeakerMergeInput,
+) -> Result<RecordDiarizationProjection, String> {
+    let record_id = input.record_id.clone();
+    let projection = state.merge_speakers(input).await?;
+    if let Some(record) = state.get(&record_id).await {
+        record_analytics::emit_record_use(
+            &record,
+            RecordUseOperation::SpeakerMerge,
+            AnalyticsSource::Desktop,
+            AnalyticsSurface::RecordDetail,
+        );
+    }
+    Ok(projection)
+}
+
+#[tauri::command]
+pub async fn cmd_record_reassign_segment_speaker(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordSegmentSpeakerReassignInput,
+) -> Result<RecordDiarizationProjection, String> {
+    let record_id = input.record_id.clone();
+    let projection = state.reassign_segment_speaker(input).await?;
+    if let Some(record) = state.get(&record_id).await {
+        record_analytics::emit_record_use(
+            &record,
+            RecordUseOperation::SpeakerReassign,
+            AnalyticsSource::Desktop,
+            AnalyticsSurface::RecordDetail,
+        );
+    }
+    Ok(projection)
+}
+
+#[tauri::command]
+pub async fn cmd_record_timeline(
+    state: tauri::State<'_, ManagedRecordStore>,
+    id: String,
+) -> Result<RecordTimelineProjection, String> {
+    state.read_timeline(&id).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_add_note(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordNoteCreateInput,
+) -> Result<RecordTimelineProjection, String> {
+    state.add_note(input).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_add_mark(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordMarkCreateInput,
+) -> Result<RecordTimelineProjection, String> {
+    state.add_mark(input).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_update_note(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordNoteUpdateInput,
+) -> Result<RecordTimelineProjection, String> {
+    state.update_note(input).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_delete_timeline_item(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordTimelineDeleteInput,
+) -> Result<RecordTimelineProjection, String> {
+    state.delete_timeline_item(input).await
+}
+
+#[tauri::command]
 pub async fn cmd_record_update_text(
     state: tauri::State<'_, ManagedRecordStore>,
     input: TextRecordUpdateInput,
@@ -3080,20 +4820,86 @@ pub async fn cmd_record_update_text(
 }
 
 #[tauri::command]
+pub async fn cmd_record_update_audio_metadata(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: AudioRecordMetadataUpdateInput,
+) -> Result<Record, String> {
+    state.update_audio_metadata(input).await
+}
+
+#[tauri::command]
+pub async fn cmd_record_export_audio(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordAudioExportInput,
+) -> Result<RecordExportResult, String> {
+    let record_id = input.record_id.clone();
+    let result = state.export_audio(input).await?;
+    if let Some(record) = state.get(&record_id).await {
+        record_analytics::emit_record_use(
+            &record,
+            RecordUseOperation::ExportAudio,
+            AnalyticsSource::Desktop,
+            AnalyticsSurface::RecordDetail,
+        );
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn cmd_record_export_text(
+    state: tauri::State<'_, ManagedRecordStore>,
+    input: RecordTextExportInput,
+) -> Result<RecordExportResult, String> {
+    let record_id = input.record_id.clone();
+    let result = state.export_text(input).await?;
+    if let Some(record) = state.get(&record_id).await {
+        record_analytics::emit_record_use(
+            &record,
+            RecordUseOperation::ExportTranscript,
+            AnalyticsSource::Desktop,
+            AnalyticsSurface::RecordDetail,
+        );
+    }
+    Ok(result)
+}
+
+#[tauri::command]
 pub async fn cmd_record_set_archived(
     state: tauri::State<'_, ManagedRecordStore>,
     id: String,
     archived: bool,
+    surface: Option<AnalyticsSurface>,
 ) -> Result<Record, String> {
-    state.set_archived(&id, archived).await
+    let record = state.set_archived(&id, archived).await?;
+    if archived {
+        record_analytics::emit_record_use(
+            &record,
+            RecordUseOperation::Archive,
+            AnalyticsSource::Desktop,
+            surface.unwrap_or(AnalyticsSurface::Unknown),
+        );
+    }
+    Ok(record)
 }
 
 #[tauri::command]
 pub async fn cmd_record_delete(
     state: tauri::State<'_, ManagedRecordStore>,
     id: String,
+    surface: Option<AnalyticsSurface>,
 ) -> Result<(), String> {
-    state.delete(&id).await
+    let record = state
+        .get(&id)
+        .await
+        .ok_or_else(|| format!("Record not found: {id}"))?;
+    state.delete(&id).await?;
+    record_analytics::emit_record_use(
+        &record,
+        RecordUseOperation::Delete,
+        AnalyticsSource::Desktop,
+        surface.unwrap_or(AnalyticsSurface::Unknown),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -3101,7 +4907,13 @@ pub async fn cmd_record_merge_text(
     state: tauri::State<'_, ManagedRecordStore>,
     source_ids: Vec<String>,
 ) -> Result<RecordMergeResult, String> {
-    state.merge_text(source_ids).await
+    let result = state.merge_text(source_ids).await?;
+    record_analytics::emit_record_create(
+        &result.merged,
+        AnalyticsSource::Desktop,
+        AnalyticsSurface::TaskCenter,
+    );
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -3642,5 +5454,462 @@ mod tests {
                 .transcription_status,
             TranscriptionStatus::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn audio_timeline_is_durable_ordered_and_operation_idempotent() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Unavailable,
+            })
+            .await
+            .unwrap();
+        let note_operation = Uuid::new_v4().to_string();
+        let note = RecordNoteCreateInput {
+            record_id: record.id.clone(),
+            operation_id: note_operation.clone(),
+            anchor_media_ms: 2_000,
+            started_at_wall_time: 10_000,
+            submitted_at_wall_time: 12_000,
+            text: "private note canary".into(),
+        };
+        let first = store.add_note(note.clone()).await.unwrap();
+        let duplicate = store.add_note(note).await.unwrap();
+        assert!(first.items == duplicate.items);
+        assert_eq!(duplicate.items.len(), 1);
+        let note_id = match &duplicate.items[0] {
+            RecordTimelineItem::Note { note_id, .. } => note_id.clone(),
+            _ => panic!("expected note"),
+        };
+
+        let with_mark = store
+            .add_mark(RecordMarkCreateInput {
+                record_id: record.id.clone(),
+                operation_id: Uuid::new_v4().to_string(),
+                media_ms: 1_000,
+                wall_time: 11_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(with_mark.items.len(), 2);
+        assert!(matches!(
+            with_mark.items.first(),
+            Some(RecordTimelineItem::Mark {
+                media_ms: 1_000,
+                ..
+            })
+        ));
+        let mark_id = with_mark
+            .items
+            .iter()
+            .find_map(|item| match item {
+                RecordTimelineItem::Mark { mark_id, .. } => Some(mark_id.clone()),
+                _ => None,
+            })
+            .unwrap();
+
+        let update = RecordNoteUpdateInput {
+            record_id: record.id.clone(),
+            operation_id: Uuid::new_v4().to_string(),
+            note_id,
+            updated_at_wall_time: 13_000,
+            text: "corrected note".into(),
+        };
+        let updated = store.update_note(update.clone()).await.unwrap();
+        let duplicate_update = store.update_note(update).await.unwrap();
+        assert!(updated.items == duplicate_update.items);
+        assert!(matches!(
+            updated.items.iter().find(|item| matches!(item, RecordTimelineItem::Note { .. })),
+            Some(RecordTimelineItem::Note { text, .. }) if text == "corrected note"
+        ));
+
+        let projection = store
+            .delete_timeline_item(RecordTimelineDeleteInput {
+                record_id: record.id.clone(),
+                operation_id: Uuid::new_v4().to_string(),
+                item_id: mark_id,
+                item_type: "mark".into(),
+                deleted_at_wall_time: 14_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(projection.items.len(), 1);
+
+        drop(store);
+        let reloaded = store_at(temp.path());
+        let recovered = reloaded.read_timeline(&record.id).await.unwrap();
+        assert!(recovered.items == projection.items);
+    }
+
+    #[tokio::test]
+    async fn audio_metadata_requires_exact_revision_and_valid_tags() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Unavailable,
+            })
+            .await
+            .unwrap();
+        let updated = store
+            .update_audio_metadata(AudioRecordMetadataUpdateInput {
+                id: record.id.clone(),
+                expected_revision: record.revision,
+                title: "Product review".into(),
+                tags: vec!["#work".into(), "work".into(), "中文".into()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.title, "Product review");
+        assert_eq!(updated.tags, vec!["work", "中文"]);
+        assert_eq!(
+            store
+                .update_audio_metadata(AudioRecordMetadataUpdateInput {
+                    id: record.id,
+                    expected_revision: record.revision,
+                    title: "stale".into(),
+                    tags: Vec::new(),
+                })
+                .await
+                .unwrap_err(),
+            "RECORD_REVISION_CONFLICT"
+        );
+    }
+
+    #[tokio::test]
+    async fn speaker_overrides_are_durable_revisioned_and_survive_model_rerun() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Queued,
+            })
+            .await
+            .unwrap();
+        let root = store.audio_workspace_path(&record.id).await.unwrap();
+        fs::write(root.join("audio/microphone.opus"), b"record-opus").unwrap();
+        store
+            .finalize_audio_capture(
+                &record.id,
+                CaptureStatus::Ready,
+                5_000,
+                vec![AudioTrackArtifactInput {
+                    track: AudioTrackKind::Microphone,
+                    relative_path: "audio/microphone.opus".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let provenance = RecordSpeechProvenance {
+            provider: "local".into(),
+            model_pack_revision: "speech-pack-1".into(),
+            onnx_runtime_version: "1.28.0".into(),
+        };
+        store
+            .commit_recording_final_transcript(
+                &record.id,
+                vec![
+                    RecordTranscriptSegment {
+                        segment_id: "segment-1".into(),
+                        track: AudioTrackKind::Microphone,
+                        start_sample: 0,
+                        end_sample: 20_000,
+                        text: "hello".into(),
+                        language: Some("en".into()),
+                        revision: 1,
+                    },
+                    RecordTranscriptSegment {
+                        segment_id: "segment-2".into(),
+                        track: AudioTrackKind::Microphone,
+                        start_sample: 20_000,
+                        end_sample: 40_000,
+                        text: "world".into(),
+                        language: Some("en".into()),
+                        revision: 1,
+                    },
+                ],
+                provenance.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .commit_diarization_result(
+                &record.id,
+                vec![
+                    RecordSpeakerTurn {
+                        start_sample: 0,
+                        end_sample: 20_000,
+                        global_speaker: 0,
+                    },
+                    RecordSpeakerTurn {
+                        start_sample: 20_000,
+                        end_sample: 40_000,
+                        global_speaker: 1,
+                    },
+                ],
+                provenance.clone(),
+            )
+            .await
+            .unwrap();
+
+        let renamed = store
+            .rename_speaker(RecordSpeakerRenameInput {
+                record_id: record.id.clone(),
+                expected_override_revision: 0,
+                speaker_id: 0,
+                name: "Alice".into(),
+                updated_at_wall_time: 10_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(renamed.override_revision, 1);
+        assert_eq!(renamed.speakers[0].custom_name.as_deref(), Some("Alice"));
+
+        let merged = store
+            .merge_speakers(RecordSpeakerMergeInput {
+                record_id: record.id.clone(),
+                expected_override_revision: 1,
+                source_speaker_id: 1,
+                target_speaker_id: 0,
+                updated_at_wall_time: 11_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(merged.override_revision, 2);
+        assert_eq!(merged.speakers[1].merged_into, Some(0));
+
+        let reassigned = store
+            .reassign_segment_speaker(RecordSegmentSpeakerReassignInput {
+                record_id: record.id.clone(),
+                expected_override_revision: 2,
+                segment_id: "segment-2".into(),
+                speaker_id: 0,
+                updated_at_wall_time: 12_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reassigned.override_revision, 3);
+        assert_eq!(
+            reassigned.segment_speaker_overrides.get("segment-2"),
+            Some(&0)
+        );
+        assert!(store
+            .rename_speaker(RecordSpeakerRenameInput {
+                record_id: record.id.clone(),
+                expected_override_revision: 2,
+                speaker_id: 0,
+                name: "stale".into(),
+                updated_at_wall_time: 13_000,
+            })
+            .await
+            .unwrap_err()
+            .contains("REVISION_CONFLICT"));
+
+        store
+            .commit_diarization_result(
+                &record.id,
+                vec![RecordSpeakerTurn {
+                    start_sample: 0,
+                    end_sample: 40_000,
+                    global_speaker: 2,
+                }],
+                provenance,
+            )
+            .await
+            .unwrap();
+        let after_rerun = store
+            .read_diarization_projection(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_rerun.override_revision, 3);
+        assert!(!after_rerun.conflicts.is_empty());
+
+        drop(store);
+        let reloaded = store_at(temp.path());
+        assert_eq!(
+            reloaded
+                .read_diarization_projection(&record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .override_revision,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn record_export_streams_audio_and_renders_user_corrections_without_overwrite() {
+        let temp = tempdir().unwrap();
+        let export_temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Queued,
+            })
+            .await
+            .unwrap();
+        let root = store.audio_workspace_path(&record.id).await.unwrap();
+        fs::write(root.join("audio/microphone.opus"), b"record-opus").unwrap();
+        store
+            .finalize_audio_capture(
+                &record.id,
+                CaptureStatus::Ready,
+                5_000,
+                vec![AudioTrackArtifactInput {
+                    track: AudioTrackKind::Microphone,
+                    relative_path: "audio/microphone.opus".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let provenance = RecordSpeechProvenance {
+            provider: "local".into(),
+            model_pack_revision: "speech-pack-1".into(),
+            onnx_runtime_version: "1.28.0".into(),
+        };
+        store
+            .commit_recording_final_transcript(
+                &record.id,
+                vec![RecordTranscriptSegment {
+                    segment_id: "segment-1".into(),
+                    track: AudioTrackKind::Microphone,
+                    start_sample: 16_000,
+                    end_sample: 32_000,
+                    text: "hello".into(),
+                    language: Some("en".into()),
+                    revision: 1,
+                }],
+                provenance.clone(),
+            )
+            .await
+            .unwrap();
+        store
+            .commit_diarization_result(
+                &record.id,
+                vec![RecordSpeakerTurn {
+                    start_sample: 16_000,
+                    end_sample: 32_000,
+                    global_speaker: 0,
+                }],
+                provenance,
+            )
+            .await
+            .unwrap();
+        store
+            .rename_speaker(RecordSpeakerRenameInput {
+                record_id: record.id.clone(),
+                expected_override_revision: 0,
+                speaker_id: 0,
+                name: "Alice".into(),
+                updated_at_wall_time: 10_000,
+            })
+            .await
+            .unwrap();
+        store
+            .add_note(RecordNoteCreateInput {
+                record_id: record.id.clone(),
+                operation_id: Uuid::new_v4().to_string(),
+                anchor_media_ms: 2_000,
+                started_at_wall_time: 11_000,
+                submitted_at_wall_time: 12_000,
+                text: "corrected note".into(),
+            })
+            .await
+            .unwrap();
+        store
+            .add_mark(RecordMarkCreateInput {
+                record_id: record.id.clone(),
+                operation_id: Uuid::new_v4().to_string(),
+                media_ms: 3_000,
+                wall_time: 13_000,
+            })
+            .await
+            .unwrap();
+
+        let search_documents = store.search_documents(&record.id).await.unwrap();
+        assert!(search_documents.iter().any(|document| {
+            document.media_ms == Some(1_000)
+                && document.content.contains("Alice")
+                && document.content.contains("hello")
+        }));
+        assert!(search_documents.iter().any(|document| {
+            document.media_ms == Some(2_000) && document.content == "corrected note"
+        }));
+
+        let audio_destination = export_temp.path().join("meeting.opus");
+        let audio_export = store
+            .export_audio(RecordAudioExportInput {
+                record_id: record.id.clone(),
+                track: AudioTrackKind::Microphone,
+                destination_path: audio_destination.to_string_lossy().to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(audio_export.bytes, 11);
+        assert_eq!(fs::read(&audio_destination).unwrap(), b"record-opus");
+        assert_eq!(
+            store
+                .export_audio(RecordAudioExportInput {
+                    record_id: record.id.clone(),
+                    track: AudioTrackKind::Microphone,
+                    destination_path: audio_destination.to_string_lossy().to_string(),
+                })
+                .await
+                .unwrap_err(),
+            "RECORD_EXPORT_DESTINATION_EXISTS"
+        );
+
+        let text_destination = export_temp.path().join("meeting.md");
+        store
+            .export_text(RecordTextExportInput {
+                record_id: record.id,
+                format: RecordTextExportFormat::Markdown,
+                destination_path: text_destination.to_string_lossy().to_string(),
+                locale: "zh-CN".into(),
+            })
+            .await
+            .unwrap();
+        let exported = fs::read_to_string(text_destination).unwrap();
+        assert!(exported.contains("[00:01] **Alice**: hello"));
+        assert!(exported.contains("[00:02] corrected note"));
+        assert!(exported.contains("[00:03] 标记重点"));
+    }
+
+    #[test]
+    fn record_search_projection_removes_private_attachment_paths() {
+        let record = Record {
+            id: "record-1".into(),
+            kind: RecordKind::Text,
+            title: "插图".into(),
+            tags: Vec::new(),
+            created_at: 1,
+            updated_at: 1,
+            archived: false,
+            converted_task_ids: Vec::new(),
+            revision: 1,
+            audio: None,
+            content: Some("说明 ![diagram](attachments/private-name.png)".into()),
+            images: vec!["attachments/private-name.png".into()],
+            artifacts: Vec::new(),
+        };
+        let stored = StoredRecord {
+            record,
+            path: PathBuf::from("unused"),
+            legacy_thought_digest: None,
+        };
+        let document = base_record_search_document(&stored);
+        assert!(document.content.contains("说明"));
+        assert!(!document.content.contains("private-name"));
     }
 }

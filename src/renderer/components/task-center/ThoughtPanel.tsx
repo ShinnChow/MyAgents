@@ -4,28 +4,33 @@
 // interaction pattern.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FolderOpen, Lightbulb, X } from 'lucide-react';
+import { NotebookPen, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   thoughtList,
-  thoughtOpenDir,
   thoughtMerge,
   thoughtDelete,
   thoughtSetArchived,
+  recordDelete,
+  recordList,
+  recordSetArchived,
   taskCenterAvailable,
 } from '@/api/taskCenter';
 import { SearchPill } from './SearchPill';
 import { ThoughtInput } from './ThoughtInput';
 import { ThoughtCard } from './ThoughtCard';
+import { AudioRecordCard } from './AudioRecordCard';
 import { ThoughtBulkBar } from './ThoughtBulkBar';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import { useToast } from '@/components/Toast';
 import { useConfig } from '@/hooks/useConfig';
 import { listenWithCleanup } from '@/utils/tauriListen';
+import { searchRecords, type RecordSearchHit } from '@/api/searchClient';
 // `projects` (not `config.agents`) feeds the # picker — see
 // useThoughtTagCandidates for the rationale.
 import { useThoughtTagCandidates } from '@/hooks/useThoughtTagCandidates';
 import type { Thought } from '@/../shared/types/thought';
+import type { RecordChange, RecordSummary } from '@/../shared/types/record';
 
 interface Props {
   onDispatchThought?: (t: Thought) => void;
@@ -42,6 +47,7 @@ interface Props {
    * into the input box without a second click (v0.1.69 UX round).
    */
   autoFocusInput?: boolean;
+  onOpenRecord?: (recordId: string, mediaMs?: number) => void;
 }
 
 export function ThoughtPanel({
@@ -49,9 +55,16 @@ export function ThoughtPanel({
   onDiscussThought,
   refreshKey,
   autoFocusInput = false,
+  onOpenRecord,
 }: Props) {
   const [thoughts, setThoughts] = useState<Thought[]>([]);
+  const [audioRecords, setAudioRecords] = useState<RecordSummary[]>([]);
+  const [kindFilter, setKindFilter] = useState<'all' | 'text' | 'audio'>('all');
   const [query, setQuery] = useState('');
+  const [recordSearchHits, setRecordSearchHits] = useState<Map<
+    string,
+    RecordSearchHit
+  > | null>(null);
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   // v0.2.16: archive view filter. Default 'active' — archived thoughts
@@ -73,14 +86,20 @@ export function ThoughtPanel({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [bulkBusy, setBulkBusy] = useState(false);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
+  const [audioDeleteTarget, setAudioDeleteTarget] =
+    useState<RecordSummary | null>(null);
   const toast = useToast();
   const { t } = useTranslation('task');
 
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const list = await thoughtList({ archived: viewMode });
+      const [list, audio] = await Promise.all([
+        thoughtList({ archived: viewMode }),
+        recordList({ kind: 'audio', archived: viewMode }),
+      ]);
       setThoughts(list);
+      setAudioRecords(audio);
       // Drop any phantom ids from the current selection — a thought that
       // was selected before reload but no longer exists (e.g. deleted in
       // another window, or merged elsewhere) shouldn't keep counting
@@ -88,7 +107,10 @@ export function ThoughtPanel({
       // deletes; this catches external mutations.
       setSelectedIds((prev) => {
         if (prev.size === 0) return prev;
-        const valid = new Set(list.map((t) => t.id));
+        const valid = new Set([
+          ...list.map((t) => t.id),
+          ...audio.map((record) => record.id),
+        ]);
         let changed = false;
         const next = new Set<string>();
         for (const id of prev) {
@@ -100,6 +122,7 @@ export function ThoughtPanel({
     } catch (err) {
       console.error('[ThoughtPanel] load failed', err);
       setThoughts([]);
+      setAudioRecords([]);
     } finally {
       setLoading(false);
     }
@@ -109,15 +132,60 @@ export function ThoughtPanel({
     void reload();
   }, [reload, refreshKey]);
 
+  useEffect(() => {
+    const needle = query.trim();
+    if (!needle) {
+      setRecordSearchHits(null);
+      return;
+    }
+    let cancelled = false;
+    setRecordSearchHits(null);
+    void searchRecords(needle, 200)
+      .then((result) => {
+        if (cancelled) return;
+        const hits = new Map<string, RecordSearchHit>();
+        for (const hit of result.hits) {
+          if (!hits.has(hit.recordId)) hits.set(hit.recordId, hit);
+        }
+        setRecordSearchHits(hits);
+      })
+      .catch((error) => {
+        console.warn(
+          '[ThoughtPanel] Record search unavailable; using metadata fallback',
+          error,
+        );
+        if (!cancelled) setRecordSearchHits(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [query]);
 
   // When a task transitions (including creation → convertedTaskIds backlink on
   // its source thought), refetch so "已派生 N 个任务" count stays live.
   useEffect(() => {
     if (!taskCenterAvailable()) return;
     const ac = new AbortController();
-    void listenWithCleanup('task:status-changed', () => {
-      void reload();
-    }, ac.signal);
+    void listenWithCleanup(
+      'task:status-changed',
+      () => {
+        void reload();
+      },
+      ac.signal,
+    );
+    return () => ac.abort();
+  }, [reload]);
+
+  useEffect(() => {
+    if (!taskCenterAvailable()) return;
+    const ac = new AbortController();
+    void listenWithCleanup<RecordChange>(
+      'record:changed',
+      () => {
+        void reload();
+      },
+      ac.signal,
+    );
     return () => ac.abort();
   }, [reload]);
 
@@ -139,7 +207,9 @@ export function ThoughtPanel({
       // a stale row behind. Search / merge / unrelated edits don't trip
       // this — only archive/unarchive does.
       const fitsView =
-        viewMode === 'archived' ? next.archived === true : next.archived !== true;
+        viewMode === 'archived'
+          ? next.archived === true
+          : next.archived !== true;
       if (!fitsView) {
         setThoughts((prev) => prev.filter((x) => x.id !== prevId));
         setSelectedIds((s) => {
@@ -195,18 +265,34 @@ export function ThoughtPanel({
   // I only see 2 cards" — a confusing state that's hard to recover from.
   // The ref guards against firing on the initial render after entering
   // select mode (which would wipe the seed thought passed by the ⋯ menu).
-  const filterSnapshotRef = useRef({ tag: activeTag, q: query });
+  const filterSnapshotRef = useRef({
+    tag: activeTag,
+    q: query,
+    kind: kindFilter,
+  });
   useEffect(() => {
     if (!selectMode) {
-      filterSnapshotRef.current = { tag: activeTag, q: query };
+      filterSnapshotRef.current = {
+        tag: activeTag,
+        q: query,
+        kind: kindFilter,
+      };
       return;
     }
     const prev = filterSnapshotRef.current;
-    if (prev.tag !== activeTag || prev.q !== query) {
-      filterSnapshotRef.current = { tag: activeTag, q: query };
+    if (
+      prev.tag !== activeTag ||
+      prev.q !== query ||
+      prev.kind !== kindFilter
+    ) {
+      filterSnapshotRef.current = {
+        tag: activeTag,
+        q: query,
+        kind: kindFilter,
+      };
       setSelectedIds(new Set());
     }
-  }, [activeTag, query, selectMode]);
+  }, [activeTag, kindFilter, query, selectMode]);
 
   // History-only tag list — drives the search-box tag cloud below, which is
   // an inventory of tags the user has *actually used*. Including agent names
@@ -218,8 +304,13 @@ export function ThoughtPanel({
         counts.set(tag, (counts.get(tag) ?? 0) + 1);
       }
     }
+    for (const record of audioRecords) {
+      for (const tag of record.tags) {
+        counts.set(tag, (counts.get(tag) ?? 0) + 1);
+      }
+    }
     return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-  }, [thoughts]);
+  }, [audioRecords, thoughts]);
 
   // Picker candidates — history tags + user-visible workspace names
   // (sanitized to pass the Rust `#` parser). Workspace names surface as
@@ -237,7 +328,10 @@ export function ThoughtPanel({
   // text or selecting a tag collapses the cloud (animated) so the result
   // list takes over.
   const showTagCloud =
-    searchFocused && query.trim() === '' && activeTag === null && allTags.length > 0;
+    searchFocused &&
+    query.trim() === '' &&
+    activeTag === null &&
+    allTags.length > 0;
 
   const filtered = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -248,6 +342,60 @@ export function ThoughtPanel({
     });
   }, [thoughts, query, activeTag]);
 
+  const filteredAudio = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return audioRecords.filter((record) => {
+      if (activeTag && !record.tags.some((tag) => tag === activeTag))
+        return false;
+      if (
+        needle &&
+        !recordSearchHits?.has(record.id) &&
+        !record.title.toLowerCase().includes(needle) &&
+        !record.tags.some((tag) => tag.toLowerCase().includes(needle))
+      )
+        return false;
+      return true;
+    });
+  }, [activeTag, audioRecords, query, recordSearchHits]);
+
+  const visibleItems = useMemo(() => {
+    const textItems =
+      kindFilter === 'audio'
+        ? []
+        : filtered.map((thought) => ({
+            kind: 'text' as const,
+            updatedAt: thought.updatedAt,
+            thought,
+          }));
+    const audioItems =
+      kindFilter === 'text'
+        ? []
+        : filteredAudio.map((record) => ({
+            kind: 'audio' as const,
+            updatedAt: record.updatedAt,
+            record,
+          }));
+    return [...textItems, ...audioItems].sort(
+      (left, right) =>
+        right.updatedAt - left.updatedAt ||
+        (right.kind === 'audio'
+          ? right.record.id
+          : right.thought.id
+        ).localeCompare(
+          left.kind === 'audio' ? left.record.id : left.thought.id,
+        ),
+    );
+  }, [filtered, filteredAudio, kindFilter]);
+
+  const audioIdSet = useMemo(
+    () => new Set(audioRecords.map((record) => record.id)),
+    [audioRecords],
+  );
+  const selectionContainsAudio = useMemo(
+    () => Array.from(selectedIds).some((id) => audioIdSet.has(id)),
+    [audioIdSet, selectedIds],
+  );
+
   const clearSearch = useCallback(() => {
     setQuery('');
     searchInputRef.current?.blur();
@@ -255,6 +403,10 @@ export function ThoughtPanel({
 
   const handleMerge = useCallback(async () => {
     if (bulkBusy) return;
+    if (selectionContainsAudio) {
+      toast.error(t('thoughts.mergeAudioUnsupported'));
+      return;
+    }
     // Walk the filtered list in display order and pick out selected ids.
     // This makes "merge follows top-to-bottom display order" robust to
     // tag filters and search queries — what the user sees is what gets
@@ -273,9 +425,13 @@ export function ThoughtPanel({
       // Drop only the sources that backend successfully removed; surface
       // the rest so the panel still shows them and the user can retry.
       const failedIds = new Set(failedSourceDeletes.map((f) => f.id));
-      const successfullyDeletedIds = orderedIds.filter((id) => !failedIds.has(id));
+      const successfullyDeletedIds = orderedIds.filter(
+        (id) => !failedIds.has(id),
+      );
       setThoughts((prev) => {
-        const dropped = prev.filter((t) => !successfullyDeletedIds.includes(t.id));
+        const dropped = prev.filter(
+          (t) => !successfullyDeletedIds.includes(t.id),
+        );
         return [merged, ...dropped];
       });
       setSelectedIds(new Set());
@@ -289,11 +445,15 @@ export function ThoughtPanel({
       }
     } catch (e) {
       // Pre-flight or atomic-create failure — no source touched, no merge.
-      toast.error(t('thoughts.mergeFailed', { message: e instanceof Error ? e.message : String(e) }));
+      toast.error(
+        t('thoughts.mergeFailed', {
+          message: e instanceof Error ? e.message : String(e),
+        }),
+      );
     } finally {
       setBulkBusy(false);
     }
-  }, [bulkBusy, selectedIds, toast, filtered, t]);
+  }, [bulkBusy, selectedIds, toast, filtered, selectionContainsAudio, t]);
 
   // Bulk archive / unarchive — flips every selected thought to the
   // opposite of the current view mode (active view → archive; archived
@@ -307,7 +467,11 @@ export function ThoughtPanel({
     setBulkBusy(true);
     try {
       const results = await Promise.allSettled(
-        ids.map((id) => thoughtSetArchived(id, targetArchived)),
+        ids.map((id) =>
+          audioIdSet.has(id)
+            ? recordSetArchived(id, targetArchived)
+            : thoughtSetArchived(id, targetArchived),
+        ),
       );
       let failures = 0;
       const succeeded: string[] = [];
@@ -319,20 +483,43 @@ export function ThoughtPanel({
       // the opposite view mode.
       if (succeeded.length > 0) {
         setThoughts((prev) => prev.filter((t) => !succeeded.includes(t.id)));
+        setAudioRecords((prev) =>
+          prev.filter((record) => !succeeded.includes(record.id)),
+        );
       }
       setSelectedIds(new Set());
       setSelectMode(false);
       if (failures === 0) {
-        toast.success(t(targetArchived ? 'thoughts.archiveSuccess' : 'thoughts.unarchiveSuccess', { count: succeeded.length }));
+        toast.success(
+          t(
+            targetArchived
+              ? 'thoughts.archiveSuccess'
+              : 'thoughts.unarchiveSuccess',
+            { count: succeeded.length },
+          ),
+        );
       } else if (succeeded.length === 0) {
-        toast.error(t(targetArchived ? 'thoughts.archiveFailed' : 'thoughts.unarchiveFailed'));
+        toast.error(
+          t(
+            targetArchived
+              ? 'thoughts.archiveFailed'
+              : 'thoughts.unarchiveFailed',
+          ),
+        );
       } else {
-        toast.error(t(targetArchived ? 'thoughts.archivePartial' : 'thoughts.unarchivePartial', { successCount: succeeded.length, failCount: failures }));
+        toast.error(
+          t(
+            targetArchived
+              ? 'thoughts.archivePartial'
+              : 'thoughts.unarchivePartial',
+            { successCount: succeeded.length, failCount: failures },
+          ),
+        );
       }
     } finally {
       setBulkBusy(false);
     }
-  }, [bulkBusy, selectedIds, viewMode, toast, t]);
+  }, [audioIdSet, bulkBusy, selectedIds, viewMode, toast, t]);
 
   const handleBulkDelete = useCallback(async () => {
     if (bulkBusy) return;
@@ -344,11 +531,18 @@ export function ThoughtPanel({
       // Run deletes in parallel — thought.delete is idempotent and
       // independent across ids; serial would just be slower with no
       // additional safety.
-      const results = await Promise.allSettled(ids.map((id) => thoughtDelete(id)));
+      const results = await Promise.allSettled(
+        ids.map((id) =>
+          audioIdSet.has(id) ? recordDelete(id) : thoughtDelete(id),
+        ),
+      );
       for (const r of results) if (r.status === 'rejected') failures += 1;
       const succeeded = ids.filter((_, i) => results[i].status === 'fulfilled');
       if (succeeded.length > 0) {
         setThoughts((prev) => prev.filter((t) => !succeeded.includes(t.id)));
+        setAudioRecords((prev) =>
+          prev.filter((record) => !succeeded.includes(record.id)),
+        );
       }
       setConfirmDeleteOpen(false);
       setSelectedIds(new Set());
@@ -358,12 +552,57 @@ export function ThoughtPanel({
       } else if (succeeded.length === 0) {
         toast.error(t('thoughts.deleteFailed'));
       } else {
-        toast.error(t('thoughts.deletePartial', { successCount: succeeded.length, failCount: failures }));
+        toast.error(
+          t('thoughts.deletePartial', {
+            successCount: succeeded.length,
+            failCount: failures,
+          }),
+        );
       }
     } finally {
       setBulkBusy(false);
     }
-  }, [bulkBusy, selectedIds, toast, t]);
+  }, [audioIdSet, bulkBusy, selectedIds, toast, t]);
+
+  const handleAudioArchive = useCallback(
+    async (id: string, archived: boolean) => {
+      try {
+        await recordSetArchived(id, archived);
+        setAudioRecords((current) =>
+          current.filter((record) => record.id !== id),
+        );
+        toast.success(
+          t(archived ? 'records.archiveSuccess' : 'records.unarchiveSuccess'),
+        );
+      } catch (error) {
+        toast.error(
+          t('records.mutationFailed', {
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    },
+    [t, toast],
+  );
+
+  const handleAudioDelete = useCallback(async () => {
+    const target = audioDeleteTarget;
+    if (!target) return;
+    try {
+      await recordDelete(target.id);
+      setAudioRecords((current) =>
+        current.filter((record) => record.id !== target.id),
+      );
+      setAudioDeleteTarget(null);
+      toast.success(t('records.deleteSuccess'));
+    } catch (error) {
+      toast.error(
+        t('records.mutationFailed', {
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+    }
+  }, [audioDeleteTarget, t, toast]);
 
   return (
     <div className="relative flex h-full flex-col">
@@ -406,45 +645,12 @@ export function ThoughtPanel({
                     their viewBox but Chinese glyphs sit slightly below
                     the em box center, making items-center alone read as
                     icon-too-high. Same tweak on TaskListPanel's CheckSquare. */}
-                <Lightbulb
+                <NotebookPen
                   className="relative top-[1px] h-4 w-4 shrink-0 text-[var(--ink-muted)]"
                   strokeWidth={1.5}
                 />
                 <span className="whitespace-nowrap text-base font-semibold text-[var(--ink)]">
-                  {t('thoughts.title')}
-                </span>
-              </div>
-              {/* "打开想法存储的文件夹" — ghost icon button, no label.
-                  Sits OUTSIDE the fold container because that container is
-                  `overflow: hidden` to drive the label slide-out animation;
-                  a tooltip rendered inside would be clipped at the bottom
-                  edge and never appear. Here it's a sibling whose own
-                  visibility is gated by `searchActive` via opacity /
-                  pointer-events, and the dark-pill tooltip is free to
-                  render below the button without clipping. */}
-              <div
-                className="group/openDir relative"
-                style={{
-                  opacity: searchActive ? 0 : 1,
-                  pointerEvents: searchActive ? 'none' : 'auto',
-                  transition: 'opacity 150ms ease-out',
-                }}
-              >
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (!taskCenterAvailable()) return;
-                    void thoughtOpenDir().catch((err) => {
-                      console.error('[ThoughtPanel] open dir failed', err);
-                    });
-                  }}
-                  aria-label={t('thoughts.openFolder')}
-                  className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)]"
-                >
-                  <FolderOpen className="h-3.5 w-3.5" strokeWidth={1.75} />
-                </button>
-                <span className="pointer-events-none absolute left-1/2 top-full z-50 mt-1.5 -translate-x-1/2 whitespace-nowrap rounded-md bg-[var(--ink)] px-2 py-1 text-xs font-medium text-[var(--paper)] opacity-0 shadow-md transition-opacity duration-150 group-hover/openDir:opacity-100">
-                  {t('thoughts.openFolder')}
+                  {t('records.title')}
                 </span>
               </div>
               <div className="ml-auto flex min-w-0 flex-1 justify-end">
@@ -453,7 +659,7 @@ export function ThoughtPanel({
                   value={query}
                   onChange={setQuery}
                   onClear={clearSearch}
-                  placeholder={t('thoughts.searchPlaceholder')}
+                  placeholder={t('records.searchPlaceholder')}
                   expandedFull
                   onFocus={() => setSearchFocused(true)}
                   // Delay blur so clicking a tag inside the floating cloud
@@ -461,9 +667,7 @@ export function ThoughtPanel({
                   // `onMouseDown` + preventDefault to re-focus the input, but
                   // that sequence still triggers a blur→focus round-trip —
                   // the 120ms grace absorbs it cleanly.
-                  onBlur={() =>
-                    setTimeout(() => setSearchFocused(false), 120)
-                  }
+                  onBlur={() => setTimeout(() => setSearchFocused(false), 120)}
                 />
               </div>
             </>
@@ -575,18 +779,35 @@ export function ThoughtPanel({
           </div>
         ) : (
           <span className="text-sm font-semibold tracking-[0.04em] text-[var(--ink-muted)]">
-            {t('thoughts.title')} <span className="text-[var(--ink-muted)]/60">({thoughts.length})</span>
+            {t('records.title')}{' '}
+            <span className="text-[var(--ink-muted)]/60">
+              ({thoughts.length + audioRecords.length})
+            </span>
           </span>
         )}
+        <div className="ml-auto mr-2 flex items-center gap-0.5 rounded-full bg-[var(--paper-inset)] p-0.5">
+          {(['all', 'text', 'audio'] as const).map((kind) => (
+            <button
+              key={kind}
+              type="button"
+              onClick={() => setKindFilter(kind)}
+              className={`rounded-full px-2 py-0.5 text-xs transition-colors ${kindFilter === kind ? 'bg-[var(--paper-elevated)] font-medium text-[var(--ink)] shadow-sm' : 'text-[var(--ink-muted)] hover:text-[var(--ink)]'}`}
+            >
+              {t(`records.kind.${kind}`)}
+            </button>
+          ))}
+        </div>
         {/* Right slot — v0.2.16: archive view toggle. Segmented control
             with two pills (活跃 / 已归档) sharing one pill background.
             Selecting a segment changes the panel's data source via
             `viewMode`. No per-segment count by user request (PRD §2.1). */}
         <div className="flex items-center gap-0.5 rounded-full bg-[var(--paper-inset)] p-0.5">
-          {([
-            ['active', t('thoughts.viewActive')],
-            ['archived', t('thoughts.viewArchived')],
-          ] as const).map(([mode, label]) => {
+          {(
+            [
+              ['active', t('thoughts.viewActive')],
+              ['archived', t('thoughts.viewArchived')],
+            ] as const
+          ).map(([mode, label]) => {
             const isActive = viewMode === mode;
             return (
               <button
@@ -624,31 +845,46 @@ export function ThoughtPanel({
           <div className="py-8 text-center text-sm text-[var(--ink-muted)]">
             {t('common.loading')}
           </div>
-        ) : filtered.length === 0 ? (
+        ) : visibleItems.length === 0 ? (
           <div className="py-12 text-center text-sm text-[var(--ink-muted)]">
-            {thoughts.length === 0
+            {thoughts.length + audioRecords.length === 0
               ? viewMode === 'archived'
-                ? t('thoughts.emptyArchived')
-                : t('thoughts.emptyActive')
-              : t('thoughts.emptySearch')}
+                ? t('records.emptyArchived')
+                : t('records.emptyActive')
+              : t('records.emptySearch')}
           </div>
         ) : (
           <div className="flex flex-col gap-3">
-            {filtered.map((t) => (
-              <ThoughtCard
-                key={t.id}
-                thought={t}
-                onChanged={(next) => handleCardChanged(t.id, next)}
-                onDispatch={selectMode ? undefined : onDispatchThought}
-                onDiscuss={selectMode ? undefined : onDiscussThought}
-                onTagClick={setActiveTag}
-                searchQuery={query}
-                selectMode={selectMode}
-                selected={selectedIds.has(t.id)}
-                onToggleSelect={() => toggleSelect(t.id)}
-                onEnterSelectMode={() => enterSelectMode(t.id)}
-              />
-            ))}
+            {visibleItems.map((item) =>
+              item.kind === 'text' ? (
+                <ThoughtCard
+                  key={item.thought.id}
+                  thought={item.thought}
+                  onChanged={(next) => handleCardChanged(item.thought.id, next)}
+                  onDispatch={selectMode ? undefined : onDispatchThought}
+                  onDiscuss={selectMode ? undefined : onDiscussThought}
+                  onTagClick={setActiveTag}
+                  searchQuery={query}
+                  selectMode={selectMode}
+                  selected={selectedIds.has(item.thought.id)}
+                  onToggleSelect={() => toggleSelect(item.thought.id)}
+                  onEnterSelectMode={() => enterSelectMode(item.thought.id)}
+                />
+              ) : (
+                <AudioRecordCard
+                  key={item.record.id}
+                  record={item.record}
+                  onOpen={(id, mediaMs) => onOpenRecord?.(id, mediaMs)}
+                  onArchive={handleAudioArchive}
+                  onDelete={() => setAudioDeleteTarget(item.record)}
+                  selectMode={selectMode}
+                  selected={selectedIds.has(item.record.id)}
+                  onToggleSelect={() => toggleSelect(item.record.id)}
+                  onEnterSelectMode={() => enterSelectMode(item.record.id)}
+                  searchHit={recordSearchHits?.get(item.record.id)}
+                />
+              ),
+            )}
           </div>
         )}
       </div>
@@ -665,6 +901,11 @@ export function ThoughtPanel({
           onCancel={exitSelectMode}
           viewMode={viewMode}
           busy={bulkBusy}
+          mergeDisabledReason={
+            selectionContainsAudio
+              ? t('thoughts.mergeAudioUnsupported')
+              : undefined
+          }
         />
       )}
 
@@ -673,13 +914,29 @@ export function ThoughtPanel({
       {confirmDeleteOpen && (
         <ConfirmDialog
           title={t('thoughts.deleteConfirmTitle')}
-          message={t('thoughts.deleteConfirmMessage', { count: selectedIds.size })}
+          message={t(
+            selectionContainsAudio
+              ? 'thoughts.deleteAudioConfirmMessage'
+              : 'thoughts.deleteConfirmMessage',
+            { count: selectedIds.size },
+          )}
           confirmText={t('common.delete')}
           cancelText={t('common.cancel')}
           confirmVariant="danger"
           loading={bulkBusy}
           onConfirm={() => void handleBulkDelete()}
           onCancel={() => setConfirmDeleteOpen(false)}
+        />
+      )}
+      {audioDeleteTarget && (
+        <ConfirmDialog
+          title={t('records.deleteConfirmTitle')}
+          message={t('records.deleteConfirmMessage')}
+          confirmText={t('common.delete')}
+          cancelText={t('common.cancel')}
+          confirmVariant="danger"
+          onConfirm={() => void handleAudioDelete()}
+          onCancel={() => setAudioDeleteTarget(null)}
         />
       )}
     </div>

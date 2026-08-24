@@ -3,6 +3,7 @@
 //! RecordStore remains the authority. This module accepts only committed
 //! Record snapshots and can always rebuild its entire directory from them.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
@@ -11,7 +12,7 @@ use tantivy::collector::{Count, TopDocs};
 use tantivy::query::QueryParser;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyError, Term};
 
-use crate::record::{Record, RecordKind};
+use crate::record::{RecordKind, RecordSearchDocument};
 
 use super::schema::{self, RecordFields, RECORD_SCHEMA_VERSION};
 use super::tokenizer;
@@ -49,7 +50,7 @@ impl RecordIndex {
         })
     }
 
-    pub fn rebuild(&self, records: &[Record]) -> Result<(), String> {
+    pub fn rebuild(&self, documents: &[RecordSearchDocument]) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
@@ -58,21 +59,27 @@ impl RecordIndex {
             .writer
             .delete_all_documents()
             .map_err(|error| format!("clear Record index: {error}"))?;
-        for record in records {
-            state.add_record(record)?;
+        for document in documents {
+            state.add_document(document)?;
         }
         state.commit()
     }
 
-    pub fn upsert(&self, record: &Record) -> Result<(), String> {
+    pub fn upsert(
+        &self,
+        record_id: &str,
+        documents: &[RecordSearchDocument],
+    ) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
             .map_err(|error| format!("Record index lock poisoned: {error}"))?;
         state
             .writer
-            .delete_term(Term::from_field_text(state.fields.record_id, &record.id));
-        state.add_record(record)?;
+            .delete_term(Term::from_field_text(state.fields.record_id, record_id));
+        for document in documents {
+            state.add_document(document)?;
+        }
         state.commit()
     }
 
@@ -104,14 +111,19 @@ impl RecordIndex {
         let parsed = parser
             .parse_query(query)
             .map_err(|error| format!("Record query parse error: {error}"))?;
-        let total = searcher
+        let matching_documents = searcher
             .search(&parsed, &Count)
             .map_err(|error| format!("Record count search failed: {error}"))?;
-        let top_docs = searcher
-            .search(&parsed, &TopDocs::with_limit(limit))
-            .map_err(|error| format!("Record search failed: {error}"))?;
+        let top_docs = if matching_documents == 0 {
+            Vec::new()
+        } else {
+            searcher
+                .search(&parsed, &TopDocs::with_limit(matching_documents))
+                .map_err(|error| format!("Record search failed: {error}"))?
+        };
         let needle = query.to_lowercase();
-        let mut hits = Vec::with_capacity(top_docs.len());
+        let mut hits = Vec::with_capacity(limit.min(top_docs.len()));
+        let mut matching_records = HashSet::new();
         for (_score, address) in top_docs {
             let document = searcher
                 .doc::<tantivy::TantivyDocument>(address)
@@ -126,9 +138,16 @@ impl RecordIndex {
             } else {
                 &title
             };
+            let record_id = get_text(&document, fields.record_id);
+            if !matching_records.insert(record_id.clone()) {
+                continue;
+            }
             let snippet = make_snippet(snippet_source, &needle, 180);
+            if hits.len() == limit {
+                continue;
+            }
             hits.push(RecordSearchHit {
-                record_id: get_text(&document, fields.record_id),
+                record_id,
                 kind: get_text(&document, fields.kind),
                 title,
                 snippet,
@@ -137,7 +156,7 @@ impl RecordIndex {
         }
         Ok(RecordSearchResult {
             hits,
-            total,
+            total: matching_records.len(),
             query_time_ms: started.elapsed().as_secs_f64() * 1000.0,
         })
     }
@@ -193,24 +212,29 @@ impl RecordIndexState {
         })
     }
 
-    fn add_record(&mut self, record: &Record) -> Result<(), String> {
-        let kind = match record.kind {
+    fn add_document(&mut self, document: &RecordSearchDocument) -> Result<(), String> {
+        let kind = match document.kind {
             RecordKind::Text => "text",
             RecordKind::Audio => "audio",
         };
-        let mut content = record.content.clone().unwrap_or_default();
-        for image in &record.images {
-            content = content.replace(image, "");
+        let mut tantivy_document = doc!(
+            self.fields.record_id => document.record_id.clone(),
+            self.fields.kind => kind,
+            self.fields.title => document.title.clone(),
+            self.fields.tags => document.tags.join("\n"),
+            self.fields.content => document.content.clone(),
+        );
+        if let Some(media_ms) = document.media_ms {
+            tantivy_document.add_u64(self.fields.media_ms, media_ms);
         }
         self.writer
-            .add_document(doc!(
-                self.fields.record_id => record.id.clone(),
-                self.fields.kind => kind,
-                self.fields.title => record.title.clone(),
-                self.fields.tags => record.tags.join("\n"),
-                self.fields.content => content,
-            ))
-            .map_err(|error| format!("index Record {}: {error}", record.id))?;
+            .add_document(tantivy_document)
+            .map_err(|error| {
+                format!(
+                    "index Record {} search document: {error}",
+                    document.record_id
+                )
+            })?;
         Ok(())
     }
 
@@ -295,21 +319,14 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn text_record(id: &str, title: &str, content: &str) -> Record {
-        Record {
-            id: id.to_string(),
+    fn text_record(id: &str, title: &str, content: &str) -> RecordSearchDocument {
+        RecordSearchDocument {
+            record_id: id.to_string(),
             kind: RecordKind::Text,
             title: title.to_string(),
             tags: vec!["项目".to_string()],
-            created_at: 1,
-            updated_at: 1,
-            archived: false,
-            converted_task_ids: Vec::new(),
-            revision: 1,
-            audio: None,
-            content: Some(content.to_string()),
-            images: Vec::new(),
-            artifacts: Vec::new(),
+            content: content.to_string(),
+            media_ms: None,
         }
     }
 
@@ -331,7 +348,7 @@ mod tests {
         assert_eq!(index.search("项目", 10).unwrap().hits[0].snippet, "项目");
 
         let updated = text_record("one", "会议规划", "内容已经替换");
-        index.upsert(&updated).unwrap();
+        index.upsert("one", &[updated]).unwrap();
         assert_eq!(index.search("离线转写", 10).unwrap().total, 0);
         assert_eq!(index.search("已经替换", 10).unwrap().total, 1);
         index.delete("one").unwrap();
@@ -341,21 +358,6 @@ mod tests {
         let reopened = RecordIndex::new(index_dir).unwrap();
         reopened.rebuild(std::slice::from_ref(&first)).unwrap();
         assert_eq!(reopened.doc_count().unwrap(), 1);
-    }
-
-    #[test]
-    fn image_storage_paths_are_not_searchable_content() {
-        let temp = tempdir().unwrap();
-        let index = RecordIndex::new(temp.path().join("records")).unwrap();
-        let mut record = text_record(
-            "one",
-            "插图",
-            "说明 ![diagram](attachments/private-name.png)",
-        );
-        record.images = vec!["attachments/private-name.png".to_string()];
-        index.rebuild(&[record]).unwrap();
-        assert_eq!(index.search("private-name", 10).unwrap().total, 0);
-        assert_eq!(index.search("说明", 10).unwrap().total, 1);
     }
 
     #[test]
@@ -378,5 +380,39 @@ mod tests {
             .unwrap();
         assert!(RecordIndex::new(live_dir).is_err());
         assert_eq!(live.search("仍然可用", 10).unwrap().total, 1);
+    }
+
+    #[test]
+    fn search_limits_unique_records_after_segment_documents() {
+        let temp = tempdir().unwrap();
+        let index = RecordIndex::new(temp.path().join("records")).unwrap();
+        let mut documents = (0..250)
+            .map(|index| RecordSearchDocument {
+                record_id: "long-record".to_string(),
+                kind: RecordKind::Audio,
+                title: "Long meeting".to_string(),
+                tags: Vec::new(),
+                content: format!("roadmap segment {index}"),
+                media_ms: Some(index * 1_000),
+            })
+            .collect::<Vec<_>>();
+        documents.push(RecordSearchDocument {
+            record_id: "short-record".to_string(),
+            kind: RecordKind::Audio,
+            title: "Short meeting".to_string(),
+            tags: Vec::new(),
+            content: "roadmap decision".to_string(),
+            media_ms: Some(1_000),
+        });
+        index.rebuild(&documents).unwrap();
+
+        let result = index.search("roadmap", 200).unwrap();
+        assert_eq!(result.total, 2);
+        assert_eq!(result.hits.len(), 2);
+        assert!(result.hits.iter().any(|hit| hit.record_id == "long-record"));
+        assert!(result
+            .hits
+            .iter()
+            .any(|hit| hit.record_id == "short-record"));
     }
 }

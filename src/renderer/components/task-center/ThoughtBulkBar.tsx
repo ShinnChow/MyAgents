@@ -33,6 +33,8 @@ interface Props {
   viewMode: 'active' | 'archived';
   /** When true, action buttons are disabled (e.g. during merge/delete RPC). */
   busy?: boolean;
+  /** Product reason that makes merge invalid even when two rows are selected. */
+  mergeDisabledReason?: string;
 }
 
 export function ThoughtBulkBar({
@@ -43,12 +45,14 @@ export function ThoughtBulkBar({
   onCancel,
   viewMode,
   busy,
+  mergeDisabledReason,
 }: Props) {
   const { t } = useTranslation('task');
-  const canMerge = count >= 2 && !busy;
+  const canMerge = count >= 2 && !busy && !mergeDisabledReason;
   const canArchive = count >= 1 && !busy;
   const canDelete = count >= 1 && !busy;
-  const archiveLabel = viewMode === 'archived' ? t('thoughts.unarchive') : t('thoughts.archive');
+  const archiveLabel =
+    viewMode === 'archived' ? t('thoughts.unarchive') : t('thoughts.archive');
   const ArchiveIcon = viewMode === 'archived' ? ArchiveRestore : Archive;
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-6 z-40 flex justify-center">
@@ -60,12 +64,22 @@ export function ThoughtBulkBar({
         <span className="px-3 text-xs tabular-nums text-[var(--ink-muted)]">
           {t('thoughts.selectedCount', { count })}
         </span>
+        {mergeDisabledReason && (
+          <span className="max-w-48 truncate px-1 text-xs text-[var(--ink-muted)]">
+            {mergeDisabledReason}
+          </span>
+        )}
         <div className="h-5 w-px bg-[var(--line)]" />
         <button
           type="button"
           onClick={onMerge}
           disabled={!canMerge}
-          title={count < 2 ? t('thoughts.mergeNeedsTwo') : t('thoughts.mergeTooltip')}
+          title={
+            mergeDisabledReason ??
+            (count < 2
+              ? t('thoughts.mergeNeedsTwo')
+              : t('thoughts.mergeTooltip'))
+          }
           className="flex items-center gap-1.5 rounded-full px-3 py-1 text-sm text-[var(--ink-secondary)] transition-colors hover:bg-[var(--accent-warm-subtle)] hover:text-[var(--accent-warm)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--ink-secondary)]"
         >
           <Layers className="h-3.5 w-3.5" strokeWidth={1.75} />
@@ -75,7 +89,11 @@ export function ThoughtBulkBar({
           type="button"
           onClick={onArchive}
           disabled={!canArchive}
-          title={viewMode === 'archived' ? t('thoughts.unarchiveSelected') : t('thoughts.archiveSelected')}
+          title={
+            viewMode === 'archived'
+              ? t('thoughts.unarchiveSelected')
+              : t('thoughts.archiveSelected')
+          }
           className="flex items-center gap-1.5 rounded-full px-3 py-1 text-sm text-[var(--ink-secondary)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--ink-secondary)]"
         >
           <ArchiveIcon className="h-3.5 w-3.5" strokeWidth={1.75} />

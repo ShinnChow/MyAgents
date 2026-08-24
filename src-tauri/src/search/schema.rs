@@ -17,7 +17,7 @@ use super::tokenizer::TOKENIZER_NAME;
 /// Schema version marker. Bump whenever the field list or tokenizer changes
 /// so existing indices are nuked and rebuilt on startup.
 pub const SCHEMA_VERSION: u32 = 3;
-pub const RECORD_SCHEMA_VERSION: u32 = 1;
+pub const RECORD_SCHEMA_VERSION: u32 = 2;
 
 fn chinese_text_options() -> TextOptions {
     TextOptions::default().set_stored().set_indexing_options(

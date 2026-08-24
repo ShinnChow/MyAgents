@@ -4,7 +4,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SupportedStreamConfig};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -64,6 +64,7 @@ impl From<CaptureFormat> for SourceFormat {
 
 pub struct CapturePlan {
     pub sources: Vec<PreparedSource>,
+    pub warnings: Vec<String>,
     token: Arc<dyn Any + Send + Sync>,
 }
 
@@ -72,6 +73,7 @@ impl std::fmt::Debug for CapturePlan {
         formatter
             .debug_struct("CapturePlan")
             .field("sources", &self.sources)
+            .field("warnings", &self.warnings)
             .finish_non_exhaustive()
     }
 }
@@ -81,6 +83,7 @@ impl CapturePlan {
     pub fn for_test(sources: Vec<PreparedSource>) -> Self {
         Self {
             sources,
+            warnings: Vec::new(),
             token: Arc::new(()),
         }
     }
@@ -97,6 +100,24 @@ pub struct CaptureSinks {
     pub system: Option<CaptureTrackSink>,
 }
 
+/// Lightweight UI projection of the latest capture-buffer peak. The archive
+/// and analysis sinks remain authoritative for audio; this meter only exposes
+/// whether an admitted source is currently producing samples.
+#[derive(Clone, Default)]
+pub(crate) struct CaptureActivity {
+    level_percent: Arc<AtomicU8>,
+}
+
+impl CaptureActivity {
+    pub(crate) fn level_percent(&self) -> u8 {
+        self.level_percent.load(Ordering::Relaxed)
+    }
+
+    fn set_level_percent(&self, level_percent: u8) {
+        self.level_percent.store(level_percent, Ordering::Relaxed);
+    }
+}
+
 /// The capture callback has one bounded fan-out point. Archive delivery is
 /// always attempted first because the durable recording remains authoritative;
 /// live analysis may fail independently without degrading the archive.
@@ -104,45 +125,59 @@ pub struct CaptureSinks {
 pub struct CaptureTrackSink {
     archive: RealtimeTrackSink,
     analysis: Option<RealtimeTrackSink>,
+    activity: CaptureActivity,
 }
 
 impl CaptureTrackSink {
     pub fn new(archive: RealtimeTrackSink, analysis: Option<RealtimeTrackSink>) -> Self {
-        Self { archive, analysis }
+        Self {
+            archive,
+            analysis,
+            activity: CaptureActivity::default(),
+        }
+    }
+
+    pub(crate) fn activity(&self) -> CaptureActivity {
+        self.activity.clone()
     }
 
     pub(crate) fn push_f32(&self, samples: &[f32]) {
-        self.archive.push_f32(samples);
+        self.activity
+            .set_level_percent(self.archive.push_f32(samples));
         if let Some(analysis) = self.analysis.as_ref() {
-            analysis.push_f32(samples);
+            let _ = analysis.push_f32(samples);
         }
     }
 
     fn push_i16(&self, samples: &[i16]) {
-        self.archive.push_i16(samples);
+        self.activity
+            .set_level_percent(self.archive.push_i16(samples));
         if let Some(analysis) = self.analysis.as_ref() {
-            analysis.push_i16(samples);
+            let _ = analysis.push_i16(samples);
         }
     }
 
     fn push_i32(&self, samples: &[i32]) {
-        self.archive.push_i32(samples);
+        self.activity
+            .set_level_percent(self.archive.push_i32(samples));
         if let Some(analysis) = self.analysis.as_ref() {
-            analysis.push_i32(samples);
+            let _ = analysis.push_i32(samples);
         }
     }
 
     fn push_i8(&self, samples: &[i8]) {
-        self.archive.push_i8(samples);
+        self.activity
+            .set_level_percent(self.archive.push_i8(samples));
         if let Some(analysis) = self.analysis.as_ref() {
-            analysis.push_i8(samples);
+            let _ = analysis.push_i8(samples);
         }
     }
 
     fn push_planar_f32(&self, planes: &[&[f32]]) {
-        self.archive.push_planar_f32(planes);
+        self.activity
+            .set_level_percent(self.archive.push_planar_f32(planes));
         if let Some(analysis) = self.analysis.as_ref() {
-            analysis.push_planar_f32(planes);
+            let _ = analysis.push_planar_f32(planes);
         }
     }
 }
@@ -233,6 +268,11 @@ impl CaptureBackend for PlatformCaptureBackend {
         };
 
         #[cfg(target_os = "linux")]
+        let mut warnings = Vec::new();
+        #[cfg(not(target_os = "linux"))]
+        let warnings = Vec::new();
+
+        #[cfg(target_os = "linux")]
         let (system, system_source) = if selection.system {
             match system_capture_device(&host).and_then(|device| {
                 let endpoint = cpal_endpoint(&device, AudioTrackKind::System, true)?;
@@ -245,6 +285,7 @@ impl CaptureBackend for PlatformCaptureBackend {
                         "[recording] PipeWire system audio unavailable; continuing microphone-only: {}",
                         error
                     );
+                    warnings.push("RECORDING_SYSTEM_AUDIO_UNAVAILABLE".to_string());
                     (None, None)
                 }
             }
@@ -265,6 +306,7 @@ impl CaptureBackend for PlatformCaptureBackend {
         }
         Ok(CapturePlan {
             sources,
+            warnings,
             token: Arc::new(PlatformPlan {
                 microphone,
                 #[cfg(not(target_os = "macos"))]

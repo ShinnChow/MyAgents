@@ -49,6 +49,7 @@ pub mod process_cmd;
 mod proxy_config;
 mod proxy_spill;
 pub mod record;
+mod record_analytics;
 pub mod recording;
 mod resource_signature;
 pub mod runtime_launch_guard;
@@ -222,6 +223,10 @@ fn classify_navigation(url: &Url) -> NavDecision {
     NavDecision::BlockSilently
 }
 
+fn should_request_exit_confirmation(code: Option<i32>, confirmed: bool) -> bool {
+    code != Some(tauri::RESTART_EXIT_CODE) && !confirmed
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // ── DIAGNOSTIC PANIC HOOK (April 2026 crash investigation) ─────────────
@@ -290,6 +295,9 @@ pub fn run() {
     let cleanup_done_for_wakelock_monitor = cleanup_done.clone();
     let cleanup_done_for_agent_monitor = cleanup_done.clone();
     let cleanup_done_for_terminal_forwarder = cleanup_done.clone();
+    let frontend_exit_confirmed = Arc::new(AtomicBool::new(false));
+    let frontend_exit_confirmed_for_setup = frontend_exit_confirmed.clone();
+    let frontend_exit_confirmed_for_exit = frontend_exit_confirmed.clone();
 
     // Create terminal manager state
     let terminal_state = terminal::TerminalManager::new();
@@ -467,6 +475,7 @@ pub fn run() {
             speech_recognition::cmd_speech_model_pack_status,
             speech_recognition::cmd_speech_model_pack_install,
             speech_recognition::cmd_speech_model_pack_remove,
+            speech_recognition::cmd_speech_record_transcribe,
             grok_auth::cmd_grok_auth_status,
             grok_auth::cmd_grok_login_start,
             grok_auth::cmd_grok_login_status,
@@ -692,10 +701,24 @@ pub fn run() {
             record::cmd_record_create,
             record::cmd_record_list,
             record::cmd_record_get,
+            record::cmd_record_transcript,
+            record::cmd_record_diarization,
+            record::cmd_record_rename_speaker,
+            record::cmd_record_merge_speakers,
+            record::cmd_record_reassign_segment_speaker,
+            record::cmd_record_timeline,
+            record::cmd_record_add_note,
+            record::cmd_record_add_mark,
+            record::cmd_record_update_note,
+            record::cmd_record_delete_timeline_item,
             record::cmd_record_update_text,
+            record::cmd_record_update_audio_metadata,
+            record::cmd_record_export_audio,
+            record::cmd_record_export_text,
             record::cmd_record_set_archived,
             record::cmd_record_delete,
             record::cmd_record_merge_text,
+            record_analytics::cmd_record_analytics_bridge_ready,
             recording::manager::cmd_recording_snapshot,
             recording::manager::cmd_recording_start,
             recording::manager::cmd_recording_pause,
@@ -775,7 +798,7 @@ pub fn run() {
             // PRD 0.2.35 — global "always-on" wake-lock toggle
             wake_lock::cmd_set_force_wake_lock,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             // Initialize logging before acquire_lock() and cleanup_stale_sidecars()
             // because those paths need a logger backend for log::warn!/info! calls.
             use tauri_plugin_log::{Target, TargetKind};
@@ -807,6 +830,52 @@ pub fn run() {
             // calls (extremely early startup) fall back to a synchronous
             // append protected by a mutex.
             logger::init_buffered_writer();
+            let analytics_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut milestones = record_analytics::subscribe();
+                loop {
+                    match milestones.recv().await {
+                        Ok(milestone) => {
+                            if let Err(error) =
+                                analytics_handle.emit(record_analytics::TAURI_EVENT, milestone)
+                            {
+                                ulog_warn!(
+                                    "[analytics] failed to emit Record milestone: {}",
+                                    error
+                                );
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            ulog_warn!(
+                                "[analytics] Record milestone bridge lagged; skipped {} events",
+                                skipped
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            let record_store = app.state::<record::ManagedRecordStore>().inner().clone();
+            let record_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut changes = record_store.subscribe_changes();
+                loop {
+                    match changes.recv().await {
+                        Ok(change) => {
+                            if let Err(error) = record_handle.emit("record:changed", change) {
+                                ulog_warn!("[record] failed to emit state change: {}", error);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            ulog_warn!(
+                                "[record] UI event bridge lagged; skipped {} state changes",
+                                skipped
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
             let recording_manager = app
                 .state::<recording::ManagedRecordingManager>()
                 .inner()
@@ -1206,6 +1275,8 @@ pub fn run() {
             let app_handle_for_tray = app.handle().clone();
             app.listen("tray:confirm-exit", move |_| {
                 ulog_info!("[App] Frontend confirmed exit, delegating to run-loop cleanup");
+                frontend_exit_confirmed_for_setup
+                    .store(true, std::sync::atomic::Ordering::Release);
                 app_handle_for_tray.exit(0);
             });
 
@@ -1642,6 +1713,21 @@ pub fn run() {
         match event {
             // Handle app exit events (Cmd+Q, Dock right-click quit, etc.)
             tauri::RunEvent::ExitRequested { code, api, .. } => {
+                if should_request_exit_confirmation(
+                    code,
+                    frontend_exit_confirmed_for_exit
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    api.prevent_exit();
+                    tray::show_main_window(_app_handle);
+                    if let Err(error) = _app_handle.emit("tray:exit-requested", ()) {
+                        ulog_error!(
+                            "[App] failed to route native exit request to the frontend: {}",
+                            error
+                        );
+                    }
+                    return;
+                }
                 if let Err(error) = tauri::async_runtime::block_on(
                     recording_state_for_exit.stop_for_app_exit(),
                 ) {
@@ -1758,15 +1844,26 @@ pub fn run() {
 #[cfg(test)]
 mod nav_guard_tests {
     use super::{
-        classify_navigation, theme_bootstrap_paper, theme_bootstrap_script, NavDecision,
-        THEME_BOOTSTRAP_APPEARANCE_MARKER, THEME_BOOTSTRAP_RUN_ID_MARKER,
-        THEME_BOOTSTRAP_WINDOW_LABEL_MARKER,
+        classify_navigation, should_request_exit_confirmation, theme_bootstrap_paper,
+        theme_bootstrap_script, NavDecision, THEME_BOOTSTRAP_APPEARANCE_MARKER,
+        THEME_BOOTSTRAP_RUN_ID_MARKER, THEME_BOOTSTRAP_WINDOW_LABEL_MARKER,
     };
     use crate::config_io::ThemeBootstrapSelection;
     use tauri::{utils::config::Color, Theme, Url};
 
     fn decide(s: &str) -> NavDecision {
         classify_navigation(&Url::parse(s).expect("parse url"))
+    }
+
+    #[test]
+    fn native_exit_requires_the_shared_frontend_confirmation_except_for_restart() {
+        assert!(should_request_exit_confirmation(None, false));
+        assert!(should_request_exit_confirmation(Some(0), false));
+        assert!(!should_request_exit_confirmation(None, true));
+        assert!(!should_request_exit_confirmation(
+            Some(tauri::RESTART_EXIT_CODE),
+            false
+        ));
     }
 
     #[test]

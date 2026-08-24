@@ -60,22 +60,22 @@
     "undoReferenceOnly": "已移除引用，但文件删除失败",
     "mode": {
       "chat": "对话",
-      "thought": "想法",
-      "switchToThought": "按 Tab 切换到「想法」",
+      "record": "记录",
+      "switchToRecord": "按 Tab 切换到「记录」",
       "switchToChat": "按 Tab 切换到「对话」"
     },
     "mention": {
       "workspaceFiles": "工作区文件",
-      "thoughts": "想法",
+      "thoughts": "记录",
       "switchHint": "⌘/Ctrl + ←/→ 切换",
       "filePlaceholder": "输入文件名搜索...",
       "searching": "搜索中...",
       "noFiles": "未找到文件",
-      "emptyThoughts": "暂无想法，先在「任务中心」记录吧",
+      "emptyThoughts": "暂无记录，先在「任务中心」保存一条吧",
       "noThoughtMatchesPrefix": "没有匹配",
-      "noThoughtMatchesSuffix": "的想法",
-      "recentThoughts": "最近 {{count}} 条想法",
-      "matchedThoughts": "匹配 \"{{query}}\" 的想法 · {{count}} 条",
+      "noThoughtMatchesSuffix": "的记录",
+      "recentThoughts": "最近 {{count}} 条记录",
+      "matchedThoughts": "匹配 \"{{query}}\" 的记录 · {{count}} 条",
       "thoughtSoftCap": "已显示前 {{count}} 条匹配，请输入更精确的关键词"
     },
     "permissionModes": {

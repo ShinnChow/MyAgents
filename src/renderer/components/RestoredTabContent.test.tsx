@@ -23,14 +23,24 @@ vi.mock('@/context/TabProvider', () => ({
 const chatRenderSpy = vi.hoisted(() => vi.fn());
 const taskCenterRenderSpy = vi.hoisted(() => vi.fn());
 vi.mock('@/pages/Chat', () => ({
-  default: ({ windowPresentation }: { windowPresentation: MainWindowPresentation }) => {
+  default: ({
+    windowPresentation,
+  }: {
+    windowPresentation: MainWindowPresentation;
+  }) => {
     chatRenderSpy(windowPresentation);
     return <div data-testid="chat" />;
   },
 }));
-vi.mock('@/pages/Launcher', () => ({ default: () => <div data-testid="launcher" /> }));
+vi.mock('@/pages/Launcher', () => ({
+  default: () => <div data-testid="launcher" />,
+}));
 vi.mock('@/pages/Settings', () => ({
-  default: function MockSettings({ mode = 'settings' }: { mode?: 'settings' | 'capabilities' }) {
+  default: function MockSettings({
+    mode = 'settings',
+  }: {
+    mode?: 'settings' | 'capabilities';
+  }) {
     const [draft, setDraft] = useState('');
     return (
       <input
@@ -65,8 +75,14 @@ function restoredTab(over: Partial<Tab> = {}): Tab {
   };
 }
 
-const AVAILABLE_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 0 };
-const SUSPENDED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: false, generation: 1 };
+const AVAILABLE_PRESENTATION: MainWindowPresentation = {
+  surfaceAvailable: true,
+  generation: 0,
+};
+const SUSPENDED_PRESENTATION: MainWindowPresentation = {
+  surfaceAvailable: false,
+  generation: 1,
+};
 
 const noopProps = {
   windowPresentation: AVAILABLE_PRESENTATION,
@@ -81,6 +97,11 @@ const noopProps = {
   capabilityInitialSelect: undefined,
   onLauncherWorkspaceSelectionChange: vi.fn(),
   onLaunchProject: vi.fn(),
+  onStartRecording: vi.fn(async () => {}),
+  onRecordingSnapshotChange: vi.fn(),
+  onRecordTitleChange: vi.fn(),
+  onRecordDeleted: vi.fn(),
+  onOpenRecord: vi.fn(),
   onOpenHistorySession: vi.fn(async () => {}),
   onNewSession: vi.fn(async () => true),
   onLaunchRuntimeBackedProviderSession: vi.fn(async () => null),
@@ -165,10 +186,18 @@ describe('restored live chat tab', () => {
 
   it('mounts TabProvider immediately for an inactive restored tab too', async () => {
     tabProviderSpy.mockClear();
-    render(<MemoizedTabContent tab={restoredTab()} isActive={false} {...noopProps} />);
+    render(
+      <MemoizedTabContent
+        tab={restoredTab()}
+        isActive={false}
+        {...noopProps}
+      />,
+    );
     expect(tabProviderSpy).toHaveBeenCalledTimes(1);
     expect(await screen.findByTestId('chat')).toBeInTheDocument();
-    expect(screen.getByTestId('tab-provider').parentElement).toHaveClass('invisible');
+    expect(screen.getByTestId('tab-provider').parentElement).toHaveClass(
+      'invisible',
+    );
   });
 
   it('projects native presentation only through the active Chat slot', async () => {
@@ -198,20 +227,40 @@ describe('restored live chat tab', () => {
         windowPresentation={SUSPENDED_PRESENTATION}
       />,
     );
-    await waitFor(() => expect(chatRenderSpy).toHaveBeenLastCalledWith(SUSPENDED_PRESENTATION));
+    await waitFor(() =>
+      expect(chatRenderSpy).toHaveBeenLastCalledWith(SUSPENDED_PRESENTATION),
+    );
   });
 
   it('keeps Settings and Capabilities UI state in their own mounted Tab slots', async () => {
     const settingsTab: Tab = {
-      id: 'settings-tab', agentDir: null, sessionId: null, view: 'settings', title: 'Settings', sidecarConfigDisposition: 'push',
+      id: 'settings-tab',
+      agentDir: null,
+      sessionId: null,
+      view: 'settings',
+      title: 'Settings',
+      sidecarConfigDisposition: 'push',
     };
     const capabilitiesTab: Tab = {
-      id: 'capabilities-tab', agentDir: null, sessionId: null, view: 'capabilities', title: 'Capabilities', sidecarConfigDisposition: 'push',
+      id: 'capabilities-tab',
+      agentDir: null,
+      sessionId: null,
+      view: 'capabilities',
+      title: 'Capabilities',
+      sidecarConfigDisposition: 'push',
     };
     const contents = (active: 'settings' | 'capabilities') => (
       <>
-        <MemoizedTabContent tab={settingsTab} isActive={active === 'settings'} {...noopProps} />
-        <MemoizedTabContent tab={capabilitiesTab} isActive={active === 'capabilities'} {...noopProps} />
+        <MemoizedTabContent
+          tab={settingsTab}
+          isActive={active === 'settings'}
+          {...noopProps}
+        />
+        <MemoizedTabContent
+          tab={capabilitiesTab}
+          isActive={active === 'capabilities'}
+          {...noopProps}
+        />
       </>
     );
     const view = render(contents('settings'));
@@ -261,9 +310,11 @@ describe('restored live chat tab', () => {
         taskPendingRoute={route(1)}
       />,
     );
-    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ generation: 1 }),
-    ));
+    await waitFor(() =>
+      expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ generation: 1 }),
+      ),
+    );
 
     view.rerender(
       <MemoizedTabContent
@@ -273,8 +324,10 @@ describe('restored live chat tab', () => {
         taskPendingRoute={route(2)}
       />,
     );
-    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ generation: 2 }),
-    ));
+    await waitFor(() =>
+      expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ generation: 2 }),
+      ),
+    );
   });
 });

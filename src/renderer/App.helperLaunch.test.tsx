@@ -85,9 +85,44 @@ const mocks = vi.hoisted(() => {
     startBackgroundCompletion: vi.fn(async () => ({ started: false, sessionId: 'session' })),
     querySessionHasPersistentOwners: vi.fn(async () => false),
     canRestoreSession: vi.fn(async () => true),
+    recordGet: vi.fn(async (recordId: string) => ({
+      id: recordId,
+      kind: 'audio' as const,
+      title: 'Recovered Record',
+      tags: [],
+      createdAt: 1,
+      updatedAt: 2,
+      archived: false,
+      convertedTaskIds: [],
+      revision: 1,
+    }) as {
+      id: string;
+      kind: 'audio';
+      title: string;
+      tags: string[];
+      createdAt: number;
+      updatedAt: number;
+      archived: boolean;
+      convertedTaskIds: string[];
+      revision: number;
+    } | null),
     durableTabs: null as null | {
       version: 1;
-      tabs: Array<{ id: string; agentDir: string; sessionId: string; title: string }>;
+      tabs: Array<
+        | {
+            view?: 'chat';
+            id: string;
+            agentDir: string;
+            sessionId: string;
+            title: string;
+          }
+        | {
+            view: 'record';
+            id: string;
+            recordId: string;
+            title: string;
+          }
+      >;
       activeTabId: string | null;
     },
     lastExitWasClean: true,
@@ -202,6 +237,10 @@ vi.mock('@/api/sessionClient', () => ({
   updateSession: vi.fn(async () => undefined),
 }));
 
+vi.mock('@/api/taskCenter', () => ({
+  recordGet: mocks.recordGet,
+}));
+
 vi.mock('@/components/ChatBootOverlay', () => ({
   default: () => <div data-testid="chat-boot-overlay" />,
 }));
@@ -258,7 +297,7 @@ vi.mock('@/components/LinkContextMenuProvider', () => ({
 }));
 
 vi.mock('@/components/TabBar', () => ({
-  default: (props: { tabs: Array<{ id: string; title: string; sessionId?: string | null; view?: string; sidecarConfigDisposition?: string }>; activeTabId: string | null; onSelectTab: (tabId: string) => void; onCloseTab: (tabId: string) => Promise<void>; onNewTab: () => void }) => {
+  default: (props: { tabs: Array<{ id: string; title: string; sessionId?: string | null; view?: string; recordId?: string; sidecarConfigDisposition?: string }>; activeTabId: string | null; onSelectTab: (tabId: string) => void; onCloseTab: (tabId: string) => Promise<void>; onNewTab: () => void }) => {
     mocks.tabbarProps.push(props);
     return <div data-testid="tabbar-active">{props.tabs.find(t => t.id === props.activeTabId)?.title ?? 'missing'}</div>;
   },
@@ -311,6 +350,12 @@ vi.mock('@/pages/Settings', () => ({
 
 vi.mock('@/pages/TaskCenter', () => ({
   default: () => <div data-testid="taskcenter-page" />,
+}));
+
+vi.mock('@/pages/RecordDetail', () => ({
+  default: ({ recordId }: { recordId: string }) => (
+    <div data-testid="record-detail-page">{recordId}</div>
+  ),
 }));
 
 vi.mock('@/components/Toast', () => ({
@@ -491,6 +536,17 @@ describe('App helper launch', () => {
     mocks.cancelBackgroundCompletion.mockResolvedValue(undefined);
     mocks.querySessionHasPersistentOwners.mockResolvedValue(false);
     mocks.canRestoreSession.mockResolvedValue(true);
+    mocks.recordGet.mockResolvedValue({
+      id: 'restored-record',
+      kind: 'audio',
+      title: 'Recovered Record',
+      tags: [],
+      createdAt: 1,
+      updatedAt: 2,
+      archived: false,
+      convertedTaskIds: [],
+      revision: 1,
+    });
     mocks.resolveBuiltinSelection.mockReturnValue({ provider: mocks.provider, model: 'mimo-v2.5-pro' });
   });
 
@@ -567,7 +623,7 @@ describe('App helper launch', () => {
     const props = mocks.tabbarProps.at(-1);
     if (!props) throw new Error('TabBar props were not captured');
     return props as {
-      tabs: Array<{ id: string; title: string; sessionId?: string | null; view?: string }>;
+      tabs: Array<{ id: string; title: string; sessionId?: string | null; view?: string; recordId?: string }>;
       activeTabId: string | null;
       onSelectTab: (tabId: string) => void;
       onNewTab: () => void;
@@ -1216,6 +1272,84 @@ describe('App helper launch', () => {
         expect.stringMatching(/^tab-/),
       );
     });
+  });
+
+  it('restores a persisted Record tab without creating a Session owner', async () => {
+    localStorage.clear();
+    mocks.lastExitWasClean = false;
+    mocks.durableTabs = {
+      version: 1,
+      tabs: [
+        {
+          view: 'record',
+          id: 'restored-record-tab',
+          recordId: 'restored-record',
+          title: 'Persisted Record title',
+        },
+      ],
+      activeTabId: 'restored-record-tab',
+    };
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId('restore-session'));
+
+    await waitFor(() => {
+      const latest = latestTabbarProps();
+      const restored = latest.tabs.find(
+        (tab) => tab.id === 'restored-record-tab',
+      );
+      expect(restored).toEqual(
+        expect.objectContaining({
+          view: 'record',
+          recordId: 'restored-record',
+          title: 'Recovered Record',
+          sessionId: null,
+        }),
+      );
+      expect(latest.activeTabId).toBe('restored-record-tab');
+    });
+    expect(mocks.recordGet).toHaveBeenCalledWith('restored-record');
+    expect(mocks.canRestoreSession).not.toHaveBeenCalled();
+    expect(mocks.ensureSessionSidecar).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the Records list when a persisted Record was deleted', async () => {
+    localStorage.clear();
+    mocks.lastExitWasClean = false;
+    mocks.recordGet.mockResolvedValueOnce(null);
+    mocks.durableTabs = {
+      version: 1,
+      tabs: [
+        {
+          view: 'record',
+          id: 'missing-record-tab',
+          recordId: 'deleted-record',
+          title: 'Deleted Record',
+        },
+      ],
+      activeTabId: 'missing-record-tab',
+    };
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId('restore-session'));
+
+    await waitFor(() => {
+      const latest = latestTabbarProps();
+      const fallback = latest.tabs.find(
+        (tab) => tab.id === 'missing-record-tab',
+      );
+      expect(fallback).toEqual(
+        expect.objectContaining({
+          view: 'taskcenter',
+          sessionId: null,
+        }),
+      );
+      expect(fallback).not.toHaveProperty('recordId');
+      expect(latest.activeTabId).toBe('missing-record-tab');
+    });
+    expect(mocks.toast.info).toHaveBeenCalledTimes(1);
+    expect(mocks.canRestoreSession).not.toHaveBeenCalled();
+    expect(mocks.ensureSessionSidecar).not.toHaveBeenCalled();
   });
 
   it('holds Session opening admission while a restore candidate is validated', async () => {

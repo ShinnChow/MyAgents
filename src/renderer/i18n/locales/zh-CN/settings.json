@@ -1492,6 +1492,38 @@
         "unsupported": "当前平台暂不支持"
       }
     },
+    "speechResource": {
+      "capabilities": "语音识别能力",
+      "diarization": "说话人区分",
+      "install": "安装模型",
+      "retry": "重试安装",
+      "remove": "移除",
+      "downloading": "正在安全下载并校验模型…",
+      "removing": "正在移除模型…",
+      "size": "下载 {{download}} · 安装后 {{installed}}",
+      "authorizationHint": "上方开关只控制 Agent 是否可调用；本地录音始终可使用已安装的语音能力。",
+      "operationFailed": "语音模型安装失败，未完整校验的资源不会生效。",
+      "removeFailed": "语音模型暂时无法移除，可能仍有任务正在使用。",
+      "activationWarning": "模型已安装，但系统未能确认目录同步完成；本次可用，异常断电后可能需要重装。",
+      "states": {
+        "checking": "正在检查本地模型…",
+        "not_installed": "尚未安装本地模型",
+        "installing": "正在安装本地模型",
+        "removing": "正在移除本地模型",
+        "ready": "本地模型已就绪"
+      },
+      "errors": {
+        "default": "本地语音资源暂时不可用，请检查网络、磁盘空间或稍后重试。",
+        "SPEECH_RESOURCE_MANIFEST_DOWNLOAD_FAILED": "无法获取官方模型清单，请检查网络或代理后重试。",
+        "SPEECH_RESOURCE_MANIFEST_SIGNATURE_INVALID": "官方模型清单签名校验失败，未安装任何不可信资源。",
+        "SPEECH_RESOURCE_DOWNLOAD_FAILED": "模型下载失败，请检查网络或代理后重试。",
+        "SPEECH_RESOURCE_SHA256_MISMATCH": "模型完整性校验失败，未安装损坏的资源。",
+        "SPEECH_RESOURCE_DISK_FULL": "磁盘空间不足，请释放空间后重试。",
+        "SPEECH_NATIVE_RUNTIME_UNAVAILABLE": "当前安装包缺少本地语音运行时，暂时无法安装模型。",
+        "SPEECH_RESOURCE_CORRUPT": "已安装模型不完整或已损坏，请重新安装。",
+        "SPEECH_RESOURCE_BUSY": "语音资源正在被任务使用，请稍后再试。"
+      }
+    },
     "dialogs": {
       "vision": {
         "title": "图片理解设置",

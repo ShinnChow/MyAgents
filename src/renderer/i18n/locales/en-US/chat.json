@@ -60,22 +60,22 @@
     "undoReferenceOnly": "Reference removed, but file deletion failed.",
     "mode": {
       "chat": "Chat",
-      "thought": "Thought",
-      "switchToThought": "Press Tab to switch to Thought",
+      "record": "Records",
+      "switchToRecord": "Press Tab to switch to Records",
       "switchToChat": "Press Tab to switch to Chat"
     },
     "mention": {
       "workspaceFiles": "Workspace files",
-      "thoughts": "Thoughts",
+      "thoughts": "Records",
       "switchHint": "⌘/Ctrl + ←/→ to switch",
       "filePlaceholder": "Type a filename to search...",
       "searching": "Searching...",
       "noFiles": "No files found",
-      "emptyThoughts": "No thoughts yet. Capture one in Task Center first.",
-      "noThoughtMatchesPrefix": "No thoughts match",
+      "emptyThoughts": "No records yet. Capture one in Task Center first.",
+      "noThoughtMatchesPrefix": "No records match",
       "noThoughtMatchesSuffix": "",
-      "recentThoughts": "Recent {{count}} thoughts",
-      "matchedThoughts": "Thoughts matching \"{{query}}\" · {{count}}",
+      "recentThoughts": "Recent {{count}} records",
+      "matchedThoughts": "Records matching \"{{query}}\" · {{count}}",
       "thoughtSoftCap": "Showing the first {{count}} matches. Type a more specific keyword."
     },
     "permissionModes": {

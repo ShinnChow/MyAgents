@@ -17,14 +17,19 @@ use super::archive::{
     recover_ogg_opus_archive, ArchiveResult, TrackArchiveHandle, ARCHIVE_SAMPLE_RATE,
 };
 use super::capture::{
-    CaptureBackend, CaptureEvent, CapturePlan, CaptureSelection, CaptureSession, CaptureSinks,
-    CaptureTrackSink, PlatformCaptureBackend, PreparedSource,
+    CaptureActivity, CaptureBackend, CaptureEvent, CapturePlan, CaptureSelection, CaptureSession,
+    CaptureSinks, CaptureTrackSink, PlatformCaptureBackend, PreparedSource,
 };
 use super::lifecycle::{LifecycleEvent, LifecycleJournal};
 use crate::record::{
     audio_track_relative_path, AudioRecordCreateInput, AudioTrackArtifactInput, AudioTrackKind,
     CaptureStatus, ManagedRecordStore, Record, RecordArchiveFilter, RecordKind, RecordListFilter,
     RecordTranscriptTrackOffset, TranscriptionStatus,
+};
+use crate::record_analytics::{
+    self, AnalyticsOutcome, AnalyticsSource, AnalyticsSurface, CaptureSources,
+    RecordAnalyticsMilestone, RecordingFinishReason, RecordingRecoveryOutcome, SpeechResourceState,
+    SystemAudioCapability, TranscriptionMode,
 };
 use crate::speech_recognition::{self, SpeechResourceStatus};
 use crate::wake_lock::WakeLock;
@@ -42,6 +47,13 @@ pub struct RecordingWarning {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct RecordingSourceActivity {
+    pub track: AudioTrackKind,
+    pub level_percent: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordingSnapshot {
     pub record_id: String,
     pub revision: u64,
@@ -51,6 +63,7 @@ pub struct RecordingSnapshot {
     pub media_duration_ms: u64,
     pub paused_wall_ms: u64,
     pub sources: Vec<PreparedSource>,
+    pub source_activity: Vec<RecordingSourceActivity>,
     pub warnings: Vec<RecordingWarning>,
 }
 
@@ -131,7 +144,9 @@ struct ActiveRecording {
     segment_started: Option<Instant>,
     pause_started: Option<Instant>,
     paused_wall_ms: u64,
+    pause_count: usize,
     sources: Vec<PreparedSource>,
+    source_activity: Vec<(AudioTrackKind, CaptureActivity)>,
     warnings: Vec<RecordingWarning>,
     journal: LifecycleJournal,
     session: Option<Arc<StdMutex<Box<dyn CaptureSession>>>>,
@@ -164,6 +179,18 @@ impl ActiveRecording {
                     .unwrap_or(0),
             ),
             sources: self.sources.clone(),
+            source_activity: self
+                .source_activity
+                .iter()
+                .map(|(track, activity)| RecordingSourceActivity {
+                    track: *track,
+                    level_percent: if self.capture_status == CaptureStatus::Recording {
+                        activity.level_percent()
+                    } else {
+                        0
+                    },
+                })
+                .collect(),
             warnings: self.warnings.clone(),
         }
     }
@@ -238,8 +265,15 @@ impl RecordingManager {
             if !is_slot_owning_status(audio.capture_status) {
                 continue;
             }
+            let record_id = record.id.clone();
             if let Err(error) = self.recover_record(record).await {
                 ulog_warn!("[recording] startup recovery failed: {}", error);
+                record_analytics::emit(RecordAnalyticsMilestone::RecordingRecovery {
+                    event_schema_version: 1,
+                    record_id,
+                    outcome: RecordingRecoveryOutcome::Unrecoverable,
+                    error_code: Some("RECORDING_RECOVERY_FAILED".to_string()),
+                });
             }
         }
     }
@@ -273,6 +307,7 @@ impl RecordingManager {
 
         let mut artifacts = Vec::new();
         let mut repaired_tracks = Vec::new();
+        let mut unrecoverable_tracks = 0_usize;
         let mut media_samples = 0_u64;
         for (track, result) in repair_results {
             match result {
@@ -286,13 +321,16 @@ impl RecordingManager {
                         repaired_tracks.push(format!("{track:?}").to_ascii_lowercase());
                     }
                 }
-                Ok(None) => {}
-                Err(error) => ulog_warn!(
-                    "[recording] skipped unrecoverable track recordId={} track={:?} error={}",
-                    record.id,
-                    track,
-                    error
-                ),
+                Ok(None) => unrecoverable_tracks = unrecoverable_tracks.saturating_add(1),
+                Err(error) => {
+                    unrecoverable_tracks = unrecoverable_tracks.saturating_add(1);
+                    ulog_warn!(
+                        "[recording] skipped unrecoverable track recordId={} track={:?} error={}",
+                        record.id,
+                        track,
+                        error
+                    );
+                }
             }
         }
         let media_ms = media_samples.saturating_mul(1_000) / ARCHIVE_SAMPLE_RATE as u64;
@@ -384,10 +422,98 @@ impl RecordingManager {
             status,
             media_ms
         );
+        record_analytics::emit(RecordAnalyticsMilestone::RecordingRecovery {
+            event_schema_version: 1,
+            record_id: record.id,
+            outcome: if !has_artifacts {
+                RecordingRecoveryOutcome::Unrecoverable
+            } else if unrecoverable_tracks > 0 {
+                RecordingRecoveryOutcome::Partial
+            } else {
+                RecordingRecoveryOutcome::Repaired
+            },
+            error_code: (unrecoverable_tracks > 0)
+                .then(|| "RECORDING_TRACK_RECOVERY_PARTIAL".to_string()),
+        });
         Ok(())
     }
 
     pub async fn start(
+        self: &Arc<Self>,
+        input: RecordingStartInput,
+    ) -> Result<RecordingStartResult, String> {
+        let selection = input.selection;
+        let result = self.start_inner(input).await;
+        let capability = speech_recognition::global().map(|manager| manager.capability_snapshot());
+        let resource_state = match capability.as_ref().map(|value| value.resource_status) {
+            Some(SpeechResourceStatus::Ready) => SpeechResourceState::Ready,
+            Some(SpeechResourceStatus::NotInstalled) | None => SpeechResourceState::NotInstalled,
+            Some(SpeechResourceStatus::NativeUnavailable) => SpeechResourceState::NativeUnavailable,
+        };
+        let (record_id, capture_sources, transcription_mode, system_audio_capability) =
+            match &result {
+                Ok(result) => (
+                    Some(result.snapshot.record_id.clone()),
+                    analytics_capture_sources(&result.snapshot.sources),
+                    if capability
+                        .as_ref()
+                        .is_some_and(|value| value.resource_status == SpeechResourceStatus::Ready)
+                    {
+                        TranscriptionMode::Live
+                    } else {
+                        TranscriptionMode::Unavailable
+                    },
+                    if !selection.system {
+                        SystemAudioCapability::NotRequested
+                    } else if result
+                        .snapshot
+                        .sources
+                        .iter()
+                        .any(|source| source.track == AudioTrackKind::System)
+                    {
+                        SystemAudioCapability::Available
+                    } else {
+                        SystemAudioCapability::Unavailable
+                    },
+                ),
+                Err(_) => (
+                    None,
+                    analytics_requested_sources(selection),
+                    if resource_state == SpeechResourceState::Ready {
+                        TranscriptionMode::Live
+                    } else {
+                        TranscriptionMode::Unavailable
+                    },
+                    if selection.system {
+                        SystemAudioCapability::Unavailable
+                    } else {
+                        SystemAudioCapability::NotRequested
+                    },
+                ),
+            };
+        if result.as_ref().is_err()
+            || result
+                .as_ref()
+                .is_ok_and(|value| !value.attached_to_existing)
+        {
+            record_analytics::emit(RecordAnalyticsMilestone::RecordingStartResult {
+                event_schema_version: 1,
+                record_id,
+                ok: result.is_ok(),
+                capture_sources,
+                transcription_mode,
+                resource_state,
+                system_audio_capability,
+                error_code: result
+                    .as_ref()
+                    .err()
+                    .map(|error| normalized_recording_error(error, "RECORDING_START_FAILED")),
+            });
+        }
+        result
+    }
+
+    async fn start_inner(
         self: &Arc<Self>,
         input: RecordingStartInput,
     ) -> Result<RecordingStartResult, String> {
@@ -446,6 +572,11 @@ impl RecordingManager {
                 transcription_status: initial_transcription_status,
             })
             .await?;
+        record_analytics::emit_record_create(
+            &record,
+            AnalyticsSource::Desktop,
+            AnalyticsSurface::LauncherInput,
+        );
         let workspace = match self.record_store.audio_workspace_path(&record.id).await {
             Ok(workspace) => workspace,
             Err(error) => {
@@ -586,7 +717,12 @@ impl RecordingManager {
             (Vec::new(), false)
         };
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut warnings = Vec::new();
+        let mut warnings = plan
+            .warnings
+            .iter()
+            .cloned()
+            .map(|code| RecordingWarning { code })
+            .collect::<Vec<_>>();
         if let Some(warning) = wake_warning {
             warnings.push(warning);
         }
@@ -600,7 +736,9 @@ impl RecordingManager {
             segment_started: None,
             pause_started: None,
             paused_wall_ms: 0,
+            pause_count: 0,
             sources: plan.sources.clone(),
+            source_activity: Vec::new(),
             warnings,
             journal,
             session: None,
@@ -623,11 +761,13 @@ impl RecordingManager {
         self.emit_change(preparing_snapshot, true);
 
         let sinks = {
-            let state = self.state.lock().await;
-            let Some(RecordingSlot::Live(active)) = state.slot.as_ref() else {
+            let mut state = self.state.lock().await;
+            let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
                 return Err("recording admission was superseded".to_string());
             };
-            capture_sinks(&active.archives, &active.analyses)
+            let (sinks, source_activity) = capture_sinks(&active.archives, &active.analyses);
+            active.source_activity = source_activity;
+            sinks
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let backend = self.backend.clone();
@@ -640,7 +780,7 @@ impl RecordingManager {
                 self.settle_generation_locked(
                     generation,
                     CaptureStatus::Failed,
-                    "device_open_failed",
+                    RecordingFinishReason::DeviceOpenFailed,
                     None,
                 )
                 .await?;
@@ -671,7 +811,7 @@ impl RecordingManager {
                     .settle_generation_locked(
                         generation,
                         CaptureStatus::Interrupted,
-                        "recording_state_commit_failed",
+                        RecordingFinishReason::RecordingStateCommitFailed,
                         None,
                     )
                     .await;
@@ -731,7 +871,7 @@ impl RecordingManager {
                     .settle_generation_locked(
                         generation,
                         CaptureStatus::Interrupted,
-                        "recording_journal_commit_failed",
+                        RecordingFinishReason::RecordingJournalCommitFailed,
                         None,
                     )
                     .await;
@@ -876,7 +1016,7 @@ impl RecordingManager {
             self.settle_generation_locked(
                 generation,
                 CaptureStatus::Interrupted,
-                "pause_resume_failed",
+                RecordingFinishReason::PauseResumeFailed,
                 None,
             )
             .await?;
@@ -927,7 +1067,7 @@ impl RecordingManager {
                     .settle_generation_locked(
                         generation,
                         CaptureStatus::Interrupted,
-                        "pause_resume_state_commit_failed",
+                        RecordingFinishReason::PauseResumeStateCommitFailed,
                         None,
                     )
                     .await;
@@ -948,13 +1088,17 @@ impl RecordingManager {
                 active.media_before_segment_ms = media_ms;
                 active.segment_started = None;
                 active.pause_started = Some(Instant::now());
-                active.journal.append(
+                let result = active.journal.append(
                     now_ms(),
                     media_ms,
                     LifecycleEvent::PauseStarted {
                         operation_id: input.operation_id.clone(),
                     },
-                )
+                );
+                if result.is_ok() {
+                    active.pause_count = active.pause_count.saturating_add(1);
+                }
+                result
             } else {
                 let paused_wall_ms = paused_started_at
                     .map(|started| duration_ms(started.elapsed()))
@@ -984,7 +1128,7 @@ impl RecordingManager {
                     .settle_generation_locked(
                         generation,
                         CaptureStatus::Interrupted,
-                        "pause_resume_journal_failed",
+                        RecordingFinishReason::PauseResumeJournalFailed,
                         None,
                     )
                     .await;
@@ -1024,7 +1168,7 @@ impl RecordingManager {
         self.settle_generation_locked(
             generation,
             CaptureStatus::Ready,
-            "user_stop",
+            RecordingFinishReason::UserStop,
             Some(input.operation_id),
         )
         .await
@@ -1040,7 +1184,12 @@ impl RecordingManager {
             slot.snapshot().generation
         };
         let snapshot = self
-            .settle_generation_locked(generation, CaptureStatus::Ready, "app_exit", None)
+            .settle_generation_locked(
+                generation,
+                CaptureStatus::Ready,
+                RecordingFinishReason::AppExit,
+                None,
+            )
             .await?;
         if matches!(
             snapshot.capture_status,
@@ -1071,7 +1220,7 @@ impl RecordingManager {
         self: &Arc<Self>,
         generation: u64,
         desired_terminal: CaptureStatus,
-        reason: &str,
+        reason: RecordingFinishReason,
         operation_id: Option<String>,
     ) -> Result<RecordingSnapshot, String> {
         let _operation = self.operation_gate.lock().await;
@@ -1083,7 +1232,7 @@ impl RecordingManager {
         self: &Arc<Self>,
         generation: u64,
         desired_terminal: CaptureStatus,
-        reason: &str,
+        reason: RecordingFinishReason,
         operation_id: Option<String>,
     ) -> Result<RecordingSnapshot, String> {
         let mut active = {
@@ -1116,7 +1265,7 @@ impl RecordingManager {
             LifecycleEvent::CaptureStatusChanged {
                 from: "active".to_string(),
                 to: "stopping".to_string(),
-                reason: reason.to_string(),
+                reason: reason.as_str().to_string(),
             },
         ) {
             ulog_warn!(
@@ -1309,6 +1458,7 @@ impl RecordingManager {
             media_duration_ms: final_media_ms,
             paused_wall_ms: active.snapshot().paused_wall_ms,
             sources: active.sources,
+            source_activity: Vec::new(),
             warnings: active.warnings,
         };
         {
@@ -1324,6 +1474,26 @@ impl RecordingManager {
             }
         }
         self.emit_change(terminal_snapshot.clone(), false);
+        let audio_bytes = terminal_record
+            .audio
+            .as_ref()
+            .map_or(0, |audio| audio.size_bytes);
+        let analytics_store = self.record_store.clone();
+        let analytics_record_id = terminal_snapshot.record_id.clone();
+        let analytics_capture_status = terminal_snapshot.capture_status;
+        let analytics_pause_count = active.pause_count;
+        tauri::async_runtime::spawn(async move {
+            emit_recording_finish_analytics(
+                analytics_store,
+                analytics_record_id,
+                analytics_capture_status,
+                reason,
+                final_media_ms,
+                analytics_pause_count,
+                audio_bytes,
+            )
+            .await;
+        });
         if !settled.archive_errors.is_empty() {
             ulog_warn!(
                 "[recording] finalized interrupted recordId={} errors={}",
@@ -1361,7 +1531,7 @@ impl RecordingManager {
                                 .settle_generation(
                                     generation,
                                     CaptureStatus::Interrupted,
-                                    "device_fatal",
+                                    RecordingFinishReason::DeviceFatal,
                                     None,
                                 )
                                 .await;
@@ -1374,7 +1544,12 @@ impl RecordingManager {
                         if let Err(error) = ensure_disk_budget(manager.record_store.root_dir()) {
                             ulog_warn!("[recording] low disk safe stop: {}", error);
                             let _ = manager
-                                .settle_generation(generation, CaptureStatus::Interrupted, "low_disk", None)
+                                .settle_generation(
+                                    generation,
+                                    CaptureStatus::Interrupted,
+                                    RecordingFinishReason::LowDisk,
+                                    None,
+                                )
                                 .await;
                             break;
                         }
@@ -1561,24 +1736,26 @@ fn checkpoint_analyses(
 fn capture_sinks(
     archives: &[TrackArchiveHandle],
     analyses: &[TrackAnalysisHandle],
-) -> CaptureSinks {
+) -> (CaptureSinks, Vec<(AudioTrackKind, CaptureActivity)>) {
     let mut sinks = CaptureSinks {
         microphone: None,
         system: None,
     };
+    let mut source_activity = Vec::new();
     for archive in archives {
         let analysis = analyses
             .iter()
             .find(|analysis| analysis.track == archive.track)
             .map(|analysis| analysis.sink.clone());
         let sink = CaptureTrackSink::new(archive.sink.clone(), analysis);
+        source_activity.push((archive.track, sink.activity()));
         match archive.track {
             AudioTrackKind::Microphone => sinks.microphone = Some(sink),
             AudioTrackKind::System => sinks.system = Some(sink),
             _ => {}
         }
     }
-    sinks
+    (sinks, source_activity)
 }
 
 fn operation_result(
@@ -1628,6 +1805,196 @@ fn validate_operation_id(operation_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn analytics_requested_sources(selection: CaptureSelection) -> CaptureSources {
+    match (selection.microphone, selection.system) {
+        (true, true) => CaptureSources::MicrophoneSystem,
+        (true, false) => CaptureSources::Microphone,
+        (false, true) => CaptureSources::System,
+        (false, false) => CaptureSources::None,
+    }
+}
+
+fn analytics_capture_sources(sources: &[PreparedSource]) -> CaptureSources {
+    let microphone = sources
+        .iter()
+        .any(|source| source.track == AudioTrackKind::Microphone);
+    let system = sources
+        .iter()
+        .any(|source| source.track == AudioTrackKind::System);
+    analytics_requested_sources(CaptureSelection { microphone, system })
+}
+
+fn normalized_recording_error(error: &str, fallback: &str) -> String {
+    let candidate = error.split_whitespace().next().unwrap_or_default();
+    if candidate.len() <= 64
+        && (candidate.starts_with("RECORDING_") || candidate.starts_with("CAPTURE_"))
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        candidate.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+async fn emit_recording_finish_analytics(
+    record_store: ManagedRecordStore,
+    record_id: String,
+    capture_status: CaptureStatus,
+    reason: RecordingFinishReason,
+    media_ms: u64,
+    pause_count: usize,
+    audio_bytes: u64,
+) {
+    let timeline = record_store.read_timeline(&record_id).await.ok();
+    let (note_count, mark_count) = timeline.map_or((0, 0), |timeline| {
+        timeline
+            .items
+            .into_iter()
+            .fold((0, 0), |(notes, marks), item| match item {
+                crate::record::RecordTimelineItem::Note { .. } => (notes + 1, marks),
+                crate::record::RecordTimelineItem::Mark { .. } => (notes, marks + 1),
+            })
+    });
+    let covered_ms = record_store
+        .read_transcript_projection(&record_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(0, |transcript| transcript_covered_ms(&transcript.segments));
+    let finalizations = record_store
+        .read_live_segment_finalizations(&record_id)
+        .await
+        .unwrap_or_default();
+    let latency_buckets = record_store
+        .audio_workspace_path(&record_id)
+        .await
+        .ok()
+        .and_then(|workspace| recording_latency_buckets(&workspace, &record_id, &finalizations));
+    record_analytics::emit(RecordAnalyticsMilestone::RecordingFinish {
+        event_schema_version: 1,
+        record_id,
+        outcome: match capture_status {
+            CaptureStatus::Ready => AnalyticsOutcome::Success,
+            CaptureStatus::Interrupted => AnalyticsOutcome::Partial,
+            _ => AnalyticsOutcome::Failed,
+        },
+        finish_reason: reason,
+        media_duration_bucket: record_analytics::media_duration_bucket(media_ms),
+        pause_count_bucket: record_analytics::small_count_bucket(pause_count),
+        note_count_bucket: record_analytics::small_count_bucket(note_count),
+        mark_count_bucket: record_analytics::small_count_bucket(mark_count),
+        audio_bytes_bucket: record_analytics::media_bytes_bucket(audio_bytes),
+        live_transcript_coverage: record_analytics::transcript_coverage_bucket(
+            covered_ms, media_ms,
+        ),
+        segment_latency_p50_bucket: latency_buckets.map(|value| value.0),
+        segment_latency_p95_bucket: latency_buckets.map(|value| value.1),
+    });
+}
+
+fn transcript_covered_ms(segments: &[crate::record::RecordTranscriptSegment]) -> u64 {
+    let mut microphone = Vec::new();
+    let mut system = Vec::new();
+    for segment in segments {
+        match segment.track {
+            AudioTrackKind::Microphone => {
+                microphone.push((segment.start_sample, segment.end_sample))
+            }
+            AudioTrackKind::System => system.push((segment.start_sample, segment.end_sample)),
+            AudioTrackKind::Mixed => {}
+        }
+    }
+    let covered_samples = [microphone, system]
+        .into_iter()
+        .map(|mut intervals| {
+            intervals.sort_unstable();
+            let mut covered = 0_u64;
+            let mut current: Option<(u64, u64)> = None;
+            for (start, end) in intervals {
+                current = match current {
+                    None => Some((start, end)),
+                    Some((current_start, current_end)) if start <= current_end => {
+                        Some((current_start, current_end.max(end)))
+                    }
+                    Some((current_start, current_end)) => {
+                        covered = covered.saturating_add(current_end.saturating_sub(current_start));
+                        Some((start, end))
+                    }
+                };
+            }
+            if let Some((start, end)) = current {
+                covered = covered.saturating_add(end.saturating_sub(start));
+            }
+            covered
+        })
+        .max()
+        .unwrap_or(0);
+    covered_samples.saturating_mul(1_000) / 16_000
+}
+
+fn recording_latency_buckets(
+    workspace: &Path,
+    record_id: &str,
+    finalizations: &[crate::record::RecordSegmentFinalization],
+) -> Option<(
+    record_analytics::SegmentLatencyBucket,
+    record_analytics::SegmentLatencyBucket,
+)> {
+    if finalizations.is_empty() {
+        return None;
+    }
+    let lifecycle = LifecycleJournal::read_entries(workspace, record_id).ok()?;
+    let capture_started_at = lifecycle.iter().find_map(|entry| match &entry.event {
+        LifecycleEvent::CaptureStatusChanged { to, .. } if to == "recording" => {
+            Some(entry.wall_time_ms)
+        }
+        _ => None,
+    })?;
+    let pauses = lifecycle
+        .iter()
+        .filter_map(|entry| match entry.event {
+            LifecycleEvent::PauseEnded { paused_wall_ms, .. } => {
+                Some((entry.media_ms, paused_wall_ms))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut latencies = finalizations
+        .iter()
+        .map(|finalization| {
+            let prior_pause_ms = pauses
+                .iter()
+                .filter(|(media_ms, _)| *media_ms < finalization.media_ms)
+                .map(|(_, paused_ms)| *paused_ms)
+                .sum::<u64>();
+            let expected_wall_time = capture_started_at
+                .saturating_add(i64::try_from(finalization.media_ms).unwrap_or(i64::MAX))
+                .saturating_add(i64::try_from(prior_pause_ms).unwrap_or(i64::MAX));
+            u64::try_from(
+                finalization
+                    .wall_time_ms
+                    .saturating_sub(expected_wall_time)
+                    .max(0),
+            )
+            .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    latencies.sort_unstable();
+    let p50 = latencies[(latencies.len() - 1) / 2];
+    let p95_index = latencies
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1);
+    let p95 = latencies[p95_index.min(latencies.len() - 1)];
+    Some((
+        record_analytics::segment_latency_bucket(p50),
+        record_analytics::segment_latency_bucket(p95),
+    ))
+}
+
 fn ensure_disk_budget(path: &Path) -> Result<(), String> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let available = crate::filesystem_capacity::available_space(&canonical).map_err(|error| {
@@ -1671,6 +2038,7 @@ fn snapshot_from_record(
         media_duration_ms: audio.map_or(0, |audio| audio.media_duration_ms),
         paused_wall_ms: 0,
         sources,
+        source_activity: Vec::new(),
         warnings,
     }
 }
@@ -1729,6 +2097,67 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::thread::JoinHandle;
     use tempfile::tempdir;
+
+    #[test]
+    fn transcript_latency_uses_media_time_and_completed_pauses() {
+        let root = tempdir().unwrap();
+        let record_id = "record-latency";
+        let mut journal = LifecycleJournal::open(root.path(), record_id).unwrap();
+        journal
+            .append(
+                1_000,
+                0,
+                LifecycleEvent::CaptureStatusChanged {
+                    from: "preparing".into(),
+                    to: "recording".into(),
+                    reason: "devices_opened".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                2_000,
+                1_000,
+                LifecycleEvent::PauseStarted {
+                    operation_id: "pause-1".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                5_000,
+                1_000,
+                LifecycleEvent::PauseEnded {
+                    operation_id: "resume-1".into(),
+                    paused_wall_ms: 3_000,
+                },
+            )
+            .unwrap();
+
+        let buckets = recording_latency_buckets(
+            root.path(),
+            record_id,
+            &[
+                crate::record::RecordSegmentFinalization {
+                    wall_time_ms: 2_500,
+                    media_ms: 1_000,
+                },
+                crate::record::RecordSegmentFinalization {
+                    wall_time_ms: 7_000,
+                    media_ms: 2_000,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            buckets.0,
+            record_analytics::SegmentLatencyBucket::FiveHundredToOneThousandMilliseconds
+        );
+        assert_eq!(
+            buckets.1,
+            record_analytics::SegmentLatencyBucket::OneToTwoSeconds
+        );
+    }
 
     struct FakeBackend;
 
@@ -1846,6 +2275,9 @@ mod tests {
         assert_eq!(attached.snapshot.record_id, started.snapshot.record_id);
 
         tokio::time::sleep(Duration::from_millis(35)).await;
+        let activity = manager.snapshot().await.unwrap().source_activity;
+        assert_eq!(activity.len(), 2);
+        assert!(activity.iter().all(|source| source.level_percent > 0));
         let paused = manager
             .pause(RecordingCommandInput {
                 record_id: started.snapshot.record_id.clone(),
@@ -1855,6 +2287,10 @@ mod tests {
             .await
             .unwrap();
         let frozen = paused.media_duration_ms;
+        assert!(paused
+            .source_activity
+            .iter()
+            .all(|source| source.level_percent == 0));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(manager.snapshot().await.unwrap().media_duration_ms, frozen);
         let resumed = manager

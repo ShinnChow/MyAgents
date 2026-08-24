@@ -5,14 +5,15 @@
 import type { Tab } from '@/types/tab';
 
 export type TabContentKind =
-    | 'deferred' // one-frame placeholder for a freshly created heavy non-Chat tab
-    | 'deferred-chat' // live TabProvider + lightweight boot surface; Chat mounts later
-    | 'launcher'
-    | 'settings'
-    | 'capabilities'
-    | 'taskcenter'
-    | 'space'
-    | 'chat'; // every chat tab is live and mounts TabProvider
+  | 'deferred' // one-frame placeholder for a freshly created heavy non-Chat tab
+  | 'deferred-chat' // live TabProvider + lightweight boot surface; Chat mounts later
+  | 'launcher'
+  | 'settings'
+  | 'capabilities'
+  | 'taskcenter'
+  | 'space'
+  | 'record'
+  | 'chat'; // every chat tab is live and mounts TabProvider
 
 /**
  * Decide which content branch a tab renders. Order matters:
@@ -21,12 +22,17 @@ export type TabContentKind =
  *  - non-chat views are dispatched by `view`
  *  - every chat tab mounts the normal TabProvider path
  */
-export function tabContentKind(tab: Tab, isDeferredMount: boolean): TabContentKind {
-    if (isDeferredMount) return tab.view === 'chat' ? 'deferred-chat' : 'deferred';
-    if (tab.view === 'launcher') return 'launcher';
-    if (tab.view === 'settings') return 'settings';
-    if (tab.view === 'capabilities') return 'capabilities';
-    if (tab.view === 'taskcenter') return 'taskcenter';
-    if (tab.view === 'space') return 'space';
-    return 'chat';
+export function tabContentKind(
+  tab: Tab,
+  isDeferredMount: boolean,
+): TabContentKind {
+  if (isDeferredMount)
+    return tab.view === 'chat' ? 'deferred-chat' : 'deferred';
+  if (tab.view === 'launcher') return 'launcher';
+  if (tab.view === 'settings') return 'settings';
+  if (tab.view === 'capabilities') return 'capabilities';
+  if (tab.view === 'taskcenter') return 'taskcenter';
+  if (tab.view === 'space') return 'space';
+  if (tab.view === 'record') return 'record';
+  return 'chat';
 }

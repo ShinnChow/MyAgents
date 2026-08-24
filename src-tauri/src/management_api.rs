@@ -3868,9 +3868,18 @@ async fn thought_create_handler(
             images: input.images,
         })
         .await
-        .and_then(thought::Thought::try_from)
     {
-        Ok(record) => Json(serde_json::json!({ "ok": true, "thought": record })),
+        Ok(record) => {
+            crate::record_analytics::emit_record_create(
+                &record,
+                crate::record_analytics::AnalyticsSource::CliAgent,
+                crate::record_analytics::AnalyticsSurface::Unknown,
+            );
+            match thought::Thought::try_from(record) {
+                Ok(thought) => Json(serde_json::json!({ "ok": true, "thought": thought })),
+                Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
+            }
+        }
         Err(e) => Json(serde_json::json!({ "ok": false, "error": e })),
     }
 }
@@ -3930,7 +3939,14 @@ async fn record_create_handler(
         }));
     };
     match store.create_text(input).await {
-        Ok(record) => Json(serde_json::json!({ "ok": true, "record": record })),
+        Ok(record) => {
+            crate::record_analytics::emit_record_create(
+                &record,
+                crate::record_analytics::AnalyticsSource::CliAgent,
+                crate::record_analytics::AnalyticsSurface::Unknown,
+            );
+            Json(serde_json::json!({ "ok": true, "record": record }))
+        }
         Err(error) => Json(serde_json::json!({ "ok": false, "error": error })),
     }
 }

@@ -90,17 +90,12 @@ impl SearchEngine {
             let mut changes = store.subscribe_changes();
             let record_index = self.record_index.clone();
             tauri::async_runtime::spawn(async move {
-                let baseline = store
-                    .list_full(crate::record::RecordListFilter {
-                        archived: Some(crate::record::RecordArchiveFilter::All),
-                        ..Default::default()
-                    })
-                    .await;
+                let baseline = store.all_search_documents().await;
                 match record_index.rebuild(&baseline) {
                     Ok(()) => {
                         let _ = app_handle.emit("record-search-index-ready", ());
                         ulog_info!(
-                            "[search] Record baseline ready: {} document(s)",
+                            "[search] Record baseline ready: {} search document(s)",
                             baseline.len()
                         );
                     }
@@ -114,9 +109,14 @@ impl SearchEngine {
                         Ok(change) => {
                             let result = match change.kind {
                                 crate::record::RecordChangeKind::Upsert => {
-                                    match store.get(&change.id).await {
-                                        Some(record) => record_index.upsert(&record),
-                                        None => record_index.delete(&change.id),
+                                    match store.search_documents(&change.id).await {
+                                        Ok(documents) => {
+                                            record_index.upsert(&change.id, &documents)
+                                        }
+                                        Err(error) if error.starts_with("Record not found:") => {
+                                            record_index.delete(&change.id)
+                                        }
+                                        Err(error) => Err(error),
                                     }
                                 }
                                 crate::record::RecordChangeKind::Delete => {
@@ -137,12 +137,7 @@ impl SearchEngine {
                                 "[search] Record observer lagged by {} event(s); rebuilding",
                                 count
                             );
-                            let snapshot = store
-                                .list_full(crate::record::RecordListFilter {
-                                    archived: Some(crate::record::RecordArchiveFilter::All),
-                                    ..Default::default()
-                                })
-                                .await;
+                            let snapshot = store.all_search_documents().await;
                             if let Err(error) = record_index.rebuild(&snapshot) {
                                 ulog_error!("[search] Record lag recovery failed: {}", error);
                             }
