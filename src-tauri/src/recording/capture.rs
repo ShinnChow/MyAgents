@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-use super::archive::{RealtimeTrackSink, SourceFormat};
+use super::audio::{RealtimeTrackSink, SourceFormat};
 use crate::record::AudioTrackKind;
 #[cfg(target_os = "linux")]
 use crate::ulog_warn;
@@ -93,8 +93,58 @@ pub enum CaptureEvent {
 }
 
 pub struct CaptureSinks {
-    pub microphone: Option<RealtimeTrackSink>,
-    pub system: Option<RealtimeTrackSink>,
+    pub microphone: Option<CaptureTrackSink>,
+    pub system: Option<CaptureTrackSink>,
+}
+
+/// The capture callback has one bounded fan-out point. Archive delivery is
+/// always attempted first because the durable recording remains authoritative;
+/// live analysis may fail independently without degrading the archive.
+#[derive(Clone)]
+pub struct CaptureTrackSink {
+    archive: RealtimeTrackSink,
+    analysis: Option<RealtimeTrackSink>,
+}
+
+impl CaptureTrackSink {
+    pub fn new(archive: RealtimeTrackSink, analysis: Option<RealtimeTrackSink>) -> Self {
+        Self { archive, analysis }
+    }
+
+    pub(crate) fn push_f32(&self, samples: &[f32]) {
+        self.archive.push_f32(samples);
+        if let Some(analysis) = self.analysis.as_ref() {
+            analysis.push_f32(samples);
+        }
+    }
+
+    fn push_i16(&self, samples: &[i16]) {
+        self.archive.push_i16(samples);
+        if let Some(analysis) = self.analysis.as_ref() {
+            analysis.push_i16(samples);
+        }
+    }
+
+    fn push_i32(&self, samples: &[i32]) {
+        self.archive.push_i32(samples);
+        if let Some(analysis) = self.analysis.as_ref() {
+            analysis.push_i32(samples);
+        }
+    }
+
+    fn push_i8(&self, samples: &[i8]) {
+        self.archive.push_i8(samples);
+        if let Some(analysis) = self.analysis.as_ref() {
+            analysis.push_i8(samples);
+        }
+    }
+
+    fn push_planar_f32(&self, planes: &[&[f32]]) {
+        self.archive.push_planar_f32(planes);
+        if let Some(analysis) = self.analysis.as_ref() {
+            analysis.push_planar_f32(planes);
+        }
+    }
 }
 
 pub trait CaptureSession: Send {
@@ -444,7 +494,7 @@ fn resolve_device(host: &cpal::Host, id: &str) -> Result<Device, String> {
 fn open_cpal_stream(
     host: &cpal::Host,
     endpoint: &CpalEndpoint,
-    sink: RealtimeTrackSink,
+    sink: CaptureTrackSink,
     events: mpsc::UnboundedSender<CaptureEvent>,
 ) -> Result<cpal::Stream, String> {
     let device = resolve_device(host, &endpoint.device_id)?;
@@ -497,7 +547,7 @@ fn open_cpal_stream(
 #[cfg(target_os = "macos")]
 fn open_macos_system_stream(
     display_id: u32,
-    sink: RealtimeTrackSink,
+    sink: CaptureTrackSink,
     events: mpsc::UnboundedSender<CaptureEvent>,
 ) -> Result<screencapturekit::stream::SCStream, String> {
     use screencapturekit::prelude::*;

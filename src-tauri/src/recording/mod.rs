@@ -1,6 +1,8 @@
 //! App-global recording authority.
 
+pub(crate) mod analysis;
 mod archive;
+pub(crate) mod audio;
 mod capture;
 mod lifecycle;
 pub(crate) mod manager;

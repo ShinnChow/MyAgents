@@ -234,6 +234,10 @@ pub enum WorkerCommand {
         identity: WorkloadIdentity,
         streams: Vec<PcmStreamEnd>,
     },
+    Flush {
+        protocol_version: u32,
+        identity: WorkloadIdentity,
+    },
     Cancel {
         protocol_version: u32,
         identity: WorkloadIdentity,
@@ -256,6 +260,7 @@ impl std::fmt::Debug for WorkerCommand {
             Self::Finalize { identity, .. } => {
                 formatter.debug_tuple("Finalize").field(identity).finish()
             }
+            Self::Flush { identity, .. } => formatter.debug_tuple("Flush").field(identity).finish(),
             Self::Cancel { identity, .. } => {
                 formatter.debug_tuple("Cancel").field(identity).finish()
             }
@@ -278,6 +283,9 @@ impl WorkerCommand {
             Self::Finalize {
                 protocol_version, ..
             }
+            | Self::Flush {
+                protocol_version, ..
+            }
             | Self::Cancel {
                 protocol_version, ..
             }
@@ -294,6 +302,7 @@ impl WorkerCommand {
         match self {
             Self::Start(start) => &start.identity,
             Self::Finalize { identity, .. }
+            | Self::Flush { identity, .. }
             | Self::Cancel { identity, .. }
             | Self::Yield { identity, .. }
             | Self::Ping { identity, .. } => identity,
@@ -307,7 +316,9 @@ impl WorkerCommand {
         match self {
             Self::Start(start) => start.has_valid_shape(),
             Self::Finalize { streams, .. } => valid_stream_ends(streams),
-            Self::Cancel { .. } | Self::Yield { .. } | Self::Ping { .. } => true,
+            Self::Flush { .. } | Self::Cancel { .. } | Self::Yield { .. } | Self::Ping { .. } => {
+                true
+            }
         }
     }
 }
@@ -872,18 +883,25 @@ mod tests {
 
     #[test]
     fn control_frame_round_trips_without_exposing_paths_in_debug() {
-        let command = WorkerCommand::Start(start_request());
-        let mut wire = Vec::new();
-        write_control_frame(&mut wire, &command).unwrap();
-        let ManagerFrame::Control(decoded) =
-            read_manager_frame(&mut wire.as_slice()).unwrap().unwrap()
-        else {
-            panic!("expected control frame");
-        };
-        assert_eq!(decoded, command);
-        let debug = format!("{decoded:?}");
-        assert!(!debug.contains("/private/"));
-        assert!(!debug.contains("libonnxruntime"));
+        for command in [
+            WorkerCommand::Start(start_request()),
+            WorkerCommand::Flush {
+                protocol_version: PROTOCOL_VERSION,
+                identity: identity(),
+            },
+        ] {
+            let mut wire = Vec::new();
+            write_control_frame(&mut wire, &command).unwrap();
+            let ManagerFrame::Control(decoded) =
+                read_manager_frame(&mut wire.as_slice()).unwrap().unwrap()
+            else {
+                panic!("expected control frame");
+            };
+            assert_eq!(decoded, command);
+            let debug = format!("{decoded:?}");
+            assert!(!debug.contains("/private/"));
+            assert!(!debug.contains("libonnxruntime"));
+        }
     }
 
     #[test]

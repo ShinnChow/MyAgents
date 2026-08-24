@@ -10,15 +10,18 @@ use crate::local_inference::{
 };
 use crate::process_cmd;
 use crate::record::{
-    AudioTrackKind, DiarizationStatus, ManagedRecordStore, RecordKind, RecordSpeakerTurn,
-    RecordSpeechProvenance, RecordTranscriptSegment, TranscriptionStatus,
+    AudioTrackKind, DiarizationStatus, ManagedRecordStore, RecordKind, RecordLiveTranscriptJournal,
+    RecordSpeakerTurn, RecordSpeechProvenance, RecordTranscriptSegment,
+    RecordTranscriptTrackOffset, TranscriptionStatus,
 };
+use crate::recording::analysis::{cleanup_analysis_spool, AnalysisSpoolSource};
 use crate::speech_model_pack_manager::{SpeechModelPackManager, SpeechModelPackStatus};
 use chrono::{DateTime, Duration, Utc};
 use myagents_media_worker_protocol::{
-    read_worker_response, write_control_frame, RecordArtifactInput, SpeakerTurn, StartRequest,
-    TrackKind, WorkerCommand, WorkerMetrics, WorkerResponse, WorkerStage, WorkloadIdentity,
-    WorkloadInput, WorkloadKind, PROTOCOL_VERSION,
+    read_worker_response, write_control_frame, write_pcm_frame, PcmFrame, PcmStreamEnd,
+    PcmStreamStart, RecordArtifactInput, SpeakerTurn, StartRequest, TrackKind, WorkerCommand,
+    WorkerMetrics, WorkerResponse, WorkerStage, WorkloadIdentity, WorkloadInput, WorkloadKind,
+    MAX_MEDIA_SAMPLES_PER_TRACK, MAX_PCM_SAMPLES_PER_FRAME, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -26,7 +29,9 @@ use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration as StdDuration;
 use tokio::sync::Notify;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -40,6 +45,8 @@ const YIELD_GRACE_SECONDS: u64 = 15;
 const MAX_TRANSCRIPT_SEGMENTS: usize = 100_000;
 const MAX_TRANSCRIPT_CHARACTERS: usize = 5_000_000;
 const MAX_DIARIZATION_TURNS: usize = 200_000;
+const LIVE_WORKER_RESPONSE_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const LIVE_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
 pub const SPEECH_HISTORY_RETENTION_DAYS: i64 = 30;
 
 pub type ManagedSpeechRecognition = Arc<SpeechRecognitionManager>;
@@ -270,7 +277,59 @@ struct ManagerState {
     queue: VecDeque<String>,
     active_job: Option<(String, u64)>,
     running: Option<RunningWorker>,
+    live_sessions: HashMap<String, LiveSessionRegistration>,
+    live_running: Option<RunningWorker>,
     next_generation: u64,
+}
+
+struct LiveSessionRegistration {
+    control: Arc<LiveControl>,
+    tracks: Vec<AudioTrackKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveBoundary {
+    offsets: Vec<RecordTranscriptTrackOffset>,
+}
+
+#[derive(Default)]
+struct LiveControlState {
+    flushes: VecDeque<LiveBoundary>,
+    finish: Option<LiveBoundary>,
+    cancelled: bool,
+}
+
+#[derive(Default)]
+struct LiveControl {
+    state: Mutex<LiveControlState>,
+}
+
+impl LiveControl {
+    fn snapshot(&self) -> Result<LiveControlStateSnapshot, &'static str> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        Ok(LiveControlStateSnapshot {
+            flush: state.flushes.front().cloned(),
+            finish: state.finish.clone(),
+            cancelled: state.cancelled,
+        })
+    }
+
+    fn complete_flush(&self, boundary: &LiveBoundary) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.flushes.front() == Some(boundary) {
+                state.flushes.pop_front();
+            }
+        }
+    }
+}
+
+struct LiveControlStateSnapshot {
+    flush: Option<LiveBoundary>,
+    finish: Option<LiveBoundary>,
+    cancelled: bool,
 }
 
 struct RunningWorker {
@@ -320,6 +379,22 @@ enum SpeechWorkerOutcome {
         code: String,
         retryable: bool,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LiveAttemptOutcome {
+    Finished,
+    Cancelled,
+    Failed { code: String, retryable: bool },
+}
+
+struct LiveTrackCursor {
+    source: AnalysisSpoolSource,
+    track: TrackKind,
+    generation_start: u64,
+    position: u64,
+    next_sequence: u64,
+    last_sequence: Option<u64>,
 }
 
 pub struct SpeechRecognitionManager {
@@ -409,6 +484,8 @@ impl SpeechRecognitionManager {
                 queue,
                 active_job: None,
                 running: None,
+                live_sessions: HashMap::new(),
+                live_running: None,
                 next_generation: 1,
             }),
             wake: Notify::new(),
@@ -592,6 +669,692 @@ impl SpeechRecognitionManager {
         Ok(job)
     }
 
+    pub(crate) async fn start_record_live(
+        self: &Arc<Self>,
+        record_id: &str,
+        sources: Vec<AnalysisSpoolSource>,
+    ) -> Result<(), String> {
+        validate_job_id(record_id).map_err(str::to_string)?;
+        validate_live_sources(&sources)?;
+        let resources = self.execution_resources().map_err(str::to_string)?;
+        let record = self
+            .record_store
+            .get(record_id)
+            .await
+            .ok_or_else(|| "SPEECH_RECORD_NOT_FOUND".to_string())?;
+        let audio = record
+            .audio
+            .as_ref()
+            .filter(|_| record.kind == RecordKind::Audio)
+            .ok_or_else(|| "SPEECH_RECORD_AUDIO_UNAVAILABLE".to_string())?;
+        let tracks = sources
+            .iter()
+            .map(AnalysisSpoolSource::track)
+            .collect::<Vec<_>>();
+        if tracks.len() != audio.tracks.len()
+            || tracks.iter().any(|track| !audio.tracks.contains(track))
+        {
+            return Err("SPEECH_ANALYSIS_SOURCE_INVALID".to_string());
+        }
+        let control = Arc::new(LiveControl::default());
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+            if !state.accepting {
+                return Err("SPEECH_MANAGER_SHUTTING_DOWN".to_string());
+            }
+            if state.live_sessions.contains_key(record_id) || !state.live_sessions.is_empty() {
+                return Err("SPEECH_RECORD_LIVE_ALREADY_ACTIVE".to_string());
+            }
+            state.live_sessions.insert(
+                record_id.to_string(),
+                LiveSessionRegistration {
+                    control: control.clone(),
+                    tracks,
+                },
+            );
+        }
+        let journal = match self
+            .record_store
+            .begin_live_transcript(record_id, resources.provenance.clone())
+            .await
+        {
+            Ok(journal) => journal,
+            Err(error) => {
+                self.remove_live_session(record_id);
+                return Err(error);
+            }
+        };
+        let manager = Arc::clone(self);
+        let record_id = record_id.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            manager.run_live_session(record_id, sources, resources, control, journal)
+        });
+        Ok(())
+    }
+
+    pub(crate) fn flush_record_live(
+        &self,
+        record_id: &str,
+        offsets: Vec<RecordTranscriptTrackOffset>,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        let session = state
+            .live_sessions
+            .get(record_id)
+            .ok_or_else(|| "SPEECH_RECORD_LIVE_NOT_ACTIVE".to_string())?;
+        let boundary = normalize_live_boundary(&session.tracks, offsets)?;
+        let mut control = session
+            .control
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        if control.cancelled || control.finish.is_some() {
+            return Err("SPEECH_RECORD_LIVE_FINALIZING".to_string());
+        }
+        if let Some(previous) = control.flushes.back() {
+            ensure_boundary_monotonic(previous, &boundary)?;
+            if previous == &boundary {
+                return Ok(());
+            }
+        }
+        control.flushes.push_back(boundary);
+        Ok(())
+    }
+
+    pub(crate) fn finish_record_live(
+        &self,
+        record_id: &str,
+        offsets: Vec<RecordTranscriptTrackOffset>,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        let session = state
+            .live_sessions
+            .get(record_id)
+            .ok_or_else(|| "SPEECH_RECORD_LIVE_NOT_ACTIVE".to_string())?;
+        let boundary = normalize_live_boundary(&session.tracks, offsets)?;
+        let mut control = session
+            .control
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        if control.cancelled {
+            return Err("SPEECH_RECORD_LIVE_NOT_ACTIVE".to_string());
+        }
+        if let Some(existing) = &control.finish {
+            return if existing == &boundary {
+                Ok(())
+            } else {
+                Err("SPEECH_RECORD_LIVE_FINALIZE_CONFLICT".to_string())
+            };
+        }
+        if let Some(previous) = control.flushes.back() {
+            ensure_boundary_monotonic(previous, &boundary)?;
+        }
+        control.finish = Some(boundary);
+        Ok(())
+    }
+
+    fn run_live_session(
+        self: Arc<Self>,
+        record_id: String,
+        sources: Vec<AnalysisSpoolSource>,
+        resources: SpeechExecutionResources,
+        control: Arc<LiveControl>,
+        mut journal: RecordLiveTranscriptJournal,
+    ) {
+        let mut attempts = 0_u32;
+        let mut finished = false;
+        let mut cancelled = false;
+        let mut terminal_error = None;
+        while attempts < MAX_WORKER_ATTEMPTS {
+            let control_snapshot = match control.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(code) => {
+                    terminal_error = Some(code.to_string());
+                    break;
+                }
+            };
+            if control_snapshot.cancelled {
+                cancelled = true;
+                break;
+            }
+            let generation = match self.allocate_live_generation(&record_id) {
+                Ok(generation) => generation,
+                Err(code) => {
+                    terminal_error = Some(code.to_string());
+                    break;
+                }
+            };
+            let replay_from = journal.replay_offsets();
+            if let Err(error) = journal.append_generation_started(generation, replay_from.clone()) {
+                crate::ulog_error!(
+                    "[speech] live journal generation start failed recordId={} generation={} error={}",
+                    record_id,
+                    generation,
+                    error
+                );
+                terminal_error = Some("SPEECH_JOB_STORE_WRITE_FAILED".to_string());
+                break;
+            }
+            attempts = attempts.saturating_add(1);
+            let compute = ComputeWorkloadIdentity {
+                kind: ComputeWorkloadKind::RecordLive,
+                id: record_id.clone(),
+                generation,
+            };
+            let lease = tauri::async_runtime::block_on(self.compute_coordinator.acquire(compute));
+            if control
+                .snapshot()
+                .map_or(true, |snapshot| snapshot.cancelled)
+            {
+                cancelled = true;
+                drop(lease);
+                break;
+            }
+            let outcome = self.execute_live_attempt(
+                &record_id,
+                generation,
+                &sources,
+                &resources,
+                &control,
+                &mut journal,
+            );
+            drop(lease);
+            match outcome {
+                LiveAttemptOutcome::Finished => {
+                    finished = true;
+                    break;
+                }
+                LiveAttemptOutcome::Cancelled => {
+                    cancelled = true;
+                    break;
+                }
+                LiveAttemptOutcome::Failed { code, retryable } => {
+                    let _ = journal.append_generation_failed(generation, &code);
+                    if !retryable {
+                        terminal_error = Some(code);
+                        break;
+                    }
+                    terminal_error = Some(code);
+                }
+            }
+        }
+
+        if finished {
+            if let Err(error) = journal.finish() {
+                crate::ulog_error!(
+                    "[speech] live journal finalization failed recordId={} error={}",
+                    record_id,
+                    error
+                );
+            }
+        } else if !cancelled {
+            let code = terminal_error.as_deref().unwrap_or("SPEECH_WORKER_CRASHED");
+            if let Err(error) = journal.fail(code) {
+                crate::ulog_error!(
+                    "[speech] live journal failure commit failed recordId={} error={}",
+                    record_id,
+                    error
+                );
+            }
+            while control
+                .snapshot()
+                .is_ok_and(|snapshot| !snapshot.cancelled && snapshot.finish.is_none())
+            {
+                thread::sleep(LIVE_POLL_INTERVAL);
+            }
+        }
+
+        self.clear_live_running(&record_id);
+        self.remove_live_session(&record_id);
+        for source in &sources {
+            if let Err(error) = cleanup_analysis_spool(source.path()) {
+                crate::ulog_warn!(
+                    "[speech] analysis spool cleanup failed recordId={} track={:?} error={}",
+                    record_id,
+                    source.track(),
+                    error
+                );
+            }
+        }
+    }
+
+    fn allocate_live_generation(&self, record_id: &str) -> Result<u64, &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        if !state.accepting || !state.live_sessions.contains_key(record_id) {
+            return Err("SPEECH_INTERRUPTED");
+        }
+        let generation = state.next_generation;
+        state.next_generation = state.next_generation.saturating_add(1).max(1);
+        Ok(generation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_live_attempt(
+        &self,
+        record_id: &str,
+        generation: u64,
+        sources: &[AnalysisSpoolSource],
+        resources: &SpeechExecutionResources,
+        control: &Arc<LiveControl>,
+        journal: &mut RecordLiveTranscriptJournal,
+    ) -> LiveAttemptOutcome {
+        let replay_from = journal.replay_offsets();
+        let mut cursors = match live_cursors(sources, &replay_from) {
+            Ok(cursors) => cursors,
+            Err(code) => return live_failed(code, false),
+        };
+        let lifecycle_spawn_permit = match crate::sidecar::begin_lifecycle_spawn_permit() {
+            Ok(permit) => permit,
+            Err(_) => return LiveAttemptOutcome::Cancelled,
+        };
+        let (child, stdin, stdout) = match self.spawn_live_worker(record_id, generation, resources)
+        {
+            Ok(worker) => worker,
+            Err(code) => return live_failed(code, true),
+        };
+        drop(lifecycle_spawn_permit);
+        let identity = WorkloadIdentity {
+            workload_id: record_id.to_string(),
+            worker_generation: generation,
+        };
+        let start = WorkerCommand::Start(StartRequest {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            workload_kind: WorkloadKind::RecordLiveAsr,
+            input: WorkloadInput::LivePcm {
+                streams: cursors
+                    .iter()
+                    .map(|cursor| PcmStreamStart {
+                        track: cursor.track,
+                        first_sequence: cursor.next_sequence,
+                        first_sample: cursor.position,
+                    })
+                    .collect(),
+            },
+            native_manifest_path: match path_for_protocol(&resources.native_manifest_path) {
+                Ok(path) => path,
+                Err(code) => {
+                    return settle_live_spawn_failure(
+                        self, record_id, generation, &child, code, false,
+                    )
+                }
+            },
+            onnx_runtime_path: match path_for_protocol(&resources.onnx_runtime_path) {
+                Ok(path) => path,
+                Err(code) => {
+                    return settle_live_spawn_failure(
+                        self, record_id, generation, &child, code, false,
+                    )
+                }
+            },
+            model_pack_manifest_path: match path_for_protocol(&resources.model_pack_manifest_path) {
+                Ok(path) => path,
+                Err(code) => {
+                    return settle_live_spawn_failure(
+                        self, record_id, generation, &child, code, false,
+                    )
+                }
+            },
+        });
+        if send_worker_command(&stdin, &start).is_err() {
+            return settle_live_spawn_failure(
+                self,
+                record_id,
+                generation,
+                &child,
+                "SPEECH_WORKER_PROTOCOL_ERROR",
+                true,
+            );
+        }
+        let responses = spawn_live_response_reader(stdout, generation);
+        match receive_live_response(&responses) {
+            Ok(WorkerResponse::Ready {
+                identity: ready_identity,
+                ..
+            }) if ready_identity == identity => {}
+            Ok(WorkerResponse::Failed {
+                identity: failed_identity,
+                code,
+                ..
+            }) if failed_identity == identity => {
+                kill_worker(&child);
+                self.clear_live_running(record_id);
+                return live_failed(&code, worker_code_retryable(&code));
+            }
+            Ok(mut response) => {
+                response.zeroize_sensitive();
+                return settle_live_spawn_failure(
+                    self,
+                    record_id,
+                    generation,
+                    &child,
+                    "SPEECH_WORKER_PROTOCOL_ERROR",
+                    true,
+                );
+            }
+            Err((code, retryable)) => {
+                return settle_live_spawn_failure(
+                    self, record_id, generation, &child, &code, retryable,
+                );
+            }
+        }
+
+        let mut next_worker_revision = 1_u64;
+        loop {
+            let snapshot = match control.snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(code) => {
+                    return settle_live_spawn_failure(
+                        self, record_id, generation, &child, code, false,
+                    )
+                }
+            };
+            if snapshot.cancelled {
+                let _ = send_worker_command(
+                    &stdin,
+                    &WorkerCommand::Cancel {
+                        protocol_version: PROTOCOL_VERSION,
+                        identity: identity.clone(),
+                    },
+                );
+                kill_worker(&child);
+                self.clear_live_running(record_id);
+                return LiveAttemptOutcome::Cancelled;
+            }
+            let boundary = snapshot.flush.as_ref().or(snapshot.finish.as_ref());
+            let mut progressed = false;
+            for cursor in &mut cursors {
+                let progress = cursor.source.snapshot();
+                if let Some(code) = progress.error_code.as_deref() {
+                    return settle_live_spawn_failure(
+                        self, record_id, generation, &child, code, false,
+                    );
+                }
+                let requested_end = boundary
+                    .and_then(|boundary| boundary_sample(boundary, cursor.source.track()))
+                    .unwrap_or(progress.committed_samples);
+                if requested_end > progress.committed_samples {
+                    if progress.finished {
+                        return settle_live_spawn_failure(
+                            self,
+                            record_id,
+                            generation,
+                            &child,
+                            "SPEECH_ANALYSIS_SOURCE_INVALID",
+                            false,
+                        );
+                    }
+                    continue;
+                }
+                if cursor.position >= requested_end {
+                    continue;
+                }
+                let sample_count = usize::try_from(
+                    requested_end
+                        .saturating_sub(cursor.position)
+                        .min(16_000)
+                        .min(MAX_PCM_SAMPLES_PER_FRAME as u64),
+                )
+                .unwrap_or(MAX_PCM_SAMPLES_PER_FRAME);
+                let samples = match cursor.source.read_samples(cursor.position, sample_count) {
+                    Ok(samples) if !samples.is_empty() => samples,
+                    Ok(_) => continue,
+                    Err(code) => {
+                        return settle_live_spawn_failure(
+                            self, record_id, generation, &child, code, false,
+                        )
+                    }
+                };
+                let end_sample = cursor.position.saturating_add(samples.len() as u64);
+                let mut frame = PcmFrame {
+                    protocol_version: PROTOCOL_VERSION,
+                    worker_generation: generation,
+                    track: cursor.track,
+                    sequence: cursor.next_sequence,
+                    start_sample: cursor.position,
+                    samples,
+                };
+                let send_result = send_pcm_frame(&stdin, &frame);
+                frame.samples.zeroize();
+                if send_result.is_err() {
+                    return settle_live_spawn_failure(
+                        self,
+                        record_id,
+                        generation,
+                        &child,
+                        "SPEECH_WORKER_PROTOCOL_ERROR",
+                        true,
+                    );
+                }
+                let response = read_live_frame_settlement(
+                    &responses,
+                    &identity,
+                    journal,
+                    &mut next_worker_revision,
+                    Some((cursor.track, cursor.next_sequence, end_sample)),
+                    None,
+                );
+                if let Err((code, retryable)) = response {
+                    return settle_live_spawn_failure(
+                        self, record_id, generation, &child, &code, retryable,
+                    );
+                }
+                cursor.position = end_sample;
+                cursor.last_sequence = Some(cursor.next_sequence);
+                let Some(next_sequence) = cursor.next_sequence.checked_add(1) else {
+                    return settle_live_spawn_failure(
+                        self,
+                        record_id,
+                        generation,
+                        &child,
+                        "SPEECH_RESOURCE_LIMIT",
+                        false,
+                    );
+                };
+                cursor.next_sequence = next_sequence;
+                progressed = true;
+            }
+
+            if let Some(flush) = snapshot.flush.as_ref() {
+                if cursors_reached(&cursors, flush) {
+                    if send_worker_command(
+                        &stdin,
+                        &WorkerCommand::Flush {
+                            protocol_version: PROTOCOL_VERSION,
+                            identity: identity.clone(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        return settle_live_spawn_failure(
+                            self,
+                            record_id,
+                            generation,
+                            &child,
+                            "SPEECH_WORKER_PROTOCOL_ERROR",
+                            true,
+                        );
+                    }
+                    if let Err((code, retryable)) = read_live_frame_settlement(
+                        &responses,
+                        &identity,
+                        journal,
+                        &mut next_worker_revision,
+                        None,
+                        None,
+                    ) {
+                        return settle_live_spawn_failure(
+                            self, record_id, generation, &child, &code, retryable,
+                        );
+                    }
+                    control.complete_flush(flush);
+                    continue;
+                }
+            } else if let Some(finish) = snapshot.finish.as_ref() {
+                if cursors_reached(&cursors, finish) {
+                    if cursors.iter().all(|cursor| cursor.last_sequence.is_none()) {
+                        let _ = send_worker_command(
+                            &stdin,
+                            &WorkerCommand::Cancel {
+                                protocol_version: PROTOCOL_VERSION,
+                                identity: identity.clone(),
+                            },
+                        );
+                        kill_worker(&child);
+                        self.clear_live_running(record_id);
+                        return LiveAttemptOutcome::Finished;
+                    }
+                    let ends = cursors
+                        .iter()
+                        .map(|cursor| PcmStreamEnd {
+                            track: cursor.track,
+                            last_sequence: cursor.last_sequence,
+                            final_sample: cursor.position,
+                        })
+                        .collect();
+                    let expected_source_samples =
+                        cursors.iter().try_fold(0_u64, |total, cursor| {
+                            total.checked_add(
+                                cursor.position.saturating_sub(cursor.generation_start),
+                            )
+                        });
+                    let Some(expected_source_samples) = expected_source_samples else {
+                        return settle_live_spawn_failure(
+                            self,
+                            record_id,
+                            generation,
+                            &child,
+                            "SPEECH_RESOURCE_LIMIT",
+                            false,
+                        );
+                    };
+                    if send_worker_command(
+                        &stdin,
+                        &WorkerCommand::Finalize {
+                            protocol_version: PROTOCOL_VERSION,
+                            identity: identity.clone(),
+                            streams: ends,
+                        },
+                    )
+                    .is_err()
+                    {
+                        return settle_live_spawn_failure(
+                            self,
+                            record_id,
+                            generation,
+                            &child,
+                            "SPEECH_WORKER_PROTOCOL_ERROR",
+                            true,
+                        );
+                    }
+                    if let Err((code, retryable)) = read_live_frame_settlement(
+                        &responses,
+                        &identity,
+                        journal,
+                        &mut next_worker_revision,
+                        None,
+                        Some(expected_source_samples),
+                    ) {
+                        return settle_live_spawn_failure(
+                            self, record_id, generation, &child, &code, retryable,
+                        );
+                    }
+                    if let Ok(mut child) = child.lock() {
+                        let _ = child.wait();
+                    }
+                    self.clear_live_running(record_id);
+                    return LiveAttemptOutcome::Finished;
+                }
+            }
+
+            if !progressed {
+                thread::sleep(LIVE_POLL_INTERVAL);
+            }
+        }
+    }
+
+    fn spawn_live_worker(
+        &self,
+        record_id: &str,
+        generation: u64,
+        resources: &SpeechExecutionResources,
+    ) -> Result<SpawnedWorker, &'static str> {
+        let private_dir = self.root.join("private").join(format!("live-{record_id}"));
+        ensure_private_directory(&private_dir).map_err(|_| "SPEECH_JOB_STORE_WRITE_FAILED")?;
+        let mut command = process_cmd::new(&resources.worker_path);
+        command
+            .current_dir(&private_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        if !state.accepting
+            || !state.live_sessions.contains_key(record_id)
+            || state.live_running.is_some()
+        {
+            return Err("SPEECH_INTERRUPTED");
+        }
+        let mut child =
+            process_cmd::spawn_tree(&mut command).map_err(|_| "SPEECH_WORKER_START_FAILED")?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill_and_wait();
+            return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill_and_wait();
+            return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill_and_wait();
+            return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+        };
+        drain_worker_stderr(stderr, record_id.to_string(), generation);
+        let child = Arc::new(Mutex::new(child));
+        let stdin = Arc::new(Mutex::new(stdin));
+        state.live_running = Some(RunningWorker {
+            job_id: record_id.to_string(),
+            generation,
+            child: child.clone(),
+            stdin: stdin.clone(),
+        });
+        Ok((child, stdin, stdout))
+    }
+
+    fn clear_live_running(&self, record_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            if state
+                .live_running
+                .as_ref()
+                .is_some_and(|running| running.job_id == record_id)
+            {
+                state.live_running = None;
+            }
+        }
+    }
+
+    fn remove_live_session(&self, record_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.live_sessions.remove(record_id);
+        }
+    }
+
     fn fail_admission(&self, job_id: &str, code: &str) {
         let snapshot = if let Ok(mut state) = self.state.lock() {
             state.queue.retain(|queued| queued != job_id);
@@ -655,7 +1418,7 @@ impl SpeechRecognitionManager {
 
     pub fn shutdown(&self) -> Result<(), String> {
         self.model_pack.cancel_operation();
-        let (snapshots, running) = {
+        let (snapshots, running, live_running) = {
             let mut state = self
                 .state
                 .lock()
@@ -664,6 +1427,12 @@ impl SpeechRecognitionManager {
             state.active_job = None;
             state.queue.clear();
             let running = state.running.take();
+            let live_running = state.live_running.take();
+            for session in state.live_sessions.values() {
+                if let Ok(mut control) = session.control.state.lock() {
+                    control.cancelled = true;
+                }
+            }
             let now = Utc::now();
             let mut snapshots = Vec::new();
             for job in state
@@ -674,9 +1443,25 @@ impl SpeechRecognitionManager {
                 settle_for_process_boundary(job, now);
                 snapshots.push(job.clone());
             }
-            (snapshots, running)
+            (snapshots, running, live_running)
         };
         if let Some(running) = running {
+            let identity = WorkloadIdentity {
+                workload_id: running.job_id.clone(),
+                worker_generation: running.generation,
+            };
+            let _ = send_worker_command(
+                &running.stdin,
+                &WorkerCommand::Cancel {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity,
+                },
+            );
+            if let Ok(mut child) = running.child.lock() {
+                let _ = child.kill_and_wait();
+            }
+        }
+        if let Some(running) = live_running {
             let identity = WorkloadIdentity {
                 workload_id: running.job_id.clone(),
                 worker_generation: running.generation,
@@ -729,7 +1514,9 @@ impl SpeechRecognitionManager {
             .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
         let in_use = state.jobs.values().any(|job| !job.state.is_terminal())
             || state.running.is_some()
-            || state.active_job.is_some();
+            || state.active_job.is_some()
+            || !state.live_sessions.is_empty()
+            || state.live_running.is_some();
         self.model_pack.remove(in_use)
     }
 
@@ -1542,6 +2329,282 @@ impl SpeechRecognitionManager {
     }
 }
 
+fn validate_live_sources(sources: &[AnalysisSpoolSource]) -> Result<(), String> {
+    if !(1..=2).contains(&sources.len()) {
+        return Err("SPEECH_ANALYSIS_SOURCE_INVALID".to_string());
+    }
+    for (index, source) in sources.iter().enumerate() {
+        if source.track() == AudioTrackKind::Mixed
+            || sources[index + 1..]
+                .iter()
+                .any(|other| other.track() == source.track())
+        {
+            return Err("SPEECH_ANALYSIS_SOURCE_INVALID".to_string());
+        }
+        let metadata = fs::symlink_metadata(source.path())
+            .map_err(|_| "SPEECH_ANALYSIS_SOURCE_UNAVAILABLE".to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+            return Err("SPEECH_ANALYSIS_SOURCE_INVALID".to_string());
+        }
+        let progress = source.snapshot();
+        if progress.committed_samples != 0 || progress.finished || progress.error_code.is_some() {
+            return Err("SPEECH_ANALYSIS_SOURCE_INVALID".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn normalize_live_boundary(
+    tracks: &[AudioTrackKind],
+    offsets: Vec<RecordTranscriptTrackOffset>,
+) -> Result<LiveBoundary, String> {
+    if offsets.len() != tracks.len() {
+        return Err("SPEECH_ANALYSIS_BOUNDARY_INVALID".to_string());
+    }
+    let mut normalized = Vec::with_capacity(tracks.len());
+    for track in tracks {
+        let matches = offsets
+            .iter()
+            .filter(|offset| offset.track == *track)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 || matches[0].sample > MAX_MEDIA_SAMPLES_PER_TRACK {
+            return Err("SPEECH_ANALYSIS_BOUNDARY_INVALID".to_string());
+        }
+        normalized.push((*matches[0]).clone());
+    }
+    Ok(LiveBoundary {
+        offsets: normalized,
+    })
+}
+
+fn ensure_boundary_monotonic(previous: &LiveBoundary, next: &LiveBoundary) -> Result<(), String> {
+    if previous.offsets.len() != next.offsets.len()
+        || previous.offsets.iter().any(|prior| {
+            next.offsets
+                .iter()
+                .find(|offset| offset.track == prior.track)
+                .map_or(true, |offset| offset.sample < prior.sample)
+        })
+    {
+        return Err("SPEECH_ANALYSIS_BOUNDARY_INVALID".to_string());
+    }
+    Ok(())
+}
+
+fn boundary_sample(boundary: &LiveBoundary, track: AudioTrackKind) -> Option<u64> {
+    boundary
+        .offsets
+        .iter()
+        .find(|offset| offset.track == track)
+        .map(|offset| offset.sample)
+}
+
+fn live_cursors(
+    sources: &[AnalysisSpoolSource],
+    replay_from: &[RecordTranscriptTrackOffset],
+) -> Result<Vec<LiveTrackCursor>, &'static str> {
+    sources
+        .iter()
+        .map(|source| {
+            let position = replay_from
+                .iter()
+                .find(|offset| offset.track == source.track())
+                .ok_or("SPEECH_ANALYSIS_SOURCE_INVALID")?
+                .sample;
+            let snapshot = source.snapshot();
+            if position > snapshot.committed_samples {
+                return Err("SPEECH_ANALYSIS_SOURCE_INVALID");
+            }
+            Ok(LiveTrackCursor {
+                source: source.clone(),
+                track: protocol_track(source.track())?,
+                generation_start: position,
+                position,
+                next_sequence: 0,
+                last_sequence: None,
+            })
+        })
+        .collect()
+}
+
+fn cursors_reached(cursors: &[LiveTrackCursor], boundary: &LiveBoundary) -> bool {
+    cursors
+        .iter()
+        .all(|cursor| boundary_sample(boundary, cursor.source.track()) == Some(cursor.position))
+}
+
+fn send_pcm_frame(
+    stdin: &Arc<Mutex<std::process::ChildStdin>>,
+    frame: &PcmFrame,
+) -> std::io::Result<()> {
+    let mut stdin = stdin
+        .lock()
+        .map_err(|_| std::io::Error::other("media Worker stdin lock poisoned"))?;
+    write_pcm_frame(&mut *stdin, frame)
+}
+
+fn spawn_live_response_reader(
+    stdout: ChildStdout,
+    generation: u64,
+) -> std_mpsc::Receiver<Result<WorkerResponse, &'static str>> {
+    let (responses, receiver) = std_mpsc::sync_channel(8);
+    let thread_name = format!("speech-live-response-{generation}");
+    let _ = thread::Builder::new().name(thread_name).spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let response = match read_worker_response(&mut reader) {
+                Ok(Some(response)) => Ok(response),
+                Ok(None) => Err("SPEECH_WORKER_CRASHED"),
+                Err(_) => Err("SPEECH_WORKER_PROTOCOL_ERROR"),
+            };
+            let terminal = response.is_err();
+            if let Err(std_mpsc::SendError(mut unsent)) = responses.send(response) {
+                if let Ok(response) = &mut unsent {
+                    response.zeroize_sensitive();
+                }
+                break;
+            }
+            if terminal {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn receive_live_response(
+    responses: &std_mpsc::Receiver<Result<WorkerResponse, &'static str>>,
+) -> Result<WorkerResponse, (String, bool)> {
+    match responses.recv_timeout(LIVE_WORKER_RESPONSE_TIMEOUT) {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(code)) => Err((code.to_string(), true)),
+        Err(std_mpsc::RecvTimeoutError::Timeout) => {
+            Err(("SPEECH_WORKER_TIMEOUT".to_string(), true))
+        }
+        Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            Err(("SPEECH_WORKER_CRASHED".to_string(), true))
+        }
+    }
+}
+
+fn read_live_frame_settlement(
+    responses: &std_mpsc::Receiver<Result<WorkerResponse, &'static str>>,
+    identity: &WorkloadIdentity,
+    journal: &mut RecordLiveTranscriptJournal,
+    next_worker_revision: &mut u64,
+    expected_ack: Option<(TrackKind, u64, u64)>,
+    expected_completed_samples: Option<u64>,
+) -> Result<(), (String, bool)> {
+    let mut acked = expected_ack.is_none();
+    loop {
+        let response = receive_live_response(responses)?;
+        if response.identity() != identity {
+            let mut response = response;
+            response.zeroize_sensitive();
+            return Err(("SPEECH_WORKER_PROTOCOL_ERROR".to_string(), true));
+        }
+        match response {
+            WorkerResponse::InputAck {
+                track,
+                sequence,
+                end_sample,
+                ..
+            } if !acked && expected_ack == Some((track, sequence, end_sample)) => {
+                acked = true;
+            }
+            WorkerResponse::TranscriptSegment {
+                track,
+                start_sample,
+                end_sample,
+                mut text,
+                mut language,
+                revision,
+                ..
+            } => {
+                if revision != *next_worker_revision {
+                    text.zeroize();
+                    if let Some(language) = &mut language {
+                        language.zeroize();
+                    }
+                    return Err(("SPEECH_WORKER_PROTOCOL_ERROR".to_string(), true));
+                }
+                let Some(next_revision) = next_worker_revision.checked_add(1) else {
+                    text.zeroize();
+                    if let Some(language) = &mut language {
+                        language.zeroize();
+                    }
+                    return Err(("SPEECH_RESOURCE_LIMIT".to_string(), false));
+                };
+                *next_worker_revision = next_revision;
+                let track = match record_track(track) {
+                    Ok(track) => track,
+                    Err(code) => {
+                        text.zeroize();
+                        if let Some(language) = &mut language {
+                            language.zeroize();
+                        }
+                        return Err((code.to_string(), false));
+                    }
+                };
+                if journal
+                    .append_segment(track, start_sample, end_sample, text, language)
+                    .is_err()
+                {
+                    return Err(("SPEECH_JOB_STORE_WRITE_FAILED".to_string(), false));
+                }
+            }
+            WorkerResponse::Heartbeat { checkpoint, .. }
+                if expected_completed_samples.is_none() && acked =>
+            {
+                if let Some((track, sequence, end_sample)) = expected_ack {
+                    if !checkpoint.streams.iter().any(|stream| {
+                        stream.track == track
+                            && stream.last_ack_sequence == Some(sequence)
+                            && stream.analysis_sample == end_sample
+                    }) {
+                        return Err(("SPEECH_WORKER_PROTOCOL_ERROR".to_string(), true));
+                    }
+                }
+                return Ok(());
+            }
+            WorkerResponse::Heartbeat { .. } if expected_completed_samples.is_some() && acked => {}
+            WorkerResponse::Completed { metrics, .. }
+                if expected_completed_samples == Some(metrics.source_samples) && acked =>
+            {
+                return Ok(())
+            }
+            WorkerResponse::Failed { code, .. } => {
+                let retryable = worker_code_retryable(&code);
+                return Err((code, retryable));
+            }
+            mut response => {
+                response.zeroize_sensitive();
+                return Err(("SPEECH_WORKER_PROTOCOL_ERROR".to_string(), true));
+            }
+        }
+    }
+}
+
+fn settle_live_spawn_failure(
+    manager: &SpeechRecognitionManager,
+    record_id: &str,
+    _generation: u64,
+    child: &Arc<Mutex<process_cmd::ChildTree>>,
+    code: &str,
+    retryable: bool,
+) -> LiveAttemptOutcome {
+    kill_worker(child);
+    manager.clear_live_running(record_id);
+    live_failed(code, retryable)
+}
+
+fn live_failed(code: &str, retryable: bool) -> LiveAttemptOutcome {
+    LiveAttemptOutcome::Failed {
+        code: code.to_string(),
+        retryable,
+    }
+}
+
 struct YieldReadGuard(Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for YieldReadGuard {
@@ -2082,7 +3145,9 @@ mod tests {
     use crate::record::{
         AudioRecordCreateInput, AudioTrackArtifactInput, CaptureStatus, RecordStore,
     };
-    use myagents_media_worker_protocol::{write_control_frame, WorkerMetrics, WorkerResponse};
+    use myagents_media_worker_protocol::{
+        write_control_frame, Checkpoint, PcmStreamCheckpoint, WorkerMetrics, WorkerResponse,
+    };
 
     fn fixture_job(
         job_id: &str,
@@ -2157,6 +3222,26 @@ mod tests {
             .map(|byte| format!("\\{:03o}", byte))
             .collect::<String>();
         let script = format!("#!/bin/sh\n/bin/sleep 0.05\n/usr/bin/printf '{octal}'\nexit 0\n");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_buffered_live_worker(path: &Path, responses: &[WorkerResponse]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut wire = Vec::new();
+        for response in responses {
+            write_control_frame(&mut wire, response).unwrap();
+        }
+        let octal = wire
+            .iter()
+            .map(|byte| format!("\\{:03o}", byte))
+            .collect::<String>();
+        let script = format!(
+            "#!/bin/sh\n/bin/sleep 0.05\n/usr/bin/printf '{octal}'\n/bin/sleep 0.2\nexit 0\n"
+        );
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, script).unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2454,6 +3539,181 @@ mod tests {
                     SpeechJobOrigin::Record { record_id } if record_id == &record.id
                 )
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_worker_streams_committed_pcm_and_publishes_stable_revision() {
+        use crate::recording::analysis::TrackAnalysisHandle;
+        use crate::recording::audio::SourceFormat;
+
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(&root);
+        let record = manager
+            .record_store
+            .create_audio(AudioRecordCreateInput {
+                title: "Live meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Live,
+            })
+            .await
+            .unwrap();
+        let record_path = manager
+            .record_store
+            .audio_workspace_path(&record.id)
+            .await
+            .unwrap();
+        let analysis_path = record_path.join("analysis/microphone.pcm16");
+        let analysis = TrackAnalysisHandle::start(
+            AudioTrackKind::Microphone,
+            analysis_path,
+            SourceFormat {
+                sample_rate: 16_000,
+                channels: 1,
+            },
+        )
+        .unwrap();
+        analysis.sink.push_i16(&vec![4_000; 16_000]);
+        let final_sample = analysis.control().checkpoint().unwrap();
+        assert_eq!(final_sample, 16_000);
+        let source = analysis.source();
+        let control = Arc::new(LiveControl::default());
+        let boundary = LiveBoundary {
+            offsets: vec![RecordTranscriptTrackOffset {
+                track: AudioTrackKind::Microphone,
+                sample: final_sample,
+            }],
+        };
+        {
+            let mut state = control.state.lock().unwrap();
+            state.flushes.push_back(boundary.clone());
+            state.finish = Some(boundary);
+        }
+        manager.state.lock().unwrap().live_sessions.insert(
+            record.id.clone(),
+            LiveSessionRegistration {
+                control: control.clone(),
+                tracks: vec![AudioTrackKind::Microphone],
+            },
+        );
+        let generation = manager.allocate_live_generation(&record.id).unwrap();
+        let identity = WorkloadIdentity {
+            workload_id: record.id.clone(),
+            worker_generation: generation,
+        };
+        let worker = root.path().join("fake-live-worker");
+        write_buffered_live_worker(
+            &worker,
+            &[
+                WorkerResponse::Ready {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                },
+                WorkerResponse::InputAck {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    track: TrackKind::Microphone,
+                    sequence: 0,
+                    end_sample: 16_000,
+                },
+                WorkerResponse::Heartbeat {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    stage: WorkerStage::Vad,
+                    checkpoint: Checkpoint {
+                        streams: vec![PcmStreamCheckpoint {
+                            track: TrackKind::Microphone,
+                            last_ack_sequence: Some(0),
+                            analysis_sample: 16_000,
+                        }],
+                        analysis_sample: 16_000,
+                    },
+                },
+                WorkerResponse::TranscriptSegment {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    segment_id: "worker-local-id".into(),
+                    track: TrackKind::Microphone,
+                    start_sample: 0,
+                    end_sample: 8_000,
+                    text: "private live transcript".into(),
+                    language: Some("en".into()),
+                    revision: 1,
+                },
+                WorkerResponse::Heartbeat {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    stage: WorkerStage::Vad,
+                    checkpoint: Checkpoint {
+                        streams: vec![PcmStreamCheckpoint {
+                            track: TrackKind::Microphone,
+                            last_ack_sequence: Some(0),
+                            analysis_sample: 16_000,
+                        }],
+                        analysis_sample: 16_000,
+                    },
+                },
+                WorkerResponse::Completed {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity,
+                    metrics: WorkerMetrics {
+                        source_samples: 16_000,
+                        segments: 1,
+                        speakers: 0,
+                        elapsed_ms: 5,
+                        peak_working_bytes: Some(1_024),
+                    },
+                },
+            ],
+        );
+        let native_manifest = root.path().join("native-manifest.json");
+        let runtime = root.path().join("libonnxruntime.dylib");
+        let model_manifest = root.path().join("model-manifest.json");
+        for path in [&native_manifest, &runtime, &model_manifest] {
+            fs::write(path, b"fixture").unwrap();
+        }
+        let resources = SpeechExecutionResources {
+            worker_path: worker,
+            native_manifest_path: native_manifest,
+            onnx_runtime_path: runtime,
+            model_pack_manifest_path: model_manifest,
+            provenance: RecordSpeechProvenance {
+                provider: "local".into(),
+                model_pack_revision: "revision-1".into(),
+                onnx_runtime_version: "1.28.0".into(),
+            },
+        };
+        let mut journal = manager
+            .record_store
+            .begin_live_transcript(&record.id, resources.provenance.clone())
+            .await
+            .unwrap();
+        journal
+            .append_generation_started(generation, journal.replay_offsets())
+            .unwrap();
+        assert_eq!(
+            manager.execute_live_attempt(
+                &record.id,
+                generation,
+                &[source],
+                &resources,
+                &control,
+                &mut journal,
+            ),
+            LiveAttemptOutcome::Finished
+        );
+        journal.finish().unwrap();
+        analysis.finish().unwrap();
+
+        let projection = manager
+            .record_store
+            .read_live_transcript_revisions(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.segments.len(), 1);
+        assert_eq!(projection.segments[0].segment_id, "live-microphone-0-8000");
+        assert_eq!(projection.segments[0].text, "private live transcript");
     }
 
     #[tokio::test]

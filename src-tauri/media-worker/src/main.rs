@@ -524,7 +524,9 @@ fn poll_batch_control(
                     nonce,
                 },
             )?,
-            WorkerCommand::Start(_) | WorkerCommand::Finalize { .. } => {
+            WorkerCommand::Start(_)
+            | WorkerCommand::Finalize { .. }
+            | WorkerCommand::Flush { .. } => {
                 return Err("SPEECH_WORKER_PROTOCOL_ERROR");
             }
         }
@@ -735,6 +737,36 @@ fn run_live(
                     return Err("SPEECH_WORKER_PROTOCOL_ERROR");
                 }
                 match command {
+                    WorkerCommand::Flush { .. } => {
+                        for index in 0..tracks.len() {
+                            tracks[index]
+                                .vad
+                                .flush()
+                                .map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+                            emitted_segments = emitted_segments.saturating_add(drain_track(
+                                index,
+                                &mut tracks,
+                                &mut asr,
+                                identity,
+                                &mut revision,
+                                writer,
+                            )?);
+                            tracks[index]
+                                .vad
+                                .reset()
+                                .map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+                            tracks[index].vad_base_sample = tracks[index].last_end_sample;
+                        }
+                        write_response(
+                            writer,
+                            WorkerResponse::Heartbeat {
+                                protocol_version: PROTOCOL_VERSION,
+                                identity: identity.clone(),
+                                stage: WorkerStage::Vad,
+                                checkpoint: checkpoint(&tracks),
+                            },
+                        )?;
+                    }
                     WorkerCommand::Finalize { streams, .. } => {
                         validate_final_streams(&tracks, &streams)?;
                         for index in 0..tracks.len() {

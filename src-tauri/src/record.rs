@@ -18,6 +18,7 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::durable_fs::{rename_directory_noreplace, sync_directory};
+use crate::durable_journal::{recover_and_read, DurableRecordJournal};
 use crate::utils::file_lock::{with_file_lock_blocking, FileLockError, FileLockOptions};
 use crate::{ulog_info, ulog_warn};
 
@@ -29,6 +30,10 @@ const LEGACY_THOUGHT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const TRANSCRIPT_SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const TRANSCRIPT_SEGMENT_LIMIT: usize = 100_000;
 const TRANSCRIPT_CHARACTER_LIMIT: usize = 5_000_000;
+const TRANSCRIPT_REVISION_SCHEMA_VERSION: u32 = 1;
+const TRANSCRIPT_REVISION_MAX_LINE_BYTES: usize = 256 * 1024;
+const TRANSCRIPT_REVISION_MAX_BYTES: u64 = 128 * 1024 * 1024;
+const LIVE_TRANSCRIPT_MAX_SAMPLES: u64 = SPEECH_SAMPLE_RATE * 60 * 60 * 8;
 const DIARIZATION_TURN_LIMIT: usize = 200_000;
 const SPEECH_SAMPLE_RATE: u64 = 16_000;
 
@@ -328,7 +333,343 @@ impl std::fmt::Debug for RecordTranscriptSegment {
 }
 
 impl RecordTranscriptSegment {
-    fn zeroize_sensitive(&mut self) {
+    pub(crate) fn zeroize_sensitive(&mut self) {
+        self.text.zeroize();
+        if let Some(language) = &mut self.language {
+            language.zeroize();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecordTranscriptTrackOffset {
+    pub track: AudioTrackKind,
+    pub sample: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+enum RecordTranscriptRevisionEvent {
+    SessionStarted {
+        provenance: RecordSpeechProvenance,
+        tracks: Vec<AudioTrackKind>,
+    },
+    GenerationStarted {
+        generation: u64,
+        replay_from: Vec<RecordTranscriptTrackOffset>,
+    },
+    SegmentUpsert {
+        segment: RecordTranscriptSegment,
+    },
+    GenerationFailed {
+        generation: u64,
+        error_code: String,
+    },
+    SessionFailed {
+        error_code: String,
+    },
+    SessionFinished,
+}
+
+pub(crate) struct RecordLiveTranscriptJournal {
+    inner: DurableRecordJournal<RecordTranscriptRevisionEvent>,
+    path: PathBuf,
+    allowed_tracks: Vec<AudioTrackKind>,
+    segments: HashMap<String, RecordTranscriptSegment>,
+    characters: usize,
+    terminal: bool,
+}
+
+impl RecordLiveTranscriptJournal {
+    fn create(
+        record_path: &Path,
+        record: &Record,
+        provenance: RecordSpeechProvenance,
+    ) -> Result<Self, String> {
+        validate_speech_provenance(&provenance)?;
+        let audio = record
+            .audio
+            .as_ref()
+            .filter(|_| record.kind == RecordKind::Audio)
+            .ok_or_else(|| "live transcript requires an audio Record".to_string())?;
+        if !matches!(
+            audio.capture_status,
+            CaptureStatus::Preparing | CaptureStatus::Recording | CaptureStatus::Paused
+        ) {
+            return Err("live transcript admission requires active capture".to_string());
+        }
+        let allowed_tracks = audio
+            .tracks
+            .iter()
+            .copied()
+            .filter(|track| *track != AudioTrackKind::Mixed)
+            .collect::<Vec<_>>();
+        if allowed_tracks.is_empty() {
+            return Err("live transcript has no physical source track".to_string());
+        }
+        let path = record_path.join("transcript/revisions.jsonl");
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err("live transcript revision target is not a regular file".to_string())
+            }
+            Ok(metadata) if metadata.len() > 0 => {
+                return Err("live transcript revision journal already exists".to_string())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect live transcript journal: {error}")),
+        }
+        let mut inner = DurableRecordJournal::open(
+            path.clone(),
+            &record.id,
+            TRANSCRIPT_REVISION_SCHEMA_VERSION,
+            TRANSCRIPT_REVISION_MAX_LINE_BYTES,
+        )?;
+        inner.append(
+            now_ms(),
+            0,
+            RecordTranscriptRevisionEvent::SessionStarted {
+                provenance: provenance.clone(),
+                tracks: allowed_tracks.clone(),
+            },
+        )?;
+        Ok(Self {
+            inner,
+            path,
+            allowed_tracks,
+            segments: HashMap::new(),
+            characters: 0,
+            terminal: false,
+        })
+    }
+
+    pub(crate) fn replay_offsets(&self) -> Vec<RecordTranscriptTrackOffset> {
+        self.allowed_tracks
+            .iter()
+            .copied()
+            .map(|track| RecordTranscriptTrackOffset {
+                track,
+                sample: self
+                    .segments
+                    .values()
+                    .filter(|segment| segment.track == track)
+                    .map(|segment| segment.end_sample)
+                    .max()
+                    .unwrap_or(0),
+            })
+            .collect()
+    }
+
+    pub(crate) fn append_generation_started(
+        &mut self,
+        generation: u64,
+        replay_from: Vec<RecordTranscriptTrackOffset>,
+    ) -> Result<(), String> {
+        if self.terminal || generation == 0 || !self.valid_offsets(&replay_from) {
+            return Err("live transcript generation metadata is invalid".to_string());
+        }
+        self.ensure_append_budget()?;
+        self.inner.append(
+            now_ms(),
+            replay_from
+                .iter()
+                .map(|offset| offset.sample)
+                .max()
+                .unwrap_or(0)
+                * 1_000
+                / SPEECH_SAMPLE_RATE,
+            RecordTranscriptRevisionEvent::GenerationStarted {
+                generation,
+                replay_from,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn append_segment(
+        &mut self,
+        track: AudioTrackKind,
+        start_sample: u64,
+        end_sample: u64,
+        text: String,
+        language: Option<String>,
+    ) -> Result<Option<RecordTranscriptSegment>, String> {
+        let mut sensitive = SensitiveLiveText { text, language };
+        if self.terminal
+            || !self.allowed_tracks.contains(&track)
+            || start_sample >= end_sample
+            || end_sample > LIVE_TRANSCRIPT_MAX_SAMPLES
+            || sensitive.text.trim().is_empty()
+            || sensitive.text.len() > 64 * 1024
+            || sensitive.text.contains('\0')
+            || sensitive.language.as_deref().is_some_and(|language| {
+                language.is_empty()
+                    || language.len() > 32
+                    || !language
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            })
+        {
+            return Err("live transcript segment is invalid".to_string());
+        }
+        let segment_id = live_segment_id(track, start_sample, end_sample);
+        if let Some(existing) = self.segments.get(&segment_id) {
+            if existing.text == sensitive.text && existing.language == sensitive.language {
+                return Ok(None);
+            }
+        }
+        let old_characters = self
+            .segments
+            .get(&segment_id)
+            .map_or(0, |segment| segment.text.chars().count());
+        let new_characters = sensitive.text.chars().count();
+        let characters = self
+            .characters
+            .checked_sub(old_characters)
+            .and_then(|count| count.checked_add(new_characters))
+            .filter(|count| *count <= TRANSCRIPT_CHARACTER_LIMIT)
+            .ok_or_else(|| "live transcript character limit exceeded".to_string())?;
+        if self.segments.len() >= TRANSCRIPT_SEGMENT_LIMIT
+            && !self.segments.contains_key(&segment_id)
+        {
+            return Err("live transcript segment limit exceeded".to_string());
+        }
+        let revision = self
+            .segments
+            .get(&segment_id)
+            .map_or(1, |segment| segment.revision.saturating_add(1).max(1));
+        let segment = RecordTranscriptSegment {
+            segment_id: segment_id.clone(),
+            track,
+            start_sample,
+            end_sample,
+            text: std::mem::take(&mut sensitive.text),
+            language: sensitive.language.take(),
+            revision,
+        };
+        self.ensure_append_budget()?;
+        let entry = self.inner.append(
+            now_ms(),
+            end_sample.saturating_mul(1_000) / SPEECH_SAMPLE_RATE,
+            RecordTranscriptRevisionEvent::SegmentUpsert { segment },
+        )?;
+        let RecordTranscriptRevisionEvent::SegmentUpsert { segment } = entry.event else {
+            unreachable!("segment append returns its own event")
+        };
+        self.characters = characters;
+        self.segments.insert(segment_id, segment.clone());
+        Ok(Some(segment))
+    }
+
+    pub(crate) fn append_generation_failed(
+        &mut self,
+        generation: u64,
+        error_code: &str,
+    ) -> Result<(), String> {
+        if self.terminal || generation == 0 || !valid_speech_error_code(error_code) {
+            return Err("live transcript failure metadata is invalid".to_string());
+        }
+        self.ensure_append_budget()?;
+        self.inner.append(
+            now_ms(),
+            self.replay_offsets()
+                .iter()
+                .map(|offset| offset.sample)
+                .max()
+                .unwrap_or(0)
+                .saturating_mul(1_000)
+                / SPEECH_SAMPLE_RATE,
+            RecordTranscriptRevisionEvent::GenerationFailed {
+                generation,
+                error_code: error_code.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<(), String> {
+        if self.terminal {
+            return Ok(());
+        }
+        self.ensure_append_budget()?;
+        self.inner.append(
+            now_ms(),
+            self.replay_offsets()
+                .iter()
+                .map(|offset| offset.sample)
+                .max()
+                .unwrap_or(0)
+                .saturating_mul(1_000)
+                / SPEECH_SAMPLE_RATE,
+            RecordTranscriptRevisionEvent::SessionFinished,
+        )?;
+        self.terminal = true;
+        Ok(())
+    }
+
+    pub(crate) fn fail(&mut self, error_code: &str) -> Result<(), String> {
+        if self.terminal {
+            return Ok(());
+        }
+        if !valid_speech_error_code(error_code) {
+            return Err("live transcript terminal failure is invalid".to_string());
+        }
+        self.ensure_append_budget()?;
+        self.inner.append(
+            now_ms(),
+            self.replay_offsets()
+                .iter()
+                .map(|offset| offset.sample)
+                .max()
+                .unwrap_or(0)
+                .saturating_mul(1_000)
+                / SPEECH_SAMPLE_RATE,
+            RecordTranscriptRevisionEvent::SessionFailed {
+                error_code: error_code.to_string(),
+            },
+        )?;
+        self.terminal = true;
+        Ok(())
+    }
+
+    fn valid_offsets(&self, offsets: &[RecordTranscriptTrackOffset]) -> bool {
+        offsets.len() == self.allowed_tracks.len()
+            && self.allowed_tracks.iter().all(|track| {
+                offsets.iter().any(|offset| {
+                    offset.track == *track && offset.sample <= LIVE_TRANSCRIPT_MAX_SAMPLES
+                })
+            })
+            && offsets
+                .windows(2)
+                .all(|pair| pair[0].track != pair[1].track)
+    }
+
+    fn ensure_append_budget(&self) -> Result<(), String> {
+        let size = fs::symlink_metadata(&self.path)
+            .map_err(|error| format!("inspect live transcript journal: {error}"))?
+            .len();
+        if size
+            > TRANSCRIPT_REVISION_MAX_BYTES
+                .saturating_sub(TRANSCRIPT_REVISION_MAX_LINE_BYTES as u64)
+        {
+            return Err("live transcript revision journal exceeds size limit".to_string());
+        }
+        Ok(())
+    }
+}
+
+struct SensitiveLiveText {
+    text: String,
+    language: Option<String>,
+}
+
+impl Drop for SensitiveLiveText {
+    fn drop(&mut self) {
         self.text.zeroize();
         if let Some(language) = &mut self.language {
             language.zeroize();
@@ -745,6 +1086,56 @@ impl RecordStore {
             return Err("Record media digest no longer matches its inventory".to_string());
         }
         Ok(media)
+    }
+
+    pub(crate) async fn begin_live_transcript(
+        &self,
+        id: &str,
+        provenance: RecordSpeechProvenance,
+    ) -> Result<RecordLiveTranscriptJournal, String> {
+        let stored = self
+            .inner
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        RecordLiveTranscriptJournal::create(&stored.path, &stored.record, provenance)
+    }
+
+    pub async fn read_live_transcript_revisions(
+        &self,
+        id: &str,
+    ) -> Result<Option<RecordTranscriptSnapshot>, String> {
+        let stored = self
+            .inner
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio || stored.record.audio.is_none() {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        let path = stored.path.join("transcript/revisions.jsonl");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("inspect live transcript journal: {error}")),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > TRANSCRIPT_REVISION_MAX_BYTES
+        {
+            return Err("live transcript revision journal is invalid".to_string());
+        }
+        let entries = recover_and_read::<RecordTranscriptRevisionEvent>(
+            &path,
+            id,
+            TRANSCRIPT_REVISION_SCHEMA_VERSION,
+            TRANSCRIPT_REVISION_MAX_LINE_BYTES,
+        )?;
+        project_live_transcript(id, entries).map(Some)
     }
 
     pub async fn update_audio_processing_status(
@@ -1670,6 +2061,180 @@ fn validate_speech_provenance(provenance: &RecordSpeechProvenance) -> Result<(),
         }
     }
     Ok(())
+}
+
+fn live_segment_id(track: AudioTrackKind, start_sample: u64, end_sample: u64) -> String {
+    let track = match track {
+        AudioTrackKind::Microphone => "microphone",
+        AudioTrackKind::System => "system",
+        AudioTrackKind::Mixed => "mixed",
+    };
+    format!("live-{track}-{start_sample}-{end_sample}")
+}
+
+fn valid_speech_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_live_transcript_segment(
+    allowed_tracks: &[AudioTrackKind],
+    segment: &RecordTranscriptSegment,
+) -> Result<(), String> {
+    if segment.segment_id
+        != live_segment_id(segment.track, segment.start_sample, segment.end_sample)
+        || segment.revision == 0
+        || segment.start_sample >= segment.end_sample
+        || segment.end_sample > LIVE_TRANSCRIPT_MAX_SAMPLES
+        || segment.track == AudioTrackKind::Mixed
+        || !allowed_tracks.contains(&segment.track)
+        || segment.text.trim().is_empty()
+        || segment.text.len() > 64 * 1024
+        || segment.text.contains('\0')
+        || segment.language.as_deref().is_some_and(|language| {
+            language.is_empty()
+                || language.len() > 32
+                || !language
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        return Err("live transcript segment is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn project_live_transcript(
+    record_id: &str,
+    entries: Vec<crate::durable_journal::DurableJournalEntry<RecordTranscriptRevisionEvent>>,
+) -> Result<RecordTranscriptSnapshot, String> {
+    let projection_revision = entries.last().map_or(0, |entry| entry.seq);
+    let mut provenance = None;
+    let mut session_tracks = None;
+    let mut segments = HashMap::<String, RecordTranscriptSegment>::new();
+    let mut characters = 0_usize;
+    let mut state = "live".to_string();
+    let mut terminal = false;
+    for entry in entries {
+        if terminal {
+            return Err("live transcript contains events after terminal".to_string());
+        }
+        match entry.event {
+            RecordTranscriptRevisionEvent::SessionStarted {
+                provenance: started,
+                tracks,
+            } if provenance.is_none()
+                && entry.seq == 1
+                && (1..=2).contains(&tracks.len())
+                && tracks.iter().all(|track| *track != AudioTrackKind::Mixed)
+                && (tracks.len() == 1 || tracks[0] != tracks[1]) =>
+            {
+                validate_speech_provenance(&started)?;
+                provenance = Some(started);
+                session_tracks = Some(tracks);
+            }
+            RecordTranscriptRevisionEvent::SessionStarted { .. } => {
+                return Err("live transcript has duplicate session start".to_string())
+            }
+            RecordTranscriptRevisionEvent::GenerationStarted {
+                generation,
+                replay_from,
+            } => {
+                let Some(tracks) = session_tracks.as_ref() else {
+                    return Err("live transcript session tracks are missing".to_string());
+                };
+                if provenance.is_none()
+                    || generation == 0
+                    || replay_from.len() != tracks.len()
+                    || replay_from.iter().any(|offset| {
+                        offset.track == AudioTrackKind::Mixed
+                            || !tracks.contains(&offset.track)
+                            || offset.sample > LIVE_TRANSCRIPT_MAX_SAMPLES
+                    })
+                    || replay_from.iter().enumerate().any(|(index, offset)| {
+                        replay_from[index + 1..]
+                            .iter()
+                            .any(|other| other.track == offset.track)
+                    })
+                {
+                    return Err("live transcript generation metadata is invalid".to_string());
+                }
+                state = "recovering".to_string();
+            }
+            RecordTranscriptRevisionEvent::SegmentUpsert { segment } => {
+                let Some(tracks) = session_tracks.as_ref() else {
+                    return Err("live transcript segment precedes session start".to_string());
+                };
+                validate_live_transcript_segment(tracks, &segment)?;
+                let old_characters = segments
+                    .get(&segment.segment_id)
+                    .map_or(0, |existing| existing.text.chars().count());
+                if segments
+                    .get(&segment.segment_id)
+                    .is_some_and(|existing| segment.revision != existing.revision.saturating_add(1))
+                    || !segments.contains_key(&segment.segment_id) && segment.revision != 1
+                {
+                    return Err("live transcript segment revision is invalid".to_string());
+                }
+                characters = characters
+                    .checked_sub(old_characters)
+                    .and_then(|count| count.checked_add(segment.text.chars().count()))
+                    .filter(|count| *count <= TRANSCRIPT_CHARACTER_LIMIT)
+                    .ok_or_else(|| "live transcript character limit exceeded".to_string())?;
+                segments.insert(segment.segment_id.clone(), segment);
+                if segments.len() > TRANSCRIPT_SEGMENT_LIMIT {
+                    return Err("live transcript segment limit exceeded".to_string());
+                }
+                state = "live".to_string();
+            }
+            RecordTranscriptRevisionEvent::GenerationFailed {
+                generation,
+                error_code,
+            } => {
+                if provenance.is_none() || generation == 0 || !valid_speech_error_code(&error_code)
+                {
+                    return Err("live transcript failure metadata is invalid".to_string());
+                }
+                state = "recovering".to_string();
+            }
+            RecordTranscriptRevisionEvent::SessionFailed { error_code } => {
+                if provenance.is_none() || !valid_speech_error_code(&error_code) {
+                    return Err("live transcript terminal failure is invalid".to_string());
+                }
+                state = "failed".to_string();
+                terminal = true;
+            }
+            RecordTranscriptRevisionEvent::SessionFinished => {
+                if provenance.is_none() {
+                    return Err("live transcript terminal precedes session start".to_string());
+                }
+                state = "finalizing".to_string();
+                terminal = true;
+            }
+        }
+    }
+    let provenance =
+        provenance.ok_or_else(|| "live transcript session start is missing".to_string())?;
+    let mut segments = segments.into_values().collect::<Vec<_>>();
+    segments.sort_by(|left, right| {
+        (left.start_sample, left.end_sample, left.segment_id.as_str()).cmp(&(
+            right.start_sample,
+            right.end_sample,
+            right.segment_id.as_str(),
+        ))
+    });
+    Ok(RecordTranscriptSnapshot {
+        schema_version: 1,
+        record_id: record_id.to_string(),
+        projection_revision,
+        state,
+        sample_rate: SPEECH_SAMPLE_RATE as u32,
+        provenance,
+        segments,
+    })
 }
 
 fn validate_transcript_segments(
@@ -2774,6 +3339,123 @@ mod tests {
             fs::read_to_string(month.join("conflict.md")).unwrap(),
             legacy
         );
+    }
+
+    #[tokio::test]
+    async fn live_transcript_journal_deduplicates_replay_and_projects_from_disk() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Live meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone, AudioTrackKind::System],
+                transcription_status: TranscriptionStatus::Queued,
+            })
+            .await
+            .unwrap();
+        let provenance = RecordSpeechProvenance {
+            provider: "local".into(),
+            model_pack_revision: "sensevoice-2024-07-17-v1".into(),
+            onnx_runtime_version: "1.28.0".into(),
+        };
+        let mut journal = store
+            .begin_live_transcript(&record.id, provenance.clone())
+            .await
+            .unwrap();
+        journal
+            .append_generation_started(
+                7,
+                vec![
+                    RecordTranscriptTrackOffset {
+                        track: AudioTrackKind::Microphone,
+                        sample: 0,
+                    },
+                    RecordTranscriptTrackOffset {
+                        track: AudioTrackKind::System,
+                        sample: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        let first = journal
+            .append_segment(
+                AudioTrackKind::Microphone,
+                1_000,
+                5_000,
+                "private live canary".into(),
+                Some("zh".into()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.segment_id, "live-microphone-1000-5000");
+        assert_eq!(first.revision, 1);
+        assert!(journal
+            .append_segment(
+                AudioTrackKind::Microphone,
+                1_000,
+                5_000,
+                "private live canary".into(),
+                Some("zh".into()),
+            )
+            .unwrap()
+            .is_none());
+        let corrected = journal
+            .append_segment(
+                AudioTrackKind::Microphone,
+                1_000,
+                5_000,
+                "private corrected canary".into(),
+                Some("zh".into()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(corrected.revision, 2);
+        assert_eq!(
+            journal.replay_offsets(),
+            vec![
+                RecordTranscriptTrackOffset {
+                    track: AudioTrackKind::Microphone,
+                    sample: 5_000,
+                },
+                RecordTranscriptTrackOffset {
+                    track: AudioTrackKind::System,
+                    sample: 0,
+                },
+            ]
+        );
+        journal.finish().unwrap();
+        drop(journal);
+        fs::write(
+            store
+                .audio_workspace_path(&record.id)
+                .await
+                .unwrap()
+                .join("audio/microphone.opus"),
+            b"partial archive",
+        )
+        .unwrap();
+        store
+            .finalize_audio_capture(
+                &record.id,
+                CaptureStatus::Interrupted,
+                1_000,
+                vec![AudioTrackArtifactInput {
+                    track: AudioTrackKind::Microphone,
+                    relative_path: "audio/microphone.opus".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let projection = store
+            .read_live_transcript_revisions(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(projection.state, "finalizing");
+        assert_eq!(projection.provenance, provenance);
+        assert_eq!(projection.segments, vec![corrected]);
+        assert!(!format!("{projection:?}").contains("private corrected canary"));
     }
 
     #[tokio::test]

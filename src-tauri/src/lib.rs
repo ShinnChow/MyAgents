@@ -1184,14 +1184,6 @@ pub fn run() {
                 ulog_error!("[App] Failed to setup system tray: {}", e);
             }
 
-            let recording_manager = app
-                .state::<recording::ManagedRecordingManager>()
-                .inner()
-                .clone();
-            tauri::async_runtime::spawn(async move {
-                recording_manager.recover_interrupted().await;
-            });
-
             // PRD 0.2.35 — boot-time hydrate the user's force wake-lock intent
             // from disk. If `forceWakeLock: true`, acquire the OS assertion now.
             // Disk → OS lock; the tray's initial `checked` was set inside
@@ -1417,6 +1409,18 @@ pub fn run() {
                     ulog_error!("[document] Failed to resolve resource directory: {}", error);
                 }
             }
+
+            // Recovery runs after speech registration so a capture that had
+            // already admitted live transcription can enqueue its exact
+            // permanent-audio backfill. Historical recordings that never
+            // started transcription remain untouched.
+            let recording_manager = app
+                .state::<recording::ManagedRecordingManager>()
+                .inner()
+                .clone();
+            tauri::async_runtime::spawn(async move {
+                recording_manager.recover_interrupted().await;
+            });
 
             // Subscribe before automation recovery can create or release a
             // Session Sidecar. The receiver buffers the short gap until its

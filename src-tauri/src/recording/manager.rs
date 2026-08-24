@@ -3,25 +3,30 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+use super::analysis::{
+    analysis_spool_relative_path, cleanup_analysis_spool, AnalysisControl, TrackAnalysisHandle,
+};
 use super::archive::{
     recover_ogg_opus_archive, ArchiveResult, TrackArchiveHandle, ARCHIVE_SAMPLE_RATE,
 };
 use super::capture::{
     CaptureBackend, CaptureEvent, CapturePlan, CaptureSelection, CaptureSession, CaptureSinks,
-    PlatformCaptureBackend, PreparedSource,
+    CaptureTrackSink, PlatformCaptureBackend, PreparedSource,
 };
 use super::lifecycle::{LifecycleEvent, LifecycleJournal};
 use crate::record::{
     audio_track_relative_path, AudioRecordCreateInput, AudioTrackArtifactInput, AudioTrackKind,
     CaptureStatus, ManagedRecordStore, Record, RecordArchiveFilter, RecordKind, RecordListFilter,
-    TranscriptionStatus,
+    RecordTranscriptTrackOffset, TranscriptionStatus,
 };
+use crate::speech_recognition::{self, SpeechResourceStatus};
 use crate::wake_lock::WakeLock;
 use crate::{ulog_info, ulog_warn};
 
@@ -131,6 +136,8 @@ struct ActiveRecording {
     journal: LifecycleJournal,
     session: Option<Arc<StdMutex<Box<dyn CaptureSession>>>>,
     archives: Vec<TrackArchiveHandle>,
+    analyses: Vec<TrackAnalysisHandle>,
+    live_transcription: bool,
     _wake_lock: Option<WakeLock>,
 }
 
@@ -244,8 +251,14 @@ impl RecordingManager {
             .as_ref()
             .map(|audio| audio.tracks.clone())
             .unwrap_or_default();
+        let live_revision_path = workspace.join("transcript/revisions.jsonl");
+        let resume_transcription =
+            fs::symlink_metadata(&live_revision_path).is_ok_and(|metadata| {
+                metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0
+            });
         let repair_inputs: Vec<(AudioTrackKind, std::path::PathBuf)> = tracks
-            .into_iter()
+            .iter()
+            .copied()
             .map(|track| (track, workspace.join(audio_track_relative_path(track))))
             .filter(|(_, path)| path.exists())
             .collect();
@@ -288,7 +301,8 @@ impl RecordingManager {
         } else {
             CaptureStatus::Interrupted
         };
-        let terminal = if artifacts.is_empty() {
+        let has_artifacts = !artifacts.is_empty();
+        let mut terminal = if artifacts.is_empty() {
             self.record_store
                 .update_audio_capture(&record.id, status, 0, Some(Vec::new()))
                 .await?
@@ -297,6 +311,60 @@ impl RecordingManager {
                 .finalize_audio_capture(&record.id, status, media_ms, artifacts)
                 .await?
         };
+        for track in tracks {
+            let Ok(relative_path) = analysis_spool_relative_path(track) else {
+                continue;
+            };
+            let path = workspace.join(relative_path);
+            if let Err(error) = cleanup_analysis_spool(&path) {
+                ulog_warn!(
+                    "[recording] recovery analysis cleanup failed recordId={} track={:?} error={}",
+                    record.id,
+                    track,
+                    error
+                );
+            }
+        }
+        if resume_transcription {
+            terminal = self
+                .record_store
+                .update_audio_processing_status(
+                    &record.id,
+                    Some(if has_artifacts {
+                        TranscriptionStatus::Recovering
+                    } else {
+                        TranscriptionStatus::Failed
+                    }),
+                    None,
+                )
+                .await?;
+            if has_artifacts {
+                if let Some(speech) = speech_recognition::global() {
+                    match speech.submit_record_backfill(&record.id).await {
+                        Ok(_) => {
+                            if let Some(latest) = self.record_store.get(&record.id).await {
+                                terminal = latest;
+                            }
+                        }
+                        Err(error) => {
+                            ulog_warn!(
+                                "[recording] recovery backfill admission failed recordId={} error={}",
+                                record.id,
+                                error
+                            );
+                            terminal = self
+                                .record_store
+                                .update_audio_processing_status(
+                                    &record.id,
+                                    Some(TranscriptionStatus::Failed),
+                                    None,
+                                )
+                                .await?;
+                        }
+                    }
+                }
+            }
+        }
         let mut journal = LifecycleJournal::open(&workspace, &record.id)?;
         journal.append(
             now_ms(),
@@ -360,12 +428,22 @@ impl RecordingManager {
 
         let title = format!("录音 {}", Local::now().format("%Y-%m-%d %H:%M"));
         let tracks = plan.sources.iter().map(|source| source.track).collect();
-        let record = self
+        let speech = speech_recognition::global()
+            .filter(|manager| {
+                manager.capability_snapshot().resource_status == SpeechResourceStatus::Ready
+            })
+            .cloned();
+        let initial_transcription_status = if speech.is_some() {
+            TranscriptionStatus::NotStarted
+        } else {
+            TranscriptionStatus::Unavailable
+        };
+        let mut record = self
             .record_store
             .create_audio(AudioRecordCreateInput {
                 title,
                 tracks,
-                transcription_status: TranscriptionStatus::Unavailable,
+                transcription_status: initial_transcription_status,
             })
             .await?;
         let workspace = match self.record_store.audio_workspace_path(&record.id).await {
@@ -444,6 +522,69 @@ impl RecordingManager {
                 return Err(error);
             }
         };
+        let (analyses, live_transcription) = if let Some(speech) = speech.as_ref() {
+            match start_analyses(&workspace, &plan) {
+                Ok(analyses) => {
+                    let sources = analyses.iter().map(TrackAnalysisHandle::source).collect();
+                    match speech.start_record_live(&record.id, sources).await {
+                        Ok(()) => {
+                            match self
+                                .record_store
+                                .update_audio_processing_status(
+                                    &record.id,
+                                    Some(TranscriptionStatus::Queued),
+                                    None,
+                                )
+                                .await
+                            {
+                                Ok(queued) => record = queued,
+                                Err(error) => ulog_warn!(
+                                    "[recording] live queued status commit failed recordId={} error={}",
+                                    record.id,
+                                    error
+                                ),
+                            }
+                            (analyses, true)
+                        }
+                        Err(error) => {
+                            ulog_warn!(
+                                "[recording] live transcription admission failed recordId={} error={}",
+                                record.id,
+                                error
+                            );
+                            cleanup_rejected_analyses(analyses);
+                            record = self
+                                .record_store
+                                .update_audio_processing_status(
+                                    &record.id,
+                                    Some(TranscriptionStatus::Failed),
+                                    None,
+                                )
+                                .await?;
+                            (Vec::new(), false)
+                        }
+                    }
+                }
+                Err(error) => {
+                    ulog_warn!(
+                        "[recording] analysis spool admission failed recordId={} error={}",
+                        record.id,
+                        error
+                    );
+                    record = self
+                        .record_store
+                        .update_audio_processing_status(
+                            &record.id,
+                            Some(TranscriptionStatus::Failed),
+                            None,
+                        )
+                        .await?;
+                    (Vec::new(), false)
+                }
+            }
+        } else {
+            (Vec::new(), false)
+        };
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut warnings = Vec::new();
         if let Some(warning) = wake_warning {
@@ -464,6 +605,8 @@ impl RecordingManager {
             journal,
             session: None,
             archives,
+            analyses,
+            live_transcription,
             _wake_lock: wake_lock,
         };
         let preparing_snapshot = preparing.snapshot();
@@ -484,7 +627,7 @@ impl RecordingManager {
             let Some(RecordingSlot::Live(active)) = state.slot.as_ref() else {
                 return Err("recording admission was superseded".to_string());
             };
-            archive_sinks(&active.archives)
+            capture_sinks(&active.archives, &active.analyses)
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let backend = self.backend.clone();
@@ -517,7 +660,7 @@ impl RecordingManager {
             active.segment_started = Some(Instant::now());
             active.session = Some(session);
         }
-        let updated = match self
+        let mut updated = match self
             .record_store
             .update_audio_capture(&record.id, CaptureStatus::Recording, 0, None)
             .await
@@ -535,6 +678,20 @@ impl RecordingManager {
                 return Err(error);
             }
         };
+        if live_transcription {
+            match self
+                .record_store
+                .update_audio_processing_status(&record.id, Some(TranscriptionStatus::Live), None)
+                .await
+            {
+                Ok(live) => updated = live,
+                Err(error) => ulog_warn!(
+                    "[recording] live transcription status commit failed recordId={} error={}",
+                    record.id,
+                    error
+                ),
+            }
+        }
         let snapshot_result = {
             let mut state = self.state.lock().await;
             let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
@@ -647,7 +804,15 @@ impl RecordingManager {
         }
         self.validate_command_revision(&input).await?;
 
-        let (session, generation, media_ms, paused_started_at) = {
+        let (
+            session,
+            generation,
+            media_ms,
+            paused_started_at,
+            analysis_controls,
+            live_transcription,
+            record_id,
+        ) = {
             let mut state = self.state.lock().await;
             let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
                 return Err("RECORDING_NOT_ACTIVE".to_string());
@@ -673,6 +838,14 @@ impl RecordingManager {
             for archive in &active.archives {
                 archive.sink.set_accepting(!pause);
             }
+            let analysis_controls = active
+                .analyses
+                .iter()
+                .map(|analysis| (analysis.track, analysis.control()))
+                .collect::<Vec<_>>();
+            for (_, control) in &analysis_controls {
+                control.set_accepting(!pause);
+            }
             (
                 active
                     .session
@@ -682,6 +855,9 @@ impl RecordingManager {
                 active.generation,
                 active.media_duration_ms(),
                 active.pause_started,
+                analysis_controls,
+                active.live_transcription,
+                active.record_id.clone(),
             )
         };
         let result = tokio::task::spawn_blocking(move || {
@@ -705,6 +881,34 @@ impl RecordingManager {
             )
             .await?;
             return Err(error);
+        }
+
+        if pause && live_transcription {
+            let checkpoint =
+                match tokio::task::spawn_blocking(move || checkpoint_analyses(&analysis_controls))
+                    .await
+                {
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => Err(format!("analysis checkpoint panicked: {error}")),
+                };
+            match checkpoint {
+                Ok(offsets) => {
+                    if let Some(speech) = speech_recognition::global() {
+                        if let Err(error) = speech.flush_record_live(&record_id, offsets) {
+                            ulog_warn!(
+                                "[recording] live pause flush failed recordId={} error={}",
+                                record_id,
+                                error
+                            );
+                        }
+                    }
+                }
+                Err(error) => ulog_warn!(
+                    "[recording] analysis pause checkpoint failed recordId={} error={}",
+                    record_id,
+                    error
+                ),
+            }
         }
 
         let status = if pause {
@@ -903,6 +1107,9 @@ impl RecordingManager {
         for archive in &active.archives {
             archive.sink.set_accepting(false);
         }
+        for analysis in &active.analyses {
+            analysis.control().set_accepting(false);
+        }
         if let Err(error) = active.journal.append(
             now_ms(),
             media_ms,
@@ -938,10 +1145,12 @@ impl RecordingManager {
 
         let session = active.session.take();
         let archives = std::mem::take(&mut active.archives);
-        let settled =
-            tokio::task::spawn_blocking(move || settle_capture_resources(session, archives))
-                .await
-                .map_err(|error| format!("recording finalization panicked: {error}"))?;
+        let analyses = std::mem::take(&mut active.analyses);
+        let settled = tokio::task::spawn_blocking(move || {
+            settle_capture_resources(session, archives, analyses)
+        })
+        .await
+        .map_err(|error| format!("recording finalization panicked: {error}"))?;
 
         let finalizing_record = self
             .record_store
@@ -968,7 +1177,7 @@ impl RecordingManager {
             .map(|archive| archive.overrun_samples)
             .sum::<u64>();
         let mut terminal = desired_terminal;
-        if !settled.errors.is_empty() || overrun_samples > 0 {
+        if !settled.archive_errors.is_empty() || overrun_samples > 0 {
             terminal = CaptureStatus::Interrupted;
         }
         let usable_archives: Vec<&ArchiveResult> = settled
@@ -998,6 +1207,7 @@ impl RecordingManager {
                 relative_path: audio_track_relative_path(archive.track),
             })
             .collect();
+        let has_usable_archives = !artifacts.is_empty();
         let terminal_record_result = if artifacts.is_empty() {
             self.record_store
                 .update_audio_capture(
@@ -1012,7 +1222,7 @@ impl RecordingManager {
                 .finalize_audio_capture(&active.record_id, terminal, final_media_ms, artifacts)
                 .await
         };
-        let terminal_record = match terminal_record_result {
+        let mut terminal_record = match terminal_record_result {
             Ok(record) => record,
             Err(error) => {
                 ulog_warn!(
@@ -1044,6 +1254,52 @@ impl RecordingManager {
                 error
             );
         }
+        if active.live_transcription {
+            if let Some(speech) = speech_recognition::global() {
+                if let Err(error) =
+                    speech.finish_record_live(&active.record_id, settled.analysis_offsets.clone())
+                {
+                    ulog_warn!(
+                        "[recording] live final boundary failed recordId={} error={}",
+                        active.record_id,
+                        error
+                    );
+                }
+                if has_usable_archives {
+                    if let Err(error) = speech.submit_record_backfill(&active.record_id).await {
+                        ulog_warn!(
+                            "[recording] final transcript backfill admission failed recordId={} error={}",
+                            active.record_id,
+                            error
+                        );
+                        if let Ok(failed) = self
+                            .record_store
+                            .update_audio_processing_status(
+                                &active.record_id,
+                                Some(TranscriptionStatus::Failed),
+                                None,
+                            )
+                            .await
+                        {
+                            terminal_record = failed;
+                        }
+                    }
+                } else if let Ok(failed) = self
+                    .record_store
+                    .update_audio_processing_status(
+                        &active.record_id,
+                        Some(TranscriptionStatus::Failed),
+                        None,
+                    )
+                    .await
+                {
+                    terminal_record = failed;
+                }
+                if let Some(latest) = self.record_store.get(&active.record_id).await {
+                    terminal_record = latest;
+                }
+            }
+        }
         let terminal_snapshot = RecordingSnapshot {
             record_id: active.record_id.clone(),
             revision: terminal_record.revision,
@@ -1068,11 +1324,18 @@ impl RecordingManager {
             }
         }
         self.emit_change(terminal_snapshot.clone(), false);
-        if !settled.errors.is_empty() {
+        if !settled.archive_errors.is_empty() {
             ulog_warn!(
                 "[recording] finalized interrupted recordId={} errors={}",
                 terminal_snapshot.record_id,
-                settled.errors.join("; ")
+                settled.archive_errors.join("; ")
+            );
+        }
+        if !settled.analysis_errors.is_empty() {
+            ulog_warn!(
+                "[recording] live analysis degraded recordId={} errors={}",
+                terminal_snapshot.record_id,
+                settled.analysis_errors.join("; ")
             );
         }
         Ok(terminal_snapshot)
@@ -1168,34 +1431,65 @@ impl RecordingManager {
 
 struct SettledResources {
     archives: Vec<ArchiveResult>,
-    errors: Vec<String>,
+    archive_errors: Vec<String>,
+    analysis_offsets: Vec<RecordTranscriptTrackOffset>,
+    analysis_errors: Vec<String>,
 }
 
 fn settle_capture_resources(
     session: Option<Arc<StdMutex<Box<dyn CaptureSession>>>>,
     archives: Vec<TrackArchiveHandle>,
+    analyses: Vec<TrackAnalysisHandle>,
 ) -> SettledResources {
-    let mut errors = Vec::new();
+    let mut archive_errors = Vec::new();
     if let Some(session) = session {
         match session.lock() {
             Ok(mut session) => {
                 if let Err(error) = session.stop() {
-                    errors.push(error);
+                    archive_errors.push(error);
                 }
             }
-            Err(_) => errors.push("capture session lock poisoned".to_string()),
+            Err(_) => archive_errors.push("capture session lock poisoned".to_string()),
         }
     }
     let mut finalized = Vec::new();
     for archive in archives {
         match archive.finish() {
             Ok(result) => finalized.push(result),
-            Err(error) => errors.push(error),
+            Err(error) => archive_errors.push(error),
+        }
+    }
+    let mut analysis_offsets = Vec::with_capacity(analyses.len());
+    let mut analysis_errors = Vec::new();
+    for analysis in analyses {
+        let track = analysis.track;
+        let source = analysis.source();
+        match analysis.finish() {
+            Ok(result) => {
+                debug_assert_eq!(result.track, track);
+                debug_assert_eq!(result.path, source.path());
+                if result.overrun_samples > 0 {
+                    analysis_errors.push("SPEECH_ANALYSIS_OVERRUN".to_string());
+                }
+                analysis_offsets.push(RecordTranscriptTrackOffset {
+                    track,
+                    sample: result.samples_16k,
+                });
+            }
+            Err(error) => {
+                analysis_errors.push(error);
+                analysis_offsets.push(RecordTranscriptTrackOffset {
+                    track,
+                    sample: source.snapshot().committed_samples,
+                });
+            }
         }
     }
     SettledResources {
         archives: finalized,
-        errors,
+        archive_errors,
+        analysis_offsets,
+        analysis_errors,
     }
 }
 
@@ -1216,15 +1510,71 @@ fn start_archives(workspace: &Path, plan: &CapturePlan) -> Result<Vec<TrackArchi
     Ok(archives)
 }
 
-fn archive_sinks(archives: &[TrackArchiveHandle]) -> CaptureSinks {
+fn start_analyses(
+    workspace: &Path,
+    plan: &CapturePlan,
+) -> Result<Vec<TrackAnalysisHandle>, String> {
+    let mut analyses = Vec::with_capacity(plan.sources.len());
+    for source in &plan.sources {
+        let path = workspace.join(analysis_spool_relative_path(source.track)?);
+        match TrackAnalysisHandle::start(source.track, path, source.format.into()) {
+            Ok(analysis) => analyses.push(analysis),
+            Err(error) => {
+                cleanup_rejected_analyses(analyses);
+                return Err(error);
+            }
+        }
+    }
+    Ok(analyses)
+}
+
+fn cleanup_rejected_analyses(analyses: Vec<TrackAnalysisHandle>) {
+    for analysis in analyses {
+        let path = analysis.source().path().to_path_buf();
+        let _ = analysis.finish();
+        if let Err(error) = cleanup_analysis_spool(&path) {
+            ulog_warn!(
+                "[recording] rejected analysis cleanup failed path={} error={}",
+                path.display(),
+                error
+            );
+        }
+    }
+}
+
+fn checkpoint_analyses(
+    controls: &[(AudioTrackKind, AnalysisControl)],
+) -> Result<Vec<RecordTranscriptTrackOffset>, String> {
+    controls
+        .iter()
+        .map(|(track, control)| {
+            control
+                .checkpoint()
+                .map(|sample| RecordTranscriptTrackOffset {
+                    track: *track,
+                    sample,
+                })
+        })
+        .collect()
+}
+
+fn capture_sinks(
+    archives: &[TrackArchiveHandle],
+    analyses: &[TrackAnalysisHandle],
+) -> CaptureSinks {
     let mut sinks = CaptureSinks {
         microphone: None,
         system: None,
     };
     for archive in archives {
+        let analysis = analyses
+            .iter()
+            .find(|analysis| analysis.track == archive.track)
+            .map(|analysis| analysis.sink.clone());
+        let sink = CaptureTrackSink::new(archive.sink.clone(), analysis);
         match archive.track {
-            AudioTrackKind::Microphone => sinks.microphone = Some(archive.sink.clone()),
-            AudioTrackKind::System => sinks.system = Some(archive.sink.clone()),
+            AudioTrackKind::Microphone => sinks.microphone = Some(sink),
+            AudioTrackKind::System => sinks.system = Some(sink),
             _ => {}
         }
     }
@@ -1590,7 +1940,7 @@ mod tests {
         let archive = TrackArchiveHandle::start(
             AudioTrackKind::Microphone,
             workspace.join(audio_track_relative_path(AudioTrackKind::Microphone)),
-            super::super::archive::SourceFormat {
+            super::super::audio::SourceFormat {
                 sample_rate: 48_000,
                 channels: 1,
             },
@@ -1598,6 +1948,8 @@ mod tests {
         .unwrap();
         archive.sink.push_f32(&vec![0.04; 96_000]);
         archive.finish().unwrap();
+        let analysis_spool = workspace.join("analysis/microphone.pcm16");
+        std::fs::write(&analysis_spool, b"private-crash-spool").unwrap();
         store
             .update_audio_capture(&record.id, CaptureStatus::Recording, 2_000, None)
             .await
@@ -1613,6 +1965,60 @@ mod tests {
         );
         assert_eq!(recovered.artifacts.len(), 1);
         assert!(recovered.audio.as_ref().unwrap().media_duration_ms >= 2_000);
+        assert!(!analysis_spool.exists());
+        assert_eq!(
+            recovered.audio.as_ref().unwrap().transcription_status,
+            TranscriptionStatus::Unavailable,
+            "a historical recording without a live journal is never auto-submitted"
+        );
+
+        let accepted = store
+            .create_audio(AudioRecordCreateInput {
+                title: "recover accepted live transcription".to_string(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::NotStarted,
+            })
+            .await
+            .unwrap();
+        let accepted_workspace = store.audio_workspace_path(&accepted.id).await.unwrap();
+        drop(
+            store
+                .begin_live_transcript(
+                    &accepted.id,
+                    crate::record::RecordSpeechProvenance {
+                        provider: "local".into(),
+                        model_pack_revision: "fixture-pack".into(),
+                        onnx_runtime_version: "1.28.0".into(),
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        let accepted_archive = TrackArchiveHandle::start(
+            AudioTrackKind::Microphone,
+            accepted_workspace.join(audio_track_relative_path(AudioTrackKind::Microphone)),
+            super::super::audio::SourceFormat {
+                sample_rate: 48_000,
+                channels: 1,
+            },
+        )
+        .unwrap();
+        accepted_archive.sink.push_f32(&vec![0.04; 48_000]);
+        accepted_archive.finish().unwrap();
+        let accepted_spool = accepted_workspace.join("analysis/microphone.pcm16");
+        std::fs::write(&accepted_spool, b"accepted-private-crash-spool").unwrap();
+        store
+            .update_audio_capture(&accepted.id, CaptureStatus::Recording, 1_000, None)
+            .await
+            .unwrap();
+        manager.recover_interrupted().await;
+        let accepted = store.get(&accepted.id).await.unwrap();
+        assert_eq!(
+            accepted.audio.as_ref().unwrap().transcription_status,
+            TranscriptionStatus::Recovering,
+            "the durable live journal is the exact auto-recovery admission marker"
+        );
+        assert!(!accepted_spool.exists());
 
         let empty = store
             .create_audio(AudioRecordCreateInput {

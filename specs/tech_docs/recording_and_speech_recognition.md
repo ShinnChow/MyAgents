@@ -36,6 +36,18 @@ Record backfill / diarization 在 App 重启后保留原 job ID，清除旧 Work
 
 Worker 结果只有同时满足 exact `(jobId, generation)`、协议 shape、业务数量/时间轴上限且当前 generation 仍持有 publish authority 时才能提交。Record ASR 成功后由同一 Manager 排队 diarization；stale generation、cancelled generation 和失败 probe 都不能发布内容。
 
+## 录制中转写
+
+资源在录音 admission 时已 ready 才会接纳 live workload；缺资源的录音只做权威 Ogg Opus 归档。模型包后续安装只改变 capability，不扫描或自动排队这些历史 Record。
+
+每个 physical track 的 callback 经一个固定 fan-out 先写 archive ring，再写可选 analysis ring。两个后台 writer 共用 `rubato` adapter；analysis 只落一份固定路径的 16 kHz mono raw PCM16 spool，不自创媒体容器。`SpeechRecognitionManager` 只读取已 `flush + sync_data` 的 committed sample，逐个有界 binary frame 发给 exact-generation Worker，并校验 ACK、heartbeat checkpoint、segment revision 和 terminal metrics。Worker response 使用 bounded reader channel 和 120 秒基础设施超时；超时只重启当前 live generation，不影响 archive。
+
+Pause 先停止两个 ring 的 admission，再暂停设备；analysis writer 排空、刷新 resampler 并 fsync 后，Manager 以每轨 exact sample boundary 发送 `Flush`。Worker 在该边界强制结束 VAD 句段、发布稳定整句并重置 VAD，不写虚假静音，也不把 wall pause 算入媒体时间。Resume 从同一 append-only spool 继续。
+
+live revision 写入 `transcript/revisions.jsonl`，复用 `DurableRecordJournal`。Worker-local ID 不成为产品 identity；RecordStore 按 `track + start + end` 生成稳定 segment ID，同边界重算只递增 revision。generation 失败时从最后 durable segment end 重放，以重建尚未发布的 VAD pending state；每帧 ACK 仍即时校验，但不能仅从最后 ACK 继续，否则会丢掉已 ACK、尚未形成稳定句段的语音。
+
+Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact；只有本次录音在开始时已接纳 live workload，才会用最终 analysis boundary 收敛 live Worker，并自动为永久 Ogg 接纳 recording-final backfill。analysis 失败不把可用音频判坏。异常退出恢复只清理 Record 内两个固定 spool 文件；只对 manifest 表明此前已经接纳 live transcription 的 interrupted Record 恢复 backfill，普通历史录音保持手动“开始转录”。
+
 ## 用户模型包
 
 当前 pack identity 固定为 `local-standard-speech / sensevoice-2024-07-17-v1`。编译期 source lock 位于 `src-tauri/media-worker/model-pack-source-lock.json`，固定：

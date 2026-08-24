@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -82,6 +83,12 @@ where
         media_ms: u64,
         event: Event,
     ) -> Result<DurableJournalEntry<Event>, String> {
+        ensure_regular_or_missing(&self.path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| format!("open durable journal: {error}"))?;
         let next_seq = self
             .next_seq
             .checked_add(1)
@@ -100,19 +107,17 @@ where
         let mut bytes = serde_json::to_vec(&line)
             .map_err(|error| format!("serialize durable journal: {error}"))?;
         if bytes.len() > self.max_line_bytes {
+            bytes.zeroize();
             return Err("durable journal event exceeds size limit".to_string());
         }
         bytes.push(b'\n');
-        ensure_regular_or_missing(&self.path)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|error| format!("open durable journal: {error}"))?;
-        file.write_all(&bytes)
+        let write_result = file
+            .write_all(&bytes)
             .and_then(|()| file.flush())
             .and_then(|()| file.sync_data())
-            .map_err(|error| format!("append durable journal: {error}"))?;
+            .map_err(|error| format!("append durable journal: {error}"));
+        bytes.zeroize();
+        write_result?;
         let JournalBody {
             seq,
             wall_time_ms,
@@ -216,9 +221,11 @@ fn body_checksum<Event>(body: &JournalBody<Event>) -> Result<String, String>
 where
     Event: Serialize,
 {
-    let bytes = serde_json::to_vec(body)
+    let mut bytes = serde_json::to_vec(body)
         .map_err(|error| format!("serialize durable journal checksum body: {error}"))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    let checksum = format!("{:x}", Sha256::digest(&bytes));
+    bytes.zeroize();
+    Ok(checksum)
 }
 
 fn validate_configuration(
