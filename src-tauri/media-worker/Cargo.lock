@@ -177,12 +177,22 @@ version = "0.4.10"
 dependencies = [
  "libc",
  "libloading",
+ "myagents-media-worker-protocol",
  "ogg",
  "opus2",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "zeroize",
+]
+
+[[package]]
+name = "myagents-media-worker-protocol"
+version = "0.4.10"
+dependencies = [
+ "serde",
+ "serde_json",
  "zeroize",
 ]
 

@@ -30,6 +30,7 @@ serde = { version = "1.0", features = ["derive"] }
 url = "2"
 percent-encoding = "2"
 log = "0.4"
+myagents-media-worker-protocol = { path = "media-worker-protocol" }
 # `macos-private-api` is required for transparent webview windows on macOS —
 # the floating ball / companion panels (PRD 0.2.35) are transparent NSPanels.
 # Main window is unaffected (it never sets transparent(true)).

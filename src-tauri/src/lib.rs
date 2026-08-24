@@ -36,6 +36,7 @@ mod macos_traffic_light;
 pub mod managed_codex;
 pub mod management_api;
 pub mod mcp_startup_admission;
+pub use myagents_media_worker_protocol as media_worker_protocol;
 pub mod memory_auto_update;
 pub mod memory_evolution;
 pub mod notification;
@@ -55,6 +56,9 @@ pub mod session_visibility;
 mod sidecar;
 pub mod space_cloud;
 mod space_cloud_mock;
+#[path = "../media-worker/src/model_pack_source.rs"]
+pub mod speech_model_pack;
+pub mod speech_recognition;
 mod sse_proxy;
 pub mod system_binary;
 pub mod task;
@@ -1322,7 +1326,7 @@ pub fn run() {
             ) {
                 ulog_error!("[local-inference] Failed to register compute coordinator: {}", error);
             } else {
-                app.manage(compute_coordinator);
+                app.manage(compute_coordinator.clone());
             }
             match app.path().resource_dir() {
                 Ok(resource_dir) => {
@@ -1342,8 +1346,8 @@ pub fn run() {
                     match app_dirs::myagents_data_dir() {
                         Some(data_dir) => {
                             match document_processing::DocumentProcessingManager::initialize(
-                                data_dir,
-                                resource_dir,
+                                data_dir.clone(),
+                                resource_dir.clone(),
                                 runtime_registry.as_ref(),
                             ) {
                                 Ok(manager) => {
@@ -1361,6 +1365,34 @@ pub fn run() {
                                 Err(error) => {
                                     ulog_error!(
                                         "[document] Failed to initialize manager: {}",
+                                        error
+                                    );
+                                }
+                            }
+                            match speech_recognition::SpeechRecognitionManager::initialize(
+                                data_dir,
+                                resource_dir,
+                                runtime_registry.as_ref(),
+                                compute_coordinator.clone(),
+                                record::get_record_store()
+                                    .expect("RecordStore initialized before Tauri setup")
+                                    .clone(),
+                            ) {
+                                Ok(manager) => {
+                                    if let Err(error) =
+                                        speech_recognition::set_global(manager.clone())
+                                    {
+                                        ulog_error!(
+                                            "[speech] Failed to register manager: {}",
+                                            error
+                                        );
+                                    } else {
+                                        app.manage(manager);
+                                    }
+                                }
+                                Err(error) => {
+                                    ulog_error!(
+                                        "[speech] Failed to initialize manager: {}",
                                         error
                                     );
                                 }
@@ -1641,6 +1673,15 @@ pub fn run() {
                         if let Err(error) = manager.shutdown() {
                             ulog_error!(
                                 "[document] shutdown failed reason={} error={}",
+                                shutdown_reason,
+                                error
+                            );
+                        }
+                    }
+                    if let Some(manager) = speech_recognition::global() {
+                        if let Err(error) = manager.shutdown() {
+                            ulog_error!(
+                                "[speech] shutdown failed reason={} error={}",
                                 shutdown_reason,
                                 error
                             );
