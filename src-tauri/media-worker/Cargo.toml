@@ -10,11 +10,16 @@ publish = false
 name = "myagents_media_worker"
 path = "src/lib.rs"
 
+[[bin]]
+name = "myagents-media-worker"
+path = "src/main.rs"
+
 [dependencies]
 libloading = "0.9.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3.10"

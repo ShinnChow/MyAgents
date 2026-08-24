@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
+use zeroize::Zeroize;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -85,6 +86,14 @@ pub struct PcmStreamStart {
     pub track: TrackKind,
     pub first_sequence: u64,
     pub first_sample: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PcmStreamEnd {
+    pub track: TrackKind,
+    pub last_sequence: Option<u64>,
+    pub final_sample: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,8 +220,7 @@ pub enum WorkerCommand {
     Finalize {
         protocol_version: u32,
         identity: WorkloadIdentity,
-        last_sequence: u64,
-        final_sample: u64,
+        streams: Vec<PcmStreamEnd>,
     },
     Cancel {
         protocol_version: u32,
@@ -279,6 +287,25 @@ impl WorkerCommand {
             | Self::Ping { identity, .. } => identity,
         }
     }
+
+    pub fn has_valid_shape(&self) -> bool {
+        if self.protocol_version() != PROTOCOL_VERSION || !self.identity().is_valid() {
+            return false;
+        }
+        match self {
+            Self::Start(start) => start.has_valid_shape(),
+            Self::Finalize { streams, .. } => valid_stream_ends(streams),
+            Self::Cancel { .. } | Self::Yield { .. } | Self::Ping { .. } => true,
+        }
+    }
+}
+
+fn valid_stream_ends(streams: &[PcmStreamEnd]) -> bool {
+    (1..=2).contains(&streams.len())
+        && streams
+            .iter()
+            .all(|stream| is_record_source_track(stream.track))
+        && (streams.len() == 1 || streams[0].track != streams[1].track)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -345,6 +372,14 @@ pub enum ProgressUnit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Checkpoint {
+    pub streams: Vec<PcmStreamCheckpoint>,
+    pub analysis_sample: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PcmStreamCheckpoint {
+    pub track: TrackKind,
     pub last_ack_sequence: Option<u64>,
     pub analysis_sample: u64,
 }
@@ -457,6 +492,17 @@ impl std::fmt::Debug for WorkerResponse {
     }
 }
 
+impl WorkerResponse {
+    pub fn zeroize_sensitive(&mut self) {
+        if let Self::TranscriptSegment { text, language, .. } = self {
+            text.zeroize();
+            if let Some(language) = language {
+                language.zeroize();
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ManagerFrame {
     Control(WorkerCommand),
@@ -464,30 +510,34 @@ pub enum ManagerFrame {
 }
 
 pub fn read_manager_frame(reader: &mut impl Read) -> io::Result<Option<ManagerFrame>> {
-    let Some(payload) = read_wire_frame(reader)? else {
+    let Some(mut payload) = read_wire_frame(reader)? else {
         return Ok(None);
     };
-    match payload[0] {
-        CONTROL_FRAME_KIND => {
-            let command = serde_json::from_slice(&payload[1..])
-                .map_err(|_| invalid_data("invalid control JSON"))?;
-            Ok(Some(ManagerFrame::Control(command)))
-        }
+    let parsed = match payload[0] {
+        CONTROL_FRAME_KIND => serde_json::from_slice(&payload[1..])
+            .map(|command| Some(ManagerFrame::Control(command)))
+            .map_err(|_| invalid_data("invalid control JSON")),
         PCM_FRAME_KIND => parse_pcm_frame(&payload).map(|frame| Some(ManagerFrame::Pcm(frame))),
         _ => Err(invalid_data("unknown media worker frame kind")),
-    }
+    };
+    payload.zeroize();
+    parsed
 }
 
 pub fn write_control_frame(writer: &mut impl Write, value: &impl Serialize) -> io::Result<()> {
-    let json =
+    let mut json =
         serde_json::to_vec(value).map_err(|_| invalid_data("control serialization failed"))?;
     if json.is_empty() || json.len() > MAX_CONTROL_FRAME_BYTES {
+        json.zeroize();
         return Err(invalid_data("control frame exceeds fixed limit"));
     }
     let mut payload = Vec::with_capacity(1 + json.len());
     payload.push(CONTROL_FRAME_KIND);
     payload.extend_from_slice(&json);
-    write_wire_frame(writer, &payload)
+    json.zeroize();
+    let result = write_wire_frame(writer, &payload);
+    payload.zeroize();
+    result
 }
 
 pub fn write_pcm_frame(writer: &mut impl Write, frame: &PcmFrame) -> io::Result<()> {
@@ -719,6 +769,36 @@ mod tests {
             !start.has_valid_shape(),
             "diarization owns one selected source"
         );
+
+        let finalize = WorkerCommand::Finalize {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity(),
+            streams: vec![
+                PcmStreamEnd {
+                    track: TrackKind::Microphone,
+                    last_sequence: Some(8),
+                    final_sample: 32_000,
+                },
+                PcmStreamEnd {
+                    track: TrackKind::System,
+                    last_sequence: None,
+                    final_sample: 32_000,
+                },
+            ],
+        };
+        assert!(finalize.has_valid_shape());
+        let WorkerCommand::Finalize { mut streams, .. } = finalize else {
+            unreachable!();
+        };
+        streams[1].track = TrackKind::Microphone;
+        assert!(
+            !WorkerCommand::Finalize {
+                protocol_version: PROTOCOL_VERSION,
+                identity: identity(),
+                streams,
+            }
+            .has_valid_shape()
+        );
     }
 
     #[test]
@@ -743,7 +823,7 @@ mod tests {
 
     #[test]
     fn transcript_response_debug_redacts_content() {
-        let response = WorkerResponse::TranscriptSegment {
+        let mut response = WorkerResponse::TranscriptSegment {
             protocol_version: PROTOCOL_VERSION,
             identity: identity(),
             segment_id: "segment-1".into(),
@@ -758,6 +838,12 @@ mod tests {
         assert!(!debug.contains("unique-secret-transcript"));
         let mut wire = Vec::new();
         write_control_frame(&mut wire, &response).unwrap();
+        response.zeroize_sensitive();
+        let WorkerResponse::TranscriptSegment { text, language, .. } = response else {
+            unreachable!();
+        };
+        assert!(text.is_empty());
+        assert_eq!(language.as_deref(), Some(""));
         assert!(
             wire.windows(24)
                 .any(|bytes| bytes == b"unique-secret-transcript")

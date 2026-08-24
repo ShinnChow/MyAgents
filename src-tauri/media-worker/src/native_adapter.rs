@@ -359,6 +359,35 @@ impl std::fmt::Debug for AsrTranscript {
     }
 }
 
+impl AsrTranscript {
+    pub fn zeroize_sensitive(&mut self) {
+        use zeroize::Zeroize;
+
+        self.text.zeroize();
+        if let Some(language) = &mut self.language {
+            language.zeroize();
+        }
+        if let Some(emotion) = &mut self.emotion {
+            emotion.zeroize();
+        }
+        if let Some(event) = &mut self.event {
+            event.zeroize();
+        }
+    }
+
+    pub fn into_publication(mut self) -> (String, Option<String>) {
+        use zeroize::Zeroize;
+
+        if let Some(emotion) = &mut self.emotion {
+            emotion.zeroize();
+        }
+        if let Some(event) = &mut self.event {
+            event.zeroize();
+        }
+        (self.text, self.language)
+    }
+}
+
 pub struct AsrEngine<'adapter> {
     api: &'adapter NativeApiV1,
     handle: NonNull<NativeAsr>,
@@ -395,7 +424,7 @@ impl AsrEngine<'_> {
         expect_status(code, NativeStatus::Ok)?;
         Ok(AsrTranscript {
             text: take_utf8(&text, output.text.length)?,
-            language: take_optional_utf8(&language, output.language.length)?,
+            language: take_optional_label(&language, output.language.length)?,
             emotion: take_optional_utf8(&emotion, output.emotion.length)?,
             event: take_optional_utf8(&event, output.event.length)?,
         })
@@ -818,6 +847,26 @@ fn take_optional_utf8(buffer: &[u8], length: u32) -> Result<Option<String>, Nati
     Ok((!value.is_empty()).then_some(value))
 }
 
+fn take_optional_label(buffer: &[u8], length: u32) -> Result<Option<String>, NativeAdapterError> {
+    let Some(value) = take_optional_utf8(buffer, length)? else {
+        return Ok(None);
+    };
+    let value = value
+        .strip_prefix("<|")
+        .and_then(|value| value.strip_suffix("|>"))
+        .unwrap_or(&value)
+        .to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(NativeAdapterError::InvalidOutput);
+    }
+    Ok(Some(value))
+}
+
 /// Validate the fixed table prefix returned by
 /// `myagents_speech_adapter_get_api(1)`.
 ///
@@ -956,7 +1005,7 @@ mod tests {
         // SAFETY: Test bytes fit every wrapper-owned output buffer.
         unsafe {
             write_fake_utf8(&mut out.text, "测试转写".as_bytes());
-            write_fake_utf8(&mut out.language, b"zh");
+            write_fake_utf8(&mut out.language, b"<|ZH|>");
             write_fake_utf8(&mut out.emotion, b"");
             write_fake_utf8(&mut out.event, b"speech");
         }
