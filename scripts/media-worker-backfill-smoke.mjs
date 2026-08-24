@@ -6,7 +6,7 @@ const [
   nativeManifestPath,
   runtimePath,
   modelManifestPath,
-  recordOpusPath,
+  sourcePath,
   requestedMode,
 ] = process.argv.slice(2);
 const mode = requestedMode ?? "complete";
@@ -15,17 +15,21 @@ if (
   !nativeManifestPath ||
   !runtimePath ||
   !modelManifestPath ||
-  !recordOpusPath ||
-  !["complete", "yield", "cancel", "diarization"].includes(mode)
+  !sourcePath ||
+  !["complete", "yield", "cancel", "diarization", "attachment"].includes(mode)
 ) {
   throw new Error(
-    "Usage: node scripts/media-worker-backfill-smoke.mjs <worker> <native-manifest> <onnx-runtime> <model-manifest> <record.opus> [complete|yield|cancel|diarization]",
+    "Usage: node scripts/media-worker-backfill-smoke.mjs <worker> <native-manifest> <onnx-runtime> <model-manifest> <source-media> [complete|yield|cancel|diarization|attachment]",
   );
 }
 
 const PROTOCOL_VERSION = 1;
 const MAX_CONTROL_BYTES = 256 * 1024;
-const identity = { workloadId: "record_backfill_smoke", workerGeneration: 1 };
+const identity = {
+  workloadId:
+    mode === "attachment" ? "attachment_asr_smoke" : "record_backfill_smoke",
+  workerGeneration: 1,
+};
 
 function controlFrame(value) {
   const json = Buffer.from(JSON.stringify(value));
@@ -76,7 +80,9 @@ const timeout = setTimeout(() => child.kill(), 45_000);
 const childError = once(child, "error").then(([error]) => {
   throw error;
 });
-const childExit = once(child, "exit").then(([exitCode, signal]) => ({
+// `close` fires after stdio is drained; `exit` may race the Worker's final
+// framed response and make a fast terminal look like a missing response.
+const childExit = once(child, "close").then(([exitCode, signal]) => ({
   exitCode,
   signal,
 }));
@@ -84,6 +90,10 @@ const childTermination = Promise.race([childExit, childError]);
 
 async function waitForResponse(type, predicate = () => true) {
   while (true) {
+    const failed = responses.find((candidate) => candidate.type === "failed");
+    if (failed && type !== "failed") {
+      throw new Error(`Worker failed before ${type}: ${failed.code}`);
+    }
     const response = responses.find(
       (candidate) => candidate.type === type && predicate(candidate),
     );
@@ -127,17 +137,24 @@ await write({
   protocolVersion: PROTOCOL_VERSION,
   identity,
   workloadKind:
-    mode === "diarization" ? "record_diarization" : "record_backfill_asr",
-  input: {
-    type: "record_artifacts",
-    inputs: [{ track: "microphone", inputPath: recordOpusPath }],
-  },
+    mode === "diarization"
+      ? "record_diarization"
+      : mode === "attachment"
+        ? "attachment_asr"
+        : "record_backfill_asr",
+  input:
+    mode === "attachment"
+      ? { type: "attachment", inputPath: sourcePath }
+      : {
+          type: "record_artifacts",
+          inputs: [{ track: "microphone", inputPath: sourcePath }],
+        },
   nativeManifestPath,
   onnxRuntimePath: runtimePath,
   modelPackManifestPath: modelManifestPath,
 });
 await waitForResponse("ready");
-if (mode === "complete" || mode === "diarization") {
+if (["complete", "diarization", "attachment"].includes(mode)) {
   await write({
     type: "ping",
     protocolVersion: PROTOCOL_VERSION,
@@ -173,6 +190,7 @@ const transcript = responses.find(
 const completed = responses.find((response) => response.type === "completed");
 const yielded = responses.find((response) => response.type === "yielded");
 const failed = responses.find((response) => response.type === "failed");
+const media = responses.find((response) => response.type === "media_probed");
 const speakerTurnCount = responses
   .filter((response) => response.type === "speaker_turn_batch")
   .reduce((count, response) => count + response.turns.length, 0);
@@ -183,6 +201,14 @@ const result = {
   counts,
   transcriptBytes: transcript ? Buffer.byteLength(transcript.text) : 0,
   language: transcript?.language,
+  media: media
+    ? {
+        mediaKind: media.mediaKind,
+        codec: media.codec,
+        durationMs: media.durationMs,
+        usedDefaultTrack: media.usedDefaultTrack,
+      }
+    : undefined,
   completedMetrics: completed?.metrics,
   failureCode: failed?.code,
   speakerTurnCount,
@@ -190,11 +216,13 @@ const result = {
 };
 console.log(JSON.stringify(result));
 const invalidComplete =
-  mode === "complete" &&
+  ["complete", "attachment"].includes(mode) &&
   (!transcript ||
     !completed ||
     counts.ready !== 1 ||
     counts.pong !== 1 ||
+    (mode === "attachment" && counts.media_probed !== 1) ||
+    (mode === "complete" && counts.media_probed) ||
     counts.yielded ||
     counts.failed);
 const invalidYield =
