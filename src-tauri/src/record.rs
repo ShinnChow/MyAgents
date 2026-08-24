@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::durable_fs::{rename_directory_noreplace, sync_directory};
 use crate::utils::file_lock::{with_file_lock_blocking, FileLockError, FileLockOptions};
@@ -326,6 +327,15 @@ impl std::fmt::Debug for RecordTranscriptSegment {
     }
 }
 
+impl RecordTranscriptSegment {
+    fn zeroize_sensitive(&mut self) {
+        self.text.zeroize();
+        if let Some(language) = &mut self.language {
+            language.zeroize();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordSpeechProvenance {
@@ -358,6 +368,24 @@ impl std::fmt::Debug for RecordTranscriptSnapshot {
             .field("provenance", &self.provenance)
             .field("segment_count", &self.segments.len())
             .finish()
+    }
+}
+
+impl Drop for RecordTranscriptSnapshot {
+    fn drop(&mut self) {
+        for segment in &mut self.segments {
+            segment.zeroize_sensitive();
+        }
+    }
+}
+
+struct SensitiveTranscriptInput(Vec<RecordTranscriptSegment>);
+
+impl Drop for SensitiveTranscriptInput {
+    fn drop(&mut self) {
+        for segment in &mut self.0 {
+            segment.zeroize_sensitive();
+        }
     }
 }
 
@@ -702,6 +730,23 @@ impl RecordStore {
         })
     }
 
+    /// Resolve a permanent audio track for an owned background processor.
+    /// Playback range requests use the cheaper inventory/size check above;
+    /// inference admission additionally re-hashes the complete immutable file
+    /// once before a Worker generation is allowed to consume it.
+    pub async fn resolve_record_media_for_processing(
+        &self,
+        id: &str,
+        track: AudioTrackKind,
+    ) -> Result<ResolvedRecordMedia, String> {
+        let media = self.resolve_record_media(id, track).await?;
+        let actual = sha256_regular_file_exact(&media.path, media.size_bytes)?;
+        if actual != media.sha256 {
+            return Err("Record media digest no longer matches its inventory".to_string());
+        }
+        Ok(media)
+    }
+
     pub async fn update_audio_processing_status(
         &self,
         id: &str,
@@ -755,6 +800,7 @@ impl RecordStore {
         segments: Vec<RecordTranscriptSegment>,
         provenance: RecordSpeechProvenance,
     ) -> Result<RecordTranscriptSnapshot, String> {
+        let mut segments = SensitiveTranscriptInput(segments);
         let mut inner = self.inner.write().await;
         let stored = inner
             .get(id)
@@ -765,7 +811,7 @@ impl RecordStore {
             .audio
             .as_ref()
             .ok_or_else(|| format!("Record is not audio: {id}"))?;
-        validate_transcript_segments(audio, &segments)?;
+        validate_transcript_segments(audio, &segments.0)?;
         validate_speech_provenance(&provenance)?;
 
         let relative = PathBuf::from("transcript/snapshot.json");
@@ -792,16 +838,24 @@ impl RecordStore {
             state: "recording_final".into(),
             sample_rate: SPEECH_SAMPLE_RATE as u32,
             provenance,
-            segments,
+            segments: std::mem::take(&mut segments.0),
         };
-        let bytes = serde_json::to_vec_pretty(&snapshot)
+        let mut bytes = serde_json::to_vec_pretty(&snapshot)
             .map_err(|error| format!("serialize transcript snapshot: {error}"))?;
         if bytes.is_empty() || bytes.len() as u64 > TRANSCRIPT_SNAPSHOT_MAX_BYTES {
+            bytes.zeroize();
             return Err("transcript snapshot exceeds the fixed size limit".to_string());
         }
-        let content = std::str::from_utf8(&bytes)
-            .map_err(|_| "transcript snapshot serialization is not UTF-8".to_string())?;
-        crate::task::write_atomic_text(&snapshot_path, content)?;
+        let content = match std::str::from_utf8(&bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                bytes.zeroize();
+                return Err("transcript snapshot serialization is not UTF-8".to_string());
+            }
+        };
+        let write_result = crate::task::write_atomic_text(&snapshot_path, content);
+        bytes.zeroize();
+        write_result?;
 
         let mut updated = stored.record;
         replace_record_artifact(
@@ -1705,9 +1759,11 @@ fn record_max_speech_sample(audio: &AudioRecordSummary) -> Result<u64, String> {
 }
 
 fn read_transcript_snapshot(path: &Path) -> Result<RecordTranscriptSnapshot, String> {
-    let bytes = read_bounded_regular_file(path, TRANSCRIPT_SNAPSHOT_MAX_BYTES)?;
-    let snapshot: RecordTranscriptSnapshot = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("parse transcript snapshot: {error}"))?;
+    let mut bytes = read_bounded_regular_file(path, TRANSCRIPT_SNAPSHOT_MAX_BYTES)?;
+    let parsed = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse transcript snapshot: {error}"));
+    bytes.zeroize();
+    let snapshot: RecordTranscriptSnapshot = parsed?;
     if snapshot.schema_version != 1
         || snapshot.projection_revision == 0
         || snapshot.state != "recording_final"

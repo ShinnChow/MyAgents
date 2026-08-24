@@ -586,7 +586,9 @@ impl WorkerResponse {
                 ..
             } => {
                 *revision > 0
-                    && (*batch_index > 0 || !turns.is_empty() || *is_last)
+                    && ((!turns.is_empty()
+                        && (*is_last || turns.len() == MAX_SPEAKER_TURNS_PER_BATCH))
+                        || (*is_last && *batch_index == 0 && turns.is_empty()))
                     && turns.len() <= MAX_SPEAKER_TURNS_PER_BATCH
                     && turns.iter().all(valid_speaker_turn)
                     && turns.windows(2).all(|pair| {
