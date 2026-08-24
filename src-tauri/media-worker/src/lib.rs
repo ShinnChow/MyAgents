@@ -10,3 +10,4 @@ pub mod model_pack_source;
 pub mod native_adapter;
 pub mod native_bundle;
 pub mod protocol;
+pub mod record_opus;
