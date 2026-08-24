@@ -7,6 +7,10 @@
 use ogg::{PacketWriteEndInfo, PacketWriter};
 use opus2::{Application, Bitrate, Channels, Encoder};
 use ringbuf::{traits::*, HeapRb};
+use rubato::{
+    calculate_cutoff, Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
+};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +26,9 @@ const OPUS_FRAME_SAMPLES: usize = 960;
 const OPUS_MAX_PACKET_BYTES: usize = 4_000;
 const ARCHIVE_RING_SECONDS: usize = 4;
 const PAGE_FRAME_COUNT: u64 = 50;
+const RESAMPLER_CHUNK_FRAMES: usize = 1_024;
+const RESAMPLER_SINC_LENGTH: usize = 128;
+const RESAMPLER_OVERSAMPLING_FACTOR: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceFormat {
@@ -113,14 +120,15 @@ impl RealtimeTrackSink {
                 .fetch_add((frames * self.channels as usize) as u64, Ordering::Relaxed);
             return;
         };
-        let mut dropped = 0_u64;
-        for frame in 0..frames {
+        let channels = self.channels as usize;
+        let accepted_frames = frames.min(producer.vacant_len() / channels);
+        for frame in 0..accepted_frames {
             for plane in planes {
-                if producer.try_push(plane[frame].clamp(-1.0, 1.0)).is_err() {
-                    dropped = dropped.saturating_add(1);
-                }
+                let pushed = producer.try_push(plane[frame].clamp(-1.0, 1.0));
+                debug_assert!(pushed.is_ok());
             }
         }
+        let dropped = ((frames - accepted_frames) * channels) as u64;
         drop(producer);
         if dropped > 0 {
             self.overrun_samples.fetch_add(dropped, Ordering::Relaxed);
@@ -132,17 +140,22 @@ impl RealtimeTrackSink {
         if !self.accepting.load(Ordering::Acquire) {
             return;
         }
+        let sample_count = samples.len();
         let Ok(mut producer) = self.producer.try_lock() else {
             self.overrun_samples
-                .fetch_add(samples.len() as u64, Ordering::Relaxed);
+                .fetch_add(sample_count as u64, Ordering::Relaxed);
             return;
         };
-        let mut dropped = 0_u64;
-        for sample in samples {
-            if producer.try_push(sample.clamp(-1.0, 1.0)).is_err() {
-                dropped = dropped.saturating_add(1);
+        let channels = self.channels as usize;
+        let aligned_samples = sample_count - sample_count % channels;
+        let accepted_samples = aligned_samples.min(producer.vacant_len() / channels * channels);
+        for (index, sample) in samples.enumerate() {
+            if index < accepted_samples {
+                let pushed = producer.try_push(sample.clamp(-1.0, 1.0));
+                debug_assert!(pushed.is_ok());
             }
         }
+        let dropped = sample_count.saturating_sub(accepted_samples) as u64;
         drop(producer);
         if dropped > 0 {
             self.overrun_samples.fetch_add(dropped, Ordering::Relaxed);
@@ -231,15 +244,16 @@ fn run_archive_worker(
 ) -> Result<ArchiveResult, String> {
     let output_channels = if format.channels == 1 { 1 } else { 2 };
     let mut writer = OggOpusWriter::create(&path, output_channels)?;
-    let mut resampler = StreamingLinearResampler::new(format, output_channels)?;
-    let mut input = vec![0.0_f32; 8_192];
+    let mut resampler = StreamingArchiveResampler::new(format, output_channels)?;
+    let input_channels = format.channels as usize;
+    let input_samples = (8_192 / input_channels).max(1) * input_channels;
+    let mut input = vec![0.0_f32; input_samples];
     let mut encoded = Vec::with_capacity(16_384);
 
     loop {
         let count = consumer.pop_slice(&mut input);
         if count > 0 {
-            let aligned = count - count % format.channels as usize;
-            resampler.process(&input[..aligned], &mut encoded);
+            resampler.process(&input[..count], &mut encoded)?;
             writer.push_interleaved(&encoded)?;
             encoded.clear();
             continue;
@@ -250,7 +264,7 @@ fn run_archive_worker(
         let _ = wake_rx.recv_timeout(Duration::from_millis(20));
     }
 
-    resampler.finish(&mut encoded);
+    resampler.finish(&mut encoded)?;
     writer.push_interleaved(&encoded)?;
     let media_samples_48k = writer.finish()?;
     let size_bytes = fs::symlink_metadata(&path)
@@ -396,75 +410,191 @@ fn ogg_crc(bytes: &[u8]) -> u32 {
     crc
 }
 
-struct StreamingLinearResampler {
+struct StreamingArchiveResampler {
+    input_sample_rate: u32,
     input_channels: usize,
     output_channels: usize,
-    step: f64,
-    position: f64,
-    frames: Vec<f32>,
+    resampler: Option<SincFixedIn<f32>>,
+    input_planes: Vec<Vec<f32>>,
+    output_planes: Vec<Vec<f32>>,
+    pending_frames: usize,
+    input_frames: u64,
+    emitted_frames: u64,
+    delay_frames: usize,
 }
 
-impl StreamingLinearResampler {
+impl StreamingArchiveResampler {
     fn new(format: SourceFormat, output_channels: usize) -> Result<Self, String> {
         if output_channels == 0 || output_channels > 2 {
             return Err("Opus archive supports one or two channels".to_string());
         }
-        Ok(Self {
-            input_channels: format.channels as usize,
+        let input_channels = format.channels as usize;
+        if format.sample_rate == ARCHIVE_SAMPLE_RATE {
+            return Ok(Self {
+                input_sample_rate: format.sample_rate,
+                input_channels,
+                output_channels,
+                resampler: None,
+                input_planes: Vec::new(),
+                output_planes: Vec::new(),
+                pending_frames: 0,
+                input_frames: 0,
+                emitted_frames: 0,
+                delay_frames: 0,
+            });
+        }
+
+        let window = WindowFunction::BlackmanHarris2;
+        let parameters = SincInterpolationParameters {
+            sinc_len: RESAMPLER_SINC_LENGTH,
+            f_cutoff: calculate_cutoff(RESAMPLER_SINC_LENGTH, window),
+            oversampling_factor: RESAMPLER_OVERSAMPLING_FACTOR,
+            interpolation: SincInterpolationType::Cubic,
+            window,
+        };
+        let ratio = ARCHIVE_SAMPLE_RATE as f64 / format.sample_rate as f64;
+        let resampler = SincFixedIn::<f32>::new(
+            ratio,
+            1.0,
+            parameters,
+            RESAMPLER_CHUNK_FRAMES,
             output_channels,
-            step: format.sample_rate as f64 / ARCHIVE_SAMPLE_RATE as f64,
-            position: 0.0,
-            frames: Vec::with_capacity(16_384),
+        )
+        .map_err(|error| format!("create archive resampler: {error}"))?;
+        let input_planes = resampler.input_buffer_allocate(true);
+        let output_planes = resampler.output_buffer_allocate(true);
+        let delay_frames = resampler.output_delay();
+        Ok(Self {
+            input_sample_rate: format.sample_rate,
+            input_channels,
+            output_channels,
+            resampler: Some(resampler),
+            input_planes,
+            output_planes,
+            pending_frames: 0,
+            input_frames: 0,
+            emitted_frames: 0,
+            delay_frames,
         })
     }
 
-    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+    fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<(), String> {
+        if input.len() % self.input_channels != 0 {
+            return Err("archive input is not aligned to source channels".to_string());
+        }
         for frame in input.chunks_exact(self.input_channels) {
-            if self.output_channels == 1 {
-                let mono = frame.iter().copied().sum::<f32>() / frame.len() as f32;
-                self.frames.push(mono);
-            } else if self.input_channels == 1 {
-                self.frames.extend_from_slice(&[frame[0], frame[0]]);
+            let mixed = mix_archive_frame(frame, self.output_channels);
+            self.input_frames = self.input_frames.saturating_add(1);
+            if self.resampler.is_none() {
+                output.extend_from_slice(&mixed[..self.output_channels]);
+                self.emitted_frames = self.emitted_frames.saturating_add(1);
+                continue;
+            }
+            for (channel, value) in mixed[..self.output_channels].iter().enumerate() {
+                self.input_planes[channel][self.pending_frames] = *value;
+            }
+            self.pending_frames += 1;
+            if self.pending_frames == RESAMPLER_CHUNK_FRAMES {
+                self.process_full_chunk(output, None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, output: &mut Vec<f32>) -> Result<(), String> {
+        let target_frames = self.expected_output_frames();
+        if self.resampler.is_none() {
+            return if self.emitted_frames == target_frames {
+                Ok(())
             } else {
-                let left =
-                    frame.iter().step_by(2).copied().sum::<f32>() / frame.len().div_ceil(2) as f32;
-                let right = frame.iter().skip(1).step_by(2).copied().sum::<f32>()
-                    / (frame.len() / 2) as f32;
-                self.frames.extend_from_slice(&[left, right]);
+                Err("archive passthrough duration drifted".to_string())
+            };
+        }
+
+        if self.pending_frames > 0 {
+            for plane in &mut self.input_planes {
+                plane[self.pending_frames..RESAMPLER_CHUNK_FRAMES].fill(0.0);
+            }
+            self.process_full_chunk(output, Some(target_frames))?;
+        }
+        for plane in &mut self.input_planes {
+            plane[..RESAMPLER_CHUNK_FRAMES].fill(0.0);
+        }
+        let mut flush_count = 0;
+        while self.emitted_frames < target_frames {
+            self.process_full_chunk(output, Some(target_frames))?;
+            flush_count += 1;
+            if flush_count > 8 {
+                return Err("archive resampler failed to flush its bounded delay".to_string());
             }
         }
-        self.produce(output, false);
-    }
-
-    fn finish(&mut self, output: &mut Vec<f32>) {
-        if !self.frames.is_empty() {
-            let tail_start = self.frames.len().saturating_sub(self.output_channels);
-            let tail = self.frames[tail_start..].to_vec();
-            self.frames.extend_from_slice(&tail);
+        if self.emitted_frames != target_frames {
+            return Err("archive resampler duration drifted".to_string());
         }
-        self.produce(output, true);
+        Ok(())
     }
 
-    fn produce(&mut self, output: &mut Vec<f32>, finishing: bool) {
-        let frame_count = self.frames.len() / self.output_channels;
-        while self.position + 1.0 < frame_count as f64
-            || (finishing && self.position < frame_count.saturating_sub(1) as f64)
-        {
-            let lower = self.position.floor() as usize;
-            let upper = (lower + 1).min(frame_count.saturating_sub(1));
-            let fraction = (self.position - lower as f64) as f32;
+    fn process_full_chunk(
+        &mut self,
+        output: &mut Vec<f32>,
+        target_frames: Option<u64>,
+    ) -> Result<(), String> {
+        let (_, produced_frames) = self
+            .resampler
+            .as_mut()
+            .expect("resampling chunks require a resampler")
+            .process_into_buffer(&self.input_planes, &mut self.output_planes, None)
+            .map_err(|error| format!("resample archive audio: {error}"))?;
+        self.pending_frames = 0;
+        let first_frame = self.delay_frames.min(produced_frames);
+        self.delay_frames -= first_frame;
+        let available_frames = produced_frames - first_frame;
+        let emitted_now = target_frames.map_or(available_frames, |target| {
+            available_frames.min(target.saturating_sub(self.emitted_frames) as usize)
+        });
+        for frame in first_frame..first_frame + emitted_now {
             for channel in 0..self.output_channels {
-                let a = self.frames[lower * self.output_channels + channel];
-                let b = self.frames[upper * self.output_channels + channel];
-                output.push(a + (b - a) * fraction);
+                output.push(self.output_planes[channel][frame]);
             }
-            self.position += self.step;
         }
-        let consumed_frames = self.position.floor() as usize;
-        if consumed_frames > 0 {
-            let consumed_samples = consumed_frames * self.output_channels;
-            self.frames.drain(..consumed_samples);
-            self.position -= consumed_frames as f64;
+        self.emitted_frames = self.emitted_frames.saturating_add(emitted_now as u64);
+        Ok(())
+    }
+
+    fn expected_output_frames(&self) -> u64 {
+        let numerator = self.input_frames as u128 * ARCHIVE_SAMPLE_RATE as u128
+            + self.input_sample_rate as u128 / 2;
+        (numerator / self.input_sample_rate as u128) as u64
+    }
+
+    #[cfg(test)]
+    fn buffered_input_frames(&self) -> usize {
+        self.pending_frames
+    }
+}
+
+fn mix_archive_frame(frame: &[f32], output_channels: usize) -> [f32; 2] {
+    if output_channels == 1 {
+        return [frame.iter().copied().sum::<f32>() / frame.len() as f32, 0.0];
+    }
+    if frame.len() == 1 {
+        return [frame[0], frame[0]];
+    }
+    let left_count = frame.len().div_ceil(2);
+    let right_count = frame.len() / 2;
+    [
+        frame.iter().step_by(2).copied().sum::<f32>() / left_count as f32,
+        frame.iter().skip(1).step_by(2).copied().sum::<f32>() / right_count as f32,
+    ]
+}
+
+impl Drop for StreamingArchiveResampler {
+    fn drop(&mut self) {
+        for plane in &mut self.input_planes {
+            plane.fill(0.0);
+        }
+        for plane in &mut self.output_planes {
+            plane.fill(0.0);
         }
     }
 }
@@ -673,20 +803,67 @@ mod tests {
     }
 
     #[test]
-    fn resampler_preserves_media_time_without_unbounded_buffering() {
-        let format = SourceFormat {
-            sample_rate: 44_100,
-            channels: 1,
-        };
-        let mut resampler = StreamingLinearResampler::new(format, 1).unwrap();
-        let source = vec![0.25_f32; 44_100];
-        let mut output = Vec::new();
-        for chunk in source.chunks(777) {
-            resampler.process(chunk, &mut output);
-            assert!(resampler.frames.len() < 2_000);
+    fn mature_resampler_preserves_exact_media_time_with_bounded_input() {
+        for sample_rate in [8_000, 16_000, 44_100, 48_000, 96_000, 192_000, 384_000] {
+            let format = SourceFormat {
+                sample_rate,
+                channels: 1,
+            };
+            let mut resampler = StreamingArchiveResampler::new(format, 1).unwrap();
+            let source = vec![0.25_f32; sample_rate as usize + 137];
+            let mut output = Vec::new();
+            for chunk in source.chunks(777) {
+                resampler.process(chunk, &mut output).unwrap();
+                assert!(resampler.buffered_input_frames() < RESAMPLER_CHUNK_FRAMES);
+            }
+            resampler.finish(&mut output).unwrap();
+            let expected = ((source.len() as u128 * ARCHIVE_SAMPLE_RATE as u128
+                + sample_rate as u128 / 2)
+                / sample_rate as u128) as usize;
+            assert_eq!(output.len(), expected, "sample rate {sample_rate}");
         }
-        resampler.finish(&mut output);
-        assert!((output.len() as i64 - 48_000).abs() <= 2);
+    }
+
+    #[test]
+    fn sinc_resampler_suppresses_downsampling_aliases() {
+        fn resample_tone(frequency: f32) -> Vec<f32> {
+            let sample_rate = 96_000_u32;
+            let source = (0..sample_rate)
+                .map(|index| {
+                    (std::f32::consts::TAU * frequency * index as f32 / sample_rate as f32).sin()
+                })
+                .collect::<Vec<_>>();
+            let mut resampler = StreamingArchiveResampler::new(
+                SourceFormat {
+                    sample_rate,
+                    channels: 1,
+                },
+                1,
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            for chunk in source.chunks(613) {
+                resampler.process(chunk, &mut output).unwrap();
+            }
+            resampler.finish(&mut output).unwrap();
+            output
+        }
+
+        fn rms(samples: &[f32]) -> f32 {
+            (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32)
+                .sqrt()
+        }
+
+        let passband = resample_tone(1_000.0);
+        let stopband = resample_tone(30_000.0);
+        let settled = ARCHIVE_SAMPLE_RATE as usize / 10;
+        let passband_rms = rms(&passband[settled..passband.len() - settled]);
+        let stopband_rms = rms(&stopband[settled..stopband.len() - settled]);
+        assert!(passband_rms > 0.6, "passband RMS was {passband_rms}");
+        assert!(
+            stopband_rms < passband_rms * 0.02,
+            "stopband RMS {stopband_rms} was not suppressed relative to {passband_rms}"
+        );
     }
 
     #[test]
@@ -702,6 +879,26 @@ mod tests {
             wake,
         };
         sink.push_f32(&[0.0, 0.1, 0.2, 0.3]);
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn callback_overrun_never_splits_a_multichannel_frame() {
+        let (producer, mut consumer) = HeapRb::<f32>::new(2).split();
+        let (wake, _wake_rx) = mpsc::sync_channel(1);
+        let dropped = Arc::new(AtomicU64::new(0));
+        let sink = RealtimeTrackSink {
+            producer: Arc::new(Mutex::new(producer)),
+            channels: 2,
+            accepting: Arc::new(AtomicBool::new(true)),
+            overrun_samples: dropped.clone(),
+            wake,
+        };
+        sink.push_f32(&[0.1, 0.2, 0.3, 0.4]);
+
+        let mut accepted = [0.0; 2];
+        assert_eq!(consumer.pop_slice(&mut accepted), 2);
+        assert_eq!(accepted, [0.1, 0.2]);
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
     }
 
