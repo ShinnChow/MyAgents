@@ -6,3 +6,4 @@
 //! durable job and publication authority.
 
 pub mod diarization;
+pub mod protocol;
