@@ -1354,6 +1354,7 @@ pub fn run() {
                                 data_dir.clone(),
                                 resource_dir.clone(),
                                 runtime_registry.as_ref(),
+                                compute_coordinator.clone(),
                             ) {
                                 Ok(manager) => {
                                     if let Err(error) =

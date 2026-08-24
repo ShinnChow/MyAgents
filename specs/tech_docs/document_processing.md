@@ -79,14 +79,16 @@ queued/running/cancelling --App restart/shutdown--> interrupted
 - job deadline 从 source admission copy 开始计 30 分钟。cancel 先持久化 `cancelling`，再发送 exact `(jobId,generation)` frame，2 秒仍运行才 kill retained `ChildTree`；cancel、timeout 与成功发布在同一 Manager lock 内裁决，发布 IO 后、写入成功终态前再次以 monotonic deadline 确定逻辑 commit time，超时不能因 watchdog 等锁而赢得成功。
 - App shutdown 先关闭 admission，把所有非终态持久化为 `interrupted`，释放 queued handle，随后取消/终止 retained Worker tree。
 - Worker crash 不自动重试；当前 job 失败为 `DOCUMENT_WORKER_CRASHED`，用户显式重试会创建新 ID。
+- 结构化解析、native PDF 文本提取和渲染不占本地推理名额。Worker 只有在确认图片或具体 PDF 页需要 PP-OCR 时才发送 exact-generation `ocr_lease_requested`；Manager 从 App-global `LocalComputeCoordinator` 取得 `DocumentOcr` lease 后才回复 `grant_ocr_lease`，Worker 在此之前不能加载 OCR session 或执行 tensor inference。
+- 更高优先级的 Record live ASR 到达时，lease 的只读 yield signal 触发 exact OCR Worker generation cancel，并在 2 秒后兜底终止 retained `ChildTree`。Document job 保持原 ID，authenticated staging 中的未发布内容被清空，私有输入重新准备后回到 FIFO；该过程不写 failed terminal、不发布 partial artifact。用户 cancel / App shutdown 与 yield 竞态时仍由 Document Manager 当前状态裁决，用户 cancel 优先。
 
 ## 私有 framed protocol
 
-Manager 与 Worker 使用 4-byte big-endian payload length + UTF-8 JSON；单 frame 最大 1 MiB。第一帧必须为 `start`，后续 Manager 只能发 `cancel`。Worker 必须依次发送一个 `ready`、零到多个 `progress`，以及恰好一个 `completed` 或 `failed`，之后 clean EOF。
+Manager 与 Worker 使用 4-byte big-endian payload length + UTF-8 JSON；单 frame 最大 1 MiB。第一帧必须为 `start`，后续 Manager 只可发 exact-generation `cancel`，或在收到唯一一次 `ocr_lease_requested` 后发 `grant_ocr_lease`。Worker 必须依次发送一个 `ready`、零到多个 `progress`、按需唯一一次 `ocr_lease_requested`，以及恰好一个 `completed` 或 `failed`，之后 clean EOF。`pagesOcr > 0` 与 lease request 必须严格对应；无 OCR 的 fast path 不得请求 lease。
 
 每帧都有 `protocolVersion`，所有响应都有 `jobId` 与 `workerGeneration`。Manager 只接受 exact identity 和固定 stage；`current/total/unit` 要么同时存在且是有效真实单位，要么全部省略，不传假百分比。旧 generation、畸形 JSON、空/超限 frame、截断 prefix/payload、ready 前 progress、重复 ready、重复终态、终态后消息或字段 shape 错误都返回 `DOCUMENT_WORKER_PROTOCOL_ERROR`；Worker 未给合法终态即退出才返回 `DOCUMENT_WORKER_CRASHED`。clean EOF 只有在一个 prefix byte 都没读到时成立。
 
-密码不进入 Worker argv、环境变量、job store、日志或 recovery command。它只出现在 CLI argv（用户已接受其 shell history/process-list 风险）、Sidecar/Rust 请求内存和 start frame；Rust secret wrapper Drop zeroize，Manager 写完 IPC 立即清除自己的副本，发送与接收 JSON buffer 写完/解析完立即 zeroize。恢复命令只使用 `<password>` 占位符。
+密码不进入 Worker argv、环境变量、job store、日志或 recovery command。它只出现在 CLI argv（用户已接受其 shell history/process-list 风险）、Sidecar/Rust 请求内存和 start frame；Rust secret wrapper Drop zeroize，发送与接收 JSON buffer 写完/解析完立即 zeroize。Manager 只在当前 admitted job 内存中保留一份 secret 到 terminal，以便 OCR 被 live ASR 抢占时重启同一 job 而不再次询问用户；job 结束、取消或失败时随 `PendingJob` Drop 清零。恢复命令只使用 `<password>` 占位符。
 
 ## 转换 pipeline
 

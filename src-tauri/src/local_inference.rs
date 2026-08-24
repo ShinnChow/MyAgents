@@ -550,6 +550,26 @@ impl LocalComputeLease {
     pub fn should_yield(&self) -> bool {
         self.yield_requested.load(Ordering::Acquire)
     }
+
+    /// A cloneable, read-only view used by an owner watchdog while the
+    /// execution thread keeps the actual lease alive. Dropping the signal
+    /// never releases capacity or changes coordinator state.
+    pub fn yield_signal(&self) -> LocalComputeYieldSignal {
+        LocalComputeYieldSignal {
+            requested: Arc::clone(&self.yield_requested),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalComputeYieldSignal {
+    requested: Arc<AtomicBool>,
+}
+
+impl LocalComputeYieldSignal {
+    pub fn should_yield(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for LocalComputeLease {
@@ -713,6 +733,7 @@ mod tests {
         let document = coordinator
             .acquire(workload(ComputeWorkloadKind::DocumentOcr, "document"))
             .await;
+        let document_signal = document.yield_signal();
         let mut attachment = Box::pin(coordinator.acquire(workload(
             ComputeWorkloadKind::AgentAttachmentAsr,
             "attachment",
@@ -730,6 +751,7 @@ mod tests {
                 .is_err()
         );
         assert!(document.should_yield());
+        assert!(document_signal.should_yield());
         drop(document);
 
         let live = tokio::time::timeout(Duration::from_secs(1), live.as_mut())

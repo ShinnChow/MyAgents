@@ -25,6 +25,11 @@ pub struct ConversionOutput {
     pub metrics: WorkerMetrics,
 }
 
+pub trait PipelineEvents {
+    fn progress(&mut self, stage: &str, value: u8);
+    fn acquire_ocr_lease(&mut self) -> Result<(), String>;
+}
+
 pub fn convert(
     input: &Path,
     source_name: &str,
@@ -32,11 +37,11 @@ pub fn convert(
     password: Option<&str>,
     resources: &VerifiedResources,
     cancelled: &AtomicBool,
-    progress: &mut impl FnMut(&str, u8),
+    events: &mut impl PipelineEvents,
 ) -> Result<ConversionOutput, String> {
     let started = Instant::now();
     validate_private_paths(input, staging)?;
-    progress("inspecting", 5);
+    events.progress("inspecting", 5);
     let mut source = File::open(input).map_err(|_| "DOCUMENT_INPUT_UNAVAILABLE".to_string())?;
     let metadata = source
         .metadata()
@@ -75,19 +80,20 @@ pub fn convert(
         if extension != "pdf" {
             warnings.push(format_mismatch_warning("PDF"));
         }
-        progress("extracting", 15);
+        events.progress("extracting", 15);
         let (markdown, pages, ocr_pages) = convert_pdf(
             &bytes,
             password,
             resources,
             cancelled,
-            progress,
+            events,
             &mut warnings,
         )?;
         (markdown, pages, ocr_pages, "pdf")
     } else if use_image {
-        progress("ocr", 15);
+        events.progress("ocr", 15);
         let image = decode_image(&bytes, &extension, &mut warnings)?;
+        events.acquire_ocr_lease()?;
         let mut engine = OcrEngine::load(
             &resources.onnx_runtime,
             &resources.detector_model,
@@ -103,7 +109,7 @@ pub fn convert(
         };
         (markdown, 1, 1, detected_format)
     } else {
-        progress("extracting", 20);
+        events.progress("extracting", 20);
         let (document_bytes, format) = prepare_office_bytes(
             &bytes,
             &extension,
@@ -126,13 +132,13 @@ pub fn convert(
         return Err("DOCUMENT_RESOURCE_LIMIT".into());
     }
     let assets_written = validate_markdown_assets(&markdown, staging)?;
-    progress("writing", 92);
+    events.progress("writing", 92);
     write_new_file(&staging.join("document.md"), markdown.as_bytes())?;
     let output_bytes = directory_size(staging)?;
     if output_bytes > MAX_OUTPUT_BYTES as u64 {
         return Err("DOCUMENT_RESOURCE_LIMIT".into());
     }
-    progress("validating", 98);
+    events.progress("validating", 98);
     Ok(ConversionOutput {
         warnings,
         detected_format: detected_format.to_string(),
@@ -341,7 +347,7 @@ fn convert_pdf(
     password: Option<&str>,
     resources: &VerifiedResources,
     cancelled: &AtomicBool,
-    progress: &mut impl FnMut(&str, u8),
+    events: &mut impl PipelineEvents,
     warnings: &mut Vec<Warning>,
 ) -> Result<(String, u32, u32), String> {
     let (page_extraction, encrypted) = match pdf_inspector::extract_pages_markdown_mem(bytes, None)
@@ -392,7 +398,7 @@ fn convert_pdf(
         let needs_ocr = encrypted || extracted.is_none_or(|page| page.needs_ocr);
         let page_markdown = if needs_ocr {
             ocr_pages += 1;
-            progress("ocr", 20 + ((page_index * 70 / count) as u8));
+            events.progress("ocr", 20 + ((page_index * 70 / count) as u8));
             let page = document
                 .pages()
                 .get(page_index as i32)
@@ -410,6 +416,7 @@ fn convert_pdf(
             let engine = match engine.as_mut() {
                 Some(engine) => engine,
                 None => {
+                    events.acquire_ocr_lease()?;
                     engine = Some(OcrEngine::load(
                         &resources.onnx_runtime,
                         &resources.detector_model,

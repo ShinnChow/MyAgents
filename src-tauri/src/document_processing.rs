@@ -2,7 +2,9 @@
 
 use crate::durable_fs::{rename_directory_noreplace, sync_directory};
 use crate::local_inference::{
-    InferenceRuntimeKind, LocalInferenceRuntimeIdentity, LocalInferenceRuntimeRegistry,
+    ComputeWorkloadIdentity, ComputeWorkloadKind, InferenceRuntimeKind, LocalComputeCoordinator,
+    LocalComputeLease, LocalComputeYieldSignal, LocalInferenceRuntimeIdentity,
+    LocalInferenceRuntimeRegistry,
 };
 use crate::process_cmd;
 use crate::workspace_files::path_safety::open_regular_file_no_follow;
@@ -14,7 +16,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 use tokio::sync::Notify;
 
 const QUEUE_LIMIT: usize = 16;
@@ -24,7 +29,8 @@ const MIN_FREE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKER_STDERR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 pub const DOCUMENT_HISTORY_RETENTION_DAYS: i64 = 30;
-const PROTOCOL_VERSION: u32 = 2;
+const PROTOCOL_VERSION: u32 = 3;
+const OCR_YIELD_GRACE_SECONDS: u64 = 2;
 const PIPELINE_VERSION: &str = "anydoc-0.1.9_ppocrv6-small_v1";
 const JOB_ID_RANDOM_HEX: usize = 12;
 const JOB_DEADLINE_SECONDS: u64 = 30 * 60;
@@ -382,6 +388,7 @@ pub struct DocumentProcessingManager {
     manifest_path: PathBuf,
     onnx_runtime_path: PathBuf,
     onnx_runtime_version: String,
+    compute_coordinator: Arc<LocalComputeCoordinator>,
     state: Mutex<ManagerState>,
     wake: Notify,
 }
@@ -391,6 +398,7 @@ impl DocumentProcessingManager {
         data_root: PathBuf,
         resource_root: PathBuf,
         runtime_registry: &LocalInferenceRuntimeRegistry,
+        compute_coordinator: Arc<LocalComputeCoordinator>,
     ) -> Result<ManagedDocumentProcessing, String> {
         let root = data_root.join("document-processing");
         let jobs_root = root.join("jobs");
@@ -432,6 +440,7 @@ impl DocumentProcessingManager {
             manifest_path,
             onnx_runtime_path,
             onnx_runtime_version,
+            compute_coordinator,
             state: Mutex::new(ManagerState {
                 accepting: true,
                 jobs,
@@ -998,9 +1007,11 @@ impl DocumentProcessingManager {
                 .map_err(|_| ())
                 .and_then(|mut stdin| write_frame(&mut *stdin, &start).map_err(|_| ()))
         };
-        // The Worker now owns the only live password copy needed for parsing.
-        // Drop and zeroize the Manager-side copy immediately after IPC write.
-        pending.password.take();
+        // Keep the Manager-side secret only for the lifetime of this admitted
+        // job. A live-ASR preemption may restart the exact Worker generation;
+        // retaining this already-owned copy avoids changing the job ID or
+        // asking the user for the password again. cleanup_pending/drop still
+        // zeroizes it at terminal settlement.
         if write_result.is_err() {
             if let Ok(mut child) = child.lock() {
                 let _ = child.kill_and_wait();
@@ -1014,11 +1025,57 @@ impl DocumentProcessingManager {
             cleanup_pending(&pending);
             return;
         }
-        let terminal = read_worker_responses(&mut stdout, &job.job_id, generation, |response| {
-            self.handle_progress(&job.job_id, generation, response)
-        });
+        let worker_settled = Arc::new(AtomicBool::new(false));
+        let requeue_for_live = Arc::new(AtomicBool::new(false));
+        let mut ocr_lease: Option<LocalComputeLease> = None;
+        let terminal = read_worker_responses(
+            &mut stdout,
+            &job.job_id,
+            generation,
+            |response| self.handle_progress(&job.job_id, generation, response),
+            || {
+                if ocr_lease.is_some() {
+                    return Err(WorkerResponseReadError::Protocol(
+                        "worker requested the OCR lease twice".into(),
+                    ));
+                }
+                let lease = tauri::async_runtime::block_on(self.compute_coordinator.acquire(
+                    ComputeWorkloadIdentity {
+                        kind: ComputeWorkloadKind::DocumentOcr,
+                        id: job.job_id.clone(),
+                        generation,
+                    },
+                ));
+                if !self.job_can_start_worker(&job.job_id, generation) {
+                    drop(lease);
+                    return Err(WorkerResponseReadError::Crashed(
+                        "document generation lost OCR admission".into(),
+                    ));
+                }
+                send_ocr_lease_grant(&stdin, &job.job_id, generation).map_err(|_| {
+                    WorkerResponseReadError::Protocol("OCR lease grant failed".into())
+                })?;
+                arm_document_ocr_yield(
+                    lease.yield_signal(),
+                    Arc::clone(&stdin),
+                    Arc::clone(&child),
+                    job.job_id.clone(),
+                    generation,
+                    Arc::clone(&worker_settled),
+                    Arc::clone(&requeue_for_live),
+                );
+                ocr_lease = Some(lease);
+                Ok(())
+            },
+        );
+        worker_settled.store(true, Ordering::Release);
         if let Ok(mut child) = child.lock() {
             let _ = child.wait();
+        }
+        drop(ocr_lease);
+        if requeue_for_live.load(Ordering::Acquire) {
+            self.settle_ocr_yield(&job.job_id, generation, pending);
+            return;
         }
         let cancelling = self
             .state
@@ -1204,6 +1261,72 @@ impl DocumentProcessingManager {
                 state.active_job = None;
             }
         }
+    }
+
+    fn settle_ocr_yield(&self, job_id: &str, generation: u64, mut pending: PendingJob) {
+        let state_allows_retry = self.state.lock().ok().is_some_and(|state| {
+            state.jobs.get(job_id).is_some_and(|job| {
+                job.state == DocumentJobState::Running
+                    && state
+                        .active_job
+                        .as_ref()
+                        .is_some_and(|active| active == &(job_id.to_string(), generation))
+            })
+        });
+        if !state_allows_retry {
+            self.finish_cancelled_if_needed(job_id, generation);
+            cleanup_pending(&pending);
+            return;
+        }
+        if prepare_pending_for_retry(&mut pending).is_err() {
+            self.finish_failed(job_id, generation, "DOCUMENT_PUBLISH_FAILED", true);
+            cleanup_pending(&pending);
+            return;
+        }
+
+        let snapshot = {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    cleanup_pending(&pending);
+                    return;
+                }
+            };
+            let can_requeue = state.jobs.get(job_id).is_some_and(|job| {
+                job.state == DocumentJobState::Running
+                    && state
+                        .active_job
+                        .as_ref()
+                        .is_some_and(|active| active == &(job_id.to_string(), generation))
+            });
+            if !can_requeue {
+                drop(state);
+                self.finish_cancelled_if_needed(job_id, generation);
+                cleanup_pending(&pending);
+                return;
+            }
+            let mut job = state.jobs.get(job_id).cloned().expect("checked above");
+            job.state = DocumentJobState::Queued;
+            job.stage = "queued".into();
+            job.started_at = None;
+            job.updated_at = Utc::now();
+            job.finished_at = None;
+            job.error = None;
+            if persist_job(&self.root, &job).is_err() {
+                drop(state);
+                self.finish_failed(job_id, generation, "DOCUMENT_JOB_STORE_WRITE_FAILED", true);
+                cleanup_pending(&pending);
+                return;
+            }
+            clear_running_locked(&mut state, job_id, generation);
+            state.active_job = None;
+            state.pending.insert(job_id.to_string(), pending);
+            state.queue.push_front(job_id.to_string());
+            state.jobs.insert(job_id.to_string(), job.clone());
+            job
+        };
+        log_document_job("ocr_yield_requeued", &snapshot);
+        self.wake.notify_one();
     }
 
     fn job_can_start_worker(&self, job_id: &str, generation: u64) -> bool {
@@ -1573,6 +1696,11 @@ enum WorkerMessage {
         total: Option<u32>,
         unit: Option<String>,
     },
+    OcrLeaseRequested {
+        protocol_version: u32,
+        job_id: String,
+        worker_generation: u64,
+    },
     Completed {
         protocol_version: u32,
         job_id: String,
@@ -1664,8 +1792,10 @@ fn read_worker_responses(
     expected_job_id: &str,
     expected_generation: u64,
     mut progress: impl FnMut(WorkerProgress),
+    mut acquire_ocr_lease: impl FnMut() -> Result<(), WorkerResponseReadError>,
 ) -> Result<WorkerTerminal, WorkerResponseReadError> {
     let mut ready = false;
+    let mut ocr_lease_requested = false;
     let mut terminal = None;
     loop {
         let payload = match read_frame(stdout) {
@@ -1754,6 +1884,27 @@ fn read_worker_responses(
                     stage,
                 });
             }
+            WorkerMessage::OcrLeaseRequested {
+                protocol_version,
+                job_id,
+                worker_generation,
+            } => {
+                validate_worker_identity(
+                    protocol_version,
+                    &job_id,
+                    worker_generation,
+                    expected_job_id,
+                    expected_generation,
+                    "ocr lease request",
+                )?;
+                if !ready || ocr_lease_requested {
+                    return Err(WorkerResponseReadError::Protocol(
+                        "OCR lease request ordering invalid".into(),
+                    ));
+                }
+                acquire_ocr_lease()?;
+                ocr_lease_requested = true;
+            }
             WorkerMessage::Completed {
                 protocol_version,
                 job_id,
@@ -1768,7 +1919,10 @@ fn read_worker_responses(
                     expected_generation,
                     "terminal",
                 )?;
-                if !ready || result.detected_format.trim().is_empty() {
+                if !ready
+                    || result.detected_format.trim().is_empty()
+                    || (result.metrics.pages_ocr > 0) != ocr_lease_requested
+                {
                     return Err(WorkerResponseReadError::Protocol(
                         "completed response shape invalid".into(),
                     ));
@@ -2895,6 +3049,42 @@ fn cleanup_pending(pending: &PendingJob) {
     );
     cleanup_private_input(&pending.private_dir);
 }
+
+fn prepare_pending_for_retry(pending: &mut PendingJob) -> Result<(), String> {
+    validate_staging_identity(
+        &pending.staging_dir,
+        &pending.staging_identity,
+        &pending.staging_token,
+    )?;
+    cleanup_owned_staging(
+        &pending.staging_dir,
+        Some(&pending.staging_identity),
+        &pending.staging_token,
+    );
+    if pending.staging_dir.exists() {
+        return Err("staging retry cleanup failed".into());
+    }
+    fs::create_dir(&pending.staging_dir)
+        .map_err(|_| "staging retry reservation failed".to_string())?;
+    set_private_permissions(&pending.staging_dir)
+        .map_err(|_| "staging retry reservation failed".to_string())?;
+    write_marker_file(
+        &pending.staging_dir.join(STAGING_OWNER_MARKER),
+        &pending.staging_token,
+    )
+    .map_err(|_| "staging retry reservation failed".to_string())?;
+    pending.staging_identity = same_file::Handle::from_path(&pending.staging_dir)
+        .map_err(|_| "staging retry identity unavailable".to_string())?;
+    if let Some(parent) = pending.staging_dir.parent() {
+        sync_directory(parent)
+            .map_err(|_| "staging retry reservation was not durable".to_string())?;
+    }
+    cleanup_private_input(&pending.private_dir);
+    let input = pending.private_dir.join("input");
+    fs::create_dir(&input).map_err(|_| "private retry input unavailable".to_string())?;
+    set_private_permissions(&input).map_err(|_| "private retry input unavailable".to_string())
+}
+
 fn cleanup_private_input(private_dir: &Path) {
     let _ = fs::remove_dir_all(private_dir.join("input"));
 }
@@ -3068,6 +3258,54 @@ fn send_cancel(
         .lock()
         .map_err(|_| "Worker stdin lock failed".to_string())?;
     write_frame(&mut *stdin, &value)
+}
+
+fn send_ocr_lease_grant(
+    stdin: &Arc<Mutex<std::process::ChildStdin>>,
+    job_id: &str,
+    generation: u64,
+) -> Result<(), String> {
+    let value = serde_json::json!({
+        "type": "grant_ocr_lease",
+        "protocolVersion": PROTOCOL_VERSION,
+        "jobId": job_id,
+        "workerGeneration": generation,
+    });
+    let mut stdin = stdin
+        .lock()
+        .map_err(|_| "Worker stdin lock failed".to_string())?;
+    write_frame(&mut *stdin, &value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn arm_document_ocr_yield(
+    signal: LocalComputeYieldSignal,
+    stdin: Arc<Mutex<std::process::ChildStdin>>,
+    child: Arc<Mutex<process_cmd::ChildTree>>,
+    job_id: String,
+    generation: u64,
+    settled: Arc<AtomicBool>,
+    requeue_for_live: Arc<AtomicBool>,
+) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if settled.load(Ordering::Acquire) {
+                return;
+            }
+            if signal.should_yield() {
+                requeue_for_live.store(true, Ordering::Release);
+                let _ = send_cancel(&stdin, &job_id, generation);
+                tokio::time::sleep(std::time::Duration::from_secs(OCR_YIELD_GRACE_SECONDS)).await;
+                if !settled.load(Ordering::Acquire) {
+                    if let Ok(mut child) = child.lock() {
+                        let _ = child.kill_and_wait();
+                    }
+                }
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    });
 }
 
 fn job_not_found(job_id: &str) -> DocumentServiceError {
@@ -3300,6 +3538,7 @@ mod tests {
             manifest_path: root.join("unused-manifest"),
             onnx_runtime_path: root.join("unused-onnx-runtime"),
             onnx_runtime_version: "1.28.0".into(),
+            compute_coordinator: LocalComputeCoordinator::new(),
             state: Mutex::new(ManagerState {
                 accepting: true,
                 jobs: HashMap::from([(job_id.clone(), job)]),
@@ -3473,6 +3712,60 @@ mod tests {
         cleanup_pending(&pending);
 
         assert!(staging.join("attacker-owned.txt").is_file());
+    }
+
+    #[test]
+    fn live_preemption_requeues_exact_document_job_without_partial_staging() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let job_id = "20260815_7f3a91c2b6d4";
+        let generation = 3;
+        let job = test_job(job_id, output.path(), DocumentJobState::Running);
+        let manager = test_manager(data.path(), job, generation);
+
+        let private_dir = data.path().join("jobs").join(job_id);
+        let input_dir = private_dir.join("input");
+        fs::create_dir(&input_dir).unwrap();
+        fs::write(input_dir.join("source.bin"), b"private input").unwrap();
+        let staging = output.path().join(format!(".{job_id}.staging"));
+        fs::create_dir(&staging).unwrap();
+        let token = "a".repeat(32);
+        write_staging_ownership(&private_dir, &staging, &token).unwrap();
+        fs::write(staging.join("document.md"), b"partial output").unwrap();
+        fs::create_dir(staging.join("assets")).unwrap();
+        fs::write(staging.join("assets/partial.png"), b"partial asset").unwrap();
+
+        let source_path = data.path().join("source.pdf");
+        fs::write(&source_path, b"data").unwrap();
+        let source_file = File::open(&source_path).unwrap();
+        let source_version = source_version(&source_file.metadata().unwrap());
+        let pending = PendingJob {
+            source: same_file::Handle::from_file(source_file).unwrap(),
+            source_version,
+            password: Some(SecretString("retry-secret".into())),
+            private_dir: private_dir.clone(),
+            staging_dir: staging.clone(),
+            staging_identity: same_file::Handle::from_path(&staging).unwrap(),
+            staging_token: token.clone(),
+            output_root_identity: same_file::Handle::from_path(output.path()).unwrap(),
+        };
+
+        manager.settle_ocr_yield(job_id, generation, pending);
+
+        let state = manager.state.lock().unwrap();
+        assert_eq!(state.jobs[job_id].state, DocumentJobState::Queued);
+        assert_eq!(state.jobs[job_id].stage, "queued");
+        assert_eq!(state.queue.front().map(String::as_str), Some(job_id));
+        assert!(state.pending.contains_key(job_id));
+        assert!(state.active_job.is_none());
+        assert!(!staging.join("document.md").exists());
+        assert!(!staging.join("assets").exists());
+        assert_eq!(
+            fs::read_to_string(staging.join(STAGING_OWNER_MARKER)).unwrap(),
+            token
+        );
+        assert!(input_dir.is_dir());
+        assert_eq!(fs::read_dir(input_dir).unwrap().count(), 0);
     }
 
     #[test]
@@ -3965,9 +4258,14 @@ mod tests {
             }),
         )
         .unwrap();
-        let error =
-            read_worker_responses(&mut Cursor::new(bytes), "20260815_bbbbbbbbbbbb", 7, |_| {})
-                .unwrap_err();
+        let error = read_worker_responses(
+            &mut Cursor::new(bytes),
+            "20260815_bbbbbbbbbbbb",
+            7,
+            |_| {},
+            || Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(
             error,
             WorkerResponseReadError::Protocol("terminal identity mismatch".into())
@@ -4004,6 +4302,7 @@ mod tests {
                 "20260815_bbbbbbbbbbbb",
                 7,
                 |_| {},
+                || Ok(()),
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("progress identity mismatch".into()),
@@ -4044,9 +4343,85 @@ mod tests {
                 "20260815_bbbbbbbbbbbb",
                 7,
                 |_| {},
+                || Ok(()),
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("completed response shape invalid".into()),
+        );
+    }
+
+    #[test]
+    fn framed_protocol_requires_one_ocr_lease_before_reporting_ocr_pages() {
+        let job_id = "20260815_bbbbbbbbbbbb";
+        let mut bytes = Vec::new();
+        for value in [
+            serde_json::json!({
+                "type": "ready", "protocolVersion": PROTOCOL_VERSION,
+                "jobId": job_id, "workerGeneration": 7
+            }),
+            serde_json::json!({
+                "type": "ocr_lease_requested", "protocolVersion": PROTOCOL_VERSION,
+                "jobId": job_id, "workerGeneration": 7
+            }),
+            serde_json::json!({
+                "type": "completed", "protocolVersion": PROTOCOL_VERSION,
+                "jobId": job_id, "workerGeneration": 7,
+                "result": {
+                    "warnings": [], "detectedFormat": "png",
+                    "metrics": {
+                        "sourceBytes": 1, "outputBytes": 1, "pagesTotal": 1,
+                        "pagesOcr": 1, "assetsWritten": 0, "elapsedMs": 1
+                    }
+                }
+            }),
+        ] {
+            write_frame(&mut bytes, &value).unwrap();
+        }
+        let mut grants = 0;
+        let terminal = read_worker_responses(
+            &mut Cursor::new(bytes),
+            job_id,
+            7,
+            |_| {},
+            || {
+                grants += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(terminal.success);
+        assert_eq!(grants, 1);
+
+        let mut missing_request = Vec::new();
+        for value in [
+            serde_json::json!({
+                "type": "ready", "protocolVersion": PROTOCOL_VERSION,
+                "jobId": job_id, "workerGeneration": 7
+            }),
+            serde_json::json!({
+                "type": "completed", "protocolVersion": PROTOCOL_VERSION,
+                "jobId": job_id, "workerGeneration": 7,
+                "result": {
+                    "warnings": [], "detectedFormat": "png",
+                    "metrics": {
+                        "sourceBytes": 1, "outputBytes": 1, "pagesTotal": 1,
+                        "pagesOcr": 1, "assetsWritten": 0, "elapsedMs": 1
+                    }
+                }
+            }),
+        ] {
+            write_frame(&mut missing_request, &value).unwrap();
+        }
+        assert_eq!(
+            read_worker_responses(
+                &mut Cursor::new(missing_request),
+                job_id,
+                7,
+                |_| {},
+                || Ok(()),
+            )
+            .unwrap_err(),
+            WorkerResponseReadError::Protocol("completed response shape invalid".into())
         );
     }
 
@@ -4069,6 +4444,7 @@ mod tests {
                 "20260815_bbbbbbbbbbbb",
                 7,
                 |_| {},
+                || Ok(()),
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("worker emitted duplicate ready".into()),
@@ -4094,6 +4470,7 @@ mod tests {
                 "20260815_bbbbbbbbbbbb",
                 7,
                 |_| {},
+                || Ok(()),
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("failed response shape invalid".into()),
@@ -4119,6 +4496,7 @@ mod tests {
                 "20260815_bbbbbbbbbbbb",
                 7,
                 |_| {},
+                || Ok(()),
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("worker progress stage invalid".into()),
@@ -4152,6 +4530,7 @@ mod tests {
                 "20260815_bbbbbbbbbbbb",
                 7,
                 |_| {},
+                || Ok(()),
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("worker emitted a frame after terminal".into()),

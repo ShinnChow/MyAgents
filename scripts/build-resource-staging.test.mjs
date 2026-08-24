@@ -372,10 +372,15 @@ test('document processing locks all release targets and publishes only verified 
     'Windows native resources must be signed before manifest hashes are committed',
   );
   assert.match(syncVersionScript, /src-tauri\/document-worker\/Cargo\.toml/);
-  assert.match(documentWorkerSmoke, /protocolVersion: 1/);
+  assert.match(documentWorkerSmoke, /protocolVersion: 3/);
+  assert.match(
+    documentWorkerSmoke,
+    /message\.type === ["']ocr_lease_requested["']/,
+  );
   assert.match(documentWorkerSmoke, /resourceManifestPath: manifestPath/);
-  assert.match(documentWorkerSmoke, /message\.type === 'ready'/);
-  assert.match(documentWorkerSmoke, /message\.type === 'completed'/);
+  assert.match(documentWorkerSmoke, /onnxRuntimePath/);
+  assert.match(documentWorkerSmoke, /message\.type === ["']ready["']/);
+  assert.match(documentWorkerSmoke, /message\.type === ["']completed["']/);
   assert.equal(
     tauriConfig.bundle.resources['../src-tauri/resources/document-processing'],
     'document-processing',
