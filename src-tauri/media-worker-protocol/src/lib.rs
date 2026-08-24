@@ -6,6 +6,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_PCM_SAMPLES_PER_FRAME: usize = SAMPLE_RATE as usize * 5;
+pub const MAX_TRANSCRIPT_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_SPEAKER_TURNS_PER_BATCH: usize = 1_000;
+pub const MAX_MEDIA_SAMPLES_PER_TRACK: u64 = SAMPLE_RATE as u64 * 60 * 60 * 8;
 
 const CONTROL_FRAME_KIND: u8 = 1;
 const PCM_FRAME_KIND: u8 = 2;
@@ -493,6 +496,117 @@ impl std::fmt::Debug for WorkerResponse {
 }
 
 impl WorkerResponse {
+    pub fn protocol_version(&self) -> u32 {
+        match self {
+            Self::Ready {
+                protocol_version, ..
+            }
+            | Self::Heartbeat {
+                protocol_version, ..
+            }
+            | Self::InputAck {
+                protocol_version, ..
+            }
+            | Self::TranscriptSegment {
+                protocol_version, ..
+            }
+            | Self::SpeakerTurnBatch {
+                protocol_version, ..
+            }
+            | Self::Progress {
+                protocol_version, ..
+            }
+            | Self::Yielded {
+                protocol_version, ..
+            }
+            | Self::Pong {
+                protocol_version, ..
+            }
+            | Self::Completed {
+                protocol_version, ..
+            }
+            | Self::Failed {
+                protocol_version, ..
+            } => *protocol_version,
+        }
+    }
+
+    pub fn identity(&self) -> &WorkloadIdentity {
+        match self {
+            Self::Ready { identity, .. }
+            | Self::Heartbeat { identity, .. }
+            | Self::InputAck { identity, .. }
+            | Self::TranscriptSegment { identity, .. }
+            | Self::SpeakerTurnBatch { identity, .. }
+            | Self::Progress { identity, .. }
+            | Self::Yielded { identity, .. }
+            | Self::Pong { identity, .. }
+            | Self::Completed { identity, .. }
+            | Self::Failed { identity, .. } => identity,
+        }
+    }
+
+    pub fn has_valid_shape(&self) -> bool {
+        if self.protocol_version() != PROTOCOL_VERSION || !self.identity().is_valid() {
+            return false;
+        }
+        match self {
+            Self::Ready { .. } | Self::Pong { .. } => true,
+            Self::Heartbeat { checkpoint, .. } | Self::Yielded { checkpoint, .. } => {
+                valid_checkpoint(checkpoint)
+            }
+            Self::InputAck {
+                track, end_sample, ..
+            } => is_record_source_track(*track) && *end_sample <= MAX_MEDIA_SAMPLES_PER_TRACK,
+            Self::TranscriptSegment {
+                segment_id,
+                track,
+                start_sample,
+                end_sample,
+                text,
+                language,
+                revision,
+                ..
+            } => {
+                valid_protocol_id(segment_id)
+                    && is_record_source_track(*track)
+                    && start_sample < end_sample
+                    && *end_sample <= MAX_MEDIA_SAMPLES_PER_TRACK
+                    && !text.trim().is_empty()
+                    && text.len() <= MAX_TRANSCRIPT_TEXT_BYTES
+                    && !text.contains('\0')
+                    && language.as_deref().is_none_or(valid_language)
+                    && *revision > 0
+            }
+            Self::SpeakerTurnBatch {
+                revision,
+                batch_index,
+                is_last,
+                turns,
+                ..
+            } => {
+                *revision > 0
+                    && (*batch_index > 0 || !turns.is_empty() || *is_last)
+                    && turns.len() <= MAX_SPEAKER_TURNS_PER_BATCH
+                    && turns.iter().all(valid_speaker_turn)
+                    && turns.windows(2).all(|pair| {
+                        (
+                            pair[0].start_sample,
+                            pair[0].end_sample,
+                            pair[0].global_speaker,
+                        ) <= (
+                            pair[1].start_sample,
+                            pair[1].end_sample,
+                            pair[1].global_speaker,
+                        )
+                    })
+            }
+            Self::Progress { current, total, .. } => *total > 0 && current <= total,
+            Self::Completed { metrics, .. } => valid_metrics(metrics),
+            Self::Failed { code, .. } => valid_error_code(code),
+        }
+    }
+
     pub fn zeroize_sensitive(&mut self) {
         if let Self::TranscriptSegment { text, language, .. } = self {
             text.zeroize();
@@ -501,6 +615,60 @@ impl WorkerResponse {
             }
         }
     }
+}
+
+fn valid_protocol_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_language(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn valid_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_checkpoint(checkpoint: &Checkpoint) -> bool {
+    (1..=2).contains(&checkpoint.streams.len())
+        && checkpoint.streams.iter().all(|stream| {
+            is_record_source_track(stream.track)
+                && stream.analysis_sample <= MAX_MEDIA_SAMPLES_PER_TRACK
+        })
+        && (checkpoint.streams.len() == 1
+            || checkpoint.streams[0].track != checkpoint.streams[1].track)
+        && checkpoint.analysis_sample
+            == checkpoint
+                .streams
+                .iter()
+                .map(|stream| stream.analysis_sample)
+                .max()
+                .unwrap_or(0)
+}
+
+fn valid_speaker_turn(turn: &SpeakerTurn) -> bool {
+    turn.start_sample < turn.end_sample
+        && turn.end_sample <= MAX_MEDIA_SAMPLES_PER_TRACK
+        && turn.global_speaker <= 4_096
+}
+
+fn valid_metrics(metrics: &WorkerMetrics) -> bool {
+    metrics.source_samples > 0
+        && metrics.source_samples <= MAX_MEDIA_SAMPLES_PER_TRACK.saturating_mul(2)
+        && metrics.segments <= 200_000
+        && metrics.speakers <= 4_096
 }
 
 #[derive(Debug)]
@@ -519,6 +687,28 @@ pub fn read_manager_frame(reader: &mut impl Read) -> io::Result<Option<ManagerFr
             .map_err(|_| invalid_data("invalid control JSON")),
         PCM_FRAME_KIND => parse_pcm_frame(&payload).map(|frame| Some(ManagerFrame::Pcm(frame))),
         _ => Err(invalid_data("unknown media worker frame kind")),
+    };
+    payload.zeroize();
+    parsed
+}
+
+pub fn read_worker_response(reader: &mut impl Read) -> io::Result<Option<WorkerResponse>> {
+    let Some(mut payload) = read_wire_frame(reader)? else {
+        return Ok(None);
+    };
+    let parsed = if payload[0] != CONTROL_FRAME_KIND {
+        Err(invalid_data("unexpected media worker response frame kind"))
+    } else {
+        serde_json::from_slice::<WorkerResponse>(&payload[1..])
+            .map_err(|_| invalid_data("invalid worker response JSON"))
+            .and_then(|mut response| {
+                if response.has_valid_shape() {
+                    Ok(Some(response))
+                } else {
+                    response.zeroize_sensitive();
+                    Err(invalid_data("invalid worker response shape"))
+                }
+            })
     };
     payload.zeroize();
     parsed
@@ -838,6 +1028,9 @@ mod tests {
         assert!(!debug.contains("unique-secret-transcript"));
         let mut wire = Vec::new();
         write_control_frame(&mut wire, &response).unwrap();
+        let decoded = read_worker_response(&mut wire.as_slice()).unwrap().unwrap();
+        assert!(decoded.has_valid_shape());
+        assert_eq!(decoded.identity(), &identity());
         response.zeroize_sensitive();
         let WorkerResponse::TranscriptSegment { text, language, .. } = response else {
             unreachable!();
@@ -848,5 +1041,38 @@ mod tests {
             wire.windows(24)
                 .any(|bytes| bytes == b"unique-secret-transcript")
         );
+    }
+
+    #[test]
+    fn manager_rejects_invalid_worker_response_shapes() {
+        let invalid = WorkerResponse::TranscriptSegment {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity(),
+            segment_id: "../segment".into(),
+            track: TrackKind::Microphone,
+            start_sample: 0,
+            end_sample: 16_000,
+            text: "sensitive text".into(),
+            language: Some("zh".into()),
+            revision: 1,
+        };
+        let mut wire = Vec::new();
+        write_control_frame(&mut wire, &invalid).unwrap();
+        let error = read_worker_response(&mut wire.as_slice()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let invalid_batch = WorkerResponse::SpeakerTurnBatch {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity(),
+            revision: 1,
+            batch_index: 0,
+            is_last: true,
+            turns: vec![SpeakerTurn {
+                start_sample: 9,
+                end_sample: 8,
+                global_speaker: 0,
+            }],
+        };
+        assert!(!invalid_batch.has_valid_shape());
     }
 }
