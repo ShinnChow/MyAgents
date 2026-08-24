@@ -237,6 +237,12 @@ HTTP client 的错误文本通常携带完整请求 URL。若协议把凭据放�
 `timeout / connection / request / body / decode` 等无 URL 的有界类别。状态码和
 服务端返回的非敏感错误描述可按现有协议记录，但不能依赖事后日志正则来补救。
 
+### 7. Record / Recording / Speech 隐私边界
+
+录音与转录日志只能记录模块前缀、operation、Record/job 的受控 identity、generation、公开资源 bytes、固定 stage 和结构化错误码。严禁记录音频/PCM、transcript、笔记、Mark、speaker name、embedding、完整本地路径、模型下载原始响应或 Worker 原始 stderr。Worker stderr 只允许 `bytes + truncated` 等有界摘要；产品 analytics 继续走既有 typed event bridge，不得复制进 unified log。
+
+推荐前缀固定为 `[record]`、`[recording]`、`[speech]`。面向用户的原始错误可以走既有产品返回契约，但写日志前必须投影为稳定 code/metadata，不能把路径或用户内容夹在 `format!("{error}")` 中。
+
 ## 文件结构
 
 ```
@@ -335,6 +341,21 @@ Builtin / external runtime 在成功持久化边界输出 `[assistant-output]`�
 1. 确认在 Tauri 环境中运行（`isTauri()` 返回 true）
 2. 检查 Rust 侧是否 emit `log:rust` 事件
 3. 检查 TabProvider 中的 Tauri event listener
+
+### 录音或转录失败
+
+先按本地日期检索结构化模块与错误码：
+
+```bash
+grep -E '\[(record|recording|speech)\]|RECORDING_|SPEECH_' ~/.myagents/logs/unified-*.log | tail -80
+```
+
+- `RECORDING_*` 优先检查平台权限、设备 identity 与 PipeWire/WASAPI/ScreenCaptureKit；模型重装不能修复 capture 问题。
+- `SPEECH_RESOURCE_*` / `SPEECH_MODEL_*` 检查 native manifest、共享 ORT、签名 manifest、pack hash 与最小加载。
+- Agent 的 `SPEECH_JOB_NOT_FOUND` 先回到原发起 Session 执行 `myagents speech list`；不要要求暴露全局 job 列表。
+- 音频 artifact 已存在但 transcript 为空时，确认该 Record 是否只需要用户手动点击“开始转录”；缺少自动 backfill 本身不一定是故障。
+
+排查过程中不要把用户音频、转录全文或 `~/.myagents/records/` 打包进日志附件。
 
 ### 前端整页崩溃（「界面渲染出错」/ 白屏）
 

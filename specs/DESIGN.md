@@ -1438,12 +1438,28 @@ Chat 中选择 `/goal` 后立即在输入框上方进入 Goal 草稿横条，不
 
 Task Center 的列表与卡片只保留执行类型 tag，生命周期状态由分组表达，精确状态在详情 Header 使用更清晰的实色徽标展示。分组固定为“进行中（running/verifying）→ 待恢复（stopped/blocked）→ 已完成（done/archived）→ 规划中（todo）”；这是只读投影，不改变 Task 状态机。列表模式的已完成区默认展示最近 10 条，“加载更多”每次追加 10 条，搜索时不得隐藏匹配项；卡片模式不分页。列表行的尾部日期槽在 hover/focus 时原位替换为“会话详情”，隐藏动作不参与静止态宽度计算，切换时不推动标题、工作区或更多菜单。列表/卡片外层不得使用包裹内部按钮的 `<button>`，需以可键盘激活的容器保证 Enter/Space 打开详情且内部动作保持独立焦点。
 
+### 15.9 Record、录音与转录
+
+Launcher 输入区提供 Chat / Record 两种明确模式。Record mode 的文字提交创建 text Record，录音动作创建 audio Record 并立即打开详情；模式切换不改变全局侧栏或顶部 Tab 结构。任务中心以一个 Record 区统一展示 text/audio，不再把音频拆成第二个历史页；卡片用类型、标题、时间、录音/转录状态表达差异，批量删除前明确展示所选数量与不可恢复后果。
+
+audio Record detail 是单实例顶部 Tab，布局按“主时间线 + 录音/播放控制 + 转录内容”组织：
+
+- 录音中 Header 固定显示计时、来源 activity、Pause/Resume 与 Stop。activity 只表达真实 capture sample 是否活跃，不做频谱、波形编辑器或装饰性随机动画。
+- 笔记 composer 与 Mark 是录音期快速动作；未提交笔记在关闭 Tab、退出或更新重启前必须 flush，失败时留在原位并阻止关闭。
+- 音频已存在但没有 transcript 时，转录区域显示主动作“开始转录”；模型资源不可用时给出安装/修复入口，不因安装成功自动处理历史 Record。
+- 转录以稳定 segment 时间线呈现；超过 100 段使用既有虚拟列表能力。点击 segment 可定位媒体时间。状态区分 queued/running/succeeded/failed/cancelled/interrupted，不用 spinner 掩盖终态错误。
+- 说话人纠错只提供改名、合并和片段重分配；操作作用于 speaker projection，不把任意文本编辑伪装成“纠错”。导出提供明确的音频/文本格式与目标结果反馈。
+- Speech 工具资源卡位于“技能与工具 → 工具”，资源安装/移除与 Agent Session 工具启用是两个独立控制：资源 ready 不等于所有 Session 已启用，permission mode 也不代替工具开关。
+
+录音中托盘 icon 增加小圆点，右键菜单增加“正在录音...”；点击只负责显示主窗口并聚焦 exact Record Tab。托盘不承载暂停、停止、转录或多层状态菜单。本期不新增悬浮录音窗、波形编辑器、全局任务监视器或自动会议总结。
+
 ---
 
 ## 版本历史
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.65 | 2026-08-25 | **统一 Record 与桌面录音规范**：Launcher 增加 Record mode；任务中心统一 text/audio；定义单实例 Record detail、录音状态、手动转录、说话人纠错、资源卡与最小托盘入口 |
 | 2.8.64 | 2026-08-23 | **App Shell 弹层材质与位置对齐**：小助理 popover 改从当前侧栏右侧 8px 出现；rail 工作区 flyout、消息中心与小助理统一使用 elevated 背景、阴影和圆角外壳 |
 | 2.8.63 | 2026-08-23 | **Task Center 想法正文降档**：左栏 compact 输入与想法卡片查看/编辑正文由 16px prose 档收至 14px UI 档，Launcher 想法输入继续与聊天输入保持 16px |
 | 2.8.62 | 2026-08-23 | **Task 编辑与创建对齐**：编辑 sheet 移除简短描述和标签，把可持久化的 Agent 工作区选择放在高级配置之前；立即执行/定时一次隐藏并清理周期专属会话与触发状态 |

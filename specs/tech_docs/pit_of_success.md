@@ -18,6 +18,7 @@
 **v0.2.0 结构性重构**
 - [`withConfigLock` / `with_config_lock`](#withconfiglock) — config.json 跨进程串行写入
 - [`withFileLock` / `with_file_lock`](#withfilelock) — 单写者文件原子性
+- [`DurableRecordJournal`](#durable-record-journal) — Record append-only 事实的 typed JSONL durability
 - [`copyPlainText`](#renderer-clipboard) — WebView 普通文本复制 fallback + 真实成功语义
 - [`killWithEscalation`](#killwithescalation) — 子进程 stop 升级链
 - [`withAbortSignal` / `cancellableFetch`](#cancellation) — 统一 cancel 协议
@@ -258,6 +259,24 @@ v0.2.0 Windows 版的 IM Bot 全部启动失败就是这个 trap：`find_tsx_run
 
 **Don't.**
 - 任何单写者文件用裸 append
+
+<a id="durable-record-journal"></a>
+## `DurableRecordJournal` (`src-tauri/src/durable_journal.rs`)
+
+**Problem.** Record lifecycle 与 transcript revision 都是 append-only 事实。如果各自实现 JSONL append/recovery，很容易在 torn tail、identity、sequence、checksum、单行上限或 fsync 上漂移；直接套通用数据库/事件框架又会为两个局部日志引入额外进程、schema owner 和迁移面。
+
+**Surface.**
+- `DurableRecordJournal<Event>::open(path, record_id, schema_version, max_line_bytes)`：验证配置、恢复合法前缀并取得 next sequence
+- `append(wall_time_ms, media_ms, event)`：写 typed event，flush + `sync_data` 后才返回已提交 entry
+- `recover_and_read<Event>(...)`：只返回通过 identity/schema/sequence/checksum 校验的 durable entry
+
+**Invariants enforced.**
+- 目标只能是普通文件或不存在；拒绝 symlink/special file
+- 每行固定绑定 `recordId + schemaVersion + seq + eventId`，checksum 覆盖 body；sequence 必须从 1 连续递增
+- 尾部 partial/畸形/超限行只在最后合法字节边界修复；identity/schema mismatch fail closed，不能把其它 Record 的内容截成“可用”日志
+- caller 必须给出领域 event enum 与 projection；helper 不拥有 recording/transcript 状态机，也不扩张成通用 event bus、数据库或跨进程队列
+
+**Don't.** Record-owned append-only 事实不得再裸写 JSONL，或复制一套 checksum/torn-tail repair。普通可原子替换的 snapshot、TaskStore 和 speech job metadata 不应为了“统一”迁入该 journal。
 - 用 `Atomics.wait` / CPU spin / `while (Date.now() < end)` 做阻塞等待
 - 自己手写 lockdir 协议
 

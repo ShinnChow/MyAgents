@@ -99,6 +99,8 @@ myagents-releases/
 
 MyAgents 支持 macOS 13，而官方 ONNX Runtime 1.28 arm64 archive 的最低系统版本是 macOS 14，且没有 x64 archive。因此 Apple Silicon 与 Intel 都从锁定源码按 deployment target 13.0 构建共享 ONNX Runtime。`build_macos.sh` 会在正式构建前通过 `scripts/prepare-native-inference.mjs` 统一检查并准备 document/speech 两个 capability；已有当前 fingerprint 的完整 prepared cache 时不会强制要求源码构建工具。脚本不会自动执行 Homebrew 或修改系统环境，缺项时会给出对应的安装与验证命令。
 
+native inference 的受支持 target 由 `src-tauri/document-worker/resource-lock.json::targets` 唯一锁定：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`。每个正式产物都必须由同一 `prepare-native-inference` 入口生成 document/speech 两份 target manifest；speech bundle 只携带 media Worker、sherpa adapter/native 依赖与 legal inventory，ONNX Runtime 必须引用同 target document artifact，不能复制第二份。真实发布验收需在对应 target 机器/runner 上检查签名、notices、Worker 最小加载和至少一份媒体 smoke；不能用 host-only 单测替代五 target 产物证据。
+
 ---
 
 ## 发布脚本

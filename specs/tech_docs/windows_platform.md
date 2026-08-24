@@ -118,6 +118,12 @@ pub fn kill_stale_processes(patterns: &[ProcessPattern]) -> CleanupReport;
 
 > **关键**：普通短生命周期子进程 spawn 仍 MUST 使用 `process_cmd::new()`（Windows CREATE_NO_WINDOW）；会创建后代的长生命周期进程 MUST 再用 `spawn_tree()`。外部 binary 解析继续走 `system_binary::find()`（PATH 补充）。禁止裸 `std::process::Command::new()`，也禁止把 stale cleanup 扩展到正常退出；recovery 扫描统一由 `process_cleanup::kill_stale_processes()` owner，调用方不要再写 ad-hoc PowerShell / `pgrep`。
 
+### Windows 录音与语音 Worker
+
+Windows microphone 与 system audio 都走 `cpal` 的 WASAPI backend；system audio 使用默认输出设备的 loopback config，不通过 ffmpeg、PowerShell、浏览器 capture 或虚拟声卡。`RecordingManager` 在 admission 时冻结 exact device ID；设备切换/拔出后 fail closed 为 `RECORDING_DEVICE_CHANGED`，不静默接管另一设备。callback 只写既有 bounded archive/analysis ring 与 activity atomic，不做阻塞 IO、重采样或 UI event。
+
+`myagents-media-worker.exe` 与 sherpa adapter/native libraries 位于随包 `speech-inference/v1`，ONNX Runtime identity 复用 `document-processing/v1` 的同 target artifact。Worker 必须通过 `process_cmd::spawn_tree()` 进入 kill-on-close Job Object，使用私有 framed stdin/stdout；禁止搜索 PATH、系统 ORT、用户模型 cache 或在线 ASR。正式安装包 smoke 需要在无系统 ORT/ffmpeg/Python、断网环境验证 microphone、WASAPI loopback、pause/resume/stop、Worker 最小加载、取消/退出进程树与 notices。
+
 Activation Trigger 的 Detector 也属于 Live lifecycle：每次 invocation 保留自己的 Job Object，timeout、stdout 超限、Task Stop/Delete 和 App shutdown 都终止同一棵树；不能只 kill 根 PID。harness 先 `env_clear()`，再恢复 Windows system/home/temp、证书、通用代理、增强 PATH 与 `LANG/LC_ALL/PYTHONUTF8/PYTHONIOENCODING` 规范 baseline，不继承 Provider credential 或 `MYAGENTS_*` 端口。它以 UTF-8 JSON 写 stdin，并把 stdout 当严格 UTF-8 协议解析；任意仍输出本地代码页字节的脚本会得到可诊断的 protocol failure，而不是静默替换字符或激活 AI。
 
 ---
@@ -190,7 +196,7 @@ let client = proxy_config::build_client_with_proxy(builder)?;
 
 ### 关键清理步骤
 
-正式 Windows x64 构建在 Tauri snapshot 前运行 `scripts/prepare-document-processing.mjs x86_64-pc-windows-msvc`，按 `resource-lock.json` 下载并校验 ONNX Runtime CPU、PDFium、PP-OCRv6 模型/字典，使用锁定 Rust toolchain 构建 `myagents-document-worker.exe`，再生成包含最终文件 hash 的 target manifest。运行时只从该 manifest 的绝对路径加载 DLL；不得搜索 PATH、系统目录或联网补资源。安装包 smoke 必须在无系统 ONNX Runtime/PDFium、断网环境验证加载、最小推理、Job Object 取消、notices 与安装包签名。
+正式 Windows x64 构建在 Tauri snapshot 前运行 `scripts/prepare-native-inference.mjs x86_64-pc-windows-msvc`，在同一锁和 content-addressed cache 下准备 document 与 speech capability：按 `resource-lock.json` 下载并校验共享 ONNX Runtime CPU、PDFium、PP-OCRv6 模型/字典，使用锁定 Rust toolchain 构建 `myagents-document-worker.exe`、`myagents-media-worker.exe` 与 sherpa adapter，再生成各自包含最终文件 hash/签名的 target manifest。运行时只从 manifest 的绝对路径加载 DLL；不得搜索 PATH、系统目录或联网补 native 资源。安装包 smoke 必须在无系统 ONNX Runtime/PDFium/ffmpeg、断网环境验证文档/语音最小推理、WASAPI capture、Job Object 取消、notices 与安装包签名。
 
 文档 source/output 的每个已存在祖先都拒绝 reparse point；source 使用 no-follow regular-file handle，输出发布前再次比较 held directory identity。Worker 由 `process_cmd::spawn_tree()` 在 resume 前加入 kill-on-close Job Object；不能退回裸 `Command` 或 `taskkill`。详细跨平台资源矩阵和错误码见 `document_processing.md`。
 
@@ -241,6 +247,7 @@ Remove-Item src-tauri\target\x86_64-pc-windows-msvc\release\resources -Recurse -
 - [ ] 版本号同步（`package.json`, `tauri.conf.json`, `Cargo.toml`）
 - [ ] TypeScript 类型检查通过
 - [ ] `npm run build:cli` 后 `resources/cli/` 只有当前 `myagents.cjs`（以及 tracked `.gitkeep`），没有旧 `myagents.cmd` staging 残留
+- [ ] `scripts/prepare-native-inference.mjs x86_64-pc-windows-msvc --offline` 可从已验证 cache 重建 document/speech resource projection
 - [ ] `.env` 文件包含 `TAURI_SIGNING_PRIVATE_KEY`
 - [ ] Rust 工具链已安装目标 `x86_64-pc-windows-msvc`
 
@@ -253,6 +260,7 @@ Remove-Item src-tauri\target\x86_64-pc-windows-msvc\release\resources -Recurse -
 - [ ] NSIS 安装包（~150MB）
 - [ ] 便携版 ZIP（~150MB）
 - [ ] Updater 签名文件（`.sig`）
+- [ ] 安装目录包含校验通过的 `document-processing/v1` 与 `speech-inference/v1`，第三方 notices/许可完整
 
 **发布**：
 ```powershell

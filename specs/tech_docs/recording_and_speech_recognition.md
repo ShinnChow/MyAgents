@@ -4,6 +4,7 @@
 
 ## Owner 与进程边界
 
+- `RecordStore` 是 `~/.myagents/records/` 下 text/audio Record、artifact、timeline、transcript revision、diarization projection、speaker override 与 export source 的持久权威。旧 `thoughts/` 只作为幂等迁移输入；迁移完成后产品不再双写。
 - `RecordingManager` 拥有 App-global 唯一采集槽、设备流、Ogg Opus 归档、pause/stop/recovery 和录音期 wake lock。Renderer 与托盘只消费其 snapshot。
 - `SpeechRecognitionManager` 拥有 durable speech job、FIFO、Worker generation、重试/取消/退出收敛，以及向 `RecordStore` 发布 transcript / diarization projection 的授权。
 - `SpeechModelPackManager` 是 `SpeechRecognitionManager` 内的模型权重子 owner：只管理显式安装、校验、active revision 和移除，不拥有 job terminal 或 Record 内容。
@@ -11,6 +12,17 @@
 - `myagents-media-worker` 是单 workload、单 generation 的受管子进程。它不监听端口、不下载资源、不读配置，也不直接写 Record 或公开 artifact。
 
 Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/stdout framed protocol；live PCM 是有界 binary frame，控制与结果是有界 JSON frame。Worker 路径、模型路径和 transcript 不进入 Debug / unified log。
+
+## 产品控制面与投影
+
+- Launcher 的 Chat/Record mode 共用输入主区域；text/audio Record 进入同一个任务中心列表。文字创建仍写 `RecordStore`，开始录音必须先取得 `RecordingManager` 唯一采集槽。
+- audio Record detail 是单实例顶部 Tab。同一 `recordId` 只聚焦，不重复打开；持久 Tab snapshot 只保存 `id/view/recordId/title`，恢复前用 `RecordStore.get` 验证。Record 不存在时同一 Tab 退回 Record 列表；Tab 不拥有 Session/Sidecar，也不持久化录音 snapshot、播放 seek 或电平。
+- active recording 的 pause/resume/stop、笔记与 Mark 都在详情页完成。待提交笔记在关闭 Tab、退出 App、安装更新重启前必须先 flush；失败则阻止该关闭动作，不能把输入框当持久 authority。
+- 没有 transcript 的历史音频在转录区域显示“开始转录”。只有用户点击后才调用 `cmd_speech_record_transcribe`；安装模型、打开详情或启动 App 都不会自动扫描历史 Record。
+- 本期人工纠错只覆盖 speaker rename、merge 与 exact segment reassign。原始 transcript revision 保留，override 单独持久化并在 projection/export/search 时合成；不提供任意字词改写。
+- 托盘只消费 `RecordingManager` projection：录音中 icon 增加状态圆点，菜单出现“正在录音...”，点击打开 exact Record Tab。托盘不拥有录音状态或导航 history。
+- SearchEngine 复用现有 Tantivy + jieba 建立 Record index；`RecordStore` change broadcast 驱动 upsert/delete，搜索按 `record_id` 合并 title/content/tag/transcript/speaker 命中，每个 Record 最多返回一项。
+- analytics 复用 renderer `track()` 与现有 Tauri bridge，只记录 typed milestone、枚举、duration bucket 与不可逆 Record hash；不记录音频、transcript、speaker name、路径或自由文本，也不新建 endpoint/outbox/retry/store。
 
 ## 依赖复用边界
 
@@ -35,6 +47,12 @@ job metadata 位于：
 Record backfill / diarization 在 App 重启后保留原 job ID，清除旧 Worker generation 并按持久顺序重排；Agent job 在进程边界收敛为 `interrupted`。每个 job 的 `pipeline` 在 admission 时冻结 provider、model-pack revision 与 ONNX Runtime revision。队列执行必须按该 snapshot 解析资源，active pack 的后续变化只影响新 job。
 
 Worker 结果只有同时满足 exact `(jobId, generation)`、协议 shape、业务数量/时间轴上限且当前 generation 仍持有 publish authority 时才能提交。Record ASR 成功后由同一 Manager 排队 diarization；stale generation、cancelled generation 和失败 probe 都不能发布内容。
+
+### Agent attachment job scope
+
+`myagents speech transcribe/status/wait/cancel/list` 是给 AI 使用的 Session-scoped 工具面。CLI 不接受 Session、Workspace 或 Sidecar scope 参数；Node 从当前 `SessionEngine` 和进程环境取得 Sidecar identity，Rust Management API 用 request header 中的 generation 回查同一 live process 的 authoritative `product_session_id + workspace_path`。job admission 自动冻结这两个字段。
+
+输入必须是该 Workspace 内已存在的普通文件，拒绝 URL、symlink、逃逸路径与不受支持格式。默认输出根为 `<workspace>/myagents_files/speech-transcriptions`，发布仍使用 private staging + authenticated owner marker + no-replace rename；partial 结果不可见。status/cancel/list 都按 exact caller Session 过滤，所以其它 Session 即使知道 job ID 也得到 `SPEECH_JOB_NOT_FOUND`。Agent job 的可见历史保留 30 天；App 重启时非终态 Agent job 收敛为 `interrupted`，不会静默继续使用旧 caller generation。
 
 ## 录制中转写
 
@@ -116,3 +134,11 @@ Tauri 提供 `cmd_speech_model_pack_status/install/remove`。状态为 `not_inst
 - `SPEECH_RESOURCE_CORRUPT`：active pointer / pack 的持久校验失败。
 
 日志只记录 operation、revision、公开资源 bytes、generation、阶段与结构化错误码；不得记录用户音频、transcript、完整路径或远端原始错误正文。
+
+## 排障顺序
+
+1. 先在 `~/.myagents/logs/unified-<本地日期>.log` 搜索 `[record]`、`[recording]`、`[speech]` 与结构化错误码；不要要求用户上传音频或 transcript。
+2. 录音无法开始时先区分 `RECORDING_MICROPHONE_UNAVAILABLE`、`RECORDING_SCREEN_PERMISSION_REQUIRED`、`RECORDING_SYSTEM_AUDIO_UNAVAILABLE`、`RECORDING_PIPEWIRE_UNAVAILABLE` 与 `RECORDING_DEVICE_CHANGED`。权限或设备问题由平台 capture backend 处理，不通过重装模型修复。
+3. 音频已保存但没有转录时查看 Record 的 transcription status 与模型 pack status。资源未 ready 时安装/修复资源；历史 Record 仍需用户手动点击“开始转录”。
+4. Agent 看不到 job 时必须在原发起 Session 运行 `myagents speech list`；不要通过增加 `--sessionId` 或全局 list 绕过隔离。
+5. 资源准备或安装失败时依次核对 target native manifest、共享 ORT identity、第一方 manifest/signature、pack 文件 hash 与最小真实加载。不得回退系统 ORT、在线 ASR、用户 cache 或临时下载。

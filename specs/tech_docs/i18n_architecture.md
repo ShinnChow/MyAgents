@@ -29,7 +29,7 @@
 | `src-tauri/src/i18n.rs` | Native UI 语言状态、system locale、托盘文案、Tauri commands |
 | `src-tauri/src/tray.rs` | 托盘菜单 handle 保存与 relabel |
 
-Renderer 文案按 namespace 分组，目前包括 `common`、`app`、`settings`、`chat`、`launcher`、`task`。新页面应优先复用既有 namespace；当页面形成独立产品面时再新增 namespace。
+Renderer 文案按 namespace 分组，目前包括 `common`、`app`、`settings`、`chat`、`launcher`、`task`。统一 Record 列表、Record detail、录音/转录与 Speech 资源卡当前复用 `task` namespace；托盘“正在录音...”属于 native 文案，位于 Rust locale table。新页面应优先复用既有 namespace；当页面形成独立产品面时再新增 namespace。
 
 ## 同步链路
 
@@ -78,5 +78,6 @@ Renderer 文案按 namespace 分组，目前包括 `common`、`app`、`settings`
 - 新增用户可见 UI 文案时，优先走 `useTranslation()` 与 locale JSON；不要把可复用产品文案继续硬编码在组件里。
 - 仍在迁移中的旧页面可以逐步抽取，但已经接入 i18n 的 surface 不应回退到硬编码中文。
 - Native 文案数量要保持很少，只覆盖不能由 React 渲染的 chrome；普通产品界面文案归 renderer JSON。
+- Record/Recording/Speech 新文案必须保持 zh-CN/en-US key parity；状态码、CLI error code、job stage 与 analytics 枚举是稳定协议值，不做翻译，Renderer 只把它们映射为 locale 文案。
 - `AppConfig.uiLanguage` 在 Tauri 环境必须通过 `ConfigProvider.updateConfig` / `cmd_set_ui_language` 修改，不要绕过 native owner 直接写盘。
 - 格式化函数必须显式接收 locale 或从 i18next 当前语言派生；公共工具函数为了兼容旧调用可默认 `zh-CN`，但新调用应传入当前 locale。

@@ -96,6 +96,7 @@ AppImage 和 deb 内部都包含：
 | Sidecar / Bridge / CLI | `resources/server-dist.js` / `resources/plugin-bridge-dist.mjs` / `resources/cli/myagents.cjs` |
 | Node.js v24（含 npm/npx） | `resources/nodejs/bin/node`（+ `lib/node_modules/npm`） |
 | Claude Agent SDK native binary | `resources/claude-agent-sdk/claude`（~210 MB，SDK team 静态链接） |
+| 本地文档/语音推理 | `resources/document-processing/v1/` + `resources/speech-inference/v1/`；两者共享同 target ONNX Runtime identity |
 | mino 默认工作区模板 | `resources/bundled-workspaces/mino/` |
 | bundled skills / agents / workspaces | `resources/bundled-skills/` / `resources/bundled-agents/` / `resources/bundled-workspaces/` |
 
@@ -105,6 +106,8 @@ AppImage 和 deb 内部都包含：
 - `git` — 大多数发行版默认安装；缺失时 Claude Code 工具会降级
 - `bash` / 核心 POSIX 工具 — 系统自带
 - 「浏览器」的 Chromium / Headless Shell / FFmpeg — 只在用户首次点击“安装资源”后由 Rust owner 下载 signed runtime set；普通 AppImage/deb build 不下载也不打包
+
+Linux 录音使用 `cpal` 的 PipeWire host：microphone 来自默认 input，system audio 只接受 PipeWire `default_sink` monitor input。monitor 不可用时允许以明确 warning 继续 microphone-only；PipeWire host 不可用或没有任何来源时录音 admission 失败。安装包不得通过捆绑 ffmpeg/PulseAudio bridge 或脚本 fallback 改变这一契约。x86_64/aarch64 发布都要在真实 PipeWire 环境验证 microphone；system audio 支持只在 monitor 可用的发行版/桌面组合声明。
 
 ## 常见问题
 
