@@ -6,4 +6,5 @@
 //! durable job and publication authority.
 
 pub mod diarization;
+pub mod model_pack_source;
 pub mod protocol;
