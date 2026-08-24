@@ -8,4 +8,5 @@
 pub mod diarization;
 pub mod model_pack_source;
 pub mod native_adapter;
+pub mod native_bundle;
 pub mod protocol;
