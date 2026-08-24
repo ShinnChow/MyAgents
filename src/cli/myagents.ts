@@ -332,6 +332,7 @@ Usage: myagents <command> [options]
 
 Commands:
   anydoc    Convert one local document to Markdown (including offline OCR)
+  speech    Transcribe one local audio/video attachment with local models
   mcp       Manage MCP tool servers
   vision    Official image-understanding CLI tool
   tool      Manage registered CLI tools (Lab-gated; enable in Settings first)
@@ -372,6 +373,7 @@ Examples:
   myagents mcp oauth start notion-mcp
   myagents vision readme
   myagents vision analyze --image myagents_files/screenshot.png --prompt "Summarize the UI state"
+  myagents speech transcribe --file myagents_files/meeting.m4a
   myagents model list
   myagents model set-key deepseek sk-xxx
   myagents skill list
@@ -560,6 +562,11 @@ export function printResult(
 
   if (group === 'anydoc') {
     printAnydocResult(action, result);
+    return;
+  }
+
+  if (group === 'speech') {
+    printSpeechResult(action, result);
     return;
   }
 
@@ -2585,6 +2592,128 @@ async function waitForAnydocJob(
   }
 }
 
+const SPEECH_TERMINAL_STATES = new Set([
+  'succeeded',
+  'succeeded_with_warnings',
+  'failed',
+  'cancelled',
+  'interrupted',
+]);
+
+function printSpeechResult(action: string, result: Record<string, unknown>): void {
+  const data = (result.data as Record<string, unknown> | undefined) ?? {};
+  const job = data.job as Record<string, unknown> | undefined;
+  if (!result.success) {
+    const code = typeof result.code === 'string' ? ` [${result.code}]` : '';
+    console.error(`Error${code}: ${String(result.error ?? 'Speech transcription failed.')}`);
+    if (typeof result.suggestion === 'string' && result.suggestion.trim()) {
+      console.error(`Suggestion: ${result.suggestion}`);
+    }
+    printAnydocRecovery(result.recoveryHint);
+    return;
+  }
+  if (action === 'list') {
+    const jobs = Array.isArray(data.items) ? data.items as Array<Record<string, unknown>> : [];
+    if (jobs.length === 0) {
+      console.log('No speech jobs from this Session.');
+      return;
+    }
+    for (const item of jobs) {
+      const output = (item.output as Record<string, unknown> | undefined) ?? {};
+      const state = String(item.state ?? '(unknown)');
+      const artifact = output.artifactAvailable === true && output.transcriptMarkdownPath
+        ? String(output.transcriptMarkdownPath)
+        : SPEECH_TERMINAL_STATES.has(state) ? '(no artifact)' : '(pending)';
+      console.log(`${String(item.jobId)}  ${state}  ${artifact}`);
+    }
+    return;
+  }
+  if (!job) {
+    console.log(formatObject(data));
+    return;
+  }
+  const output = (job.output as Record<string, unknown> | undefined) ?? {};
+  const jobId = String(job.jobId ?? '(unknown)');
+  const state = String(job.state ?? '(unknown)');
+  if (action === 'transcribe' && (state === 'queued' || state === 'running')) {
+    console.log(`Speech job accepted: ${jobId}`);
+    console.log(`Status: ${state}`);
+    console.log(`Output when ready: ${String(output.transcriptMarkdownPath ?? '(unknown)')}`);
+    console.log(`→ Run: myagents speech status ${jobId}`);
+    console.log(`→ Run: myagents speech cancel ${jobId}`);
+    return;
+  }
+  console.log(`Speech job: ${jobId}`);
+  console.log(`Status: ${state}`);
+  if (!SPEECH_TERMINAL_STATES.has(state)) {
+    console.log(`Stage: ${String(job.stage ?? '(unknown)')}`);
+  }
+  if (output.artifactAvailable === true && output.transcriptMarkdownPath) {
+    console.log(`Transcript: ${String(output.transcriptMarkdownPath)}`);
+  } else if (SPEECH_TERMINAL_STATES.has(state)) {
+    console.log('Transcript: unavailable');
+  }
+  const terminalError = job.error as Record<string, unknown> | undefined;
+  if (terminalError) {
+    console.error(`Error [${String(terminalError.code ?? 'SPEECH_FAILED')}].`);
+  }
+}
+
+async function waitForSpeechJob(
+  jobId: string,
+  initial: Record<string, unknown>,
+  jsonMode: boolean,
+): Promise<Record<string, unknown>> {
+  let result = initial;
+  let delayMs = 250;
+  let lastStage = '';
+  const onInterrupt = () => {
+    console.error(`Speech wait interrupted; job ${jobId} is still app-owned and was not cancelled.`);
+    console.error(`→ Run: myagents speech status ${jobId}`);
+    console.error(`→ Run: myagents speech cancel ${jobId}`);
+    process.exit(130);
+  };
+  process.once('SIGINT', onInterrupt);
+  try {
+    while (result.success) {
+      const data = (result.data as Record<string, unknown> | undefined) ?? {};
+      const job = data.job as Record<string, unknown> | undefined;
+      if (!job || job.jobId !== jobId) {
+        return {
+          success: false,
+          code: 'SPEECH_PROTOCOL_ERROR',
+          error: 'The status response did not contain the expected speech job.',
+          suggestion: `Retry with myagents speech status ${jobId}.`,
+        };
+      }
+      const state = String(job.state ?? '');
+      if (SPEECH_TERMINAL_STATES.has(state)) {
+        if (state === 'failed' || state === 'cancelled' || state === 'interrupted') {
+          const terminalError = (job.error as Record<string, unknown> | undefined) ?? {};
+          return {
+            ...result,
+            success: false,
+            code: terminalError.code ?? 'SPEECH_FAILED',
+            error: `Speech job ended as ${state}.`,
+          };
+        }
+        return result;
+      }
+      const stage = String(job.stage ?? state);
+      if (!jsonMode && stage !== lastStage) {
+        console.error(`Speech ${jobId}: ${stage}`);
+        lastStage = stage;
+      }
+      await new Promise(resolveDelay => setTimeout(resolveDelay, delayMs));
+      delayMs = Math.min(delayMs * 2, 2_000);
+      result = await callApi('speech/status', { jobId });
+    }
+    return result;
+  } finally {
+    process.removeListener('SIGINT', onInterrupt);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Command routing
 // ---------------------------------------------------------------------------
@@ -2671,6 +2800,13 @@ async function main(): Promise<void> {
         result = await waitForAnydocJob(job.jobId, result, jsonMode);
       }
     }
+    if (group === 'speech' && result.success) {
+      const job = ((result.data as Record<string, unknown> | undefined)?.job ?? undefined) as Record<string, unknown> | undefined;
+      const shouldWait = action === 'wait' || (action === 'transcribe' && flags.wait === true);
+      if (shouldWait && job && typeof job.jobId === 'string') {
+        result = await waitForSpeechJob(job.jobId, result, jsonMode);
+      }
+    }
 
     printResult(group, action, result, jsonMode, flags, restArgs);
   }
@@ -2745,6 +2881,9 @@ export function rejectUnsupportedSpaceDryRun(
 export function buildRoute(group: string, action: string, rest: string[]): string {
   if (group === 'anydoc' && action === 'wait') {
     return 'anydoc/status';
+  }
+  if (group === 'speech' && action === 'wait') {
+    return 'speech/status';
   }
   if (group === 'task' && action === 'trigger') {
     const triggerAction = rest[0] || 'validate';
@@ -2844,6 +2983,7 @@ export function buildRoute(group: string, action: string, rest: string[]): strin
 
 const PUBLISHED_ADMIN_ROUTES = new Set([
   'anydoc/convert', 'anydoc/status', 'anydoc/cancel', 'anydoc/list',
+  'speech/transcribe', 'speech/status', 'speech/cancel', 'speech/list',
   'mcp/list', 'mcp/show', 'mcp/add', 'mcp/remove', 'mcp/enable', 'mcp/disable', 'mcp/env', 'mcp/test',
   'mcp/oauth/discover', 'mcp/oauth/start', 'mcp/oauth/status', 'mcp/oauth/revoke',
   'tool/list', 'tool/info', 'tool/add', 'tool/remove', 'tool/enable', 'tool/disable', 'tool/readme', 'tool/env',
@@ -2873,7 +3013,7 @@ const PUBLISHED_ADMIN_ROUTES = new Set([
 ]);
 
 const PUBLISHED_COMMAND_GROUPS = new Set([
-  'anydoc', 'mcp', 'tool', 'vision', 'model', 'agent', 'runtime', 'diagnose', 'cron', 'goal', 'im', 'widget',
+  'anydoc', 'speech', 'mcp', 'tool', 'vision', 'model', 'agent', 'runtime', 'diagnose', 'cron', 'goal', 'im', 'widget',
   'plugin', 'cc-plugin', 'skill', 'config', 'task', 'thought', 'record', 'space', 'issue', 'session',
   'status', 'reload', 'version',
 ]);
@@ -3996,6 +4136,119 @@ function buildAnydocRequestBody(
   return { jobId: rest[0].trim() };
 }
 
+function buildSpeechRequestBody(
+  action: string,
+  rest: string[],
+  flags: Record<string, unknown>,
+): Record<string, unknown> {
+  const allowedByAction: Record<string, Set<string>> = {
+    transcribe: new Set(['file', 'fileValueMissing', 'output', 'wait', 'waitInvalidValue', 'json', 'port']),
+    status: new Set(['json', 'port']),
+    wait: new Set(['json', 'port']),
+    cancel: new Set(['json', 'port']),
+    list: new Set(['limit', 'json', 'port']),
+  };
+  const allowed = allowedByAction[action];
+  if (!allowed) {
+    return exitAgentCliError(flags, {
+      code: 'UNKNOWN_COMMAND',
+      error: `Unknown speech command: ${action}`,
+      suggestion: 'Inspect the published speech commands.',
+      suggestedCommand: 'myagents speech --help',
+    });
+  }
+  const unsupported = Object.keys(flags).find(key => !allowed.has(key));
+  if (unsupported) {
+    const displayFlag = unsupported.replace(/[A-Z]/g, value => `-${value.toLowerCase()}`);
+    return exitAgentCliError(flags, {
+      code: unsupported === 'dryRun' ? 'DRY_RUN_UNSUPPORTED' : 'FLAG_UNSUPPORTED',
+      error: `myagents speech ${action} does not support --${displayFlag}.`,
+      suggestion: 'Session and Workspace scope are injected automatically; use only documented options.',
+      suggestedCommand: `myagents speech ${action} --help`,
+    });
+  }
+  if (action === 'transcribe') {
+    const files = Array.isArray(flags.file) ? flags.file : [];
+    if (flags.fileValueMissing || files.length !== 1 || typeof files[0] !== 'string' || !files[0].trim()) {
+      return exitAgentCliError(flags, {
+        code: 'SPEECH_FILE_COUNT_INVALID',
+        error: 'speech transcribe requires exactly one --file <input>.',
+        suggestion: 'Choose one local audio/video attachment in the current Workspace.',
+        suggestedCommand: 'myagents speech transcribe --help',
+      });
+    }
+    if (rest.length > 0) {
+      return exitAgentCliError(flags, {
+        code: 'SPEECH_ARGUMENT_UNEXPECTED',
+        error: `speech transcribe does not accept positional input: ${rest.join(' ')}`,
+        suggestion: 'Pass the single input through --file <input>.',
+        suggestedCommand: 'myagents speech transcribe --help',
+      });
+    }
+    if (flags.waitInvalidValue !== undefined) {
+      return exitAgentCliError(flags, {
+        code: 'SPEECH_WAIT_VALUE_INVALID',
+        error: '--wait is a presence flag and does not accept true or false.',
+        suggestion: 'Use bare --wait, or omit it for immediate acceptance.',
+        suggestedCommand: 'myagents speech transcribe --help',
+      });
+    }
+    if (flags.output !== undefined && (typeof flags.output !== 'string' || !flags.output.trim())) {
+      return exitAgentCliError(flags, {
+        code: 'SPEECH_OUTPUT_PATH_INVALID',
+        error: '--output requires a directory path.',
+        suggestion: 'Pass an output root inside the current Workspace.',
+        suggestedCommand: 'myagents speech transcribe --help',
+      });
+    }
+    const source = files[0].trim();
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(source)) {
+      return exitAgentCliError(flags, {
+        code: 'SPEECH_SOURCE_PATH_INVALID',
+        error: 'speech transcribe accepts one local file path, not a URL.',
+        suggestion: 'Choose a local attachment in the current Workspace.',
+        suggestedCommand: 'myagents speech transcribe --help',
+      });
+    }
+    const pathMod = require('path') as typeof import('path');
+    return {
+      sourcePath: pathMod.resolve(process.cwd(), source),
+      ...(typeof flags.output === 'string'
+        ? { outputRoot: pathMod.resolve(process.cwd(), flags.output.trim()) }
+        : {}),
+    };
+  }
+  if (action === 'list') {
+    if (rest.length > 0) {
+      return exitAgentCliError(flags, {
+        code: 'SPEECH_ARGUMENT_UNEXPECTED',
+        error: 'speech list does not accept positional arguments.',
+        suggestedCommand: 'myagents speech list --help',
+      });
+    }
+    const rawLimit = flags.limit ?? '20';
+    const limit = typeof rawLimit === 'string' && /^\d+$/.test(rawLimit) ? Number(rawLimit) : Number.NaN;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      return exitAgentCliError(flags, {
+        code: 'SPEECH_LIST_LIMIT_INVALID',
+        error: '--limit must be an integer from 1 to 100.',
+        suggestion: 'Retry with --limit 20 or another allowed value.',
+        suggestedCommand: 'myagents speech list --help',
+      });
+    }
+    return { limit };
+  }
+  if (rest.length !== 1 || typeof rest[0] !== 'string' || !rest[0].trim()) {
+    return exitAgentCliError(flags, {
+      code: 'SPEECH_JOB_ID_REQUIRED',
+      error: `speech ${action} requires exactly one <job-id>.`,
+      suggestion: 'Copy the exact job ID from speech list.',
+      suggestedCommand: 'myagents speech list',
+    });
+  }
+  return { jobId: rest[0].trim() };
+}
+
 function assertSupportedCronFlags(
   action: 'add' | 'update',
   flags: Record<string, unknown>,
@@ -4038,6 +4291,9 @@ export function buildRequestBody(
 ): Record<string, unknown> {
   if (group === 'anydoc') {
     return buildAnydocRequestBody(action, rest, flags);
+  }
+  if (group === 'speech') {
+    return buildSpeechRequestBody(action, rest, flags);
   }
   // Official image understanding tool. Unlike the user-defined CLI tool
   // registry, this is a built-in product capability backed by AppConfig model

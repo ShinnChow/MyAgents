@@ -449,6 +449,14 @@ pub enum WorkerResponse {
         sequence: u64,
         end_sample: u64,
     },
+    MediaProbed {
+        protocol_version: u32,
+        identity: WorkloadIdentity,
+        media_kind: String,
+        codec: String,
+        duration_ms: Option<u64>,
+        used_default_track: bool,
+    },
     TranscriptSegment {
         protocol_version: u32,
         identity: WorkloadIdentity,
@@ -504,6 +512,7 @@ impl std::fmt::Debug for WorkerResponse {
             Self::Ready { .. } => "WorkerResponse::Ready",
             Self::Heartbeat { .. } => "WorkerResponse::Heartbeat",
             Self::InputAck { .. } => "WorkerResponse::InputAck",
+            Self::MediaProbed { .. } => "WorkerResponse::MediaProbed",
             Self::TranscriptSegment { .. } => "WorkerResponse::TranscriptSegment([REDACTED])",
             Self::SpeakerTurnBatch { .. } => "WorkerResponse::SpeakerTurnBatch",
             Self::Progress { .. } => "WorkerResponse::Progress",
@@ -525,6 +534,9 @@ impl WorkerResponse {
                 protocol_version, ..
             }
             | Self::InputAck {
+                protocol_version, ..
+            }
+            | Self::MediaProbed {
                 protocol_version, ..
             }
             | Self::TranscriptSegment {
@@ -556,6 +568,7 @@ impl WorkerResponse {
             Self::Ready { identity, .. }
             | Self::Heartbeat { identity, .. }
             | Self::InputAck { identity, .. }
+            | Self::MediaProbed { identity, .. }
             | Self::TranscriptSegment { identity, .. }
             | Self::SpeakerTurnBatch { identity, .. }
             | Self::Progress { identity, .. }
@@ -578,6 +591,20 @@ impl WorkerResponse {
             Self::InputAck {
                 track, end_sample, ..
             } => is_record_source_track(*track) && *end_sample <= MAX_MEDIA_SAMPLES_PER_TRACK,
+            Self::MediaProbed {
+                media_kind,
+                codec,
+                duration_ms,
+                ..
+            } => {
+                matches!(
+                    media_kind.as_str(),
+                    "wav" | "aiff" | "mp3" | "flac" | "ogg" | "m4a" | "mp4" | "mov"
+                ) && matches!(
+                    codec.as_str(),
+                    "pcm" | "adpcm" | "mp3" | "flac" | "vorbis" | "aac-lc" | "alac"
+                ) && duration_ms.is_none_or(|duration| duration <= 8 * 60 * 60 * 1_000)
+            }
             Self::TranscriptSegment {
                 segment_id,
                 track,
@@ -589,7 +616,7 @@ impl WorkerResponse {
                 ..
             } => {
                 valid_protocol_id(segment_id)
-                    && is_record_source_track(*track)
+                    && is_transcription_track(*track)
                     && start_sample < end_sample
                     && *end_sample <= MAX_MEDIA_SAMPLES_PER_TRACK
                     && !text.trim().is_empty()
@@ -666,7 +693,7 @@ fn valid_error_code(value: &str) -> bool {
 fn valid_checkpoint(checkpoint: &Checkpoint) -> bool {
     (1..=2).contains(&checkpoint.streams.len())
         && checkpoint.streams.iter().all(|stream| {
-            is_record_source_track(stream.track)
+            is_transcription_track(stream.track)
                 && stream.analysis_sample <= MAX_MEDIA_SAMPLES_PER_TRACK
         })
         && (checkpoint.streams.len() == 1
@@ -678,6 +705,10 @@ fn valid_checkpoint(checkpoint: &Checkpoint) -> bool {
                 .map(|stream| stream.analysis_sample)
                 .max()
                 .unwrap_or(0)
+}
+
+fn is_transcription_track(track: TrackKind) -> bool {
+    is_record_source_track(track) || track == TrackKind::Attachment
 }
 
 fn valid_speaker_turn(turn: &SpeakerTurn) -> bool {
@@ -1075,6 +1106,47 @@ mod tests {
         assert!(
             wire.windows(24)
                 .any(|bytes| bytes == b"unique-secret-transcript")
+        );
+    }
+
+    #[test]
+    fn attachment_probe_and_transcript_use_the_attachment_track_only() {
+        let probe = WorkerResponse::MediaProbed {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity(),
+            media_kind: "m4a".into(),
+            codec: "aac-lc".into(),
+            duration_ms: Some(60_000),
+            used_default_track: true,
+        };
+        assert!(probe.has_valid_shape());
+        let transcript = WorkerResponse::TranscriptSegment {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity(),
+            segment_id: "segment-1".into(),
+            track: TrackKind::Attachment,
+            start_sample: 0,
+            end_sample: 16_000,
+            text: "private attachment words".into(),
+            language: Some("en".into()),
+            revision: 1,
+        };
+        assert!(transcript.has_valid_shape());
+        assert!(
+            WorkerResponse::Heartbeat {
+                protocol_version: PROTOCOL_VERSION,
+                identity: identity(),
+                stage: WorkerStage::Transcribing,
+                checkpoint: Checkpoint {
+                    streams: vec![PcmStreamCheckpoint {
+                        track: TrackKind::Attachment,
+                        last_ack_sequence: None,
+                        analysis_sample: 16_000,
+                    }],
+                    analysis_sample: 16_000,
+                },
+            }
+            .has_valid_shape()
         );
     }
 

@@ -3,7 +3,11 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { describe, expect, it } from 'vitest';
 
-import { IMAGE_UNDERSTANDING_TOOL_ID, type OfficialToolId } from '../../shared/official-tools';
+import {
+  IMAGE_UNDERSTANDING_TOOL_ID,
+  SPEECH_RECOGNITION_TOOL_ID,
+  type OfficialToolId,
+} from '../../shared/official-tools';
 import {
   getEffectiveOfficialToolIdsForSession,
   isImageUnderstandingToolCallable,
@@ -30,6 +34,19 @@ function apiVisionConfig(overrides: Partial<AdminAppConfig> = {}): AdminAppConfi
 }
 
 describe('official image understanding availability', () => {
+  it('keeps authorized speech visible even when local resources are not a config fact', () => {
+    const config: AdminAppConfig = {
+      enabledOfficialToolIds: [SPEECH_RECOGNITION_TOOL_ID],
+    };
+
+    expect(getEffectiveOfficialToolIdsForSession(
+      '/workspace',
+      null,
+      [SPEECH_RECOGNITION_TOOL_ID],
+      config,
+    )).toEqual([SPEECH_RECOGNITION_TOOL_ID]);
+  });
+
   it('keeps effective official tools only when the configured image model is callable', () => {
     const config = apiVisionConfig();
 

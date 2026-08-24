@@ -29,7 +29,10 @@ import {
 } from '../shared/providerExecution';
 import { deriveCliToolKind, type CliToolRegistryEntry } from '../shared/types/cliTools';
 import { workspacePathsEqual } from '../shared/workspacePath';
-import { IMAGE_UNDERSTANDING_TOOL_ID } from '../shared/official-tools';
+import {
+  IMAGE_UNDERSTANDING_TOOL_ID,
+  SPEECH_RECOGNITION_TOOL_ID,
+} from '../shared/official-tools';
 import { removeProviderFromProxySettingsScope } from '../shared/proxyScope';
 import { removeCustomMcpServerCascade, McpRemovalError } from './services/mcp-removal';
 import { SDK_RESERVED_MCP_NAMES } from './agent-session';
@@ -66,6 +69,7 @@ import {
   withAvailableProvidersProjection,
   isCliToolRegistryEnabled,
   listImageUnderstandingModelOptions,
+  getEffectiveOfficialToolIdsForSession,
   type AdminAppConfig,
   type AgentConfigSlim,
   type ChannelConfigSlim,
@@ -2345,6 +2349,113 @@ EXAMPLES
 
 ERROR RECOVERY
   Retry with a limit from 1 through 100.`,
+  speech: `myagents speech — Transcribe one local audio/video attachment
+
+Commands:
+  transcribe --file <input>  Submit one Session-scoped ASR job
+  status <job-id>            Inspect one job from this Session
+  wait <job-id>              Poll one job until terminal
+  cancel <job-id>            Cancel one queued or running job
+  list                       List this Session's recent jobs
+
+Session ID and Workspace are bound automatically by MyAgents. Never pass or infer caller scope.
+Run myagents speech <command> --help for the exact contract.`,
+  'speech/transcribe': `myagents speech transcribe --file <input> — Submit one attachment transcription
+
+WHEN TO CALL
+  Convert one supported local audio/video attachment into an ASR transcript. This command does not create a Record or perform diarization.
+
+EFFECT
+  Creates an app-owned asynchronous job bound to the exact calling Session and its authoritative Workspace.
+
+OPTIONS
+  --file <input>           Required exactly once; local Workspace file
+  --output <directory>     Optional Workspace output root; default is myagents_files/speech-transcriptions
+  --wait                   Poll this same job until terminal
+  --json                   Emit one machine-readable JSON document
+
+IDENTITY / PATH SAFETY
+  Caller scope is injected by MyAgents and cannot be overridden. Links, special files, directories, and URLs are rejected. The source and output must remain inside the authoritative Workspace.
+
+FIXED LIMITS
+  One file, at most 4 GiB and 8 hours. Supported containers/codecs are probed from file content. Runtime deadline is max(30 minutes, twice the media duration).
+
+ASYNC / EXIT
+  Without --wait, acceptance exits 0 immediately. With --wait, success exits 0; failed/cancelled/interrupted exits 1. Ctrl-C exits 130 without cancelling.
+
+OUTPUT
+  <output-root>/<job-id>/transcript.md and transcript.json, published together only after the exact job generation succeeds.
+
+ERROR RECOVERY
+  Follow the returned code and suggestion. Missing local models return SPEECH_RESOURCE_REQUIRED; Global CLI returns SPEECH_SESSION_REQUIRED.`,
+  'speech/status': `myagents speech status <job-id> — Inspect one transcription job
+
+WHEN TO CALL
+  Read the current stage or terminal result of one job submitted by this exact Session.
+EFFECT
+  Performs one read-only exact-Session lookup.
+OPTIONS
+  <job-id>                 Required exact ID from myagents speech list
+  --json                   Machine-readable output
+IDENTITY / PATH SAFETY
+  Caller scope is injected automatically. Jobs from other Sessions are indistinguishable from missing jobs.
+ASYNC / EXIT
+  Exits after one status read; use wait to poll until terminal.
+OUTPUT
+  Job state, stage, safe artifact paths, metrics, and structured terminal error.
+ERROR RECOVERY
+  Copy the exact ID from myagents speech list.`,
+  'speech/wait': `myagents speech wait <job-id> — Wait for one transcription job
+
+WHEN TO CALL
+  Continue only after a previously accepted job from this Session has finished.
+EFFECT
+  Polls status with bounded backoff and never creates another job.
+OPTIONS
+  <job-id>                 Required exact ID from myagents speech list
+  --json                   Emit one JSON document only after completion
+IDENTITY / PATH SAFETY
+  Caller scope is injected automatically; no Session or Workspace option exists.
+ASYNC / EXIT
+  succeeded exits 0; failed/cancelled/interrupted exits 1. Ctrl-C exits 130 and leaves the app-owned job running.
+OUTPUT
+  The terminal job and published transcript paths, or its structured terminal error.
+ERROR RECOVERY
+  After Ctrl-C, run status or cancel with the printed job ID.`,
+  'speech/cancel': `myagents speech cancel <job-id> — Cancel one transcription job
+
+WHEN TO CALL
+  Stop a queued or running job from this exact Session when its result is no longer needed.
+EFFECT
+  Requests cancellation from the app-owned speech scheduler; repeating cancel is safe.
+OPTIONS
+  <job-id>                 Required exact ID from myagents speech list
+  --json                   Machine-readable output
+IDENTITY / PATH SAFETY
+  Caller scope is injected automatically. Partial output is never published as a successful artifact.
+ASYNC / EXIT
+  A running job may first report cancelling while the Worker stops.
+OUTPUT
+  The updated job receipt.
+ERROR RECOVERY
+  Use list to recover an exact job ID; terminal jobs cannot be cancelled.`,
+  'speech/list': `myagents speech list — List recent transcription jobs from this Session
+
+WHEN TO CALL
+  Discover a job ID or review the calling Session's local transcription history.
+EFFECT
+  Reads durable job metadata filtered by the exact caller Session; other Sessions are never included.
+OPTIONS
+  --limit <1..100>         Number of newest jobs; default 20
+  --json                   Machine-readable output
+IDENTITY / PATH SAFETY
+  Session and Workspace are injected automatically. File contents are not read by list.
+ASYNC / EXIT
+  Read-only; exits 0 when the query succeeds.
+OUTPUT
+  This Session's jobs ordered newest first.
+ERROR RECOVERY
+  Retry with a limit from 1 through 100.`,
   'mcp/add': taskLeafHelp({
     usage: 'myagents mcp add --id <id> [connection options] [--dry-run]',
     when: 'Use when registering a new custom MCP server.',
@@ -3916,6 +4027,84 @@ export async function handleAnydocCancel(payload: { jobId?: string }): Promise<A
 export async function handleAnydocList(payload: { limit?: number }): Promise<AdminResponse> {
   const response = await managementApi(`/api/document/list${qsFrom({ limit: payload.limit })}`);
   return wrapMgmtResponse(response);
+}
+
+type SpeechAdminCaller = {
+  sidecarId: string;
+};
+
+function resolveSpeechAdminCaller(): SpeechAdminCaller | AdminResponse {
+  const context = getSessionEngine().getCurrentSessionContext();
+  const sidecarId = process.env.MYAGENTS_SIDECAR_ID?.trim();
+  if (!context.sessionId?.trim() || !context.workspacePath?.trim() || !sidecarId) {
+    return {
+      success: false,
+      code: 'SPEECH_SESSION_REQUIRED',
+      error: 'Speech recognition requires an active MyAgents Session with an authoritative Workspace.',
+      suggestion: 'Run the command from the MyAgents chat Session that should own the job.',
+      suggestedCommand: 'myagents speech --help',
+    };
+  }
+  const enabled = getEffectiveOfficialToolIdsForSession(
+    context.workspacePath,
+    context.sessionMeta ?? null,
+  );
+  if (!enabled.includes(SPEECH_RECOGNITION_TOOL_ID)) {
+    return {
+      success: false,
+      code: 'SPEECH_TOOL_DISABLED',
+      error: 'Speech recognition is not enabled for the current Session.',
+      suggestion: 'Enable Speech Recognition for this Agent or Workspace, then start a new Session.',
+      suggestedCommand: 'myagents speech --help',
+    };
+  }
+  return { sidecarId };
+}
+
+function speechCallerIsError(
+  value: SpeechAdminCaller | AdminResponse,
+): value is AdminResponse {
+  return 'success' in value;
+}
+
+export async function handleSpeechTranscribe(payload: {
+  sourcePath?: string;
+  outputRoot?: string;
+}): Promise<AdminResponse> {
+  const caller = resolveSpeechAdminCaller();
+  if (speechCallerIsError(caller)) return caller;
+  return wrapMgmtResponse(await managementApi('/api/speech/transcribe', 'POST', {
+    sidecarId: caller.sidecarId,
+    sourcePath: payload.sourcePath,
+    outputRoot: payload.outputRoot,
+  }));
+}
+
+export async function handleSpeechStatus(payload: { jobId?: string }): Promise<AdminResponse> {
+  const caller = resolveSpeechAdminCaller();
+  if (speechCallerIsError(caller)) return caller;
+  return wrapMgmtResponse(await managementApi('/api/speech/status', 'POST', {
+    sidecarId: caller.sidecarId,
+    jobId: payload.jobId,
+  }));
+}
+
+export async function handleSpeechCancel(payload: { jobId?: string }): Promise<AdminResponse> {
+  const caller = resolveSpeechAdminCaller();
+  if (speechCallerIsError(caller)) return caller;
+  return wrapMgmtResponse(await managementApi('/api/speech/cancel', 'POST', {
+    sidecarId: caller.sidecarId,
+    jobId: payload.jobId,
+  }));
+}
+
+export async function handleSpeechList(payload: { limit?: number }): Promise<AdminResponse> {
+  const caller = resolveSpeechAdminCaller();
+  if (speechCallerIsError(caller)) return caller;
+  return wrapMgmtResponse(await managementApi('/api/speech/list', 'POST', {
+    sidecarId: caller.sidecarId,
+    limit: payload.limit,
+  }));
 }
 
 // ---------------------------------------------------------------------------

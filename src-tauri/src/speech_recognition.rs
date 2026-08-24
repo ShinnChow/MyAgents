@@ -16,6 +16,10 @@ use crate::record::{
 };
 use crate::recording::analysis::{cleanup_analysis_spool, AnalysisSpoolSource};
 use crate::speech_model_pack_manager::{SpeechModelPackManager, SpeechModelPackStatus};
+use crate::workspace_files::path_safety::{
+    ensure_workspace_directory_no_follow, open_workspace_regular_file_no_follow,
+    validate_workspace_root,
+};
 use chrono::{DateTime, Duration, Utc};
 use myagents_media_worker_protocol::{
     read_worker_response, write_control_frame, write_pcm_frame, PcmFrame, PcmStreamEnd,
@@ -24,14 +28,15 @@ use myagents_media_worker_protocol::{
     MAX_MEDIA_SAMPLES_PER_TRACK, MAX_PCM_SAMPLES_PER_FRAME, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::fs;
-use std::io::{BufReader, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Stdio};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 use tokio::sync::Notify;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -41,11 +46,19 @@ const MAX_JOB_METADATA_BYTES: u64 = 1024 * 1024;
 const MAX_WORKER_ATTEMPTS: u32 = 3;
 const MAX_WORKER_STDERR_BYTES: u64 = 64 * 1024;
 const MAX_PENDING_JOBS: usize = 256;
+const MAX_AGENT_SOURCE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const AGENT_OUTPUT_DIRECTORY: &str = "myagents_files/speech-transcriptions";
+const AGENT_STAGING_MARKER: &str = ".myagents-speech-owner";
+const AGENT_PRIVATE_STAGING_TOKEN: &str = ".staging-token";
+const AGENT_PUBLISH_INTENT: &str = "publish-intent.json";
 const YIELD_GRACE_SECONDS: u64 = 15;
 const MAX_TRANSCRIPT_SEGMENTS: usize = 100_000;
 const MAX_TRANSCRIPT_CHARACTERS: usize = 5_000_000;
 const MAX_DIARIZATION_TURNS: usize = 200_000;
 const LIVE_WORKER_RESPONSE_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const BATCH_WORKER_RESPONSE_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const MIN_AGENT_DEADLINE: StdDuration = StdDuration::from_secs(30 * 60);
+const MAX_AGENT_DEADLINE: StdDuration = StdDuration::from_secs(16 * 60 * 60);
 const LIVE_POLL_INTERVAL: StdDuration = StdDuration::from_millis(100);
 pub const SPEECH_HISTORY_RETENTION_DAYS: i64 = 30;
 
@@ -163,6 +176,12 @@ pub struct SpeechJobSource {
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_default_track: Option<bool>,
 }
 
 impl std::fmt::Debug for SpeechJobSource {
@@ -173,6 +192,9 @@ impl std::fmt::Debug for SpeechJobSource {
             .field("size_bytes", &self.size_bytes)
             .field("has_sha256", &self.sha256.is_some())
             .field("media_kind", &self.media_kind)
+            .field("codec", &self.codec)
+            .field("duration_ms", &self.duration_ms)
+            .field("used_default_track", &self.used_default_track)
             .finish()
     }
 }
@@ -275,11 +297,53 @@ struct ManagerState {
     accepting: bool,
     jobs: HashMap<String, SpeechJob>,
     queue: VecDeque<String>,
+    pending_agent: HashMap<String, PendingAgentJob>,
     active_job: Option<(String, u64)>,
     running: Option<RunningWorker>,
     live_sessions: HashMap<String, LiveSessionRegistration>,
     live_running: Option<RunningWorker>,
     next_generation: u64,
+}
+
+struct PendingAgentJob {
+    source: same_file::Handle,
+    source_version: AgentSourceVersion,
+    prepared_source: Option<(PathBuf, String)>,
+    private_dir: PathBuf,
+    private_identity: same_file::Handle,
+    staging_dir: PathBuf,
+    staging_identity: same_file::Handle,
+    staging_token: String,
+    output_root_identity: same_file::Handle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentPublishIntent {
+    schema_version: u32,
+    job_id: String,
+    staging_directory: String,
+    destination_directory: String,
+    staging_token: String,
+}
+
+impl Drop for PendingAgentJob {
+    fn drop(&mut self) {
+        cleanup_pending_agent(self);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentSourceVersion {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+    #[cfg(windows)]
+    last_write_time: u64,
 }
 
 struct LiveSessionRegistration {
@@ -466,6 +530,7 @@ impl SpeechRecognitionManager {
             compute_coordinator.clone(),
         )?;
         let mut jobs = load_jobs(&root)?;
+        recover_agent_publish_intents(&root, &mut jobs);
         recover_nonterminal_jobs(&root, &mut jobs);
         prune_expired_jobs(&root, &mut jobs);
         let queue = recovered_record_queue(&jobs);
@@ -482,6 +547,7 @@ impl SpeechRecognitionManager {
                 accepting: true,
                 jobs,
                 queue,
+                pending_agent: HashMap::new(),
                 active_job: None,
                 running: None,
                 live_sessions: HashMap::new(),
@@ -568,6 +634,167 @@ impl SpeechRecognitionManager {
         })
     }
 
+    pub fn submit_agent_attachment(
+        self: &Arc<Self>,
+        initiator_session_id: &str,
+        workspace_identity: &Path,
+        source_path: &str,
+        output_root: Option<&str>,
+    ) -> Result<SpeechJob, &'static str> {
+        validate_session_id(initiator_session_id)?;
+        let workspace_text = workspace_identity
+            .to_str()
+            .ok_or("SPEECH_PATH_ENCODING_UNSUPPORTED")?;
+        let workspace =
+            validate_workspace_root(workspace_text).map_err(|_| "SPEECH_WORKSPACE_UNSAFE")?;
+        let resources = self
+            .execution_resources()
+            .map_err(|_| "SPEECH_RESOURCE_REQUIRED")?;
+        let (source_path, source_file) =
+            open_workspace_regular_file_no_follow(&workspace, source_path, "speech source")
+                .map_err(|_| "SPEECH_SOURCE_UNSAFE")?;
+        let metadata = source_file.metadata().map_err(|_| "SPEECH_SOURCE_UNSAFE")?;
+        if metadata.len() == 0 || metadata.len() > MAX_AGENT_SOURCE_BYTES {
+            return Err("SPEECH_MEDIA_LIMIT_EXCEEDED");
+        }
+        let source_version = agent_source_version(&metadata);
+        let source =
+            same_file::Handle::from_file(source_file).map_err(|_| "SPEECH_SOURCE_UNSAFE")?;
+
+        let default_output = workspace.join(AGENT_OUTPUT_DIRECTORY);
+        let output_text = output_root.unwrap_or_else(|| {
+            default_output
+                .to_str()
+                .expect("Workspace path was already valid UTF-8")
+        });
+        let (output_root, output_directory) =
+            ensure_workspace_directory_no_follow(&workspace, output_text)
+                .map_err(|_| "SPEECH_OUTPUT_PATH_UNSAFE")?;
+        let output_root_identity = same_file::Handle::from_file(output_directory)
+            .map_err(|_| "SPEECH_OUTPUT_PATH_UNSAFE")?;
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        if !state.accepting {
+            return Err("SPEECH_MANAGER_SHUTTING_DOWN");
+        }
+        if state.queue.len() + usize::from(state.active_job.is_some()) >= MAX_PENDING_JOBS {
+            return Err("SPEECH_QUEUE_FULL");
+        }
+
+        let job_id = new_job_id();
+        let public_dir = output_root.join(&job_id);
+        if fs::symlink_metadata(&public_dir).is_ok() {
+            return Err("SPEECH_OUTPUT_COLLISION");
+        }
+        let staging_dir = output_root.join(format!(".myagents-speech-{job_id}.staging"));
+        let private_dir = self.root.join("private").join(&job_id);
+        ensure_private_directory(&staging_dir).map_err(|_| "SPEECH_PRIVATE_STORAGE_UNAVAILABLE")?;
+        if let Err(error) = ensure_private_directory(&private_dir) {
+            let _ = fs::remove_dir(&staging_dir);
+            crate::ulog_warn!("[speech] failed to create private job input: {}", error);
+            return Err("SPEECH_PRIVATE_STORAGE_UNAVAILABLE");
+        }
+        let private_identity = match same_file::Handle::from_path(&private_dir) {
+            Ok(identity) => identity,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&private_dir);
+                let _ = fs::remove_dir(&staging_dir);
+                return Err("SPEECH_PRIVATE_STORAGE_UNAVAILABLE");
+            }
+        };
+        let staging_identity = match same_file::Handle::from_path(&staging_dir) {
+            Ok(identity) => identity,
+            Err(_) => {
+                let _ = fs::remove_dir_all(&private_dir);
+                let _ = fs::remove_dir(&staging_dir);
+                return Err("SPEECH_OUTPUT_PATH_UNSAFE");
+            }
+        };
+        let staging_token = Uuid::new_v4().simple().to_string();
+        if write_agent_staging_marker(&staging_dir, &staging_token).is_err()
+            || write_agent_private_staging_token(&private_dir, &staging_token).is_err()
+        {
+            let _ = fs::remove_dir_all(&private_dir);
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err("SPEECH_PRIVATE_STORAGE_UNAVAILABLE");
+        }
+
+        let now = Utc::now();
+        let job = SpeechJob {
+            schema_version: JOB_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            kind: SpeechJobKind::AgentAttachmentAsr,
+            state: SpeechJobState::Queued,
+            stage: SpeechJobStage::Validating,
+            origin: SpeechJobOrigin::Agent {
+                initiator_session_id: initiator_session_id.to_string(),
+                workspace_identity: workspace.to_string_lossy().into_owned(),
+            },
+            source: SpeechJobSource {
+                path: source_path.to_string_lossy().into_owned(),
+                size_bytes: metadata.len(),
+                sha256: None,
+                media_kind: None,
+                codec: None,
+                duration_ms: None,
+                used_default_track: None,
+            },
+            output: SpeechJobOutput {
+                root_directory: Some(output_root.to_string_lossy().into_owned()),
+                job_directory: Some(public_dir.to_string_lossy().into_owned()),
+                transcript_markdown_path: Some(
+                    public_dir
+                        .join("transcript.md")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                transcript_json_path: Some(
+                    public_dir
+                        .join("transcript.json")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                artifact_available: false,
+            },
+            pipeline: pipeline_from_provenance(&resources.provenance),
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+            worker_generation: None,
+            worker_attempts: 0,
+            error: None,
+            metrics: None,
+        };
+        if persist_job(&self.root, &job).is_err() {
+            let _ = fs::remove_dir_all(&private_dir);
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err("SPEECH_JOB_STORE_WRITE_FAILED");
+        }
+        state.pending_agent.insert(
+            job_id.clone(),
+            PendingAgentJob {
+                source,
+                source_version,
+                prepared_source: None,
+                private_dir,
+                private_identity,
+                staging_dir,
+                staging_identity,
+                staging_token,
+                output_root_identity,
+            },
+        );
+        state.queue.push_back(job_id.clone());
+        state.jobs.insert(job_id, job.clone());
+        drop(state);
+        self.wake.notify_one();
+        Ok(job)
+    }
+
     pub async fn submit_record_backfill(
         self: &Arc<Self>,
         record_id: &str,
@@ -639,6 +866,9 @@ impl SpeechRecognitionManager {
                     size_bytes: source_size,
                     sha256: None,
                     media_kind: Some("record/ogg-opus".into()),
+                    codec: None,
+                    duration_ms: None,
+                    used_default_track: None,
                 },
                 output: empty_output(),
                 pipeline: pipeline_from_provenance(&resources.provenance),
@@ -1388,6 +1618,10 @@ impl SpeechRecognitionManager {
             .filter(|job| job.kind.is_agent())
             .filter(|job| job.origin.agent_session_id() == Some(session_id))
             .cloned()
+            .map(|mut job| {
+                job.output.artifact_available = agent_artifact_is_available(&job);
+                job
+            })
             .ok_or("SPEECH_JOB_NOT_FOUND")
     }
 
@@ -1413,12 +1647,101 @@ impl SpeechRecognitionManager {
             .collect::<Vec<_>>();
         jobs.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         jobs.truncate(limit);
+        for job in &mut jobs {
+            job.output.artifact_available = agent_artifact_is_available(job);
+        }
         Ok(jobs)
+    }
+
+    pub fn cancel_agent_job(
+        self: &Arc<Self>,
+        session_id: &str,
+        job_id: &str,
+    ) -> Result<SpeechJob, &'static str> {
+        validate_session_id(session_id)?;
+        validate_job_id(job_id)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        let snapshot = state
+            .jobs
+            .get(job_id)
+            .filter(|job| job.kind.is_agent())
+            .filter(|job| job.origin.agent_session_id() == Some(session_id))
+            .cloned()
+            .ok_or("SPEECH_JOB_NOT_FOUND")?;
+        match snapshot.state {
+            SpeechJobState::Queued => {
+                let mut job = snapshot;
+                let now = Utc::now();
+                job.state = SpeechJobState::Cancelled;
+                job.stage = SpeechJobStage::Publishing;
+                job.updated_at = now;
+                job.finished_at = Some(now);
+                job.error = Some(SpeechJobError {
+                    code: "SPEECH_CANCELLED".into(),
+                    retryable: false,
+                });
+                persist_job(&self.root, &job).map_err(|_| "SPEECH_JOB_STORE_WRITE_FAILED")?;
+                state.queue.retain(|queued| queued != job_id);
+                let pending = state.pending_agent.remove(job_id);
+                state.jobs.insert(job_id.to_string(), job.clone());
+                drop(state);
+                if let Some(pending) = pending {
+                    cleanup_pending_agent(&pending);
+                }
+                Ok(job)
+            }
+            SpeechJobState::Running => {
+                let mut job = snapshot;
+                job.state = SpeechJobState::Cancelling;
+                job.updated_at = Utc::now();
+                persist_job(&self.root, &job).map_err(|_| "SPEECH_JOB_STORE_WRITE_FAILED")?;
+                let running = state.running.as_ref().map(|running| {
+                    (
+                        running.generation,
+                        Arc::clone(&running.stdin),
+                        Arc::clone(&running.child),
+                    )
+                });
+                state.jobs.insert(job_id.to_string(), job.clone());
+                drop(state);
+                if let Some((generation, stdin, child)) = running {
+                    let _ = send_worker_command(
+                        &stdin,
+                        &WorkerCommand::Cancel {
+                            protocol_version: PROTOCOL_VERSION,
+                            identity: WorkloadIdentity {
+                                workload_id: job_id.to_string(),
+                                worker_generation: generation,
+                            },
+                        },
+                    );
+                    let manager = Arc::clone(self);
+                    let id = job_id.to_string();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(StdDuration::from_secs(2)).await;
+                        if manager.job_is_cancelling_generation(&id, generation) {
+                            if let Ok(mut child) = child.lock() {
+                                let _ = child.kill_and_wait();
+                            }
+                        }
+                    });
+                }
+                Ok(job)
+            }
+            SpeechJobState::Cancelling | SpeechJobState::Cancelled => Ok(snapshot),
+            SpeechJobState::Succeeded
+            | SpeechJobState::SucceededWithWarnings
+            | SpeechJobState::Failed
+            | SpeechJobState::Interrupted => Err("SPEECH_JOB_NOT_CANCELLABLE"),
+        }
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
         self.model_pack.cancel_operation();
-        let (snapshots, running, live_running) = {
+        let (snapshots, running, live_running, pending_agent) = {
             let mut state = self
                 .state
                 .lock()
@@ -1426,6 +1749,7 @@ impl SpeechRecognitionManager {
             state.accepting = false;
             state.active_job = None;
             state.queue.clear();
+            let pending_agent = std::mem::take(&mut state.pending_agent);
             let running = state.running.take();
             let live_running = state.live_running.take();
             for session in state.live_sessions.values() {
@@ -1443,7 +1767,7 @@ impl SpeechRecognitionManager {
                 settle_for_process_boundary(job, now);
                 snapshots.push(job.clone());
             }
-            (snapshots, running, live_running)
+            (snapshots, running, live_running, pending_agent)
         };
         if let Some(running) = running {
             let identity = WorkloadIdentity {
@@ -1479,6 +1803,9 @@ impl SpeechRecognitionManager {
         }
         for job in snapshots {
             persist_job(&self.root, &job)?;
+        }
+        for pending in pending_agent.into_values() {
+            cleanup_pending_agent(&pending);
         }
         self.wake.notify_waiters();
         Ok(())
@@ -1598,7 +1925,7 @@ impl SpeechRecognitionManager {
             .get(&job_id)
             .cloned()
             .ok_or_else(|| "queued speech job is missing".to_string())?;
-        if job.state != SpeechJobState::Queued || job.kind.is_agent() {
+        if job.state != SpeechJobState::Queued {
             return Err("speech queue contains an ineligible job".to_string());
         }
         job.state = SpeechJobState::Running;
@@ -1624,6 +1951,10 @@ impl SpeechRecognitionManager {
         resources: SpeechExecutionResources,
         lease: LocalComputeLease,
     ) {
+        if job.kind == SpeechJobKind::AgentAttachmentAsr {
+            self.execute_agent_job(job, generation, resources, lease);
+            return;
+        }
         if let Err(code) = self.update_record_running_status(job, generation) {
             self.finish_failed(job, generation, code, true);
             return;
@@ -1723,6 +2054,495 @@ impl SpeechRecognitionManager {
                 self.finish_failed(job, generation, &code, retryable)
             }
         }
+    }
+
+    fn execute_agent_job(
+        self: &Arc<Self>,
+        job: &SpeechJob,
+        generation: u64,
+        resources: SpeechExecutionResources,
+        lease: LocalComputeLease,
+    ) {
+        let mut pending = match self.take_pending_agent(&job.job_id, generation) {
+            Ok(pending) => pending,
+            Err(code) => {
+                self.finish_failed(job, generation, code, false);
+                return;
+            }
+        };
+        self.update_worker_stage(&job.job_id, generation, WorkerStage::Decoding);
+        let (input_path, source_hash) = match pending.prepared_source.clone() {
+            Some(prepared) => prepared,
+            None => {
+                let input_path = pending.private_dir.join("source.media");
+                let source_hash = match copy_agent_source(
+                    pending.source.as_file_mut(),
+                    &input_path,
+                    job.source.size_bytes,
+                    &pending.source_version,
+                    || {
+                        if self.job_can_execute(&job.job_id, generation) {
+                            Ok(())
+                        } else {
+                            Err("SPEECH_CANCELLED")
+                        }
+                    },
+                ) {
+                    Ok(hash) => hash,
+                    Err(code) => {
+                        if code == "SPEECH_CANCELLED" {
+                            self.finish_cancelled_if_needed(job, generation);
+                            cleanup_pending_agent(&pending);
+                        } else {
+                            self.finish_agent_failure(
+                                job,
+                                generation,
+                                &code,
+                                worker_code_retryable(&code),
+                                pending,
+                            );
+                        }
+                        return;
+                    }
+                };
+                pending.prepared_source = Some((input_path.clone(), source_hash.clone()));
+                (input_path, source_hash)
+            }
+        };
+        self.update_agent_source_hash(&job.job_id, generation, source_hash);
+        let input = match path_for_protocol(&input_path) {
+            Ok(input_path) => WorkloadInput::Attachment { input_path },
+            Err(code) => {
+                self.finish_failed(job, generation, code, false);
+                cleanup_pending_agent(&pending);
+                return;
+            }
+        };
+        let identity = WorkloadIdentity {
+            workload_id: job.job_id.clone(),
+            worker_generation: generation,
+        };
+        let start = WorkerCommand::Start(StartRequest {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            workload_kind: WorkloadKind::AttachmentAsr,
+            input,
+            native_manifest_path: resources
+                .native_manifest_path
+                .to_string_lossy()
+                .into_owned(),
+            onnx_runtime_path: resources.onnx_runtime_path.to_string_lossy().into_owned(),
+            model_pack_manifest_path: resources
+                .model_pack_manifest_path
+                .to_string_lossy()
+                .into_owned(),
+        });
+        let (child, stdin, stdout) = match self.spawn_registered_worker(job, generation, &resources)
+        {
+            Ok(worker) => worker,
+            Err(code) => {
+                self.finish_agent_failure(job, generation, code, true, pending);
+                return;
+            }
+        };
+        if send_worker_command(&stdin, &start).is_err() {
+            kill_worker(&child);
+            self.clear_running(&job.job_id, generation);
+            self.finish_agent_failure(
+                job,
+                generation,
+                "SPEECH_WORKER_PROTOCOL_ERROR",
+                true,
+                pending,
+            );
+            return;
+        }
+        let outcome =
+            self.collect_worker_result(job, generation, &identity, stdout, &stdin, &child, &lease);
+        if let Ok(mut child) = child.lock() {
+            let _ = child.wait();
+        }
+        self.clear_running(&job.job_id, generation);
+        if self.job_is_cancelling_generation(&job.job_id, generation) {
+            self.finish_cancelled_if_needed(job, generation);
+            cleanup_pending_agent(&pending);
+            return;
+        }
+        if !self.job_can_publish(&job.job_id, generation) {
+            cleanup_pending_agent(&pending);
+            return;
+        }
+        match outcome {
+            SpeechWorkerOutcome::Completed {
+                transcripts,
+                turns,
+                metrics,
+            } if turns.is_empty() => {
+                let published = self.publish_agent_success(
+                    job,
+                    generation,
+                    &resources.provenance,
+                    transcripts,
+                    metrics,
+                    &pending,
+                );
+                if published {
+                    cleanup_agent_private_input(&pending);
+                } else {
+                    cleanup_pending_agent(&pending);
+                }
+            }
+            SpeechWorkerOutcome::Completed { .. } => {
+                self.finish_agent_failure(
+                    job,
+                    generation,
+                    "SPEECH_WORKER_PROTOCOL_ERROR",
+                    true,
+                    pending,
+                );
+            }
+            SpeechWorkerOutcome::Yielded => {
+                self.restore_pending_agent(&job.job_id, generation, pending);
+                self.requeue_yielded(job, generation);
+            }
+            SpeechWorkerOutcome::Failed { code, retryable } => {
+                self.finish_agent_failure(job, generation, &code, retryable, pending);
+            }
+        }
+    }
+
+    fn take_pending_agent(
+        &self,
+        job_id: &str,
+        generation: u64,
+    ) -> Result<PendingAgentJob, &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        if !exact_running_generation(&state, job_id, generation) {
+            return Err("SPEECH_INTERRUPTED");
+        }
+        state
+            .pending_agent
+            .remove(job_id)
+            .ok_or("SPEECH_PRIVATE_INPUT_UNAVAILABLE")
+    }
+
+    fn restore_pending_agent(&self, job_id: &str, generation: u64, pending: PendingAgentJob) {
+        if let Ok(mut state) = self.state.lock() {
+            if exact_running_generation(&state, job_id, generation) {
+                state.pending_agent.insert(job_id.to_string(), pending);
+            } else {
+                drop(state);
+                cleanup_pending_agent(&pending);
+            }
+        } else {
+            cleanup_pending_agent(&pending);
+        }
+    }
+
+    fn finish_agent_failure(
+        &self,
+        job: &SpeechJob,
+        generation: u64,
+        code: &str,
+        retryable: bool,
+        pending: PendingAgentJob,
+    ) {
+        let will_retry = self.state.lock().ok().is_some_and(|state| {
+            retryable
+                && state.accepting
+                && exact_running_generation(&state, &job.job_id, generation)
+                && state
+                    .jobs
+                    .get(&job.job_id)
+                    .is_some_and(|current| current.worker_attempts < MAX_WORKER_ATTEMPTS)
+        });
+        if will_retry {
+            self.restore_pending_agent(&job.job_id, generation, pending);
+        } else {
+            cleanup_pending_agent(&pending);
+        }
+        self.finish_failed(job, generation, code, retryable);
+    }
+
+    fn update_agent_source_hash(&self, job_id: &str, generation: u64, sha256: String) {
+        let snapshot = if let Ok(mut state) = self.state.lock() {
+            state.jobs.get_mut(job_id).and_then(|job| {
+                (job.kind.is_agent()
+                    && job.state == SpeechJobState::Running
+                    && job.worker_generation == Some(generation))
+                .then(|| {
+                    job.source.sha256 = Some(sha256);
+                    job.stage = SpeechJobStage::Decoding;
+                    job.updated_at = Utc::now();
+                    job.clone()
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(snapshot) = snapshot {
+            let _ = persist_job(&self.root, &snapshot);
+        }
+    }
+
+    fn update_agent_media_probe(
+        &self,
+        job_id: &str,
+        generation: u64,
+        media_kind: String,
+        codec: String,
+        duration_ms: Option<u64>,
+        used_default_track: bool,
+    ) -> Result<(), &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        let current = state
+            .jobs
+            .get(job_id)
+            .filter(|job| {
+                job.kind.is_agent()
+                    && job.state == SpeechJobState::Running
+                    && job.worker_generation == Some(generation)
+                    && job.source.media_kind.is_none()
+                    && job.source.codec.is_none()
+            })
+            .ok_or("SPEECH_WORKER_PROTOCOL_ERROR")?;
+        let mut snapshot = current.clone();
+        snapshot.source.media_kind = Some(media_kind);
+        snapshot.source.codec = Some(codec);
+        snapshot.source.duration_ms = duration_ms;
+        snapshot.source.used_default_track = Some(used_default_track);
+        snapshot.stage = SpeechJobStage::Transcribing;
+        snapshot.updated_at = Utc::now();
+        persist_job(&self.root, &snapshot).map_err(|_| "SPEECH_JOB_STORE_WRITE_FAILED")?;
+        state.jobs.insert(job_id.to_string(), snapshot);
+        Ok(())
+    }
+
+    fn job_is_cancelling_generation(&self, job_id: &str, generation: u64) -> bool {
+        self.state.lock().ok().is_some_and(|state| {
+            state.active_job.as_ref() == Some(&(job_id.to_string(), generation))
+                && state.jobs.get(job_id).is_some_and(|job| {
+                    job.state == SpeechJobState::Cancelling
+                        && job.worker_generation == Some(generation)
+                })
+        })
+    }
+
+    fn finish_cancelled_if_needed(&self, source_job: &SpeechJob, generation: u64) {
+        let snapshot = if let Ok(mut state) = self.state.lock() {
+            let active_matches =
+                state.active_job.as_ref() == Some(&(source_job.job_id.clone(), generation));
+            if !active_matches {
+                None
+            } else {
+                state.jobs.get_mut(&source_job.job_id).and_then(|job| {
+                    matches!(
+                        job.state,
+                        SpeechJobState::Running | SpeechJobState::Cancelling
+                    )
+                    .then(|| {
+                        let now = Utc::now();
+                        job.state = SpeechJobState::Cancelled;
+                        job.stage = SpeechJobStage::Publishing;
+                        job.updated_at = now;
+                        job.finished_at = Some(now);
+                        job.error = Some(SpeechJobError {
+                            code: "SPEECH_CANCELLED".into(),
+                            retryable: false,
+                        });
+                        job.clone()
+                    })
+                })
+            }
+        } else {
+            None
+        };
+        if let Some(snapshot) = snapshot {
+            let _ = persist_job(&self.root, &snapshot);
+        }
+    }
+
+    fn publish_agent_success(
+        &self,
+        source_job: &SpeechJob,
+        generation: u64,
+        provenance: &RecordSpeechProvenance,
+        transcripts: SensitiveTranscriptSegments,
+        metrics: WorkerMetrics,
+        pending: &PendingAgentJob,
+    ) -> bool {
+        let publication_job = self.state.lock().ok().and_then(|state| {
+            exact_running_generation(&state, &source_job.job_id, generation)
+                .then(|| state.jobs.get(&source_job.job_id).cloned())
+                .flatten()
+        });
+        let Some(publication_job) = publication_job else {
+            return false;
+        };
+        if write_agent_artifacts(
+            &pending.staging_dir,
+            &publication_job,
+            provenance,
+            &transcripts.0,
+        )
+        .is_err()
+        {
+            self.finish_failed(source_job, generation, "SPEECH_PUBLISH_FAILED", false);
+            return false;
+        }
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return false,
+        };
+        if !exact_running_generation(&state, &source_job.job_id, generation)
+            || validate_agent_publish_paths(&publication_job, pending).is_err()
+        {
+            return false;
+        }
+        let Some(mut publishing_job) = state.jobs.get(&source_job.job_id).cloned() else {
+            return false;
+        };
+        publishing_job.stage = SpeechJobStage::Publishing;
+        publishing_job.updated_at = Utc::now();
+        if persist_job(&self.root, &publishing_job).is_err() {
+            finish_job_locked(
+                &self.root,
+                &mut state,
+                &source_job.job_id,
+                generation,
+                SpeechJobState::Failed,
+                Some(SpeechJobError {
+                    code: "SPEECH_JOB_STORE_WRITE_FAILED".into(),
+                    retryable: false,
+                }),
+                None,
+            );
+            return false;
+        }
+        state
+            .jobs
+            .insert(source_job.job_id.clone(), publishing_job.clone());
+        let destination = PathBuf::from(
+            publication_job
+                .output
+                .job_directory
+                .as_deref()
+                .expect("Agent jobs reserve a destination"),
+        );
+        let intent = AgentPublishIntent {
+            schema_version: 1,
+            job_id: source_job.job_id.clone(),
+            staging_directory: pending.staging_dir.to_string_lossy().into_owned(),
+            destination_directory: destination.to_string_lossy().into_owned(),
+            staging_token: pending.staging_token.clone(),
+        };
+        if persist_agent_publish_intent(&self.root, &intent).is_err()
+            || publish_agent_staging(pending, &destination).is_err()
+        {
+            let rolled_back = rollback_agent_publish(
+                &destination,
+                &pending.staging_dir,
+                &pending.staging_identity,
+                &pending.staging_token,
+            );
+            if rolled_back || validate_agent_staging(pending).is_ok() || !destination.exists() {
+                let _ = clear_agent_publish_intent(&self.root, &source_job.job_id);
+            }
+            finish_job_locked(
+                &self.root,
+                &mut state,
+                &source_job.job_id,
+                generation,
+                SpeechJobState::Failed,
+                Some(SpeechJobError {
+                    code: "SPEECH_PUBLISH_FAILED".into(),
+                    retryable: false,
+                }),
+                None,
+            );
+            return false;
+        }
+        let job_metrics = SpeechJobMetrics {
+            source_samples: metrics.source_samples,
+            segments: metrics.segments,
+            speakers: 0,
+            elapsed_ms: metrics.elapsed_ms,
+            peak_working_bytes: metrics.peak_working_bytes,
+        };
+        let used_default_track = state
+            .jobs
+            .get(&source_job.job_id)
+            .and_then(|job| job.source.used_default_track)
+            .unwrap_or(false);
+        let Some(mut terminal_job) = state.jobs.get(&source_job.job_id).cloned() else {
+            let _ = rollback_agent_publish(
+                &destination,
+                &pending.staging_dir,
+                &pending.staging_identity,
+                &pending.staging_token,
+            );
+            return false;
+        };
+        let now = Utc::now();
+        terminal_job.state = if used_default_track {
+            SpeechJobState::Succeeded
+        } else {
+            SpeechJobState::SucceededWithWarnings
+        };
+        terminal_job.stage = SpeechJobStage::Publishing;
+        terminal_job.updated_at = now;
+        terminal_job.finished_at = Some(now);
+        terminal_job.error = (!used_default_track).then_some(SpeechJobError {
+            code: "SPEECH_DEFAULT_AUDIO_TRACK_MISSING".into(),
+            retryable: false,
+        });
+        terminal_job.metrics = Some(job_metrics);
+        terminal_job.output.artifact_available = true;
+        if persist_job_resolving_unknown(&self.root, &terminal_job).is_err() {
+            if rollback_agent_publish(
+                &destination,
+                &pending.staging_dir,
+                &pending.staging_identity,
+                &pending.staging_token,
+            ) {
+                let _ = clear_agent_publish_intent(&self.root, &source_job.job_id);
+            }
+            finish_job_locked(
+                &self.root,
+                &mut state,
+                &source_job.job_id,
+                generation,
+                SpeechJobState::Failed,
+                Some(SpeechJobError {
+                    code: "SPEECH_PUBLISH_FAILED".into(),
+                    retryable: false,
+                }),
+                None,
+            );
+            return false;
+        }
+        state.jobs.insert(source_job.job_id.clone(), terminal_job);
+
+        let cleanup_durable = validate_agent_directory(
+            &destination,
+            &pending.staging_identity,
+            &pending.staging_token,
+        )
+        .is_ok()
+            && fs::remove_file(destination.join(AGENT_STAGING_MARKER))
+                .and_then(|_| crate::durable_fs::sync_directory(&destination))
+                .is_ok();
+        if cleanup_durable {
+            let _ = clear_agent_publish_intent(&self.root, &source_job.job_id);
+        }
+        true
     }
 
     fn resolve_record_worker_input(
@@ -1855,8 +2675,11 @@ impl SpeechRecognitionManager {
         child: &Arc<Mutex<process_cmd::ChildTree>>,
         lease: &LocalComputeLease,
     ) -> SpeechWorkerOutcome {
-        let mut reader = BufReader::new(stdout);
+        let responses = start_batch_response_reader(stdout);
+        let started_at = Instant::now();
+        let mut overall_deadline = MAX_AGENT_DEADLINE;
         let mut ready = false;
+        let mut media_probed = false;
         let mut yield_sent = false;
         let yield_settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _yield_guard = YieldReadGuard(Arc::clone(&yield_settled));
@@ -1869,15 +2692,30 @@ impl SpeechRecognitionManager {
         let mut speaker_last_seen = false;
 
         loop {
-            let response = match read_worker_response(&mut reader) {
-                Ok(Some(response)) => response,
-                Ok(None) if yield_sent => return SpeechWorkerOutcome::Yielded,
-                Ok(None) => {
+            let elapsed = started_at.elapsed();
+            if elapsed >= overall_deadline {
+                kill_worker(child);
+                return failed_outcome("SPEECH_DEADLINE_EXCEEDED", false);
+            }
+            let response_timeout = BATCH_WORKER_RESPONSE_TIMEOUT.min(overall_deadline - elapsed);
+            let response = match responses.recv_timeout(response_timeout) {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) | Err(std_mpsc::RecvTimeoutError::Disconnected) if yield_sent => {
+                    return SpeechWorkerOutcome::Yielded;
+                }
+                Ok(Err(code)) => return failed_outcome(code, true),
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                     return failed_outcome("SPEECH_WORKER_CRASHED", true);
                 }
-                Err(_) if yield_sent => return SpeechWorkerOutcome::Yielded,
-                Err(_) => {
-                    return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true);
+                Err(std_mpsc::RecvTimeoutError::Timeout)
+                    if started_at.elapsed() >= overall_deadline =>
+                {
+                    kill_worker(child);
+                    return failed_outcome("SPEECH_DEADLINE_EXCEEDED", false);
+                }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    kill_worker(child);
+                    return failed_outcome("SPEECH_WORKER_TIMEOUT", true);
                 }
             };
             if response.identity() != identity {
@@ -1890,6 +2728,28 @@ impl SpeechRecognitionManager {
                 WorkerResponse::Ready { .. } if !ready => ready = true,
                 WorkerResponse::Ready { .. } => {
                     return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true);
+                }
+                WorkerResponse::MediaProbed {
+                    media_kind,
+                    codec,
+                    duration_ms,
+                    used_default_track,
+                    ..
+                } if ready && job.kind == SpeechJobKind::AgentAttachmentAsr && !media_probed => {
+                    if let Err(code) = self.update_agent_media_probe(
+                        &job.job_id,
+                        generation,
+                        media_kind,
+                        codec,
+                        duration_ms,
+                        used_default_track,
+                    ) {
+                        return failed_outcome(code, false);
+                    }
+                    overall_deadline = duration_ms.map_or(MAX_AGENT_DEADLINE, |duration| {
+                        StdDuration::from_millis(duration.saturating_mul(2)).max(MIN_AGENT_DEADLINE)
+                    });
+                    media_probed = true;
                 }
                 WorkerResponse::Heartbeat { stage, .. }
                 | WorkerResponse::Progress { stage, .. }
@@ -1906,7 +2766,13 @@ impl SpeechRecognitionManager {
                     language,
                     revision,
                     ..
-                } if ready && job.kind == SpeechJobKind::RecordBackfillAsr => {
+                } if ready
+                    && (!job.kind.is_agent() || media_probed)
+                    && matches!(
+                        job.kind,
+                        SpeechJobKind::RecordBackfillAsr | SpeechJobKind::AgentAttachmentAsr
+                    ) =>
+                {
                     let next_characters = transcript_characters
                         .checked_add(text.chars().count())
                         .filter(|count| *count <= MAX_TRANSCRIPT_CHARACTERS);
@@ -1927,12 +2793,19 @@ impl SpeechRecognitionManager {
                         return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true);
                     };
                     next_transcript_revision = next_revision;
-                    transcripts.0.push(RecordTranscriptSegment {
-                        segment_id,
-                        track: match record_track(track) {
+                    let track = match (job.kind, track) {
+                        (SpeechJobKind::AgentAttachmentAsr, TrackKind::Attachment) => {
+                            AudioTrackKind::Mixed
+                        }
+                        (SpeechJobKind::RecordBackfillAsr, track) => match record_track(track) {
                             Ok(track) => track,
                             Err(code) => return failed_outcome(code, false),
                         },
+                        _ => return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true),
+                    };
+                    transcripts.0.push(RecordTranscriptSegment {
+                        segment_id,
+                        track,
                         start_sample,
                         end_sample,
                         text,
@@ -1972,7 +2845,9 @@ impl SpeechRecognitionManager {
                 WorkerResponse::Yielded { .. } if ready && yield_sent => {
                     return SpeechWorkerOutcome::Yielded;
                 }
-                WorkerResponse::Completed { metrics, .. } if ready => {
+                WorkerResponse::Completed { metrics, .. }
+                    if ready && (!job.kind.is_agent() || media_probed) =>
+                {
                     if !completed_shape_matches(
                         job.kind,
                         &transcripts.0,
@@ -2227,7 +3102,6 @@ impl SpeechRecognitionManager {
         if let SpeechJobOrigin::Record { record_id } = &source_job.origin {
             if queued {
                 update_record_queued_status(&self.record_store, source_job.kind, record_id);
-                self.wake.notify_one();
             } else {
                 update_record_terminal_status(
                     &self.record_store,
@@ -2236,6 +3110,9 @@ impl SpeechRecognitionManager {
                     false,
                 );
             }
+        }
+        if queued {
+            self.wake.notify_one();
         }
     }
 
@@ -2708,7 +3585,15 @@ fn completed_shape_matches(
                     .max()
                     .map_or(true, |maximum| *maximum < metrics.speakers)
         }
-        SpeechJobKind::AgentAttachmentAsr => false,
+        SpeechJobKind::AgentAttachmentAsr => {
+            turns.is_empty()
+                && !speaker_last_seen
+                && metrics.segments as usize == transcripts.len()
+                && metrics.speakers == 0
+                && transcripts
+                    .iter()
+                    .all(|segment| segment.track == AudioTrackKind::Mixed)
+        }
     }
 }
 
@@ -2779,6 +3664,29 @@ fn drain_worker_stderr(mut stderr: ChildStderr, job_id: String, generation: u64)
         });
 }
 
+fn start_batch_response_reader(
+    stdout: ChildStdout,
+) -> std_mpsc::Receiver<Result<WorkerResponse, &'static str>> {
+    let (sender, receiver) = std_mpsc::sync_channel(16);
+    let _ = std::thread::Builder::new()
+        .name("speech-worker-response".into())
+        .spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let response = match read_worker_response(&mut reader) {
+                    Ok(Some(response)) => Ok(response),
+                    Ok(None) => Err("SPEECH_WORKER_CRASHED"),
+                    Err(_) => Err("SPEECH_WORKER_PROTOCOL_ERROR"),
+                };
+                let terminal = response.is_err();
+                if sender.send(response).is_err() || terminal {
+                    break;
+                }
+            }
+        });
+    receiver
+}
+
 fn failed_outcome(code: &str, retryable: bool) -> SpeechWorkerOutcome {
     SpeechWorkerOutcome::Failed {
         code: code.into(),
@@ -2794,6 +3702,7 @@ fn worker_code_retryable(code: &str) -> bool {
             | "SPEECH_WORKER_PROTOCOL_ERROR"
             | "SPEECH_WORKER_CRASHED"
             | "SPEECH_WORKER_START_FAILED"
+            | "SPEECH_WORKER_TIMEOUT"
             | "SPEECH_MODEL_LOAD_FAILED"
             | "SPEECH_INFERENCE_FAILED"
     )
@@ -2865,6 +3774,9 @@ fn enqueue_diarization_locked(
             size_bytes: source_size,
             sha256: None,
             media_kind: Some("record/ogg-opus".into()),
+            codec: None,
+            duration_ms: None,
+            used_default_track: None,
         },
         output: empty_output(),
         pipeline: pipeline_from_provenance(provenance),
@@ -2984,6 +3896,132 @@ fn recovered_record_queue(jobs: &HashMap<String, SpeechJob>) -> VecDeque<String>
     queued.iter().map(|job| job.job_id.clone()).collect()
 }
 
+fn recover_agent_publish_intents(root: &Path, jobs: &mut HashMap<String, SpeechJob>) {
+    for job in jobs.values().filter(|job| job.kind.is_agent()) {
+        let Some(output_root) = job.output.root_directory.as_deref().map(Path::new) else {
+            continue;
+        };
+        let Some(destination) = job.output.job_directory.as_deref().map(Path::new) else {
+            continue;
+        };
+        let staging = output_root.join(format!(".myagents-speech-{}.staging", job.job_id));
+        let private_dir = root.join("private").join(&job.job_id);
+        let private_token = read_agent_token(
+            &private_dir.join(AGENT_PRIVATE_STAGING_TOKEN),
+            AGENT_PRIVATE_STAGING_TOKEN,
+        );
+        let intent = read_agent_publish_intent(root, &job.job_id).filter(|intent| {
+            intent.schema_version == 1
+                && intent.job_id == job.job_id
+                && Path::new(&intent.staging_directory) == staging
+                && Path::new(&intent.destination_directory) == destination
+                && valid_agent_staging_token(&intent.staging_token)
+                && private_token
+                    .as_deref()
+                    .is_none_or(|private| private == intent.staging_token)
+        });
+        let Some(token) = intent
+            .as_ref()
+            .map(|intent| intent.staging_token.as_str())
+            .or(private_token.as_deref())
+        else {
+            continue;
+        };
+
+        if matches!(
+            job.state,
+            SpeechJobState::Succeeded | SpeechJobState::SucceededWithWarnings
+        ) {
+            if let Ok(identity) = same_file::Handle::from_path(destination) {
+                if validate_agent_directory(destination, &identity, token).is_ok() {
+                    let _cleaned = fs::remove_file(destination.join(AGENT_STAGING_MARKER))
+                        .and_then(|_| crate::durable_fs::sync_directory(destination))
+                        .is_ok();
+                }
+            }
+            cleanup_agent_owned_directory(&staging, token);
+            let _ = clear_agent_publish_intent(root, &job.job_id);
+            cleanup_agent_private_directory(root, &private_dir);
+            continue;
+        }
+
+        // Before terminal metadata commits, an authenticated destination is
+        // still private staging even if the directory rename was visible.
+        // Never expose or delete a replacement path whose inode/token changed.
+        cleanup_agent_owned_directory(destination, token);
+        cleanup_agent_owned_directory(&staging, token);
+        let destination_owned = agent_directory_has_token(destination, token);
+        let staging_owned = agent_directory_has_token(&staging, token);
+        if !destination_owned && !staging_owned {
+            let _ = clear_agent_publish_intent(root, &job.job_id);
+            cleanup_agent_private_directory(root, &private_dir);
+        }
+    }
+}
+
+fn read_agent_publish_intent(root: &Path, job_id: &str) -> Option<AgentPublishIntent> {
+    let path = agent_publish_intent_path(root, job_id);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
+        return None;
+    }
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn read_agent_token(path: &Path, label: &str) -> Option<String> {
+    let file =
+        crate::workspace_files::path_safety::open_regular_file_no_follow(path, label).ok()?;
+    let mut token = String::new();
+    file.take(128).read_to_string(&mut token).ok()?;
+    valid_agent_staging_token(&token).then_some(token)
+}
+
+fn agent_directory_has_token(path: &Path, token: &str) -> bool {
+    same_file::Handle::from_path(path)
+        .is_ok_and(|identity| validate_agent_directory(path, &identity, token).is_ok())
+}
+
+fn cleanup_agent_owned_directory(path: &Path, token: &str) {
+    let Ok(identity) = same_file::Handle::from_path(path) else {
+        return;
+    };
+    if validate_agent_directory(path, &identity, token).is_err() {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    for _ in 0..8 {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let quarantine = parent.join(format!(".myagents-speech-cleanup-{}", &suffix[..12]));
+        match crate::durable_fs::rename_directory_noreplace(path, &quarantine) {
+            Ok(()) => {
+                if validate_agent_directory(&quarantine, &identity, token).is_err() {
+                    let _ = crate::durable_fs::rename_directory_noreplace(&quarantine, path);
+                    return;
+                }
+                let _ = fs::remove_dir_all(&quarantine);
+                let _ = crate::durable_fs::sync_directory(parent);
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+fn cleanup_agent_private_directory(root: &Path, private_dir: &Path) {
+    let private_root = root.join("private");
+    if private_dir.parent() == Some(private_root.as_path())
+        && fs::symlink_metadata(private_dir)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
+        let _ = fs::remove_dir_all(private_dir);
+        let _ = crate::durable_fs::sync_directory(&private_root);
+    }
+}
+
 fn recover_nonterminal_jobs(root: &Path, jobs: &mut HashMap<String, SpeechJob>) {
     let now = Utc::now();
     for job in jobs.values_mut().filter(|job| !job.state.is_terminal()) {
@@ -3068,6 +4106,391 @@ fn valid_job_shape(job: &SpeechJob) -> bool {
     }
 }
 
+fn agent_source_version(metadata: &fs::Metadata) -> AgentSourceVersion {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt;
+
+    AgentSourceVersion {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        #[cfg(unix)]
+        ctime: metadata.ctime(),
+        #[cfg(unix)]
+        ctime_nsec: metadata.ctime_nsec(),
+        #[cfg(windows)]
+        last_write_time: metadata.last_write_time(),
+    }
+}
+
+fn copy_agent_source(
+    source: &mut File,
+    destination: &Path,
+    expected_size: u64,
+    expected_version: &AgentSourceVersion,
+    mut checkpoint: impl FnMut() -> Result<(), &'static str>,
+) -> Result<String, String> {
+    if agent_source_version(&source.metadata().map_err(|_| "SPEECH_SOURCE_READ_FAILED")?)
+        != *expected_version
+    {
+        return Err("SPEECH_SOURCE_CHANGED".into());
+    }
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|_| "SPEECH_SOURCE_READ_FAILED".to_string())?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|_| "SPEECH_PRIVATE_STORAGE_UNAVAILABLE".to_string())?;
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        checkpoint().map_err(str::to_string)?;
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| "SPEECH_SOURCE_READ_FAILED".to_string())?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| "SPEECH_MEDIA_LIMIT_EXCEEDED".to_string())?;
+        if total > MAX_AGENT_SOURCE_BYTES {
+            return Err("SPEECH_MEDIA_LIMIT_EXCEEDED".into());
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|_| "SPEECH_PRIVATE_STORAGE_UNAVAILABLE".to_string())?;
+        digest.update(&buffer[..read]);
+    }
+    if total != expected_size
+        || agent_source_version(&source.metadata().map_err(|_| "SPEECH_SOURCE_READ_FAILED")?)
+            != *expected_version
+    {
+        return Err("SPEECH_SOURCE_CHANGED".into());
+    }
+    output
+        .sync_all()
+        .map_err(|_| "SPEECH_PRIVATE_STORAGE_UNAVAILABLE".to_string())?;
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn write_agent_staging_marker(staging: &Path, token: &str) -> Result<(), String> {
+    write_agent_token_file(&staging.join(AGENT_STAGING_MARKER), token)?;
+    crate::durable_fs::sync_directory(staging)
+        .map_err(|error| format!("sync speech staging: {error}"))
+}
+
+fn write_agent_private_staging_token(private: &Path, token: &str) -> Result<(), String> {
+    write_agent_token_file(&private.join(AGENT_PRIVATE_STAGING_TOKEN), token)?;
+    crate::durable_fs::sync_directory(private)
+        .map_err(|error| format!("sync speech private input: {error}"))
+}
+
+fn write_agent_token_file(path: &Path, token: &str) -> Result<(), String> {
+    if !valid_agent_staging_token(token) {
+        return Err("speech staging token is invalid".into());
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("create speech staging marker: {error}"))?;
+    file.write_all(token.as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("write speech staging marker: {error}"))
+}
+
+fn valid_agent_staging_token(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_agent_staging(pending: &PendingAgentJob) -> Result<(), &'static str> {
+    validate_agent_directory(
+        &pending.staging_dir,
+        &pending.staging_identity,
+        &pending.staging_token,
+    )
+}
+
+fn validate_agent_directory(
+    directory: &Path,
+    expected_identity: &same_file::Handle,
+    expected_token: &str,
+) -> Result<(), &'static str> {
+    if !same_file::Handle::from_path(directory).is_ok_and(|current| &current == expected_identity) {
+        return Err("SPEECH_OUTPUT_PATH_UNSAFE");
+    }
+    let marker = directory.join(AGENT_STAGING_MARKER);
+    let marker_file = crate::workspace_files::path_safety::open_regular_file_no_follow(
+        &marker,
+        "speech staging marker",
+    )
+    .map_err(|_| "SPEECH_OUTPUT_PATH_UNSAFE")?;
+    let mut token = String::new();
+    marker_file
+        .take(128)
+        .read_to_string(&mut token)
+        .map_err(|_| "SPEECH_OUTPUT_PATH_UNSAFE")?;
+    if token != expected_token || !valid_agent_staging_token(&token) {
+        return Err("SPEECH_OUTPUT_PATH_UNSAFE");
+    }
+    Ok(())
+}
+
+fn validate_agent_publish_paths(
+    job: &SpeechJob,
+    pending: &PendingAgentJob,
+) -> Result<(), &'static str> {
+    let output_root = job
+        .output
+        .root_directory
+        .as_deref()
+        .map(Path::new)
+        .ok_or("SPEECH_OUTPUT_PATH_UNSAFE")?;
+    if !same_file::Handle::from_path(output_root)
+        .is_ok_and(|current| current == pending.output_root_identity)
+    {
+        return Err("SPEECH_OUTPUT_PATH_UNSAFE");
+    }
+    validate_agent_staging(pending)
+}
+
+fn publish_agent_staging(
+    pending: &PendingAgentJob,
+    destination: &Path,
+) -> Result<(), &'static str> {
+    let output_root = destination.parent().ok_or("SPEECH_OUTPUT_PATH_UNSAFE")?;
+    if !same_file::Handle::from_path(output_root)
+        .is_ok_and(|current| current == pending.output_root_identity)
+        || validate_agent_staging(pending).is_err()
+    {
+        return Err("SPEECH_OUTPUT_PATH_UNSAFE");
+    }
+    crate::durable_fs::rename_directory_noreplace(&pending.staging_dir, destination).map_err(
+        |error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "SPEECH_OUTPUT_COLLISION"
+            } else {
+                "SPEECH_PUBLISH_FAILED"
+            }
+        },
+    )?;
+    if validate_agent_directory(
+        destination,
+        &pending.staging_identity,
+        &pending.staging_token,
+    )
+    .is_err()
+        || crate::durable_fs::sync_directory(output_root).is_err()
+    {
+        let _ = rollback_agent_publish(
+            destination,
+            &pending.staging_dir,
+            &pending.staging_identity,
+            &pending.staging_token,
+        );
+        return Err("SPEECH_PUBLISH_FAILED");
+    }
+    Ok(())
+}
+
+fn rollback_agent_publish(
+    destination: &Path,
+    staging: &Path,
+    expected_identity: &same_file::Handle,
+    token: &str,
+) -> bool {
+    if validate_agent_directory(destination, expected_identity, token).is_err()
+        || fs::symlink_metadata(staging).is_ok()
+    {
+        return false;
+    }
+    if crate::durable_fs::rename_directory_noreplace(destination, staging).is_err()
+        || validate_agent_directory(staging, expected_identity, token).is_err()
+    {
+        return false;
+    }
+    destination
+        .parent()
+        .is_some_and(|root| crate::durable_fs::sync_directory(root).is_ok())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTranscriptArtifact<'a> {
+    schema_version: u32,
+    job_id: &'a str,
+    sample_rate_hz: u32,
+    segments: Vec<AgentTranscriptArtifactSegment<'a>>,
+    provenance: AgentTranscriptProvenance<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTranscriptArtifactSegment<'a> {
+    segment_id: &'a str,
+    start_ms: u64,
+    end_ms: u64,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTranscriptProvenance<'a> {
+    provider: &'a str,
+    model_pack_revision: &'a str,
+    onnx_runtime_version: &'a str,
+    media_kind: &'a str,
+    codec: &'a str,
+}
+
+fn write_agent_artifacts(
+    staging: &Path,
+    job: &SpeechJob,
+    provenance: &RecordSpeechProvenance,
+    transcripts: &[RecordTranscriptSegment],
+) -> Result<(), &'static str> {
+    let segments = transcripts
+        .iter()
+        .map(|segment| AgentTranscriptArtifactSegment {
+            segment_id: &segment.segment_id,
+            start_ms: segment.start_sample.saturating_mul(1_000) / 16_000,
+            end_ms: segment.end_sample.saturating_mul(1_000) / 16_000,
+            text: &segment.text,
+            language: segment.language.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    let artifact = AgentTranscriptArtifact {
+        schema_version: 1,
+        job_id: &job.job_id,
+        sample_rate_hz: 16_000,
+        segments,
+        provenance: AgentTranscriptProvenance {
+            provider: &provenance.provider,
+            model_pack_revision: &provenance.model_pack_revision,
+            onnx_runtime_version: &provenance.onnx_runtime_version,
+            media_kind: job
+                .source
+                .media_kind
+                .as_deref()
+                .ok_or("SPEECH_WORKER_PROTOCOL_ERROR")?,
+            codec: job
+                .source
+                .codec
+                .as_deref()
+                .ok_or("SPEECH_WORKER_PROTOCOL_ERROR")?,
+        },
+    };
+    let json = serde_json::to_vec_pretty(&artifact).map_err(|_| "SPEECH_PUBLISH_FAILED")?;
+    let mut markdown = String::from("# Transcript\n\n");
+    for segment in &artifact.segments {
+        use std::fmt::Write as _;
+        writeln!(
+            markdown,
+            "[{} – {}] {}\n",
+            format_agent_timestamp(segment.start_ms),
+            format_agent_timestamp(segment.end_ms),
+            segment.text
+        )
+        .map_err(|_| "SPEECH_PUBLISH_FAILED")?;
+    }
+    write_agent_artifact_file(&staging.join("transcript.json"), &json)?;
+    write_agent_artifact_file(&staging.join("transcript.md"), markdown.as_bytes())?;
+    crate::durable_fs::sync_directory(staging).map_err(|_| "SPEECH_PUBLISH_FAILED")
+}
+
+fn write_agent_artifact_file(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| "SPEECH_PUBLISH_FAILED")?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "SPEECH_PUBLISH_FAILED")
+}
+
+fn format_agent_timestamp(milliseconds: u64) -> String {
+    let total_seconds = milliseconds / 1_000;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        total_seconds / 3_600,
+        (total_seconds / 60) % 60,
+        total_seconds % 60,
+        milliseconds % 1_000
+    )
+}
+
+fn agent_artifact_is_available(job: &SpeechJob) -> bool {
+    job.kind.is_agent()
+        && matches!(
+            job.state,
+            SpeechJobState::Succeeded | SpeechJobState::SucceededWithWarnings
+        )
+        && job
+            .output
+            .transcript_markdown_path
+            .as_deref()
+            .is_some_and(|path| plain_file(Path::new(path)))
+        && job
+            .output
+            .transcript_json_path
+            .as_deref()
+            .is_some_and(|path| plain_file(Path::new(path)))
+}
+
+fn cleanup_agent_private_input(pending: &PendingAgentJob) {
+    if same_file::Handle::from_path(&pending.private_dir)
+        .is_ok_and(|current| current == pending.private_identity)
+    {
+        let _ = fs::remove_dir_all(&pending.private_dir);
+    }
+}
+
+fn cleanup_pending_agent(pending: &PendingAgentJob) {
+    cleanup_agent_private_input(pending);
+    if same_file::Handle::from_path(&pending.staging_dir)
+        .is_ok_and(|current| current == pending.staging_identity)
+    {
+        let _ = fs::remove_dir_all(&pending.staging_dir);
+    }
+}
+
+fn agent_publish_intent_path(root: &Path, job_id: &str) -> PathBuf {
+    root.join("jobs").join(job_id).join(AGENT_PUBLISH_INTENT)
+}
+
+fn persist_agent_publish_intent(root: &Path, intent: &AgentPublishIntent) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(intent)
+        .map_err(|error| format!("serialize speech publish intent: {error}"))?;
+    crate::task::write_atomic_text(&agent_publish_intent_path(root, &intent.job_id), &content)
+}
+
+fn clear_agent_publish_intent(root: &Path, job_id: &str) -> Result<(), String> {
+    let path = agent_publish_intent_path(root, job_id);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("remove speech publish intent: {error}")),
+    }
+    path.parent()
+        .ok_or_else(|| "speech publish intent parent missing".to_string())
+        .and_then(|parent| {
+            crate::durable_fs::sync_directory(parent)
+                .map_err(|error| format!("sync speech publish intent directory: {error}"))
+        })
+}
+
 fn persist_job(root: &Path, job: &SpeechJob) -> Result<(), String> {
     let content = serde_json::to_string_pretty(job)
         .map_err(|error| format!("serialize speech job: {error}"))?;
@@ -3075,6 +4498,30 @@ fn persist_job(root: &Path, job: &SpeechJob) -> Result<(), String> {
         &root.join("jobs").join(&job.job_id).join("job.json"),
         &content,
     )
+}
+
+fn persist_job_resolving_unknown(root: &Path, job: &SpeechJob) -> Result<(), String> {
+    match persist_job(root, job) {
+        Ok(()) => Ok(()),
+        Err(original) => {
+            let path = root.join("jobs").join(&job.job_id).join("job.json");
+            let expected = serde_json::to_value(job)
+                .map_err(|error| format!("serialize expected speech job: {error}"))?;
+            let persisted_matches = fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                .is_some_and(|actual| actual == expected);
+            if persisted_matches
+                && path
+                    .parent()
+                    .is_some_and(|parent| crate::durable_fs::sync_directory(parent).is_ok())
+            {
+                Ok(())
+            } else {
+                Err(original)
+            }
+        }
+    }
 }
 
 fn validate_job_id(value: &str) -> Result<(), &'static str> {
@@ -3168,6 +4615,9 @@ mod tests {
                 size_bytes: 42,
                 sha256: None,
                 media_kind: None,
+                codec: None,
+                duration_ms: None,
+                used_default_track: None,
             },
             output: SpeechJobOutput {
                 root_directory: None,
@@ -3340,6 +4790,267 @@ mod tests {
         );
         assert!(!debug.contains("/private/source"));
         assert!(!debug.contains(root.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn agent_private_copy_rejects_a_source_version_change() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("source.wav");
+        fs::write(&source_path, b"first").unwrap();
+        let mut source = File::open(&source_path).unwrap();
+        let version = agent_source_version(&source.metadata().unwrap());
+        fs::write(&source_path, b"other-size").unwrap();
+
+        assert_eq!(
+            copy_agent_source(
+                &mut source,
+                &root.path().join("private.media"),
+                5,
+                &version,
+                || Ok(()),
+            ),
+            Err("SPEECH_SOURCE_CHANGED".into())
+        );
+    }
+
+    #[test]
+    fn agent_publish_writes_only_transcript_artifacts_and_commits_exact_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(&root);
+        let output_root = root.path().join("workspace-output");
+        let staging = output_root.join(".staging");
+        let private = manager.root.join("private").join("speech_publish");
+        ensure_private_directory(&staging).unwrap();
+        ensure_private_directory(&private).unwrap();
+        let token = "0123456789abcdef0123456789abcdef".to_string();
+        write_agent_staging_marker(&staging, &token).unwrap();
+        write_agent_private_staging_token(&private, &token).unwrap();
+        let source_path = root.path().join("source.wav");
+        fs::write(&source_path, b"audio").unwrap();
+        let source_file = File::open(&source_path).unwrap();
+        let source_version = agent_source_version(&source_file.metadata().unwrap());
+        let source = same_file::Handle::from_file(source_file).unwrap();
+        let pending = PendingAgentJob {
+            source,
+            source_version,
+            prepared_source: None,
+            private_dir: private.clone(),
+            private_identity: same_file::Handle::from_path(&private).unwrap(),
+            staging_dir: staging.clone(),
+            staging_identity: same_file::Handle::from_path(&staging).unwrap(),
+            staging_token: token,
+            output_root_identity: same_file::Handle::from_path(&output_root).unwrap(),
+        };
+        let mut job = fixture_job(
+            "speech_publish",
+            SpeechJobKind::AgentAttachmentAsr,
+            SpeechJobOrigin::Agent {
+                initiator_session_id: "session-a".into(),
+                workspace_identity: root.path().display().to_string(),
+            },
+            SpeechJobState::Running,
+            Utc::now(),
+        );
+        let public = output_root.join(&job.job_id);
+        job.output = SpeechJobOutput {
+            root_directory: Some(output_root.to_string_lossy().into_owned()),
+            job_directory: Some(public.to_string_lossy().into_owned()),
+            transcript_markdown_path: Some(
+                public.join("transcript.md").to_string_lossy().into_owned(),
+            ),
+            transcript_json_path: Some(
+                public
+                    .join("transcript.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            artifact_available: false,
+        };
+        job.source.used_default_track = Some(true);
+        job.source.media_kind = Some("wav".into());
+        job.source.codec = Some("pcm".into());
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.active_job = Some((job.job_id.clone(), 9));
+            state.jobs.insert(job.job_id.clone(), job.clone());
+        }
+        let transcript = SensitiveTranscriptSegments(vec![RecordTranscriptSegment {
+            segment_id: "segment-1".into(),
+            track: AudioTrackKind::Mixed,
+            start_sample: 16_000,
+            end_sample: 32_000,
+            text: "private words".into(),
+            language: Some("en".into()),
+            revision: 1,
+        }]);
+        let provenance = RecordSpeechProvenance {
+            provider: "local".into(),
+            model_pack_revision: "revision-1".into(),
+            onnx_runtime_version: "1.28.0".into(),
+        };
+
+        assert!(manager.publish_agent_success(
+            &job,
+            9,
+            &provenance,
+            transcript,
+            WorkerMetrics {
+                source_samples: 32_000,
+                segments: 1,
+                speakers: 0,
+                elapsed_ms: 10,
+                peak_working_bytes: None,
+            },
+            &pending,
+        ));
+        let markdown = fs::read_to_string(public.join("transcript.md")).unwrap();
+        let json = fs::read_to_string(public.join("transcript.json")).unwrap();
+        assert!(markdown.contains("00:00:01.000 – 00:00:02.000"));
+        assert!(json.contains("private words"));
+        assert!(!json.contains("session-a"));
+        assert!(!json.contains("source.wav"));
+        assert!(!public.join(AGENT_STAGING_MARKER).exists());
+        assert_eq!(
+            manager.state.lock().unwrap().jobs["speech_publish"].state,
+            SpeechJobState::Succeeded
+        );
+    }
+
+    #[test]
+    fn startup_removes_an_uncommitted_authenticated_public_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = manager(&root);
+        let job_id = "speech_publish_crash";
+        let output_root = root.path().join("workspace-output");
+        let staging = output_root.join(format!(".myagents-speech-{job_id}.staging"));
+        let destination = output_root.join(job_id);
+        let private = initial.root.join("private").join(job_id);
+        ensure_private_directory(&staging).unwrap();
+        ensure_private_directory(&private).unwrap();
+        let token = "0123456789abcdef0123456789abcdef";
+        write_agent_staging_marker(&staging, token).unwrap();
+        write_agent_private_staging_token(&private, token).unwrap();
+        fs::write(staging.join("transcript.md"), "private words").unwrap();
+        fs::write(staging.join("transcript.json"), "{}").unwrap();
+        let mut job = fixture_job(
+            job_id,
+            SpeechJobKind::AgentAttachmentAsr,
+            SpeechJobOrigin::Agent {
+                initiator_session_id: "session-a".into(),
+                workspace_identity: root.path().display().to_string(),
+            },
+            SpeechJobState::Running,
+            Utc::now(),
+        );
+        job.stage = SpeechJobStage::Publishing;
+        job.output = SpeechJobOutput {
+            root_directory: Some(output_root.to_string_lossy().into_owned()),
+            job_directory: Some(destination.to_string_lossy().into_owned()),
+            transcript_markdown_path: Some(
+                destination
+                    .join("transcript.md")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            transcript_json_path: Some(
+                destination
+                    .join("transcript.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            artifact_available: false,
+        };
+        persist_job(&initial.root, &job).unwrap();
+        persist_agent_publish_intent(
+            &initial.root,
+            &AgentPublishIntent {
+                schema_version: 1,
+                job_id: job_id.into(),
+                staging_directory: staging.to_string_lossy().into_owned(),
+                destination_directory: destination.to_string_lossy().into_owned(),
+                staging_token: token.into(),
+            },
+        )
+        .unwrap();
+        crate::durable_fs::rename_directory_noreplace(&staging, &destination).unwrap();
+        crate::durable_fs::sync_directory(&output_root).unwrap();
+        drop(initial);
+
+        let recovered = manager(&root);
+        let job = recovered.get_agent_job("session-a", job_id).unwrap();
+        assert_eq!(job.state, SpeechJobState::Interrupted);
+        assert!(!destination.exists());
+        assert!(!staging.exists());
+        assert!(!private.exists());
+        assert!(!agent_publish_intent_path(&recovered.root, job_id).exists());
+    }
+
+    #[test]
+    fn startup_finishes_cleanup_after_durable_agent_success() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = manager(&root);
+        let job_id = "speech_success_cleanup";
+        let output_root = root.path().join("workspace-output");
+        let destination = output_root.join(job_id);
+        let private = initial.root.join("private").join(job_id);
+        ensure_private_directory(&destination).unwrap();
+        ensure_private_directory(&private).unwrap();
+        let token = "fedcba9876543210fedcba9876543210";
+        write_agent_staging_marker(&destination, token).unwrap();
+        write_agent_private_staging_token(&private, token).unwrap();
+        fs::write(destination.join("transcript.md"), "private words").unwrap();
+        fs::write(destination.join("transcript.json"), "{}").unwrap();
+        let mut job = fixture_job(
+            job_id,
+            SpeechJobKind::AgentAttachmentAsr,
+            SpeechJobOrigin::Agent {
+                initiator_session_id: "session-a".into(),
+                workspace_identity: root.path().display().to_string(),
+            },
+            SpeechJobState::Succeeded,
+            Utc::now(),
+        );
+        job.output = SpeechJobOutput {
+            root_directory: Some(output_root.to_string_lossy().into_owned()),
+            job_directory: Some(destination.to_string_lossy().into_owned()),
+            transcript_markdown_path: Some(
+                destination
+                    .join("transcript.md")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            transcript_json_path: Some(
+                destination
+                    .join("transcript.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            artifact_available: true,
+        };
+        persist_job(&initial.root, &job).unwrap();
+        persist_agent_publish_intent(
+            &initial.root,
+            &AgentPublishIntent {
+                schema_version: 1,
+                job_id: job_id.into(),
+                staging_directory: output_root
+                    .join(format!(".myagents-speech-{job_id}.staging"))
+                    .to_string_lossy()
+                    .into_owned(),
+                destination_directory: destination.to_string_lossy().into_owned(),
+                staging_token: token.into(),
+            },
+        )
+        .unwrap();
+        drop(initial);
+
+        let recovered = manager(&root);
+        let job = recovered.get_agent_job("session-a", job_id).unwrap();
+        assert_eq!(job.state, SpeechJobState::Succeeded);
+        assert!(job.output.artifact_available);
+        assert!(!destination.join(AGENT_STAGING_MARKER).exists());
+        assert!(!private.exists());
+        assert!(!agent_publish_intent_path(&recovered.root, job_id).exists());
     }
 
     #[test]

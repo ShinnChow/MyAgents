@@ -24,7 +24,11 @@
 
 import type { InteractionScenario } from './system-prompt';
 import { getUserToolsPromptSection } from './utils/cli-tools-registry';
-import { IMAGE_UNDERSTANDING_TOOL_ID, type OfficialToolId } from '../shared/official-tools';
+import {
+  IMAGE_UNDERSTANDING_TOOL_ID,
+  SPEECH_RECOGNITION_TOOL_ID,
+  type OfficialToolId,
+} from '../shared/official-tools';
 
 // ===== Capability sections =====
 //
@@ -155,6 +159,20 @@ For details:
   myagents vision --help
   myagents vision readme
 </myagents-cli-vision>`;
+
+const SECTION_SPEECH = `<myagents-cli-speech>
+MyAgents can transcribe one audio or video attachment from the current
+Workspace with its local speech models. Use the required system skill
+\`myagents-speech-recognition\` when the user asks you to transcribe a local
+meeting, voice note, recording, or media attachment.
+
+Start with the exact command help:
+  myagents speech --help
+
+The command is asynchronous. MyAgents automatically binds every job to the
+current Session and Workspace; never look for or invent Session/Workspace
+scope flags.
+</myagents-cli-speech>`;
 
 /**
  * Single source of truth for the widget trigger rule. Embedded into both the
@@ -291,6 +309,10 @@ export function buildCliToolsAppend(
 
   if (options?.enabledOfficialToolIds?.includes(IMAGE_UNDERSTANDING_TOOL_ID)) {
     parts.push(SECTION_VISION);
+  }
+
+  if (options?.enabledOfficialToolIds?.includes(SPEECH_RECOGNITION_TOOL_ID)) {
+    parts.push(SECTION_SPEECH);
   }
 
   // User-registered CLI tools — universal (PRD 0.2.36 cli_first_tool_registry).

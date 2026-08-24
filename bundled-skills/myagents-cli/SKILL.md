@@ -56,6 +56,10 @@ CLI 通过 `~/.myagents/bin/myagents` 暴露，你的 SDK 子进程 PATH 已注�
 
 MyAgents 内置 AnyDoc 本地文档转 Markdown/OCR 能力。先运行 `myagents anydoc --help`；需要详细使用说明时加载 `/myagents-anydoc`。
 
+### 本地附件语音识别
+
+MyAgents 能把当前 Workspace 内的单个本地音频或视频附件提交给 App-owned 离线异步转写任务。先运行 `myagents speech --help`；需要完整 Session 隔离、输入格式与任务生命周期说明时加载 `/myagents-speech-recognition`。Session 与 Workspace 由产品自动绑定，不自行传参。
+
 ### MCP 工具（mcp）
 
 ```bash

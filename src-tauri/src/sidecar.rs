@@ -71,11 +71,11 @@ pub use legacy::{
 };
 #[allow(unused_imports)]
 pub use manager::create_sidecar_manager;
-pub(crate) use manager::FrontendSidecarBinding;
 pub use manager::{
     create_sidecar_state, LegacySidecarConfig, ManagedSidecar, ManagedSidecarManager,
     SidecarManager, SidecarStatus,
 };
+pub(crate) use manager::{FrontendSidecarBinding, SessionProcessSource};
 #[allow(unused_imports)]
 pub use proxy::cmd_propagate_proxy;
 #[allow(unused_imports)]

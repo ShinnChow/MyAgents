@@ -155,6 +155,10 @@ pub async fn start_management_api() -> Result<u16, String> {
         .route("/api/document/status", get(document_status_handler))
         .route("/api/document/cancel", post(document_cancel_handler))
         .route("/api/document/list", get(document_list_handler))
+        .route("/api/speech/transcribe", post(speech_transcribe_handler))
+        .route("/api/speech/status", post(speech_status_handler))
+        .route("/api/speech/cancel", post(speech_cancel_handler))
+        .route("/api/speech/list", post(speech_list_handler))
         .route("/api/goal/get", get(goal_get_handler))
         .route("/api/goal/create", post(goal_create_handler))
         .route("/api/goal/turn/claim", post(goal_turn_claim_handler))
@@ -4658,6 +4662,203 @@ async fn session_watch_handler(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpeechTranscribeRequest {
+    sidecar_id: String,
+    source_path: String,
+    output_root: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpeechJobRequest {
+    sidecar_id: String,
+    job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SpeechListRequest {
+    sidecar_id: String,
+    limit: Option<usize>,
+}
+
+fn resolve_speech_caller(
+    headers: &HeaderMap,
+    sidecar_id: &str,
+) -> Result<crate::sidecar::SessionProcessSource, serde_json::Value> {
+    let sidecar_id = sidecar_id.trim();
+    if sidecar_id.is_empty() {
+        return Err(speech_error_value("SPEECH_SESSION_REQUIRED"));
+    }
+    let generation = request_sidecar_generation(headers).map_err(|Json(value)| value)?;
+    let Some(sidecars) = get_sidecar_state() else {
+        return Err(serde_json::json!({
+            "ok": false,
+            "code": "SPEECH_MANAGER_UNAVAILABLE",
+            "error": "The Sidecar identity owner is unavailable.",
+            "suggestion": "Restart MyAgents and retry.",
+        }));
+    };
+    sidecars
+        .lock()
+        .map_err(|_| speech_error_value("SPEECH_MANAGER_UNAVAILABLE"))?
+        .resolve_session_process_source(sidecar_id, generation)
+        .ok_or_else(|| speech_error_value("SPEECH_SESSION_REQUIRED"))
+}
+
+async fn speech_transcribe_handler(
+    headers: HeaderMap,
+    Json(request): Json<SpeechTranscribeRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let caller = match resolve_speech_caller(&headers, &request.sidecar_id) {
+        Ok(caller) => caller,
+        Err(value) => return no_store_json(value),
+    };
+    if request.source_path.trim().is_empty() {
+        return no_store_json(speech_error_value("SPEECH_SOURCE_PATH_INVALID"));
+    }
+    let Some(manager) = crate::speech_recognition::global() else {
+        return no_store_json(speech_error_value("SPEECH_MANAGER_UNAVAILABLE"));
+    };
+    match manager.submit_agent_attachment(
+        &caller.product_session_id,
+        &caller.workspace_path,
+        request.source_path.trim(),
+        request.output_root.as_deref(),
+    ) {
+        Ok(job) => no_store_json(serde_json::json!({ "ok": true, "job": job })),
+        Err(code) => no_store_json(speech_error_value(code)),
+    }
+}
+
+async fn speech_status_handler(
+    headers: HeaderMap,
+    Json(request): Json<SpeechJobRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let caller = match resolve_speech_caller(&headers, &request.sidecar_id) {
+        Ok(caller) => caller,
+        Err(value) => return no_store_json(value),
+    };
+    let Some(manager) = crate::speech_recognition::global() else {
+        return no_store_json(speech_error_value("SPEECH_MANAGER_UNAVAILABLE"));
+    };
+    match manager.get_agent_job(&caller.product_session_id, request.job_id.trim()) {
+        Ok(job) => no_store_json(serde_json::json!({ "ok": true, "job": job })),
+        Err(code) => no_store_json(speech_error_value(code)),
+    }
+}
+
+async fn speech_cancel_handler(
+    headers: HeaderMap,
+    Json(request): Json<SpeechJobRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let caller = match resolve_speech_caller(&headers, &request.sidecar_id) {
+        Ok(caller) => caller,
+        Err(value) => return no_store_json(value),
+    };
+    let Some(manager) = crate::speech_recognition::global() else {
+        return no_store_json(speech_error_value("SPEECH_MANAGER_UNAVAILABLE"));
+    };
+    match manager.cancel_agent_job(&caller.product_session_id, request.job_id.trim()) {
+        Ok(job) => no_store_json(serde_json::json!({ "ok": true, "job": job })),
+        Err(code) => no_store_json(speech_error_value(code)),
+    }
+}
+
+async fn speech_list_handler(
+    headers: HeaderMap,
+    Json(request): Json<SpeechListRequest>,
+) -> (HeaderMap, Json<serde_json::Value>) {
+    let caller = match resolve_speech_caller(&headers, &request.sidecar_id) {
+        Ok(caller) => caller,
+        Err(value) => return no_store_json(value),
+    };
+    let Some(manager) = crate::speech_recognition::global() else {
+        return no_store_json(speech_error_value("SPEECH_MANAGER_UNAVAILABLE"));
+    };
+    match manager.list_agent_jobs(&caller.product_session_id, request.limit.unwrap_or(20)) {
+        Ok(items) => no_store_json(serde_json::json!({
+            "ok": true,
+            "items": items,
+            "retentionDays": crate::speech_recognition::SPEECH_HISTORY_RETENTION_DAYS,
+        })),
+        Err(code) => no_store_json(speech_error_value(code)),
+    }
+}
+
+fn speech_error_value(code: &str) -> serde_json::Value {
+    let (error, suggestion) = match code {
+        "SPEECH_SESSION_REQUIRED" => (
+            "Speech recognition requires an active MyAgents Session with an authoritative Workspace.",
+            "Run the command from the MyAgents Session that should own the job.",
+        ),
+        "SPEECH_RESOURCE_REQUIRED" | "SPEECH_MODEL_PACK_UNAVAILABLE" | "SPEECH_NATIVE_RUNTIME_UNAVAILABLE" => (
+            "The local speech recognition resources are not ready.",
+            "Open Skills & Tools > Tools, install or repair Speech Recognition resources, then retry the same command.",
+        ),
+        "SPEECH_JOB_NOT_FOUND" => (
+            "The speech job was not found for this Session.",
+            "Run `myagents speech list` in the Session that submitted the job.",
+        ),
+        "SPEECH_JOB_NOT_CANCELLABLE" => (
+            "The speech job is already terminal and cannot be cancelled.",
+            "Run `myagents speech status <job-id>` to inspect its terminal result.",
+        ),
+        "SPEECH_MEDIA_LIMIT_EXCEEDED" => (
+            "The media source is empty or exceeds the 4 GiB / 8 hour limits.",
+            "Choose a smaller supported local media file and retry.",
+        ),
+        "SPEECH_NO_AUDIO_TRACK" => (
+            "The media file does not contain a readable audio track.",
+            "Export the meeting with one supported audio track, then retry.",
+        ),
+        "SPEECH_ENCRYPTED_MEDIA" => (
+            "Encrypted media cannot be transcribed locally.",
+            "Export an unencrypted WAV, AIFF, MP3, FLAC, OGG/Vorbis, M4A, MP4, or MOV file and retry.",
+        ),
+        "SPEECH_UNSUPPORTED_CODEC" => (
+            "The probed media container and audio codec combination is not supported.",
+            "Re-export the audio as WAV/PCM or another format listed by `myagents speech transcribe --help`.",
+        ),
+        "SPEECH_CORRUPT_MEDIA" => (
+            "The media container or selected audio stream is damaged.",
+            "Verify playback, re-export the file, and retry the new local copy.",
+        ),
+        "SPEECH_DEADLINE_EXCEEDED" | "SPEECH_WORKER_TIMEOUT" => (
+            "Local speech processing stopped because the Worker exceeded its deadline or heartbeat window.",
+            "Retry once; if it repeats, re-export the media and inspect MyAgents diagnostics.",
+        ),
+        "SPEECH_SOURCE_UNSAFE" | "SPEECH_SOURCE_PATH_INVALID" | "SPEECH_SOURCE_CHANGED" => (
+            "The media source is missing, unsafe, outside the current Workspace, or changed during admission.",
+            "Choose one stable regular file inside the current Workspace and retry.",
+        ),
+        "SPEECH_OUTPUT_PATH_UNSAFE" | "SPEECH_OUTPUT_COLLISION" => (
+            "The transcript output directory is unsafe or already contains this job identity.",
+            "Choose a stable directory inside the current Workspace and retry.",
+        ),
+        "SPEECH_LIST_LIMIT_INVALID" => (
+            "Speech list limit must be from 1 through 100.",
+            "Retry with `myagents speech list --limit 20`.",
+        ),
+        "SPEECH_MANAGER_UNAVAILABLE" => (
+            "The speech recognition manager is unavailable.",
+            "Restart MyAgents and retry.",
+        ),
+        _ => (
+            "The speech recognition operation failed.",
+            "Inspect the returned code, then run `myagents speech --help` for recovery guidance.",
+        ),
+    };
+    serde_json::json!({
+        "ok": false,
+        "code": code,
+        "error": error,
+        "suggestion": suggestion,
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DocumentJobQuery {
@@ -4760,6 +4961,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn speech_requests_accept_process_identity_but_reject_caller_scope() {
+        let request: SpeechTranscribeRequest = serde_json::from_value(serde_json::json!({
+            "sidecarId": "session-birth",
+            "sourcePath": "/workspace/meeting.m4a",
+            "outputRoot": "/workspace/transcripts",
+        }))
+        .expect("process-bound speech request should deserialize");
+        assert_eq!(request.sidecar_id, "session-birth");
+
+        for forged in [
+            serde_json::json!({
+                "sidecarId": "session-birth",
+                "sourcePath": "/workspace/meeting.m4a",
+                "sessionId": "forged-session",
+            }),
+            serde_json::json!({
+                "sidecarId": "session-birth",
+                "sourcePath": "/workspace/meeting.m4a",
+                "workspace": "/forged-workspace",
+            }),
+        ] {
+            assert!(serde_json::from_value::<SpeechTranscribeRequest>(forged).is_err());
+        }
     }
 
     #[test]

@@ -1070,7 +1070,7 @@ fn sync_admin_agent_blocking<R: Runtime>(app_handle: AppHandle<R>) -> Result<boo
 // matching exclusion list in src/server/index.ts::seedBundledSkills
 // MUST be kept in sync (comment there points back here).
 
-const SYSTEM_SKILLS_VERSION: &str = "53";
+const SYSTEM_SKILLS_VERSION: &str = "54";
 
 /// One process-wide transaction owner for the versioned system-skill
 /// snapshot. Startup automation and ConfigProvider may request convergence at
@@ -1104,6 +1104,10 @@ const SYSTEM_SKILLS: &[&str] = &[
     // converter. It is required because every Runtime must discover the same
     // App-owned job surface without an always-on prompt section.
     "myagents-anydoc",
+    // v54: progressive instructions for the Session-scoped local attachment
+    // transcription CLI. Identity stays product-injected; the Skill exposes
+    // only the public job and artifact contract.
+    "myagents-speech-recognition",
     // v53: Task automation documents the stable Agent-facing receipt,
     // idempotent run semantics, and existing result channels. Command
     // Detector protocol remains a progressive reference, not a competing
@@ -1580,14 +1584,15 @@ mod system_skills_tests {
     }
 
     #[test]
-    fn v53_keeps_task_cli_automation_and_creator_skills_aligned() {
-        assert_eq!(SYSTEM_SKILLS_VERSION, "53");
+    fn v54_keeps_task_cli_speech_automation_and_creator_skills_aligned() {
+        assert_eq!(SYSTEM_SKILLS_VERSION, "54");
         assert!(SYSTEM_SKILLS.contains(&"myagents-task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-implement"));
         assert!(SYSTEM_SKILLS.contains(&"skill-creator"));
         let bundled = include_str!("../../bundled-skills/myagents-cli/SKILL.md");
         let anydoc = include_str!("../../bundled-skills/myagents-anydoc/SKILL.md");
+        let speech = include_str!("../../bundled-skills/myagents-speech-recognition/SKILL.md");
         let description = bundled
             .split("---")
             .nth(1)
@@ -1597,6 +1602,9 @@ mod system_skills_tests {
         assert!(bundled.contains("myagents anydoc --help"));
         assert!(bundled.contains("/myagents-anydoc"));
         assert!(anydoc.contains("myagents anydoc convert --file <input>"));
+        assert!(bundled.contains("/myagents-speech-recognition"));
+        assert!(speech.contains("myagents speech transcribe --file <input>"));
+        assert!(!speech.contains("--session-id"));
         assert!(bundled.contains("myagents space list --json"));
         assert!(bundled.contains("myagents space whoami --space <slug> --json"));
         assert!(bundled.contains("myagents space goal list --space <slug> --json"));

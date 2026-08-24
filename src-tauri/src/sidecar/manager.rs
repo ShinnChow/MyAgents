@@ -77,12 +77,11 @@ pub(crate) struct FrontendSidecarBinding {
     generation: u64,
 }
 
-/// Server-authoritative identity used when a live Session Sidecar asks Rust
-/// for an application Browser Host capability. The requesting process may
-/// prove its immutable birth identity, but it may not choose a different
-/// logical Session or filesystem root.
+/// Server-authoritative identity for one exact live Session Sidecar process.
+/// The requesting process may prove its immutable birth identity, but it may
+/// not choose a different logical Session or filesystem root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BrowserCapabilitySource {
+pub(crate) struct SessionProcessSource {
     pub(crate) product_session_id: String,
     pub(crate) workspace_path: PathBuf,
     pub(crate) interactive: bool,
@@ -376,18 +375,18 @@ impl SidecarManager {
     /// Session Sidecar process generation. This follows pending -> real Session
     /// rekeys because `management_id` is immutable while `session_id` is the
     /// manager-owned current identity.
-    pub(crate) fn resolve_browser_capability_source(
+    pub(crate) fn resolve_session_process_source(
         &self,
         management_id: &str,
         generation: u64,
-    ) -> Option<BrowserCapabilitySource> {
+    ) -> Option<SessionProcessSource> {
         self.sidecars
             .iter()
             .find(|(session_id, sidecar)| {
                 sidecar.management_id == management_id
                     && self.sidecar_generations.get(*session_id).copied() == Some(generation)
             })
-            .map(|(_, sidecar)| BrowserCapabilitySource {
+            .map(|(_, sidecar)| SessionProcessSource {
                 product_session_id: sidecar.session_id.clone(),
                 workspace_path: std::fs::canonicalize(&sidecar.workspace_path)
                     .unwrap_or_else(|_| sidecar.workspace_path.clone()),
@@ -395,6 +394,14 @@ impl SidecarManager {
                     matches!(owner, SidecarOwner::Tab(_) | SidecarOwner::Companion(_))
                 }),
             })
+    }
+
+    pub(crate) fn resolve_browser_capability_source(
+        &self,
+        management_id: &str,
+        generation: u64,
+    ) -> Option<SessionProcessSource> {
+        self.resolve_session_process_source(management_id, generation)
     }
 
     /// Validate a future Runtime identity for Browser capability projection.
@@ -2343,7 +2350,7 @@ mod completion_claim_tests {
     }
 
     #[test]
-    fn browser_capability_source_is_manager_owned_and_follows_rekey() {
+    fn session_process_source_is_manager_owned_and_follows_rekey() {
         let mut manager = SidecarManager::new();
         manager.insert_test_ready_frontend_sidecar(
             "pending-tab-a",
@@ -2362,7 +2369,7 @@ mod completion_claim_tests {
 
         assert_eq!(
             manager
-                .resolve_browser_capability_source(&management_id, generation)
+                .resolve_session_process_source(&management_id, generation)
                 .expect("pending binding")
                 .product_session_id,
             "pending-tab-a",
@@ -2370,16 +2377,16 @@ mod completion_claim_tests {
         assert!(manager.upgrade_session_id_for_tab("pending-tab-a", "session-real", "tab-a",));
         assert_eq!(
             manager
-                .resolve_browser_capability_source(&management_id, generation)
+                .resolve_session_process_source(&management_id, generation)
                 .expect("rekeyed binding")
                 .product_session_id,
             "session-real",
         );
         assert!(manager
-            .resolve_browser_capability_source(&management_id, generation + 1)
+            .resolve_session_process_source(&management_id, generation + 1)
             .is_none());
         assert!(manager
-            .resolve_browser_capability_source("another-process", generation)
+            .resolve_session_process_source("another-process", generation)
             .is_none());
     }
 

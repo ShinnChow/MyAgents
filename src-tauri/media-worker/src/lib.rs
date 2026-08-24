@@ -5,6 +5,7 @@
 //! exact worker generation owns all model execution state while the App keeps
 //! durable job and publication authority.
 
+pub mod attachment_audio;
 pub mod diarization;
 pub mod model_pack_source;
 pub mod native_adapter;

@@ -178,6 +178,7 @@ const COMMON_ADMIN_PREFIXES = [
   'readme/',
   'runtime/',
   'skill/',
+  'speech/',
   'space/',
   'task/',
   'thought/',

@@ -1,3 +1,4 @@
+use myagents_media_worker::attachment_audio::{AttachmentAudioDecoder, AttachmentAudioError};
 use myagents_media_worker::diarization::{
     BoundedDiarizationConfig, DiarizationError, LocalSpeakerObservation, WindowObservation,
     WindowSpec, consolidate_diarization,
@@ -91,6 +92,9 @@ fn run_started(
         }
         (WorkloadKind::RecordDiarization, WorkloadInput::RecordArtifacts { inputs }) => {
             run_record_diarization(&start.identity, &inputs[0], &adapter, &models, writer)
+        }
+        (WorkloadKind::AttachmentAsr, WorkloadInput::Attachment { input_path }) => {
+            run_attachment_asr(&start.identity, input_path, &adapter, &models, writer)
         }
         _ => Err("SPEECH_WORKLOAD_NOT_READY"),
     }
@@ -445,6 +449,127 @@ fn run_record_backfill(
     )
 }
 
+fn run_attachment_asr(
+    identity: &WorkloadIdentity,
+    input_path: &str,
+    adapter: &LoadedNativeAdapter,
+    models: &myagents_media_worker::model_pack_source::VerifiedModelPack,
+    writer: &mut BufWriter<StdoutLock<'_>>,
+) -> Result<(), &'static str> {
+    let started_at = Instant::now();
+    let controls = start_batch_control_reader()?;
+    let mut decoder =
+        AttachmentAudioDecoder::open(Path::new(input_path)).map_err(map_attachment_decode_error)?;
+    let info = decoder.info();
+    let mut asr = adapter
+        .create_asr(models)
+        .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+    let mut vad = adapter
+        .create_vad(models)
+        .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+    let mut checkpoints = vec![PcmStreamCheckpoint {
+        track: TrackKind::Attachment,
+        last_ack_sequence: None,
+        analysis_sample: 0,
+    }];
+    write_response(
+        writer,
+        WorkerResponse::Ready {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+        },
+    )?;
+    write_response(
+        writer,
+        WorkerResponse::MediaProbed {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            media_kind: info.media_kind.into(),
+            codec: info.codec.into(),
+            duration_ms: info.duration_ms,
+            used_default_track: info.used_default_track,
+        },
+    )?;
+
+    let mut revision = 0_u64;
+    let mut emitted_segments = 0_u32;
+    let mut last_heartbeat_at = Instant::now();
+    while let Some(chunk) = decoder.read_chunk().map_err(map_attachment_decode_error)? {
+        if poll_batch_control(identity, &controls, &checkpoints, writer)? {
+            return Ok(());
+        }
+        if chunk.start_sample() != checkpoints[0].analysis_sample {
+            return Err("SPEECH_CORRUPT_MEDIA");
+        }
+        vad.accept(chunk.samples())
+            .map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+        checkpoints[0].analysis_sample = checkpoints[0]
+            .analysis_sample
+            .checked_add(chunk.samples().len() as u64)
+            .ok_or("SPEECH_RESOURCE_LIMIT")?;
+        emitted_segments = emitted_segments.saturating_add(drain_batch_vad(
+            &mut vad,
+            TrackKind::Attachment,
+            checkpoints[0].analysis_sample,
+            &mut asr,
+            identity,
+            &mut revision,
+            writer,
+        )?);
+        if last_heartbeat_at.elapsed() >= Duration::from_secs(2) {
+            last_heartbeat_at = Instant::now();
+            write_response(
+                writer,
+                WorkerResponse::Heartbeat {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    stage: WorkerStage::Transcribing,
+                    checkpoint: batch_checkpoint(&checkpoints),
+                },
+            )?;
+        }
+    }
+    if decoder.output_samples() != checkpoints[0].analysis_sample {
+        return Err("SPEECH_CORRUPT_MEDIA");
+    }
+    vad.flush().map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+    emitted_segments = emitted_segments.saturating_add(drain_batch_vad(
+        &mut vad,
+        TrackKind::Attachment,
+        checkpoints[0].analysis_sample,
+        &mut asr,
+        identity,
+        &mut revision,
+        writer,
+    )?);
+    if poll_batch_control(identity, &controls, &checkpoints, writer)? {
+        return Ok(());
+    }
+    write_response(
+        writer,
+        WorkerResponse::Heartbeat {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            stage: WorkerStage::Finalizing,
+            checkpoint: batch_checkpoint(&checkpoints),
+        },
+    )?;
+    write_response(
+        writer,
+        WorkerResponse::Completed {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            metrics: WorkerMetrics {
+                source_samples: checkpoints[0].analysis_sample,
+                segments: emitted_segments,
+                speakers: 0,
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+                peak_working_bytes: None,
+            },
+        },
+    )
+}
+
 enum BatchControl {
     Command(WorkerCommand),
     ProtocolError,
@@ -607,6 +732,22 @@ fn map_record_decode_error(error: RecordOpusError) -> &'static str {
         }
         RecordOpusError::CorruptContainer | RecordOpusError::DecodeFailed => "SPEECH_CORRUPT_MEDIA",
         RecordOpusError::UnsupportedStream => "SPEECH_UNSUPPORTED_CODEC",
+    }
+}
+
+fn map_attachment_decode_error(error: AttachmentAudioError) -> &'static str {
+    match error {
+        AttachmentAudioError::SourceUnavailable => "SPEECH_SOURCE_UNAVAILABLE",
+        AttachmentAudioError::UnsafeSource => "SPEECH_SOURCE_UNSAFE",
+        AttachmentAudioError::SourceTooLarge
+        | AttachmentAudioError::DurationExceeded
+        | AttachmentAudioError::ResourceLimit => "SPEECH_MEDIA_LIMIT_EXCEEDED",
+        AttachmentAudioError::UnsupportedContainer | AttachmentAudioError::UnsupportedCodec => {
+            "SPEECH_UNSUPPORTED_CODEC"
+        }
+        AttachmentAudioError::EncryptedMedia => "SPEECH_ENCRYPTED_MEDIA",
+        AttachmentAudioError::NoAudioTrack => "SPEECH_NO_AUDIO_TRACK",
+        AttachmentAudioError::CorruptMedia => "SPEECH_CORRUPT_MEDIA",
     }
 }
 
