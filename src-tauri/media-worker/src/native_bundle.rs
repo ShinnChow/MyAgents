@@ -5,8 +5,11 @@
 //! while its ONNX Runtime entry references (and re-hashes) the one shared
 //! App-owned file selected by `LocalInferenceRuntimeRegistry`.
 
+use crate::model_pack_source::VerifiedModelPack;
 use crate::native_adapter::{
-    ADAPTER_ABI_VERSION, NativeAdapterError, NativeApiV1, NativeBuildIdentity, validate_api,
+    ADAPTER_ABI_VERSION, AsrEngine, DiarizerEngine, NativeAdapterError, NativeApiV1,
+    NativeBuildIdentity, VadEngine, create_asr_engine, create_diarizer_engine, create_vad_engine,
+    validate_api,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -419,6 +422,37 @@ impl LoadedNativeAdapter {
 
     pub fn build_identity(&self) -> &NativeBuildIdentity {
         &self.build_identity
+    }
+
+    pub fn create_asr<'adapter>(
+        &'adapter self,
+        models: &VerifiedModelPack,
+    ) -> Result<AsrEngine<'adapter>, NativeBundleError> {
+        create_asr_engine(
+            self.api(),
+            &models.sense_voice_model,
+            &models.sense_voice_tokens,
+        )
+        .map_err(NativeBundleError::Adapter)
+    }
+
+    pub fn create_vad<'adapter>(
+        &'adapter self,
+        models: &VerifiedModelPack,
+    ) -> Result<VadEngine<'adapter>, NativeBundleError> {
+        create_vad_engine(self.api(), &models.silero_vad_model).map_err(NativeBundleError::Adapter)
+    }
+
+    pub fn create_diarizer<'adapter>(
+        &'adapter self,
+        models: &VerifiedModelPack,
+    ) -> Result<DiarizerEngine<'adapter>, NativeBundleError> {
+        create_diarizer_engine(
+            self.api(),
+            &models.pyannote_segmentation_model,
+            &models.speaker_embedding_model,
+        )
+        .map_err(NativeBundleError::Adapter)
     }
 
     pub fn api(&self) -> &NativeApiV1 {

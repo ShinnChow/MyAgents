@@ -6,8 +6,12 @@
 //! mirrors only the fixed MyAgents operations and validates the table prefix
 //! before a verified native bundle may call it.
 
-use std::ffi::{CStr, c_char, c_float};
+use crate::diarization::{LocalSegment, LocalSpeakerObservation, WindowObservation, WindowSpec};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString, c_char, c_float};
 use std::mem::size_of;
+use std::path::Path;
+use std::ptr::NonNull;
 
 pub const ADAPTER_ABI_VERSION: u32 = 1;
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -44,6 +48,8 @@ pub enum NativeAdapterError {
     InvalidBuildIdentity,
     Native(NativeStatus),
     UnknownStatus,
+    InvalidPath,
+    InvalidOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +322,502 @@ fn native_status(code: NativeStatusCode) -> Result<NativeStatus, NativeAdapterEr
     }
 }
 
+fn expect_status(code: NativeStatusCode, expected: NativeStatus) -> Result<(), NativeAdapterError> {
+    let status = native_status(code)?;
+    if status == expected {
+        Ok(())
+    } else {
+        Err(NativeAdapterError::Native(status))
+    }
+}
+
+fn path_c_string(path: &Path) -> Result<CString, NativeAdapterError> {
+    if !path.is_absolute() {
+        return Err(NativeAdapterError::InvalidPath);
+    }
+    let path = path.to_str().ok_or(NativeAdapterError::InvalidPath)?;
+    CString::new(path).map_err(|_| NativeAdapterError::InvalidPath)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct AsrTranscript {
+    pub text: String,
+    pub language: Option<String>,
+    pub emotion: Option<String>,
+    pub event: Option<String>,
+}
+
+impl std::fmt::Debug for AsrTranscript {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AsrTranscript")
+            .field("text", &"[REDACTED]")
+            .field("language", &self.language)
+            .field("emotion", &self.emotion.as_ref().map(|_| "[REDACTED]"))
+            .field("event", &self.event.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+pub struct AsrEngine<'adapter> {
+    api: &'adapter NativeApiV1,
+    handle: NonNull<NativeAsr>,
+}
+
+impl AsrEngine<'_> {
+    pub fn transcribe(&mut self, samples: &[f32]) -> Result<AsrTranscript, NativeAdapterError> {
+        if samples.is_empty() || samples.len() > MAX_ASR_SAMPLES as usize {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
+        let mut text = vec![0_u8; MAX_TEXT_BYTES as usize + 1];
+        let mut language = vec![0_u8; 128];
+        let mut emotion = vec![0_u8; 128];
+        let mut event = vec![0_u8; 128];
+        let mut output = NativeAsrResult {
+            struct_size: size_of::<NativeAsrResult>() as u32,
+            text: utf8_buffer(&mut text),
+            language: utf8_buffer(&mut language),
+            emotion: utf8_buffer(&mut emotion),
+            event: utf8_buffer(&mut event),
+        };
+        // SAFETY: The handle is owned by this engine, samples and every output
+        // buffer remain live for the call, and all lengths fit the ABI limits.
+        let code = unsafe {
+            self.api
+                .transcribe
+                .ok_or(NativeAdapterError::MissingFunction)?(
+                self.handle.as_ptr(),
+                samples.as_ptr(),
+                samples.len() as u32,
+                &mut output,
+            )
+        };
+        expect_status(code, NativeStatus::Ok)?;
+        Ok(AsrTranscript {
+            text: take_utf8(&text, output.text.length)?,
+            language: take_optional_utf8(&language, output.language.length)?,
+            emotion: take_optional_utf8(&emotion, output.emotion.length)?,
+            event: take_optional_utf8(&event, output.event.length)?,
+        })
+    }
+}
+
+impl Drop for AsrEngine<'_> {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.api.destroy_asr {
+            // SAFETY: This engine uniquely owns the live adapter handle.
+            unsafe { destroy(self.handle.as_ptr()) };
+        }
+    }
+}
+
+pub(crate) fn create_asr_engine<'adapter>(
+    api: &'adapter NativeApiV1,
+    model: &Path,
+    tokens: &Path,
+) -> Result<AsrEngine<'adapter>, NativeAdapterError> {
+    api.validate()?;
+    let model = path_c_string(model)?;
+    let tokens = path_c_string(tokens)?;
+    let config = NativeAsrConfig {
+        struct_size: size_of::<NativeAsrConfig>() as u32,
+        sense_voice_model: model.as_ptr(),
+        tokens: tokens.as_ptr(),
+        num_threads: 1,
+        use_itn: 1,
+    };
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: Config strings remain alive for the synchronous constructor and
+    // the output pointer is writable. The adapter owns any returned handle.
+    let code =
+        unsafe { api.create_asr.ok_or(NativeAdapterError::MissingFunction)?(&config, &mut handle) };
+    expect_status(code, NativeStatus::Ok)?;
+    let handle = NonNull::new(handle).ok_or(NativeAdapterError::InvalidOutput)?;
+    Ok(AsrEngine { api, handle })
+}
+
+#[derive(Clone, PartialEq)]
+pub struct VadSpeechSegment {
+    pub start_sample: u64,
+    pub samples: Vec<f32>,
+}
+
+impl std::fmt::Debug for VadSpeechSegment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VadSpeechSegment")
+            .field("start_sample", &self.start_sample)
+            .field("sample_count", &self.samples.len())
+            .finish()
+    }
+}
+
+pub struct VadEngine<'adapter> {
+    api: &'adapter NativeApiV1,
+    handle: NonNull<NativeVad>,
+}
+
+impl VadEngine<'_> {
+    pub fn accept(&mut self, samples: &[f32]) -> Result<(), NativeAdapterError> {
+        if samples.is_empty() || samples.len() > MAX_PCM_CHUNK_SAMPLES as usize {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
+        // SAFETY: The owned handle and bounded sample slice remain live.
+        let code = unsafe {
+            self.api
+                .vad_accept
+                .ok_or(NativeAdapterError::MissingFunction)?(
+                self.handle.as_ptr(),
+                samples.as_ptr(),
+                samples.len() as u32,
+            )
+        };
+        expect_status(code, NativeStatus::Ok)
+    }
+
+    pub fn flush(&mut self) -> Result<(), NativeAdapterError> {
+        // SAFETY: The owned handle is live and used only on this thread.
+        let code = unsafe {
+            self.api
+                .vad_flush
+                .ok_or(NativeAdapterError::MissingFunction)?(self.handle.as_ptr())
+        };
+        expect_status(code, NativeStatus::Ok)
+    }
+
+    pub fn reset(&mut self) -> Result<(), NativeAdapterError> {
+        // SAFETY: The owned handle is live and used only on this thread.
+        let code = unsafe {
+            self.api
+                .vad_reset
+                .ok_or(NativeAdapterError::MissingFunction)?(self.handle.as_ptr())
+        };
+        expect_status(code, NativeStatus::Ok)
+    }
+
+    pub fn pop(&mut self) -> Result<Option<VadSpeechSegment>, NativeAdapterError> {
+        let mut query = NativeVadSegment {
+            struct_size: size_of::<NativeVadSegment>() as u32,
+            start_sample: 0,
+            samples: std::ptr::null_mut(),
+            sample_capacity: 0,
+            sample_count: 0,
+        };
+        let pop = self
+            .api
+            .vad_pop
+            .ok_or(NativeAdapterError::MissingFunction)?;
+        // SAFETY: Query output is writable; a buffer-too-small query does not
+        // pop the native queue entry.
+        let query_code = unsafe { pop(self.handle.as_ptr(), &mut query) };
+        match native_status(query_code)? {
+            NativeStatus::Unavailable => return Ok(None),
+            NativeStatus::BufferTooSmall => {}
+            status => return Err(NativeAdapterError::Native(status)),
+        }
+        if query.sample_count == 0 || query.sample_count > MAX_ASR_SAMPLES {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
+        let mut samples = vec![0.0_f32; query.sample_count as usize];
+        let mut output = NativeVadSegment {
+            struct_size: size_of::<NativeVadSegment>() as u32,
+            start_sample: 0,
+            samples: samples.as_mut_ptr(),
+            sample_capacity: samples.len() as u32,
+            sample_count: 0,
+        };
+        // SAFETY: The exact-size output buffer remains live for the call.
+        let code = unsafe { pop(self.handle.as_ptr(), &mut output) };
+        expect_status(code, NativeStatus::Ok)?;
+        if output.sample_count != samples.len() as u32
+            || samples.iter().any(|sample| !sample.is_finite())
+        {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
+        Ok(Some(VadSpeechSegment {
+            start_sample: output.start_sample,
+            samples,
+        }))
+    }
+}
+
+impl Drop for VadEngine<'_> {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.api.destroy_vad {
+            // SAFETY: This engine uniquely owns the live adapter handle.
+            unsafe { destroy(self.handle.as_ptr()) };
+        }
+    }
+}
+
+pub(crate) fn create_vad_engine<'adapter>(
+    api: &'adapter NativeApiV1,
+    model: &Path,
+) -> Result<VadEngine<'adapter>, NativeAdapterError> {
+    api.validate()?;
+    let model = path_c_string(model)?;
+    let config = NativeVadConfig {
+        struct_size: size_of::<NativeVadConfig>() as u32,
+        silero_model: model.as_ptr(),
+        num_threads: 1,
+        threshold: 0.25,
+        min_silence_seconds: 0.5,
+        min_speech_seconds: 0.25,
+        max_speech_seconds: 30.0,
+    };
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: Config strings remain alive for the synchronous constructor.
+    let code =
+        unsafe { api.create_vad.ok_or(NativeAdapterError::MissingFunction)?(&config, &mut handle) };
+    expect_status(code, NativeStatus::Ok)?;
+    let handle = NonNull::new(handle).ok_or(NativeAdapterError::InvalidOutput)?;
+    Ok(VadEngine { api, handle })
+}
+
+pub struct DiarizerEngine<'adapter> {
+    api: &'adapter NativeApiV1,
+    handle: NonNull<NativeDiarizer>,
+}
+
+impl DiarizerEngine<'_> {
+    pub fn diarize_window(
+        &mut self,
+        window: WindowSpec,
+        samples: &[f32],
+    ) -> Result<WindowObservation, NativeAdapterError> {
+        let expected_length = window
+            .end_sample
+            .checked_sub(window.start_sample)
+            .ok_or(NativeAdapterError::InvalidOutput)?;
+        if samples.is_empty()
+            || samples.len() > MAX_DIARIZATION_SAMPLES as usize
+            || expected_length != samples.len() as u64
+        {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
+        let mut result = std::ptr::null_mut();
+        // SAFETY: The owned handle and bounded samples remain live; result is
+        // initialized by the adapter and released by the guard below.
+        let code = unsafe {
+            self.api
+                .diarize_window
+                .ok_or(NativeAdapterError::MissingFunction)?(
+                self.handle.as_ptr(),
+                samples.as_ptr(),
+                samples.len() as u32,
+                &mut result,
+            )
+        };
+        expect_status(code, NativeStatus::Ok)?;
+        let result = NonNull::new(result).ok_or(NativeAdapterError::InvalidOutput)?;
+        let guard = NativeDiarizationGuard {
+            api: self.api,
+            handle: result,
+        };
+        copy_window_observation(self.api, guard.handle, window, samples.len())
+    }
+}
+
+impl Drop for DiarizerEngine<'_> {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.api.destroy_diarizer {
+            // SAFETY: This engine uniquely owns the live adapter handle.
+            unsafe { destroy(self.handle.as_ptr()) };
+        }
+    }
+}
+
+pub(crate) fn create_diarizer_engine<'adapter>(
+    api: &'adapter NativeApiV1,
+    segmentation_model: &Path,
+    embedding_model: &Path,
+) -> Result<DiarizerEngine<'adapter>, NativeAdapterError> {
+    api.validate()?;
+    let segmentation_model = path_c_string(segmentation_model)?;
+    let embedding_model = path_c_string(embedding_model)?;
+    let config = NativeDiarizerConfig {
+        struct_size: size_of::<NativeDiarizerConfig>() as u32,
+        segmentation_model: segmentation_model.as_ptr(),
+        embedding_model: embedding_model.as_ptr(),
+        num_threads: 1,
+        segmentation_window_shift_ratio: 1.0,
+        local_clustering_threshold: 0.50,
+        min_duration_on_seconds: 0.3,
+        min_duration_off_seconds: 0.5,
+    };
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: Config strings remain alive for the synchronous constructor.
+    let code = unsafe {
+        api.create_diarizer
+            .ok_or(NativeAdapterError::MissingFunction)?(&config, &mut handle)
+    };
+    expect_status(code, NativeStatus::Ok)?;
+    let handle = NonNull::new(handle).ok_or(NativeAdapterError::InvalidOutput)?;
+    Ok(DiarizerEngine { api, handle })
+}
+
+struct NativeDiarizationGuard<'adapter> {
+    api: &'adapter NativeApiV1,
+    handle: NonNull<NativeDiarizationResult>,
+}
+
+impl Drop for NativeDiarizationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.api.destroy_diarization_result {
+            // SAFETY: This guard uniquely owns the result handle.
+            unsafe { destroy(self.handle.as_ptr()) };
+        }
+    }
+}
+
+fn copy_window_observation(
+    api: &NativeApiV1,
+    result: NonNull<NativeDiarizationResult>,
+    window: WindowSpec,
+    sample_count: usize,
+) -> Result<WindowObservation, NativeAdapterError> {
+    let copy = api
+        .copy_diarization_result
+        .ok_or(NativeAdapterError::MissingFunction)?;
+    let mut query = empty_diarization_output();
+    // SAFETY: Query output is writable and the result guard keeps the native
+    // object alive for both calls.
+    let query_code = unsafe { copy(result.as_ptr(), &mut query) };
+    let query_status = native_status(query_code)?;
+    if query_status != NativeStatus::Ok && query_status != NativeStatus::BufferTooSmall {
+        return Err(NativeAdapterError::Native(query_status));
+    }
+    if query.speaker_count > MAX_LOCAL_SPEAKERS
+        || query.segment_count > MAX_LOCAL_SEGMENTS
+        || query.embedding_count
+            != query
+                .speaker_count
+                .checked_mul(EMBEDDING_DIMENSION)
+                .ok_or(NativeAdapterError::InvalidOutput)?
+    {
+        return Err(NativeAdapterError::InvalidOutput);
+    }
+    if query.speaker_count == 0 {
+        if query.segment_count != 0 || query.embedding_count != 0 {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
+        return Ok(WindowObservation {
+            window,
+            speakers: Vec::new(),
+        });
+    }
+    let mut speakers = vec![NativeLocalSpeaker { local_speaker: 0 }; query.speaker_count as usize];
+    let mut segments = vec![
+        NativeLocalSegment {
+            start_sample: 0,
+            end_sample: 0,
+            local_speaker: 0,
+        };
+        query.segment_count as usize
+    ];
+    let mut embeddings = vec![0.0_f32; query.embedding_count as usize];
+    let mut output = NativeDiarizationOutput {
+        struct_size: size_of::<NativeDiarizationOutput>() as u32,
+        speakers: speakers.as_mut_ptr(),
+        speaker_capacity: speakers.len() as u32,
+        speaker_count: 0,
+        segments: segments.as_mut_ptr(),
+        segment_capacity: segments.len() as u32,
+        segment_count: 0,
+        embeddings: embeddings.as_mut_ptr(),
+        embedding_capacity: embeddings.len() as u32,
+        embedding_count: 0,
+    };
+    // SAFETY: All output buffers have the exact capacities from the bounded
+    // query and remain live for the call.
+    let code = unsafe { copy(result.as_ptr(), &mut output) };
+    expect_status(code, NativeStatus::Ok)?;
+    if output.speaker_count != speakers.len() as u32
+        || output.segment_count != segments.len() as u32
+        || output.embedding_count != embeddings.len() as u32
+        || embeddings.iter().any(|value| !value.is_finite())
+    {
+        return Err(NativeAdapterError::InvalidOutput);
+    }
+    let unique = speakers
+        .iter()
+        .map(|speaker| speaker.local_speaker)
+        .collect::<BTreeSet<_>>();
+    if unique.len() != speakers.len() {
+        return Err(NativeAdapterError::InvalidOutput);
+    }
+    let mut grouped_segments = BTreeMap::<u32, Vec<LocalSegment>>::new();
+    for segment in segments {
+        if !unique.contains(&segment.local_speaker)
+            || segment.start_sample >= segment.end_sample
+            || segment.end_sample > sample_count as u64
+        {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
+        grouped_segments
+            .entry(segment.local_speaker)
+            .or_default()
+            .push(LocalSegment {
+                start_sample: segment.start_sample,
+                end_sample: segment.end_sample,
+            });
+    }
+    let speakers = speakers
+        .into_iter()
+        .enumerate()
+        .map(|(index, speaker)| {
+            let start = index * EMBEDDING_DIMENSION as usize;
+            let end = start + EMBEDDING_DIMENSION as usize;
+            LocalSpeakerObservation {
+                local_speaker: speaker.local_speaker,
+                embedding: embeddings[start..end].to_vec(),
+                segments: grouped_segments
+                    .remove(&speaker.local_speaker)
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    Ok(WindowObservation { window, speakers })
+}
+
+fn empty_diarization_output() -> NativeDiarizationOutput {
+    NativeDiarizationOutput {
+        struct_size: size_of::<NativeDiarizationOutput>() as u32,
+        speakers: std::ptr::null_mut(),
+        speaker_capacity: 0,
+        speaker_count: 0,
+        segments: std::ptr::null_mut(),
+        segment_capacity: 0,
+        segment_count: 0,
+        embeddings: std::ptr::null_mut(),
+        embedding_capacity: 0,
+        embedding_count: 0,
+    }
+}
+
+fn utf8_buffer(buffer: &mut [u8]) -> NativeUtf8Buffer {
+    NativeUtf8Buffer {
+        data: buffer.as_mut_ptr().cast(),
+        capacity: buffer.len() as u32,
+        length: 0,
+    }
+}
+
+fn take_utf8(buffer: &[u8], length: u32) -> Result<String, NativeAdapterError> {
+    let length = length as usize;
+    if length >= buffer.len() || buffer.get(length) != Some(&0) {
+        return Err(NativeAdapterError::InvalidOutput);
+    }
+    std::str::from_utf8(&buffer[..length])
+        .map(str::to_owned)
+        .map_err(|_| NativeAdapterError::InvalidOutput)
+}
+
+fn take_optional_utf8(buffer: &[u8], length: u32) -> Result<Option<String>, NativeAdapterError> {
+    let value = take_utf8(buffer, length)?;
+    Ok((!value.is_empty()).then_some(value))
+}
+
 /// Validate the fixed table prefix returned by
 /// `myagents_speech_adapter_get_api(1)`.
 ///
@@ -350,6 +852,7 @@ unsafe fn bounded_c_string(value: *const c_char) -> Result<String, NativeAdapter
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     static SHERPA_VERSION: &[u8] = b"1.13.6\0";
     static SHERPA_COMMIT: &[u8] = b"1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911\0";
@@ -433,6 +936,134 @@ mod tests {
     }
     unsafe extern "C" fn stub_destroy_diarization(_: *mut NativeDiarizationResult) {}
 
+    unsafe extern "C" fn create_fake_asr(
+        _: *const NativeAsrConfig,
+        out: *mut *mut NativeAsr,
+    ) -> NativeStatusCode {
+        // SAFETY: The wrapper passes a live output pointer.
+        unsafe { *out = NonNull::<NativeAsr>::dangling().as_ptr() };
+        NativeStatus::Ok as NativeStatusCode
+    }
+
+    unsafe extern "C" fn fake_transcribe(
+        _: *mut NativeAsr,
+        _: *const c_float,
+        _: u32,
+        out: *mut NativeAsrResult,
+    ) -> NativeStatusCode {
+        // SAFETY: The wrapper passes the exact ABI result and writable buffers.
+        let out = unsafe { &mut *out };
+        // SAFETY: Test bytes fit every wrapper-owned output buffer.
+        unsafe {
+            write_fake_utf8(&mut out.text, "测试转写".as_bytes());
+            write_fake_utf8(&mut out.language, b"zh");
+            write_fake_utf8(&mut out.emotion, b"");
+            write_fake_utf8(&mut out.event, b"speech");
+        }
+        NativeStatus::Ok as NativeStatusCode
+    }
+
+    unsafe fn write_fake_utf8(buffer: &mut NativeUtf8Buffer, value: &[u8]) {
+        assert!(buffer.capacity as usize > value.len());
+        // SAFETY: Assertion and wrapper-owned allocation establish both writes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), buffer.data.cast(), value.len());
+            *buffer.data.add(value.len()) = 0;
+        }
+        buffer.length = value.len() as u32;
+    }
+
+    unsafe extern "C" fn create_fake_vad(
+        _: *const NativeVadConfig,
+        out: *mut *mut NativeVad,
+    ) -> NativeStatusCode {
+        // SAFETY: The wrapper passes a live output pointer.
+        unsafe { *out = NonNull::<NativeVad>::dangling().as_ptr() };
+        NativeStatus::Ok as NativeStatusCode
+    }
+
+    static VAD_POP_STATE: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn fake_vad_pop(
+        _: *mut NativeVad,
+        out: *mut NativeVadSegment,
+    ) -> NativeStatusCode {
+        // SAFETY: The wrapper passes the exact ABI output struct.
+        let out = unsafe { &mut *out };
+        if VAD_POP_STATE.load(Ordering::SeqCst) != 0 {
+            out.sample_count = 0;
+            return NativeStatus::Unavailable as NativeStatusCode;
+        }
+        out.start_sample = 7;
+        out.sample_count = 3;
+        if out.samples.is_null() || out.sample_capacity < 3 {
+            return NativeStatus::BufferTooSmall as NativeStatusCode;
+        }
+        // SAFETY: The wrapper allocated the advertised three-float buffer.
+        unsafe { std::ptr::copy_nonoverlapping([0.1, 0.2, 0.3].as_ptr(), out.samples, 3) };
+        VAD_POP_STATE.store(1, Ordering::SeqCst);
+        NativeStatus::Ok as NativeStatusCode
+    }
+
+    unsafe extern "C" fn create_fake_diarizer(
+        _: *const NativeDiarizerConfig,
+        out: *mut *mut NativeDiarizer,
+    ) -> NativeStatusCode {
+        // SAFETY: The wrapper passes a live output pointer.
+        unsafe { *out = NonNull::<NativeDiarizer>::dangling().as_ptr() };
+        NativeStatus::Ok as NativeStatusCode
+    }
+
+    unsafe extern "C" fn fake_diarize_window(
+        _: *mut NativeDiarizer,
+        _: *const c_float,
+        _: u32,
+        out: *mut *mut NativeDiarizationResult,
+    ) -> NativeStatusCode {
+        // SAFETY: The wrapper passes a live output pointer.
+        unsafe { *out = NonNull::<NativeDiarizationResult>::dangling().as_ptr() };
+        NativeStatus::Ok as NativeStatusCode
+    }
+
+    unsafe extern "C" fn fake_copy_diarization(
+        _: *const NativeDiarizationResult,
+        out: *mut NativeDiarizationOutput,
+    ) -> NativeStatusCode {
+        // SAFETY: The wrapper passes the exact ABI output struct.
+        let out = unsafe { &mut *out };
+        out.speaker_count = 2;
+        out.segment_count = 2;
+        out.embedding_count = 2 * EMBEDDING_DIMENSION;
+        if out.speakers.is_null() || out.segments.is_null() || out.embeddings.is_null() {
+            return NativeStatus::BufferTooSmall as NativeStatusCode;
+        }
+        if out.speaker_capacity < 2
+            || out.segment_capacity < 2
+            || out.embedding_capacity < 2 * EMBEDDING_DIMENSION
+        {
+            return NativeStatus::BufferTooSmall as NativeStatusCode;
+        }
+        // SAFETY: Capacities are checked against each fixed write.
+        unsafe {
+            *out.speakers.add(0) = NativeLocalSpeaker { local_speaker: 3 };
+            *out.speakers.add(1) = NativeLocalSpeaker { local_speaker: 8 };
+            *out.segments.add(0) = NativeLocalSegment {
+                start_sample: 0,
+                end_sample: 4,
+                local_speaker: 3,
+            };
+            *out.segments.add(1) = NativeLocalSegment {
+                start_sample: 4,
+                end_sample: 10,
+                local_speaker: 8,
+            };
+            std::ptr::write_bytes(out.embeddings, 0, (2 * EMBEDDING_DIMENSION) as usize);
+            *out.embeddings.add(0) = 1.0;
+            *out.embeddings.add(EMBEDDING_DIMENSION as usize + 1) = 1.0;
+        }
+        NativeStatus::Ok as NativeStatusCode
+    }
+
     fn complete_api() -> NativeApiV1 {
         NativeApiV1 {
             struct_size: size_of::<NativeApiV1>() as u32,
@@ -491,5 +1122,58 @@ mod tests {
         assert_eq!(api.validate(), Err(NativeAdapterError::MissingFunction));
 
         assert_eq!(native_status(77), Err(NativeAdapterError::UnknownStatus));
+    }
+
+    #[test]
+    fn safe_wrappers_copy_and_validate_native_outputs() {
+        VAD_POP_STATE.store(0, Ordering::SeqCst);
+        let mut api = complete_api();
+        api.create_asr = Some(create_fake_asr);
+        api.transcribe = Some(fake_transcribe);
+        api.create_vad = Some(create_fake_vad);
+        api.vad_pop = Some(fake_vad_pop);
+        api.create_diarizer = Some(create_fake_diarizer);
+        api.diarize_window = Some(fake_diarize_window);
+        api.copy_diarization_result = Some(fake_copy_diarization);
+        let root = tempfile::tempdir().unwrap();
+
+        let mut asr = create_asr_engine(
+            &api,
+            &root.path().join("sensevoice.onnx"),
+            &root.path().join("tokens.txt"),
+        )
+        .unwrap();
+        let transcript = asr.transcribe(&[0.0; 160]).unwrap();
+        assert_eq!(transcript.text, "测试转写");
+        assert_eq!(transcript.language.as_deref(), Some("zh"));
+        assert!(!format!("{transcript:?}").contains("测试转写"));
+
+        let mut vad = create_vad_engine(&api, &root.path().join("vad.onnx")).unwrap();
+        vad.accept(&[0.0; 160]).unwrap();
+        let segment = vad.pop().unwrap().unwrap();
+        assert_eq!(segment.start_sample, 7);
+        assert_eq!(segment.samples, vec![0.1, 0.2, 0.3]);
+        assert_eq!(vad.pop().unwrap(), None);
+
+        let mut diarizer = create_diarizer_engine(
+            &api,
+            &root.path().join("segmentation.onnx"),
+            &root.path().join("embedding.onnx"),
+        )
+        .unwrap();
+        let observation = diarizer
+            .diarize_window(
+                WindowSpec {
+                    index: 2,
+                    start_sample: 20,
+                    end_sample: 30,
+                },
+                &[0.0; 10],
+            )
+            .unwrap();
+        assert_eq!(observation.speakers.len(), 2);
+        assert_eq!(observation.speakers[0].local_speaker, 3);
+        assert_eq!(observation.speakers[0].segments[0].end_sample, 4);
+        assert_eq!(observation.speakers[1].embedding[1], 1.0);
     }
 }
