@@ -52,6 +52,7 @@ npm-debug.log*
 # Tauri / Rust
 src-tauri/target/
 src-tauri/document-worker/target/
+src-tauri/media-worker/target/
 src-tauri/binaries/
 src-tauri/resources/server-dist.js
 src-tauri/resources/server-dist.js.map
