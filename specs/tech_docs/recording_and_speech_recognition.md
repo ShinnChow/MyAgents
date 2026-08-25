@@ -31,11 +31,14 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 算法、codec 和通用格式能力优先复用成熟依赖；本模块只保留 MyAgents-specific owner、授权、生命周期、固定内部 profile 和依赖无法表达的 hard limit。2026-08-25 的 live PCM 前审计形成以下约束：
 
 - archive 已用固定版本 `rubato 0.16.2` 替换手写线性重采样器。适配层只负责 interleaved/planar 转换、尾部 duration 对齐与 buffer hard limit；capture callback 不执行 DSP，live analysis 不再建立第二套重采样算法；
+- attachment container/codec probe 与解码固定使用 crates.io `symphonia =0.6.1` 及 Cargo.lock checksum，不再依赖同版本 Git release commit；features 仍只打开产品白名单需要的 AAC/ADPCM/AIFF/ALAC/FLAC/ISO-MP4/MP3/Ogg/PCM/Vorbis/WAV，不引入 FFmpeg 或第二个 decoder；
 - `ogg 0.9.2` 继续用于归档 mux/test，Opus 编解码继续使用 bundled libopus。media Worker 的 reader 只接受 MyAgents 自有单 logical stream、20 ms packet 固定 profile；之所以保留最小 parser，是因为通用 `PacketReader` 会在调用方取得 packet 前完成跨页重组，无法在分配前执行 4,000-byte packet 上限，也不暴露本文需要的连续 page sequence/fail-closed 契约；
 - diarization 的模型推理和单窗口能力属于 sherpa-onnx。自有代码只负责 8 小时输入所需的有界窗口、跨窗口 global identity、重叠裁决、确定性稀疏 fallback 与敏感 embedding 清理；不引入通用 clustering 框架或扩张为 ML toolkit；
 - transcript revisions 与 recording lifecycle 共享内部 `DurableRecordJournal`：统一 regular-file 检查、identity/schema、sequence/checksum、单行上限、durable append 和 torn-tail repair；领域模块只保留事件类型与投影。
 
 引入或保留底层 primitive 时，必须在 PRD 执行台账记录候选依赖、许可证/target、关键契约与可复现能力缺口；没有缺口就使用依赖，不保留双实现或 feature flag。
+
+2026-08-26 稳定版复核没有机械追新：Rubato `5.0.0` 要求 Rust `1.87`，而主 App 仍声明 `rust-version = 1.81`；其 5.0 修复的动态 ratio ramp 路径也不被上述固定 ratio adapter 使用。因此当前继续锁定 `0.16.2`，避免为不相关修复抬高整个 App MSRV并迁移两份 adapter。该结论不妨碍以后在项目统一提高 MSRV或确实需要动态 ratio 时重新评估。
 
 ## 版本化质量基准
 
