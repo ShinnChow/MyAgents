@@ -13,7 +13,7 @@ MyAgents 是基于 Tauri v2 的桌面 AI Agent 客户端，提供 Claude Agent S
 - 定时任务
 - MCP 工具集成
 - 多 Agent Runtime（Claude Code CLI / Codex CLI / Gemini CLI）
-- 任务中心（想法速记 + 任务编辑 + 调度 + 状态机审计）
+- 任务中心（任务编辑 + 调度 + 状态机审计）
 - 统一 Record（文字速记、桌面录音、本地转录与说话人纠错）
 
 ## 技术栈
@@ -269,13 +269,13 @@ Global control request
 | `/api/task/*` | Task Center 任务 CRUD、run/run-now/rerun、Trigger validate/test/check-now/reset-checkpoint 与 doc 读写 | CLI、`admin-api.ts` |
 | `/api/document/*`（4 条） | App-owned 本地文档 conversion job submit/status/cancel/list | `admin-api.ts` 的 AnyDoc 薄转发 |
 | `/api/speech/*`（4 条） | Session-scoped attachment transcription submit/status/cancel/list；caller scope 由 Sidecar process identity 注入 | `admin-api.ts` 的 Speech 薄转发 |
-| `/api/record/*` | 文字 Record 的 CLI create/list 兼容面 | CLI、`admin-api.ts` |
+| `/api/record/*` | 文字 Record 的 canonical CLI create/list | CLI、`admin-api.ts` |
 | `/api/mcp/remove-references` | Task 中删除 custom MCP identity 的持久引用 | `admin-api.ts` MCP remove cascade |
 | `/api/app/config-changed` | 将 disk-first AppConfig 失效信号广播到所有 WebView（空 payload，不携带 secret） | `admin-api.ts` model / MCP mutation |
 | `/api/runtime/sdk-child/{admit,settle}` | Rust-owned Claude SDK native child launch circuit；按 executable identity 限流 deterministic exec denial | Global / Session Sidecar 的 `createGuardedSdkQuery()` |
 | `/api/mcp/startup/*` | MyAgents-owned 本地 stdio MCP 的应用级启动准入；优先级、FIFO/aging、取消、过期与 stale settlement | Session Sidecar |
 | Management `/api/browser/*` | 「浏览器」Host capability、受管 Chromium resource resolution 与 Browser Identity checkpoint/CAS | Rust/Tauri；仅当前 Global/Session birth identity 可调用 |
-| `/api/thought/*`（2 条） | 想法 create / list | CLI、`admin-api.ts` |
+| `/api/thought/*`（2 条） | 已发布脚本的文字 Record create/list 兼容 facade | CLI、`admin-api.ts` |
 | `/api/im/*` + `/api/im-bridge/*` | IM Bot 唤醒 + 媒体下发 + Plugin Bridge 回调 | Node.js / 社区插件 Bridge |
 | `/api/plugin/*`（3 条） | OpenClaw 插件 CRUD | CLI |
 | `/api/agent/runtime-status`、`/api/agent/stop-channel(s)` | Agent 运行时状态查询；durable 删除/停用/归档后的精确或整组 Channel 生命周期收敛 | Node.js / 前端 |
@@ -376,7 +376,7 @@ Tab 内 MUST 用 `useTabState()` 的 `apiGet` / `apiPost`，禁止全局 `apiPos
 
 `GlobalSidebar` 挂在 `App` 的 Tab Workspace 之外，是应用级导航和资源投影，不是新的页面容器或 Session owner。顶部 Tab 仍是所有主内容页面的唯一 authority：active、关闭、恢复、拖拽、Sidecar owner token 与 pending-session birth 都继续由现有 Tab 状态机管理。
 
-App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Thought 只提交创建/讨论意图，不各自挂第二个 modal；普通 Task 详情选择属于 Task Center 内部状态，`task.comment` typed route 则由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
+App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Record 只提交创建/讨论意图，不各自挂第二个 modal；普通 Task 详情选择属于 Task Center 内部状态，`task.comment` typed route 则由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
 
 Record detail 也是普通顶部 Tab，但不是 Chat Tab：同一 `recordId` 只打开一个实例，持久 Tab snapshot 只保存 `{ id, view:'record', recordId, title }`。恢复时必须先经 `RecordStore.get` 验证；Record 已删除则保留同一 Tab identity 并退回统一 Record 列表。Record Tab 不创建 Session、Sidecar、owner token，也不持久化录音 snapshot、播放进度或活动电平。
 
@@ -419,7 +419,7 @@ MyAgents 产品级 append 由 `buildSystemPromptAppend()` 统一组装：
 | **L1** 基础身份 | 告诉 AI 运行在 MyAgents 产品中 | 始终 |
 | **L2** 交互方式 | 桌面客户端 / IM Bot / Agent Channel | 互斥选一 |
 | **L3** 场景与产品交互 | Task / IM 心跳 / Registered Agent / 浮球 / Widget / Session 协作                   | 按需叠加 |
-| **L4** CLI 能力发现 | Task / Goal / Thought / IM 媒体 / Vision / 用户注册工具 | 按场景与能力开关叠加 |
+| **L4** CLI 能力发现 | Task / Goal / Record / IM 媒体 / Vision / 用户注册工具 | 按场景与能力开关叠加 |
 
 当前 `InteractionScenario` 包含 desktop、im、agent-channel、cron 和 registeredAgent；
 精确字段、预设片段条件矩阵、四种 Runtime 的投送方式、Workspace 指令兼容和
@@ -791,7 +791,7 @@ installer.ts         — analyseTree → staging → 文件锁内复核/rename �
 - Task/Session identity protection 由 per-Session lifecycle guard 串行化：任何 durable mutation（含 legacy migration）只要让 Task 进入受保护状态或新增受保护 Session binding，都与 Session 删除遵循 `lifecycle → TaskStore` 锁序；scheduler active execution 覆盖 Session id 已 claim、Sidecar `Task` owner 尚未附着的窗口，birth guard 只保留到权威 Session metadata 出现（不持满整轮），shared-session joiner 不得提前 adopt。metadata creator 由该 reservation 决定，不绑定 Sidecar `isNew`；被删除的 fixed Session 换新 UUID，不复活旧 identity
 - 同一 Task 的 status、timer、execution claim 与 stop side effect 由 keyed Task-control lifecycle 串行化；stop 使用现有 `queueId` 精确停止当前 Turn。持久 `Running/Stopped` 只表达 scheduler intent，具体 Turn 以非持久 `running/stopping/stop_failed` 投影；stop 未确认时禁止 rerun。Attached Space Task 的终态不能 generic rerun，必须由新的 claim/reopen 创建新 Attached Task
 - Runtime terminal 先由 TaskStore 在一笔原子提交中结算 counter/time/`lastExecution`/连续失败/可选终态，再写 `cron_runs` 审计、通知和释放 Session owner；外围 cleanup 没有 Task 状态写权限。recurring 可重试失败第 5 次才 Blocked，成功清零；永久失败、一次性任务失败或 termination 未确认立即 Blocked，manual run-now 不改 durable status
-- AI 讨论路径：智能创建或 Thought「AI 讨论」→ 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`
+- AI 讨论路径：智能创建或 Record「AI 讨论」→ 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`
 - Record 列表统一展示 text/audio；文字 Record 可继续派发 Task，audio Record 打开单实例详情完成播放、笔记/Mark、手动补转录、说话人改名/合并/片段重分配与导出。Record 与 Task 生命周期保持独立，不把 transcription job 或录音状态塞进 Task row
 - Agent comment 的本地有界 locator index 由 TaskStore 从 `comments.jsonl` 异步重建并增量维护；App 级通知投影与 Cloud source 合并排序、source-aware 已读和 typed route，但不复制评论正文 authority
 - 状态变更广播 Tauri event `task:status-changed`（非 SSE），所有打开的任务中心 Tab 实时同步
@@ -1017,7 +1017,7 @@ Space 与其它 renderer CSS surface 一样直接继承 `<html>` 上当前 Theme
 | 浏览器打开 | `cmd_browser_create(tabId, url, x, y, width, height)` |
 | 浏览器关闭 / Tab 关闭 | `cmd_browser_close(tabId)` |
 | 任务立即执行 / 重新派发 | `TaskApplication::run*` / `cron run-now` → 直接触发 Task execution use case；不创建 CronTask |
-| Task 软删除 | `TaskApplication::delete_ordinary` → `TaskStore` 写 `→ deleted` 伪状态 + 联动清理 thought |
+| Task 软删除 | `TaskApplication::delete_ordinary` → `TaskStore` 写 `→ deleted` 伪状态 + 联动清理来源 Record |
 | 应用退出 / 普通重启 | Rust `RunEvent::ExitRequested` 统一关闭资源创建入口，等待在途创建完成登记或释放，再通过现有进程树句柄停止 Sidecar / Plugin Bridge 并清理 IM、终端和浏览器；普通重启通过 `request_restart()` 进入同一路径 |
 
 **Owner 释放规则：** 当一个 Session 的所有 Owner 都释放后，Sidecar 才停止。

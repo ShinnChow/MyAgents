@@ -99,7 +99,7 @@ assembler。调用方传入：
 | L1 基础身份       | MyAgents 身份、当前 Runtime、全局目录、时间判断约束                            | 始终包含             |
 | L2 交互渠道       | 桌面，或具体 IM/Agent Channel 与私聊/群聊信息                                  | 互斥选一             |
 | L3 场景与产品交互 | Task、Heartbeat、Registered Agent、浮球、Widget、Session 协作                  | 按条件叠加           |
-| L4 CLI 能力发现   | Task、Goal、Thought、IM 媒体、Vision、用户注册工具                             | 按场景与能力开关叠加 |
+| L4 CLI 能力发现   | Task、Goal、Record、IM 媒体、Vision、用户注册工具                              | 按场景与能力开关叠加 |
 
 ### 当前预设片段矩阵
 
@@ -119,12 +119,12 @@ assembler。调用方传入：
 | `myagents-cli-goal`                      | Goal Mode 只在用户明确要求时创建                        | `desktop`，以及私聊 `im` / `agent-channel`         |
 | `myagents-cli-task-exit`                 | 目标完成时用 CLI 提前结束 Task                          | `cron && aiCanExit`                                |
 | `myagents-cli-im-media`                  | 向当前聊天发送文件、图片、PDF 等                        | `im`、`agent-channel`                              |
-| `myagents-cli-thought`                   | 仅在用户明确要求“记一下”时写 Thought                    | `desktop`、`im`、`agent-channel`                   |
+| `myagents-cli-record`                    | 仅在用户明确要求“记一下”时创建文字 Record               | `desktop`、`im`、`agent-channel`                   |
 | `myagents-cli-vision`                    | 当前模型不能读图时调用图片理解 helper                   | Session 启用 image-understanding 官方工具          |
 | `myagents-user-tools`                    | 用户注册 CLI 工具的名称、description 与发现方法         | 实验开关开启且注册表存在 enabled 工具              |
 
 `cron` 与 `registeredAgent` 使用 desktop-style shell I/O 的 channel block，但不因此成为
-桌面交互场景；它们不会获得 Widget、Thought 或 Goal 的桌面能力提示。
+桌面交互场景；它们不会获得 Widget、Record 或 Goal 的桌面能力提示。
 
 ### 渐进披露与工具边界
 
@@ -244,7 +244,7 @@ payload，而 UI 只展示 envelope 后的 visible tail 或 badge。它适合 Tu
 Plugin 或工具的数据仍需结构化标记、转义并声明为 untrusted context，不能因为被隐藏就
 当成系统指令。
 
-Task 智能讨论采用“薄动态 reminder + product-owned Skill”分工：`TASK_DISCUSSION` 只携带 discussion/workspace/可选 Thought identity 和原始 visible tail，`InitialMessage.requiredSystemSkill` 要求 app-owned `myagents-task-alignment` exact source/hash/inventory revision。澄清方法、完整 `task.md` 写作和确认协议留在 Skill；Task 参数事实由 `myagents-task-automation` 与 CLI leaf help 按需披露。不得在 App handler 再复制问卷、参数矩阵或四文档模板，也不得仅靠 slash 文本猜 Skill 已加载。
+Task 智能讨论采用“薄动态 reminder + product-owned Skill”分工：`TASK_DISCUSSION` 只携带 discussion/workspace/可选 Record identity 和原始 visible tail，`InitialMessage.requiredSystemSkill` 要求 app-owned `myagents-task-alignment` exact source/hash/inventory revision。澄清方法、完整 `task.md` 写作和确认协议留在 Skill；Task 参数事实由 `myagents-task-automation` 与 CLI leaf help 按需披露。不得在 App handler 再复制问卷、参数矩阵或四文档模板，也不得仅靠 slash 文本猜 Skill 已加载。
 
 ## 其它独立 Prompt
 

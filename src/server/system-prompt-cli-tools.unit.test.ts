@@ -57,7 +57,9 @@ instructions.
     expect(text).toContain('myagents task readme');
     expect(text).not.toContain('<myagents-cli-cron>');
     expect(text).toContain('<myagents-cli-goal>');
-    expect(text).toContain('<myagents-cli-thought>');
+    expect(text).toContain('<myagents-cli-record>');
+    expect(text).toContain('myagents record create');
+    expect(text).not.toContain('myagents thought create');
     expect(text).toContain('myagents goal --help');
     expect(text).toContain('goal-objective.txt');
     expect(text).toContain('system\ntemp files are both accepted');

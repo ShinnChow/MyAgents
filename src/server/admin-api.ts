@@ -2662,7 +2662,7 @@ This experimental feature is currently disabled.
 
 Enable it from Settings → About & Feedback → Lab → CLI tool registry before
 using 'myagents tool ...'. The stable built-in myagents CLI commands
-(cron, thought, im, widget, task, runtime, etc.) remain available.`;
+(cron, record, im, widget, task, runtime, etc.) remain available.`;
 
 function taskLeafHelp(input: {
   usage: string;
@@ -4216,12 +4216,19 @@ Commands:
 Use 'myagents im channels' to discover bot ids for --notificationBotChannelId
 on 'myagents task create-direct / update'.`,
 
-  thought: `myagents thought — Inbox capture for the user's second brain
-(run 'myagents thought readme' for long-form docs)
+  record: `myagents record — Manage unified text and audio Records
 
 Commands:
-  list                  List thoughts (filter via --tag / --query / --limit)
-  create <content>      Capture a new thought (also: --content / --content-file)`,
+  list                  List Records (--kind text|audio / --tag / --query / --limit)
+  create <content>      Capture a text Record (also: --content / --content-file)
+
+New workflows use this command. Creating audio Records and starting microphone
+recording remain desktop product actions.`,
+
+  thought: `myagents thought — Legacy compatibility alias for text Records
+
+Published scripts may continue to use list/create. New Agent workflows use
+'myagents record'; this alias does not read the legacy Thought directory.`,
 
   widget: `myagents widget — Generative UI widget design guidelines
 (run 'myagents widget readme' for the full design system + modules)
@@ -6458,32 +6465,29 @@ EXAMPLES
 
 The output begins with the required <generative-ui-widget> output format contract; do not skip reading it.`;
 
-const README_THOUGHT = `myagents thought — Inbox capture for the user's second brain
+const README_THOUGHT = `myagents thought — Legacy compatibility alias for text Records
 
-WHAT
-  Lightweight, unstructured idea / TODO entries the user surfaces
-  mid-conversation. The full guidance lives in your system prompt's
-  <myagents-cli-thought> section — that brief is sufficient. There is no
-  expanded readme here (this command is intentionally minimal).
+COMPATIBILITY
+  This published alias maps list/create to the canonical RecordStore and keeps
+  the legacy JSON shape. New Agent workflows must use 'myagents record'.
 
 COMMANDS
   list [--tag X] [--limit N] [--json]
-      Browse / search the inbox. Use BEFORE create to spot duplicates.
+      Browse text Records through the compatibility projection.
 
   create '<content>'              # primary form, single-quoted on Linux/macOS
-  create --content "<content>"    # explicit flag, works in any shell
+  create --content '<content>'    # explicit flag; keep content single-quoted
   create --content-file <path>    # read content from file (recommended for
                                     multi-line, CJK, or content with shell-
                                     special chars; bypasses any shell quoting
                                     quirk on Windows / pwsh)
 
   Tag inline with #xxx inside the content body — there is no separate
-  --tag flag on create. Run \`myagents thought list\` to browse.
+  --tag flag on create.
 
-WHEN TO CALL
-  Only when the user explicitly asks to record / save / note specific
-  content for later ("记一下", "帮我记", "记下来", "remember this", etc.).
-  Do not file FYI remarks, brainstorming, or unsolicited ideas.`;
+RECOVERY
+  Run 'myagents record --help' and replace this alias in new commands. This
+  compatibility surface cannot create audio Records.`;
 
 async function spaceManagementResponse(
   path: string,

@@ -12,7 +12,7 @@ metadata:
 
 # MyAgents Task Alignment
 
-你正在承接 MyAgents 发起的任务讨论。目标不是把每个想法都变成 Task，而是先把用户真正想完成的事情聊清楚，再选择最合适的承载方式。
+你正在承接 MyAgents 发起的任务讨论。目标不是把每条 Record 都变成 Task，而是先把用户真正想完成的事情聊清楚，再选择最合适的承载方式。
 
 ## 先读取产品能力
 
@@ -25,7 +25,7 @@ metadata:
 - `candidatesDir`
 - `workspaceId`
 - `workspacePath`
-- 可选的 `sourceThoughtId` 与标签
+- 可选的 `sourceRecordId` 与标签
 
 这些值来自应用，不要要求用户重填，也不要自行猜测或改写。若隐藏上下文缺失或路径无效，说明当前讨论无法安全创建 Task；仍可继续普通讨论，但不要调用 Task 创建命令。
 
@@ -91,7 +91,7 @@ myagents task create-direct --name "<name>" \
   <其余已确认参数> --json
 ```
 
-若有 `sourceThoughtId`，传入对应来源参数；不要创建第二份 Task 文档。解析 JSON 中的权威 `taskId`，回读确认。只有提案明确包含“立即派发/启用”，且用户一并确认时，才继续 `myagents task run <taskId> --json`；否则保持创建后的默认状态。
+若有 `sourceRecordId`，传入 `--sourceRecordId`；不要创建第二份 Task 文档。解析 JSON 中的权威 `taskId`，回读确认。只有提案明确包含“立即派发/启用”，且用户一并确认时，才继续 `myagents task run <taskId> --json`；否则保持创建后的默认状态。
 
 完成后简洁报告 Task 名称、ID、实际模式、下一次执行信息（如有）和 Task Center 入口。创建失败时保留候选稿，说明可重试的具体错误，不伪造成功结果。
 

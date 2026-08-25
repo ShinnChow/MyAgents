@@ -116,6 +116,8 @@ Global flags:
   --disable-nonessential  禁用非必要校验
 ```
 
+Agent-facing system prompt、Required Skills 与 help 只推荐 canonical `myagents record` / `sourceRecordId`。`myagents thought`、`/api/admin/thought/*` 与持久层 `sourceThoughtId` 仅在已发布脚本、旧 JSON shape 和升级读取边界保留；兼容面薄映射到 Record owner，不能重新成为产品主入口或第二份 Store。
+
 `mcp add` 是 create-only 操作：自定义 MCP ID 已存在时明确失败并保持原定义不变；需要替换时先检查并显式 `mcp remove`，避免省略的 `args/env/description` 被一次不完整 add 静默清空。
 
 ### 请求-响应模式

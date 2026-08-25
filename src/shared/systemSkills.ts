@@ -1,5 +1,5 @@
 /** Version shared with Rust's SYSTEM_SKILLS_VERSION contract. */
-export const SYSTEM_SKILLS_VERSION = '54';
+export const SYSTEM_SKILLS_VERSION = '55';
 
 /**
  * Canonical Skill names that are part of MyAgents' always-available runtime
@@ -41,7 +41,7 @@ export const TASK_ALIGNMENT_SKILL_REQUIREMENT: ProductSystemSkillRequirement = {
   name: 'myagents-task-alignment',
   sourceLocalId: 'myagents-task-alignment',
   systemSkillsVersion: SYSTEM_SKILLS_VERSION,
-  contentSha256: 'f75b651bb595404c3ec0274822d901a44b8bd47435f208822b6e2a2daa747b3a',
+  contentSha256: 'cbc98fc9150037d87dcf9ee33a7a6613b995de5d76ef5d62710f4180cfa554cf',
 };
 
 export type SystemSkillAdmissionRequirement =

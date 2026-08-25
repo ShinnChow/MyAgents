@@ -37,7 +37,7 @@ metadata:
 | Provider、Model、订阅、Runtime、权限模式、代理、Codex/Claude Code/Gemini | `references/models-providers-runtimes.md` |
 | MCP、Skills、官方/自定义 CLI 工具、Claude Plugin、OpenClaw Plugin、读图与 Widget | `references/tools-skills-plugins.md` |
 | 自定义 Agent、IM Channel、Telegram/钉钉/飞书/微信、heartbeat、长期记忆、小助理与悬浮窗 | `references/agents-channels.md` |
-| Thought、Task、定时/Cron、Goal Mode、状态与执行关系 | `references/automation.md` |
+| Record、Task、定时/Cron、Goal Mode、状态与执行关系 | `references/automation.md` |
 | Team Space、Space Goal、Issue、Registered Agent、Delivery、共享 Skill | `references/cloud-space.md` |
 | 实验室门控、生效时机、本地数据、安全、语言、更新与功能可用性 | `references/settings-safety.md` |
 
@@ -47,7 +47,7 @@ metadata:
 |---|---|
 | Workspace / Agent / Session / Tab | Workspace 是工作内容所在目录；Agent 是围绕工作区配置的 AI；Session 是持续的对话与执行身份；Tab 是桌面上承载 Session 的视图 |
 | Provider / Model / Runtime | Provider 提供模型与认证；Model 是具体模型；Runtime 是实际驱动 Agent 回合的执行引擎 |
-| Thought / Task / Cron / Goal | Thought 收集未成熟想法；Task 承载可追踪工作；Cron 是定时 Task 的兼容操作面；Goal 让当前 Session 围绕一个目标持续推进 |
+| Record / Task / Cron / Goal | Record 保存文字或音频记录；Task 承载可追踪工作；Cron 是定时 Task 的兼容操作面；Goal 让当前 Session 围绕一个目标持续推进 |
 | MCP / Skill / Plugin / CLI Tool | MCP 接入可调用工具；Skill 教 Agent 怎样完成流程；Plugin 扩展成组能力；CLI Tool 是可执行命令能力 |
 | Session Goal / Space Goal | Session Goal 是本地当前会话的持续执行模式；Space Goal 是团队空间内组织 Issue 的层级，两者不是同一资源 |
 

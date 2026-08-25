@@ -7,7 +7,7 @@ MyAgents 是开源、桌面端、本地优先的个人 Agent 工作台。它把�
 它主要解决三类问题：
 
 1. **让 AI 围绕真实工作持续工作**：每个 Agent 有工作区、文件、历史、工具和配置，不是一次性的空聊天。
-2. **把零散对话沉淀成可追踪工作**：Thought、Task、定时调度和 Goal Mode 分别承载不同成熟度与时间尺度的工作。
+2. **把零散信息沉淀成记录或可追踪工作**：Record、Task、定时调度和 Goal Mode 分别承载不同成熟度与时间尺度的内容。
 3. **让用户决定模型与能力组合**：Provider、Runtime、MCP、Skills、Plugin、Channel 都可以按工作区和场景组合。
 
 ## 产品心智模型
@@ -19,7 +19,7 @@ Workspace（真实文件与项目背景）
       │   └─ Tab / 悬浮窗 / IM 等交互入口
       ├─ Provider + Model + Runtime（用谁、跑哪个模型、由什么引擎执行）
       ├─ MCP + Skills + Plugins + CLI Tools（能调用什么、知道怎样做）
-      └─ Thought / Task / Schedule / Goal（如何承载长期与自动化工作）
+      └─ Record / Task / Schedule / Goal（如何保存信息、承载长期与自动化工作）
 
 Cloud Space（可选的团队协作层）
   └─ Member / Goal / Issue / Registered Agent / Shared Skill
@@ -39,7 +39,7 @@ Cloud Space（可选的团队协作层）
 
 ### 任务中心
 
-把 Thought 对齐成 Task，安排一次性或周期执行，追踪状态、运行记录、文档和验收结果。适合不应只留在聊天历史里的工作。
+把 Record 对齐成 Task，安排一次性或周期执行，追踪状态、运行记录、文档和验收结果。适合不应只留在聊天历史里的工作。
 
 ### 设置
 
@@ -66,7 +66,7 @@ Cloud Space（可选的团队协作层）
 | 用户目标 | 优先能力 |
 |---|---|
 | 临时讨论、立即处理 | Chat Session |
-| 记下尚未成熟的念头 | Thought |
+| 保存文字想法、笔记或会议录音 | Record |
 | 有明确目标、需要状态和验收 | Task |
 | 到时间自动执行 | 带 schedule 的 Task；用户仍可使用 Cron 入口管理 |
 | 当前会话持续推进直到完成 | Goal Mode |

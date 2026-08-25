@@ -343,8 +343,8 @@ Commands:
   cron      Legacy-compatible scheduled Task aliases
   goal      Manage the current session Goal (get/create/update)
   task      Manage Task Center and scheduled automation tasks
-  thought   Manage Task Center thoughts (list/create)
-  record    Manage text and audio records (list/create)
+  record    Manage unified text and audio Records (list/create)
+  thought   Legacy compatibility alias for text Record list/create
   space     Discover Cloud Goals and manage Space Issues/attachments
   im        IM runtime actions for current chat (send-media)
   session   Discover, start, message, and observe Agent execution contexts
@@ -444,7 +444,6 @@ Examples:
   myagents space issue attachment add <issueId> --space <slug> --file report.pdf
   myagents space issue close <issueId> --space <slug>
   myagents space attachment download <attachmentId> --space <slug> --output myagents_files/space/file.bin
-  myagents thought list
   myagents record list
   myagents plugin list
   myagents cc-plugin list
@@ -2296,7 +2295,7 @@ function printTaskDetail(task: Record<string, unknown>): void {
     console.log('  Bot channel:    (not set — IM push disabled; set --notificationBotChannelId via `task update`)');
   }
 
-  // Sessions + source thought
+  // Sessions + source Record
   const sessionIds = Array.isArray(task.sessionIds) ? (task.sessionIds as string[]) : [];
   if (sessionIds.length > 0) {
     console.log(`\nSessions:         ${sessionIds.join(', ')} (${sessionIds.length} total)`);
@@ -5507,6 +5506,10 @@ export function buildRequestBody(
   // Canonical Record CLI plus the published Thought compatibility alias.
   if (group === 'record' || group === 'thought') {
     if (action === 'list') {
+      if (group === 'thought' && flags.kind !== undefined) {
+        console.error('Error: thought list does not support --kind. Use myagents record list --kind text|audio.');
+        process.exit(1);
+      }
       const kind = typeof flags.kind === 'string' ? flags.kind : undefined;
       if (group === 'record' && kind !== undefined && kind !== 'text' && kind !== 'audio') {
         console.error('Error: record list --kind must be text or audio.');
@@ -5521,7 +5524,7 @@ export function buildRequestBody(
       };
     }
     if (action === 'create') {
-      // Issue #149: on Windows the AI-emitted `myagents thought create '<text>'`
+      // Issue #149: on Windows the AI-emitted text-Record create command
       // sometimes loses the positional argument (root cause not reproducible
       // from macOS — likely a shell-quoting interaction in
       // git-bash → cmd.exe → node argv). The result was a silent
@@ -5539,7 +5542,7 @@ export function buildRequestBody(
         try {
           // Lazy-require keeps the cold path short for other commands.
           const fs = require('fs') as typeof import('fs');
-          const MAX_BYTES = 1024 * 1024; // 1 MB — pathological for a thought
+          const MAX_BYTES = 1024 * 1024; // 1 MB — pathological for a text Record
           const stat = fs.statSync(flags.contentFile);
           if (stat.size > MAX_BYTES) {
             console.error(`Error: --content-file "${flags.contentFile}" is ${stat.size} bytes, exceeds ${MAX_BYTES} (1 MB) limit`);

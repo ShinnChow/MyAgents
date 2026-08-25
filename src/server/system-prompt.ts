@@ -133,7 +133,7 @@ export interface SystemPromptOptions {
   cliToolsEnabled?: boolean;
   /**
    * Include user-registered CLI tools from ~/.myagents/tools/registry.json in
-   * the prompt. Separate from `cliToolsEnabled` because cron / thought / IM
+   * the prompt. Separate from `cliToolsEnabled` because Task / Record / IM
    * media are stable product CLI capabilities, while the user tool registry is
    * an experimental feature gate.
    */
@@ -207,7 +207,7 @@ export function buildSystemPromptAppend(scenario: InteractionScenario, options?:
   // L4: CLI-backed capability hints — universal across runtimes since v0.2.11
   // (both agent-session.ts and external-session.ts pass cliToolsEnabled: true;
   // see SystemPromptOptions.cliToolsEnabled doc above). Carries the static
-  // capability sections (cron / IM media / thought) plus the dynamic
+  // capability sections (Task / IM media / Record) plus the dynamic
   // user-registered CLI tools section (PRD 0.2.36).
   if (options?.cliToolsEnabled) {
     const cliTools = buildCliToolsAppend(scenario, {

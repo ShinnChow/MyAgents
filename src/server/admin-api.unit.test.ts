@@ -194,6 +194,18 @@ afterEach(() => {
 });
 
 describe('admin-api help registry', () => {
+  it('presents Record as canonical and Thought only as a compatibility alias', async () => {
+    const { handleHelp } = await import('./admin-api');
+    const record = String((handleHelp({ path: ['record'] }).data as { text?: string })?.text ?? '');
+    const thought = String((handleHelp({ path: ['thought'] }).data as { text?: string })?.text ?? '');
+
+    expect(record).toContain('Manage unified text and audio Records');
+    expect(record).toContain('--kind text|audio');
+    expect(record).toContain('New workflows use this command');
+    expect(thought).toContain('Legacy compatibility alias');
+    expect(thought).toContain("New Agent workflows use\n'myagents record'");
+  });
+
   it('provides exact multi-level AnyDoc help without a readme command', async () => {
     const { handleHelp } = await import('./admin-api');
     const group = String((handleHelp({ path: ['anydoc'] }).data as { text?: string })?.text ?? '');

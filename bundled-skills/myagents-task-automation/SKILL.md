@@ -1,7 +1,7 @@
 ---
 name: myagents-task-automation
 description: >-
-  让 Agent 建立 MyAgents Task 的完整产品心智模型，并创建、验证和治理需要持久追踪、独立 Session 或未来触发的工作：理解 Task 与立即执行/Thought/Goal 的边界，以及 once/scheduled/recurring、Session routing、结束条件和 command Detector。用户提到创建 Task、定时、稍后、周期检查、持续关注、满足条件才处理时使用；普通立即执行、仅记录 Thought 或明确要求 Goal Mode 的工作不使用。
+  让 Agent 建立 MyAgents Task 的完整产品心智模型，并创建、验证和治理需要持久追踪、独立 Session 或未来触发的工作：理解 Task 与立即执行/Record/Goal 的边界，以及 once/scheduled/recurring、Session routing、结束条件和 command Detector。用户提到创建 Task、定时、稍后、周期检查、持续关注、满足条件才处理时使用；普通立即执行、仅保存 Record 或明确要求 Goal Mode 的工作不使用。
 metadata:
   author: MyAgents
 ---
@@ -36,7 +36,7 @@ Task 解决四类问题：
 | 用户真正需要的是什么 | 正确承载 |
 |----------------------|----------|
 | 现在就在当前回合完成一件事 | 直接执行，不创建 Task |
-| 先记下一条尚未成熟的想法，暂时不执行 | Thought |
+| 先保存一条文字或音频记录，暂时不执行 | Record |
 | 一项已经明确、需要未来触发或持续追踪的工作 | Task |
 | 当前 Session 围绕同一目标连续多轮自主推进 | Goal Mode，不用循环 Task 模拟 |
 | App 完全退出后仍必须由 OS 常驻执行 | 不属于 MyAgents Task；不要伪装成已部署成功 |

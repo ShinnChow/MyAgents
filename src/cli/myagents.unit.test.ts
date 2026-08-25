@@ -1029,6 +1029,10 @@ describe('myagents CLI Space issue contracts', () => {
   });
 
   it('keeps canonical Record requests and legacy Thought aliases distinct', () => {
+    expect(TOP_HELP).toContain('record    Manage unified text and audio Records');
+    expect(TOP_HELP).toContain('thought   Legacy compatibility alias');
+    expect(TOP_HELP).toContain('myagents record list');
+    expect(TOP_HELP).not.toContain('  myagents thought list');
     expect(buildRoute('record', 'list', [])).toBe('record/list');
     expect(buildRoute('record', 'create', [])).toBe('record/create');
     expect(buildRequestBody('record', 'list', [], {
@@ -1049,7 +1053,6 @@ describe('myagents CLI Space issue contracts', () => {
     });
     expect(buildRoute('thought', 'list', [])).toBe('thought/list');
     expect(buildRequestBody('thought', 'list', [], {
-      kind: 'audio',
       archived: true,
     })).toEqual({
       kind: undefined,
@@ -1058,6 +1061,23 @@ describe('myagents CLI Space issue contracts', () => {
       limit: undefined,
       archived: 'archived',
     });
+  });
+
+  it('rejects canonical-only Record kind filters on the legacy Thought alias', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as typeof process.exit);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() => buildRequestBody('thought', 'list', [], { kind: 'audio' }))
+        .toThrow('process.exit(1)');
+      expect(error).toHaveBeenLastCalledWith(
+        'Error: thought list does not support --kind. Use myagents record list --kind text|audio.',
+      );
+    } finally {
+      exit.mockRestore();
+      error.mockRestore();
+    }
   });
 
   it('accepts the existing goalId alias and each single body source for update', () => {

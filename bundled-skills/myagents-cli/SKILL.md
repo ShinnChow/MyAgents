@@ -1,11 +1,11 @@
 ---
 name: myagents-cli
 description: >-
-  你正在 MyAgents 这款 AI 产品里运行——MyAgents 自带一套"产品能力"（定时任务、任务中心、想法收集、MCP 工具接入、
+  你正在 MyAgents 这款 AI 产品里运行——MyAgents 自带一套"产品能力"（定时任务、任务中心、记录收集、MCP 工具接入、
   模型 Provider、IM Bot 渠道、社区插件、Skills 安装、MyAgents Cloud Space、Generative UI Widget、Goal 目标模式等），全部通过内置 `myagents` CLI 暴露给你。
   当用户的需求**落在 MyAgents 产品能力的射程内**，就加载并使用这个 skill，用 CLI 主动帮用户把事情做掉，
   而不是让用户去 GUI 点击。
-  典型触发场景：用户说"每天 X 点帮我 Y / 等 X 发生后继续 / 持续盯着，命中才处理"（→ myagents-task-automation）、"记一下这个想法"（→ thought）、"派发成任务"（→ task）、
+  典型触发场景：用户说"每天 X 点帮我 Y / 等 X 发生后继续 / 持续盯着，命中才处理"（→ myagents-task-automation）、"记一下这个想法"（→ record）、"派发成任务"（→ task）、
   "接个 X 工具进来"（→ mcp）、"配 X 模型/Provider"（→ model）、"在飞书/钉钉/Telegram 里跟我聊"（→ agent channel）、
   "装个 X 插件 / 装个 X skill"（→ plugin / skill）、"处理 Space Issue / 下载附件 / 回复 Issue"（→ space）、
   "把图发到 IM 里"（→ im send-media）、"用已配置的读图模型理解图片"（→ vision analyze）、"持续执行直到目标完成"（→ goal）、
@@ -281,16 +281,17 @@ myagents goal update --status blocked                  # AI 判断无法继续�
 - 用户问"现在目标是什么/状态如何" → `goal get`
 - 不要用 `goal update` 表示用户取消；取消由 UI/宿主控制。
 
-### 任务中心（task / thought）
+### 记录与任务中心（record / task）
 
 用户要定时、未来唤醒、循环执行或满足条件才叫醒 AI 时，统一加载 `myagents-task-automation`。command Detector 的协议、fixture 和测试由该 Skill 按需路由到自己的 reference；这里仅保留 Task Center 的通用命令索引。
 
 ```bash
-myagents thought list [--tag X --query X --limit N]     # 列想法（用户先记下来、后续派发的轻量条目）
-myagents thought create '...'                           # 记一条想法（首选：单引号包裹防 shell 注入；
+myagents record list [--kind text|audio --tag X --query X --limit N]
+                                                        # 列统一记录；省略 --kind 时同时包含文字与音频
+myagents record create '...'                            # 记一条文字 Record（首选：单引号包裹防 shell 注入；
                                                         # 用 #xxx 内联打 tag —— 没有 --tag flag）
-myagents thought create --content "..."                 # 显式 flag 形态，跟单引号等价
-myagents thought create --content-file <abs-path>       # 内容含多行 / CJK / shell 元字符 /
+myagents record create --content '...'                  # 显式 flag 形态，同样使用单引号
+myagents record create --content-file <abs-path>        # 内容含多行 / CJK / shell 元字符 /
                                                         # Windows 下单引号失灵时的保底通道
 
 myagents task list [--status X --tag X --query X --limit N --includeDeleted]
@@ -299,7 +300,7 @@ myagents task get <taskId>                              # 详情 + statusHistory
 myagents task create-direct --name "..." \
     [--taskMdFile <path> | --taskMdContent "..."] \
     [--runtime X --providerId X --model X --permissionMode X --runtimeConfig <jsonStr> --mcpEnabledServers a,b] \
-    [--executor agent --executionMode once --runMode X --tags x,y --sourceThoughtId X]
+    [--executor agent --executionMode once --runMode X --tags x,y --sourceRecordId X]
                                                         # 从完整 task.md 物化普通任务（当前 workspace 可自动继承）
 myagents task comments <taskId> [--limit 50 --before <cursor>]
                                                         # 读取本地线性评论时间线
@@ -335,9 +336,11 @@ myagents task delete <taskId>                           # 不可恢复地移出�
 
 `task update <taskId>` 清覆盖用显式 flag：`--clearProviderOverride` / `--clearRuntimeOverride` / `--clearMcpOverride`。注意 `--mcpEnabledServers ""` 不是清回继承，而是显式无 MCP。
 
+`myagents thought list/create` 只为已发布脚本保留兼容，薄映射到文字 Record。新工作流一律使用 `myagents record`，不要主动生成 legacy 命令。
+
 **何时用：**
 - "看我还有啥没做完的" → `task list --status running` / `task list`
-- "这个想法派发出去" → 先将完整任务上下文写入 `task.md`，再用 `task create-direct --taskMdFile ...` 创建；是否立即 `task run` 取决于用户已确认的动作
+- "把这条记录派发出去" → 先将完整任务上下文写入 `task.md`，再用 `task create-direct --taskMdFile ... --sourceRecordId <id>` 创建；是否立即 `task run` 取决于用户已确认的动作
 - "创个 review PR 的任务用 codex" → `task create-direct ... --runtime codex --model gpt-5.2 --permissionMode full-auto`
 - "任务过程中我开了个新对话登记一下" → `task append-session <taskId> <sessionId>`
 - "把重要结果回复到本地任务" → 将正文写入文件，再用 `task comment <taskId> --body-file ...`；普通 assistant 输出不会自动复制到 Task
