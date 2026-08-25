@@ -145,7 +145,7 @@ function main() {
   } else {
     console.log(`[speech-models] wrote ${signaturePath}`);
     console.log(
-      `[speech-models] publish only manifest.json and manifest.json.sig to R2 path models/speech/sets/${lock.packRevision}/`,
+      `[speech-models] publish mirrored sources first, then manifest.json and manifest.json.sig to R2 path models/speech/sets/${lock.packRevision}/`,
     );
   }
 }

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "packId": "local-standard-speech",
+  "packRevision": "local-standard-speech-v2",
+  "sources": [
+    {
+      "id": "asset:sensevoice",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
+    },
+    {
+      "id": "asset:silero-vad",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.int8.onnx"
+    },
+    {
+      "id": "asset:pyannote-segmentation",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+    },
+    {
+      "id": "asset:3dspeaker-eres2net",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+    },
+    {
+      "id": "legal:funasr-model-license",
+      "url": "https://raw.githubusercontent.com/modelscope/FunASR/3c58cb56a56598232c3efffa15d313d7e82a4307/MODEL_LICENSE"
+    },
+    {
+      "id": "legal:silero-license",
+      "url": "https://raw.githubusercontent.com/snakers4/silero-vad/867c2aa692646a1f1de3e94a15c9dd9f614c0acb/LICENSE"
+    },
+    {
+      "id": "legal:3dspeaker-license",
+      "url": "https://raw.githubusercontent.com/modelscope/3D-Speaker/065629c313eaf1a01c65c640c46d77e61e9607b4/LICENSE"
+    }
+  ]
+}

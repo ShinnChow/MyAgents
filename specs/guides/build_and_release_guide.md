@@ -210,7 +210,7 @@ Runtime set 是按平台分片补发的：macOS 主机默认发布 `darwin-arm64
 
 ### publish_speech_model_set.sh
 
-**用途**：把当前 App/Worker 已编译锁定的标准语音模型清单签名并发布到 R2。它只发布 `manifest.json` 与 `manifest.json.sig`，不会下载、重新打包或镜像模型；模型和许可仍从 `src-tauri/media-worker/model-pack-source-lock.json` 中锁定的上游 HTTPS 地址下载。目录中的 `local-standard-speech-v1` 是 pack revision，JSON 内的 `schemaVersion: 1` 是 manifest schema，因此文件名不重复带 `-v1`。
+**用途**：把当前 App/Worker 已编译锁定的标准语音模型资源与签名清单发布到 R2。当前 `local-standard-speech-v2` 将四个模型 asset 和三个 remote legal source 放在 `models/speech/assets/sha256/<sha256>/<filename>` 的 content-addressed 第一方路径；manifest 目录仍只使用 pack revision，JSON 内的 `schemaVersion: 1` 是 manifest schema，因此文件名不重复带 `-v1` / `-v2`。
 
 本地可用 unsigned 模式验证输出路径与逐字节 identity，但该产物不能发布，也不会被 App 接受：
 
@@ -224,7 +224,7 @@ npm run package:speech-model-set -- --allow-unsigned
 npm run publish:speech-model-set -- -y
 ```
 
-发布脚本使用临时 staging 和两个显式 R2 immutable object，只补传远端缺失对象，绝不覆盖已存在对象。远端已有 manifest 必须与编译 source lock 逐字节一致，已有或新签名都必须通过 App updater 公钥验签；任何漂移都要求提升 `packRevision`。它不接受 revision、URL、asset 或 trust-root 覆盖，避免发布内容与客户端编译 lock 分叉。模型清单是独立资源发布动作，不应绑到每次桌面 App build；锁变化或首次启用新 revision 时必须先完成发布和真实安装 smoke。
+发布脚本把运行时 source lock 与 release-only `model-pack-mirror-origin-lock.json` 按 exact ID join，复用构建资源的 content-addressed cache 从锁定的上游 URL 下载并校验七个 source。它先只补传缺失的 immutable source，并逐个从公网完整回读比对；确认全部可用后才上传 `manifest.json` 与 `manifest.json.sig`。远端已有 source/manifest 必须与本地逐字节一致，已有或新签名都必须通过 App updater 公钥验签；任何漂移都要求提升 `packRevision`。脚本不接受 revision、URL、asset 或 trust-root 覆盖，避免发布内容与客户端编译 lock 分叉。模型资源发布是独立 release 动作，不应绑到每次桌面 App build；锁变化或首次启用新 revision 时必须先完成发布和真实安装 smoke。
 
 ### 可选「浏览器」Runtime 资源
 

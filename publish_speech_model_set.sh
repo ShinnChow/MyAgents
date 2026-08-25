@@ -1,13 +1,13 @@
 #!/bin/bash
-# Publish the immutable speech model source-lock manifest to Cloudflare R2.
-# Upstream model assets remain on their locked official URLs; MyAgents only
-# hosts the exact signed manifest consumed by SpeechModelPackManager.
+# Publish immutable speech model sources and the signed source-lock manifest to
+# Cloudflare R2. Content-addressed sources become public before the manifest.
 
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
 SOURCE_LOCK="${PROJECT_DIR}/src-tauri/media-worker/model-pack-source-lock.json"
+ORIGIN_LOCK="${PROJECT_DIR}/src-tauri/media-worker/model-pack-mirror-origin-lock.json"
 TAURI_CONFIG="${PROJECT_DIR}/src-tauri/tauri.conf.json"
 R2_BUCKET="myagents-releases"
 DOWNLOAD_BASE_URL="https://download.myagents.io"
@@ -16,13 +16,18 @@ YES=0
 PACKAGE_DIR=""
 RCLONE_CONFIG=""
 VERIFY_DIR=""
+MIRROR_PLAN=""
 
 usage() {
     cat <<'EOF'
 Usage: ./publish_speech_model_set.sh [options]
 
-Signs and uploads the exact compiled speech model source lock to:
+Mirrors the exact locked speech sources, then signs and uploads the compiled
+source lock to:
   https://download.myagents.io/models/speech/sets/<pack-revision>/
+
+Mirrored sources use immutable content-addressed paths under:
+  https://download.myagents.io/models/speech/assets/sha256/<sha256>/
 
 Options:
   -y, --yes                  Skip interactive confirmation.
@@ -82,6 +87,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 require_command node "Install the bundled development dependencies first."
+if [ ! -f "$SOURCE_LOCK" ] || [ ! -f "$ORIGIN_LOCK" ]; then
+    echo "Error: speech model source or mirror origin lock is unavailable" >&2
+    exit 1
+fi
 PACK_REVISION=$(node - "$SOURCE_LOCK" <<'NODE'
 const { readFileSync } = require('node:fs');
 const [lockPath] = process.argv.slice(2);
@@ -122,6 +131,7 @@ require_command minisign "macOS: brew install minisign."
 
 echo "Speech model revision: ${PACK_REVISION}"
 echo "Files:"
+echo "  7 content-addressed model/license sources"
 echo "  manifest.json"
 echo "  manifest.json.sig"
 echo "Target: ${PUBLIC_BASE_URL}/"
@@ -137,15 +147,12 @@ PACKAGE_DIR=$(mktemp -d)
 SET_DIR="${PACKAGE_DIR}/sets/${PACK_REVISION}"
 MANIFEST_PATH="${SET_DIR}/manifest.json"
 SIGNATURE_PATH="${MANIFEST_PATH}.sig"
-TAURI_SIGNING_PRIVATE_KEY="$TAURI_SIGNING_PRIVATE_KEY" \
-TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
-    node "${PROJECT_DIR}/scripts/package-speech-model-set.mjs" --out "$PACKAGE_DIR"
-if [ ! -f "$MANIFEST_PATH" ] || [ ! -s "$SIGNATURE_PATH" ]; then
-    echo "Error: signed speech model manifest output is incomplete" >&2
-    exit 1
-fi
-if ! cmp -s "$SOURCE_LOCK" "$MANIFEST_PATH"; then
-    echo "Error: packaged manifest bytes differ from the compiled source lock" >&2
+SOURCE_LOCK_SNAPSHOT="${PACKAGE_DIR}/source-lock.before-mirror.json"
+cp "$SOURCE_LOCK" "$SOURCE_LOCK_SNAPSHOT"
+node "${PROJECT_DIR}/scripts/prepare-speech-model-mirror.mjs" --out "$PACKAGE_DIR"
+MIRROR_PLAN="${PACKAGE_DIR}/mirror-plan.json"
+if [ ! -s "$MIRROR_PLAN" ]; then
+    echo "Error: speech model mirror plan is unavailable" >&2
     exit 1
 fi
 
@@ -178,11 +185,25 @@ writeFileSync(decodedPath, decodedSignature, { mode: 0o600 });
 NODE
 }
 
-decode_signature "$SIGNATURE_PATH" "${VERIFY_DIR}/local-manifest.minisig"
-if ! minisign -Vm "$MANIFEST_PATH" -x "${VERIFY_DIR}/local-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
-    echo "Error: manifest signature does not match the App updater public key" >&2
-    exit 1
-fi
+purge_urls() {
+    if [ "$#" -eq 0 ] || [ -z "${CF_ZONE_ID:-}" ] || [ -z "${CF_API_TOKEN:-}" ]; then
+        return
+    fi
+    local payload
+    payload=$(node - "$@" <<'NODE'
+const urls = process.argv.slice(2);
+process.stdout.write(JSON.stringify({ files: urls }));
+NODE
+)
+    local purge_response
+    purge_response=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$payload")
+    if ! echo "$purge_response" | grep -q '"success":true'; then
+        echo "Warning: Cloudflare purge did not report success" >&2
+    fi
+}
 
 REMOTE_MANIFEST_EXISTS=0
 REMOTE_SIGNATURE_EXISTS=0
@@ -210,30 +231,21 @@ for filename in manifest.json manifest.json.sig; do
     esac
 done
 
-if [ "$REMOTE_MANIFEST_EXISTS" -eq 1 ] && ! cmp -s "$MANIFEST_PATH" "${VERIFY_DIR}/remote-manifest.json"; then
+if [ "$REMOTE_MANIFEST_EXISTS" -eq 1 ] && ! cmp -s "$SOURCE_LOCK_SNAPSHOT" "${VERIFY_DIR}/remote-manifest.json"; then
     echo "Error: immutable remote manifest differs; publish a new packRevision" >&2
     exit 1
 fi
 if [ "$REMOTE_SIGNATURE_EXISTS" -eq 1 ]; then
     decode_signature "${VERIFY_DIR}/remote-manifest.json.sig" "${VERIFY_DIR}/remote-manifest.minisig"
-    if ! minisign -Vm "$MANIFEST_PATH" -x "${VERIFY_DIR}/remote-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
+    if ! minisign -Vm "$SOURCE_LOCK_SNAPSHOT" -x "${VERIFY_DIR}/remote-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
         echo "Error: immutable remote signature is invalid; publish a new packRevision" >&2
         exit 1
     fi
 fi
 
-if [ "$REMOTE_MANIFEST_EXISTS" -eq 0 ] || [ "$REMOTE_SIGNATURE_EXISTS" -eq 0 ]; then
-    if ! cmp -s "$SOURCE_LOCK" "$MANIFEST_PATH"; then
-        echo "Error: source lock changed while preparing publication" >&2
-        exit 1
-    fi
-    if ! minisign -Vm "$MANIFEST_PATH" -x "${VERIFY_DIR}/local-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
-        echo "Error: prepared signature changed before publication" >&2
-        exit 1
-    fi
-    RCLONE_CONFIG=$(mktemp)
-    chmod 600 "$RCLONE_CONFIG"
-    cat > "$RCLONE_CONFIG" <<EOF
+RCLONE_CONFIG=$(mktemp)
+chmod 600 "$RCLONE_CONFIG"
+cat > "$RCLONE_CONFIG" <<EOF
 [r2]
 type = s3
 provider = Cloudflare
@@ -242,26 +254,126 @@ secret_access_key = ${R2_SECRET_ACCESS_KEY}
 endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
 acl = private
 EOF
+RCLONE_ARGS=(--config="$RCLONE_CONFIG" --s3-no-check-bucket --progress --immutable)
 
-    RCLONE_ARGS=(--config="$RCLONE_CONFIG" --s3-no-check-bucket --progress --immutable)
-    if [ "$REMOTE_MANIFEST_EXISTS" -eq 0 ]; then
-        rclone "${RCLONE_ARGS[@]}" copyto "$MANIFEST_PATH" "${R2_TARGET}manifest.json"
+SOURCE_IDS=()
+SOURCE_URLS=()
+SOURCE_REMOTE_PATHS=()
+SOURCE_LOCAL_PATHS=()
+MISSING_SOURCE_INDEXES=()
+source_index=0
+while IFS=$'\t' read -r source_id public_url remote_path local_relative_path; do
+    local_path="${PACKAGE_DIR}/${local_relative_path}"
+    if [ ! -f "$local_path" ]; then
+        echo "Error: prepared speech model source is missing: ${source_id}" >&2
+        exit 1
     fi
-    if [ "$REMOTE_SIGNATURE_EXISTS" -eq 0 ]; then
-        rclone "${RCLONE_ARGS[@]}" copyto "$SIGNATURE_PATH" "${R2_TARGET}manifest.json.sig"
+    SOURCE_IDS+=("$source_id")
+    SOURCE_URLS+=("$public_url")
+    SOURCE_REMOTE_PATHS+=("$remote_path")
+    SOURCE_LOCAL_PATHS+=("$local_path")
+
+    if ! http_code=$(curl -sS -o /dev/null -w "%{http_code}" -I "$public_url"); then
+        echo "Error: cannot determine whether ${public_url} exists" >&2
+        exit 1
     fi
-else
-    echo "Immutable speech model revision is already published; no upload needed."
+    case "$http_code" in
+        200)
+            verify_path="${VERIFY_DIR}/source-${source_index}"
+            curl -fsSL "$public_url" -o "$verify_path"
+            if ! cmp -s "$local_path" "$verify_path"; then
+                echo "Error: immutable remote speech model source differs: ${source_id}" >&2
+                exit 1
+            fi
+            ;;
+        404)
+            MISSING_SOURCE_INDEXES+=("$source_index")
+            ;;
+        *)
+            echo "Error: cannot determine whether ${public_url} exists (HTTP ${http_code})" >&2
+            exit 1
+            ;;
+    esac
+    source_index=$((source_index + 1))
+done < <(node - "$MIRROR_PLAN" <<'NODE'
+const { readFileSync } = require('node:fs');
+const [planPath] = process.argv.slice(2);
+const plan = JSON.parse(readFileSync(planPath, 'utf8'));
+if (plan.schemaVersion !== 1 || !Array.isArray(plan.entries) || plan.entries.length !== 7) {
+  throw new Error(`Invalid speech mirror plan: ${planPath}`);
+}
+for (const entry of plan.entries) {
+  for (const value of [entry.id, entry.publicUrl, entry.remotePath, entry.localRelativePath]) {
+    if (typeof value !== 'string' || value.length === 0 || /[\t\r\n]/.test(value)) {
+      throw new Error(`Invalid speech mirror plan entry: ${entry.id}`);
+    }
+  }
+  process.stdout.write(`${entry.id}\t${entry.publicUrl}\t${entry.remotePath}\t${entry.localRelativePath}\n`);
+}
+NODE
+)
+
+if [ "${#SOURCE_IDS[@]}" -ne 7 ]; then
+    echo "Error: speech mirror plan did not produce exactly seven sources" >&2
+    exit 1
 fi
 
-if { [ "$REMOTE_MANIFEST_EXISTS" -eq 0 ] || [ "$REMOTE_SIGNATURE_EXISTS" -eq 0 ]; } && [ -n "${CF_ZONE_ID:-}" ] && [ -n "${CF_API_TOKEN:-}" ]; then
-    purge_response=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
-        -H "Authorization: Bearer ${CF_API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        -d "{\"files\":[\"${PUBLIC_BASE_URL}/manifest.json\",\"${PUBLIC_BASE_URL}/manifest.json.sig\"]}")
-    if ! echo "$purge_response" | grep -q '"success":true'; then
-        echo "Warning: Cloudflare purge did not report success" >&2
+ASSET_PURGE_URLS=()
+for index in "${MISSING_SOURCE_INDEXES[@]}"; do
+    rclone "${RCLONE_ARGS[@]}" copyto \
+        "${SOURCE_LOCAL_PATHS[$index]}" \
+        "r2:${R2_BUCKET}/${SOURCE_REMOTE_PATHS[$index]}"
+    ASSET_PURGE_URLS+=("${SOURCE_URLS[$index]}")
+done
+purge_urls "${ASSET_PURGE_URLS[@]}"
+
+for index in "${MISSING_SOURCE_INDEXES[@]}"; do
+    verify_path="${VERIFY_DIR}/source-${index}"
+    curl -fsSL "${SOURCE_URLS[$index]}" -o "$verify_path"
+    if ! cmp -s "${SOURCE_LOCAL_PATHS[$index]}" "$verify_path"; then
+        echo "Error: published speech model source differs: ${SOURCE_IDS[$index]}" >&2
+        exit 1
     fi
+done
+
+if ! cmp -s "$SOURCE_LOCK_SNAPSHOT" "$SOURCE_LOCK"; then
+    echo "Error: source lock changed while preparing publication" >&2
+    exit 1
+fi
+TAURI_SIGNING_PRIVATE_KEY="$TAURI_SIGNING_PRIVATE_KEY" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
+    node "${PROJECT_DIR}/scripts/package-speech-model-set.mjs" --out "$PACKAGE_DIR"
+if [ ! -f "$MANIFEST_PATH" ] || [ ! -s "$SIGNATURE_PATH" ]; then
+    echo "Error: signed speech model manifest output is incomplete" >&2
+    exit 1
+fi
+if ! cmp -s "$SOURCE_LOCK" "$MANIFEST_PATH"; then
+    echo "Error: packaged manifest bytes differ from the compiled source lock" >&2
+    exit 1
+fi
+decode_signature "$SIGNATURE_PATH" "${VERIFY_DIR}/local-manifest.minisig"
+if ! minisign -Vm "$MANIFEST_PATH" -x "${VERIFY_DIR}/local-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
+    echo "Error: manifest signature does not match the App updater public key" >&2
+    exit 1
+fi
+
+MANIFEST_PURGE_URLS=()
+if [ "$REMOTE_MANIFEST_EXISTS" -eq 0 ]; then
+    rclone "${RCLONE_ARGS[@]}" copyto "$MANIFEST_PATH" "${R2_TARGET}manifest.json"
+    MANIFEST_PURGE_URLS+=("${PUBLIC_BASE_URL}/manifest.json")
+fi
+if [ "$REMOTE_SIGNATURE_EXISTS" -eq 0 ]; then
+    rclone "${RCLONE_ARGS[@]}" copyto "$SIGNATURE_PATH" "${R2_TARGET}manifest.json.sig"
+    MANIFEST_PURGE_URLS+=("${PUBLIC_BASE_URL}/manifest.json.sig")
+fi
+purge_urls "${MANIFEST_PURGE_URLS[@]}"
+
+if [ "${#MISSING_SOURCE_INDEXES[@]}" -eq 0 ] && [ "$REMOTE_MANIFEST_EXISTS" -eq 1 ] && [ "$REMOTE_SIGNATURE_EXISTS" -eq 1 ]; then
+    echo "Immutable speech model revision and all mirrored sources are already published; no upload needed."
+elif [ "${#MISSING_SOURCE_INDEXES[@]}" -gt 0 ]; then
+    echo "Published ${#MISSING_SOURCE_INDEXES[@]} missing immutable speech model sources before the manifest."
+else
+    echo "All immutable speech model sources were already published."
 fi
 
 curl -fsSL "${PUBLIC_BASE_URL}/manifest.json" -o "${VERIFY_DIR}/manifest.json"
@@ -276,4 +388,5 @@ if ! minisign -Vm "${VERIFY_DIR}/manifest.json" -x "${VERIFY_DIR}/published-mani
     exit 1
 fi
 
+echo "Speech model mirrored sources verified: ${#SOURCE_IDS[@]}"
 echo "Speech model manifest published: ${PUBLIC_BASE_URL}/manifest.json"

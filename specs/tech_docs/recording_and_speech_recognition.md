@@ -52,6 +52,8 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 
 2026-08-26 首次发布前将上述同一组模型字节的 pack revision 从 `sensevoice-2024-07-17-v1` 收敛为 `local-standard-speech-v1`；所有 asset URL、size 和 SHA-256 不变，因此已冻结的质量结果仍适用，这项 identity-only rename 不单独重跑质量基准。
 
+2026-08-26 中国大陆三网节点对 GitHub release 的 10 秒 HTTP 可达率只约 `58.5%–62.8%`，因此新的 `local-standard-speech-v2` 将相同的四个 asset 和三个 remote legal source 改由 `download.myagents.io` 的 content-addressed R2 object 供应。模型、license、upstream revision、size/SHA-256 和总预算均不变；已发布的 v1 不覆盖，质量基准不重跑。
+
 ## Durable speech job
 
 job metadata 位于：
@@ -85,9 +87,9 @@ Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact�
 
 ## 用户模型包
 
-当前 pack identity 固定为 `local-standard-speech / local-standard-speech-v1`。编译期 source lock 位于 `src-tauri/media-worker/model-pack-source-lock.json`，固定：
+当前 pack identity 固定为 `local-standard-speech / local-standard-speech-v2`。编译期 source lock 位于 `src-tauri/media-worker/model-pack-source-lock.json`，固定：
 
-- 四项上游下载 asset 与各自 URL、revision、size、SHA-256、格式和许可；
+- 四项第一方镜像 asset 与各自 URL、upstream revision、size、SHA-256、格式和许可；
 - 五个实际推理文件的 archive source path、安装相对路径、size 与 SHA-256；
 - 五份 legal artifact 的 remote/archive 来源；
 - 总下载预算和 300 MiB 硬上限；
@@ -100,11 +102,12 @@ Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact�
 ```text
 https://download.myagents.io/models/speech/sets/<pack-revision>/manifest.json
 https://download.myagents.io/models/speech/sets/<pack-revision>/manifest.json.sig
+https://download.myagents.io/models/speech/assets/sha256/<sha256>/<filename>
 ```
 
 远端 manifest bytes 必须与 App/Worker 编译内 source lock 完全一致，签名才会被接受。远端 JSON 不能提供新的本地路径、host、模型或 native library。
 
-发布 owner 是根目录 `publish_speech_model_set.sh`：它调用 `scripts/package-speech-model-set.mjs` 在临时 staging 中原样复制编译 source lock，并复用 Tauri updater signer 生成 detached signature；随后只向既有 R2 immutable revision 路径补传缺失的两个固定对象。任何已有 manifest 必须逐字节等于 source lock，所有签名必须先通过 App updater 公钥验证，已存在对象绝不覆盖；发布器不下载或镜像模型、不重新计算业务 inventory，也不接受 revision/asset/URL 覆盖。完整 source lock 语义仍由 Rust/Worker 的同一解析与测试裁决。
+发布 owner 是根目录 `publish_speech_model_set.sh`：它先调用 `scripts/prepare-speech-model-mirror.mjs`，将运行时 source lock 与 release-only `model-pack-mirror-origin-lock.json` 按 exact asset/legal ID join，复用 `acquireLockedResource` 的 content-addressed cache 从锁定 GitHub origin 取得并校验七个 source。publisher 先补传缺失的 content-addressed object 并逐个从公网完整回读比对，再调用 `scripts/package-speech-model-set.mjs` 原样复制编译 source lock、复用 Tauri updater signer 生成 detached signature，最后发布 manifest/signature。任何已有 source/manifest 内容漂移或签名失配都 fail closed，不接受 force、revision、asset、URL 或 trust-root 覆盖。GitHub origin lock 不进入 App 运行时；完整 source lock 语义仍由 Rust/Worker 的同一解析与测试裁决。
 
 持久布局：
 
@@ -126,7 +129,7 @@ https://download.myagents.io/models/speech/sets/<pack-revision>/manifest.json.si
 1. 用户显式调用 install；同一时刻只允许一个 install/remove operation。
 2. 校验随 App 发布的 media Worker、native manifest 与共享 ORT 都是普通文件。
 3. 从固定第一方地址取得 manifest/signature，验证 byte identity 与 updater Minisign trust root。
-4. 顺序下载锁定 asset 到 0700 private 目录中的 0600 `create_new` 文件；每个响应限制为 HTTPS GitHub 固定 host 集，逐 chunk 执行 exact size、SHA-256 与总下载硬上限。
+4. 顺序下载锁定 asset 到 0700 private 目录中的 0600 `create_new` 文件；每个响应只允许 HTTPS `download.myagents.io` 固定 host，逐 chunk 执行 exact size、SHA-256 与总下载硬上限。
 5. Rust 内置的 pure-Rust bzip2 decoder + tar reader 只选择 source lock 白名单文件。archive 中任意 traversal、重复路径、symlink 或 special entry 都让整个 staging 失败；运行时不调用系统 tar、Python 或用户 PATH。
 6. manifest 最后写入；Worker/Manager 都要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。
 7. 取得 `SpeechModelValidation` compute lease，让当前随包 Worker 依次真实创建并释放 ASR、VAD 和 diarizer engine。高优先级 workload 到达时 kill exact probe tree、释放 lease 后重试。

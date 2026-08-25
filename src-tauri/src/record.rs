@@ -5167,7 +5167,7 @@ mod tests {
             .unwrap();
         let provenance = RecordSpeechProvenance {
             provider: "local".into(),
-            model_pack_revision: "local-standard-speech-v1".into(),
+            model_pack_revision: "local-standard-speech-v2".into(),
             onnx_runtime_version: "1.28.0".into(),
         };
         let mut journal = store
@@ -5298,7 +5298,7 @@ mod tests {
             .unwrap();
         let provenance = RecordSpeechProvenance {
             provider: "local".into(),
-            model_pack_revision: "local-standard-speech-v1".into(),
+            model_pack_revision: "local-standard-speech-v2".into(),
             onnx_runtime_version: "1.28.0".into(),
         };
         let transcript = store

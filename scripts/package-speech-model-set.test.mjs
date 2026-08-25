@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
@@ -22,6 +22,10 @@ const publisher = join(repoRoot, "publish_speech_model_set.sh");
 const sourceLockPath = join(
   repoRoot,
   "src-tauri/media-worker/model-pack-source-lock.json",
+);
+const originLockPath = join(
+  repoRoot,
+  "src-tauri/media-worker/model-pack-mirror-origin-lock.json",
 );
 
 function writeExecutable(path, contents) {
@@ -34,6 +38,7 @@ function createPublisherFixture() {
   const fakeBin = join(root, "fake-bin");
   const remoteDir = join(root, "remote");
   const rcloneLog = join(root, "rclone.log");
+  const eventLog = join(root, "events.log");
   mkdirSync(join(root, "scripts"), { recursive: true });
   mkdirSync(join(root, "src-tauri", "media-worker"), { recursive: true });
   mkdirSync(fakeBin);
@@ -50,6 +55,15 @@ function createPublisherFixture() {
     join(root, "src-tauri", "media-worker", "model-pack-source-lock.json"),
   );
   cpSync(
+    originLockPath,
+    join(
+      root,
+      "src-tauri",
+      "media-worker",
+      "model-pack-mirror-origin-lock.json",
+    ),
+  );
+  cpSync(
     join(repoRoot, "src-tauri", "tauri.conf.json"),
     join(root, "src-tauri", "tauri.conf.json"),
   );
@@ -63,6 +77,33 @@ function createPublisherFixture() {
       "",
     ].join("\n"),
   );
+  writeFileSync(
+    join(root, "scripts", "prepare-speech-model-mirror.mjs"),
+    `import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+const outIndex = process.argv.indexOf("--out");
+if (outIndex < 0 || !process.argv[outIndex + 1]) throw new Error("missing --out");
+const outDir = process.argv[outIndex + 1];
+const entries = Array.from({ length: 7 }, (_, index) => {
+  const digest = String(index + 1).repeat(64);
+  const remotePath = \`models/speech/assets/sha256/\${digest}/source-\${index}.bin\`;
+  const localRelativePath = \`mirror/\${remotePath}\`;
+  const destination = join(outDir, localRelativePath);
+  mkdirSync(dirname(destination), { recursive: true });
+  writeFileSync(destination, \`source-\${index}\`);
+  return {
+    id: \`asset:fixture-\${index}\`,
+    publicUrl: \`https://download.myagents.io/\${remotePath}\`,
+    remotePath,
+    localRelativePath,
+  };
+});
+writeFileSync(
+  join(outDir, "mirror-plan.json"),
+  JSON.stringify({ schemaVersion: 1, entries }),
+);
+`,
+  );
   writeExecutable(
     join(fakeBin, "npx"),
     `#!/bin/sh
@@ -73,6 +114,7 @@ if [ "\${FAKE_SIGNING_VALID:-1}" = "1" ]; then
 else
   signature="ZmFrZS1pbnZhbGlk"
 fi
+printf 'sign\n' >> "\${FAKE_EVENT_LOG}"
 printf '%s' "$signature" > "\${manifest}.sig"
 `,
   );
@@ -105,8 +147,8 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
-filename="\${url##*/}"
-remote="\${FAKE_REMOTE_DIR}/\${filename}"
+relative="\${url#https://download.myagents.io/}"
+remote="\${FAKE_REMOTE_DIR}/\${relative}"
 if [ "$head_request" -eq 1 ]; then
   if [ -f "$remote" ]; then printf '200'; else printf '404'; fi
   exit 0
@@ -125,12 +167,23 @@ for argument in "$@"; do
   current="$argument"
 done
 source_path="$previous"
-filename="\${current##*/}"
-cp "$source_path" "\${FAKE_REMOTE_DIR}/\${filename}"
-printf '%s\n' "$filename" >> "$FAKE_RCLONE_LOG"
+relative="\${current#r2:myagents-releases/}"
+destination="\${FAKE_REMOTE_DIR}/\${relative}"
+mkdir -p "\${destination%/*}"
+cp "$source_path" "$destination"
+printf '%s\n' "$relative" >> "$FAKE_RCLONE_LOG"
+printf 'upload:%s\n' "$relative" >> "$FAKE_EVENT_LOG"
 `,
   );
-  return { root, fakeBin, remoteDir, rcloneLog };
+  const sourceLock = JSON.parse(readFileSync(sourceLockPath, "utf8"));
+  return {
+    root,
+    fakeBin,
+    remoteDir,
+    rcloneLog,
+    eventLog,
+    packRevision: sourceLock.packRevision,
+  };
 }
 
 function runPublisher(fixture, extraEnv = {}) {
@@ -147,6 +200,7 @@ function runPublisher(fixture, extraEnv = {}) {
         CF_API_TOKEN: "",
         FAKE_REMOTE_DIR: fixture.remoteDir,
         FAKE_RCLONE_LOG: fixture.rcloneLog,
+        FAKE_EVENT_LOG: fixture.eventLog,
         ...extraEnv,
       },
     },
@@ -222,9 +276,10 @@ test(
   },
 );
 
-test("speech model publisher delegates signing and limits publication to two immutable objects", () => {
+test("speech model publisher prepares mirrored sources before the signed manifest", () => {
   const source = readFileSync(publisher, "utf8");
   assert.match(source, /scripts\/package-speech-model-set\.mjs/);
+  assert.match(source, /scripts\/prepare-speech-model-mirror\.mjs/);
   assert.match(source, /models\/speech\/sets\/\$\{PACK_REVISION\}/);
   assert.match(source, /cmp -s "\$SOURCE_LOCK" "\$MANIFEST_PATH"/);
   assert.match(source, /--progress --immutable/);
@@ -241,16 +296,35 @@ test("speech model publisher delegates signing and limits publication to two imm
 });
 
 test(
-  "speech model publisher uploads exactly the two fixed objects",
+  "speech model publisher uploads seven sources before the two manifest objects",
   { skip: process.platform === "win32" },
   () => {
     const fixture = createPublisherFixture();
     try {
       const result = runPublisher(fixture);
       assert.equal(result.status, 0, result.stderr);
+      const uploads = readFileSync(fixture.rcloneLog, "utf8")
+        .trim()
+        .split("\n");
+      assert.equal(uploads.length, 9);
       assert.deepEqual(
-        readFileSync(fixture.rcloneLog, "utf8").trim().split("\n"),
-        ["manifest.json", "manifest.json.sig"],
+        uploads.slice(0, 7),
+        Array.from({ length: 7 }, (_, index) => {
+          const digest = String(index + 1).repeat(64);
+          return `models/speech/assets/sha256/${digest}/source-${index}.bin`;
+        }),
+      );
+      assert.deepEqual(uploads.slice(7), [
+        `models/speech/sets/${fixture.packRevision}/manifest.json`,
+        `models/speech/sets/${fixture.packRevision}/manifest.json.sig`,
+      ]);
+      assert.deepEqual(
+        readFileSync(fixture.eventLog, "utf8").trim().split("\n"),
+        [
+          ...uploads.slice(0, 7).map((path) => `upload:${path}`),
+          "sign",
+          ...uploads.slice(7).map((path) => `upload:${path}`),
+        ],
       );
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
@@ -267,7 +341,11 @@ test(
       const result = runPublisher(fixture, { FAKE_SIGNING_VALID: "0" });
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /does not match the App updater public key/);
-      assert.equal(existsSync(fixture.rcloneLog), false);
+      const uploads = readFileSync(fixture.rcloneLog, "utf8")
+        .trim()
+        .split("\n");
+      assert.equal(uploads.length, 7);
+      assert.doesNotMatch(uploads.join("\n"), /models\/speech\/sets\//);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
@@ -280,10 +358,49 @@ test(
   () => {
     const fixture = createPublisherFixture();
     try {
-      writeFileSync(join(fixture.remoteDir, "manifest.json"), "different\n");
+      const manifestPath = join(
+        fixture.remoteDir,
+        "models",
+        "speech",
+        "sets",
+        fixture.packRevision,
+        "manifest.json",
+      );
+      mkdirSync(dirname(manifestPath), { recursive: true });
+      writeFileSync(manifestPath, "different\n");
       const result = runPublisher(fixture);
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /immutable remote manifest differs/);
+      assert.equal(existsSync(fixture.rcloneLog), false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "speech model publisher refuses an existing content-addressed source with different bytes",
+  { skip: process.platform === "win32" },
+  () => {
+    const fixture = createPublisherFixture();
+    try {
+      const remotePath = join(
+        fixture.remoteDir,
+        "models",
+        "speech",
+        "assets",
+        "sha256",
+        "1".repeat(64),
+        "source-0.bin",
+      );
+      mkdirSync(dirname(remotePath), { recursive: true });
+      writeFileSync(remotePath, "different\n");
+      const result = runPublisher(fixture);
+      assert.notEqual(result.status, 0);
+      assert.match(
+        result.stderr,
+        /immutable remote speech model source differs/,
+      );
       assert.equal(existsSync(fixture.rcloneLog), false);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });

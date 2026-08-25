@@ -393,12 +393,8 @@ impl SpeechModelPackManager {
             return Err("SPEECH_NATIVE_RUNTIME_UNAVAILABLE");
         }
         // This client intentionally targets the signed first-party resource
-        // manifest and its pinned HTTPS upstream assets, never localhost.
-        #[allow(clippy::disallowed_methods)]
-        let client_builder = reqwest::Client::builder()
-            .user_agent(format!("MyAgents/{}", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(30 * 60));
+        // manifest and its pinned first-party HTTPS assets, never localhost.
+        let client_builder = speech_model_http_client_builder();
         let client = crate::proxy_config::build_client_with_proxy(client_builder)
             .map_err(|_| "SPEECH_RESOURCE_NETWORK")?;
         let signature = fetch_verified_release_manifest(&client, &self.plan).await?;
@@ -526,7 +522,7 @@ impl SpeechModelPackManager {
             .map_err(|_| "SPEECH_RESOURCE_NETWORK")?
             .error_for_status()
             .map_err(|_| "SPEECH_RESOURCE_NETWORK")?;
-        validate_upstream_response(response.url())?;
+        validate_model_resource_response(response.url())?;
         if response
             .content_length()
             .is_some_and(|size| size != expected_size)
@@ -787,6 +783,15 @@ fn release_manifest_url(pack_revision: &str) -> String {
     format!("{MODEL_SETS_BASE_URL}/{pack_revision}/manifest.json")
 }
 
+#[allow(clippy::disallowed_methods)]
+fn speech_model_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent(format!("MyAgents/{}", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30 * 60))
+}
+
 async fn fetch_limited_bytes(
     client: &reqwest::Client,
     url: &str,
@@ -818,18 +823,8 @@ async fn fetch_limited_bytes(
     Ok(bytes)
 }
 
-fn validate_upstream_response(url: &reqwest::Url) -> Result<(), &'static str> {
-    if url.scheme() != "https"
-        || !matches!(
-            url.host_str(),
-            Some(
-                "github.com"
-                    | "raw.githubusercontent.com"
-                    | "release-assets.githubusercontent.com"
-                    | "objects.githubusercontent.com"
-            )
-        )
-    {
+fn validate_model_resource_response(url: &reqwest::Url) -> Result<(), &'static str> {
+    if url.scheme() != "https" || url.host_str() != Some(MODEL_DOWNLOAD_HOST) {
         return Err("SPEECH_RESOURCE_NETWORK");
     }
     Ok(())
@@ -1414,8 +1409,61 @@ mod tests {
     #[test]
     fn release_manifest_url_uses_pack_revision_without_schema_suffix() {
         assert_eq!(
-            release_manifest_url("local-standard-speech-v1"),
-            "https://download.myagents.io/models/speech/sets/local-standard-speech-v1/manifest.json"
+            release_manifest_url("local-standard-speech-v2"),
+            "https://download.myagents.io/models/speech/sets/local-standard-speech-v2/manifest.json"
+        );
+    }
+
+    #[test]
+    fn model_resource_response_only_accepts_first_party_https() {
+        assert!(validate_model_resource_response(
+            &reqwest::Url::parse("https://download.myagents.io/models/speech/assets/file").unwrap()
+        )
+        .is_ok());
+        assert!(validate_model_resource_response(
+            &reqwest::Url::parse("https://github.com/example/file").unwrap()
+        )
+        .is_err());
+        assert!(validate_model_resource_response(
+            &reqwest::Url::parse("http://download.myagents.io/models/speech/assets/file").unwrap()
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn speech_model_http_client_never_follows_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tauri::async_runtime::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{address}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_ok()
+        });
+
+        let client = speech_model_http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{address}/manifest.json"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            !server.await.unwrap(),
+            "redirect target received a second request"
         );
     }
 
@@ -1655,7 +1703,7 @@ mod tests {
             download_hard_limit_bytes: 1024,
             assets: vec![ModelPackAsset {
                 id: "archive".into(),
-                url: "https://github.com/fixture".into(),
+                url: "https://download.myagents.io/models/speech/assets/fixture".into(),
                 sha256: "0".repeat(64),
                 size: 1,
                 format: ModelPackAssetFormat::TarBz2,

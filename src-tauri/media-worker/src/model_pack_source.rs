@@ -225,7 +225,7 @@ pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
     let lock: SourceLock = serde_json::from_str(json).map_err(|_| SourceLockError::InvalidJson)?;
     if lock.schema_version != 1
         || lock.pack_id != "local-standard-speech"
-        || lock.pack_revision != "local-standard-speech-v1"
+        || lock.pack_revision != "local-standard-speech-v2"
         || lock.download_hard_limit_bytes != 300 * 1024 * 1024
     {
         return Err(SourceLockError::InvalidIdentity);
@@ -258,7 +258,7 @@ pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
             return Err(SourceLockError::DuplicateIdentity);
         }
         if !EXPECTED_ASSET_IDS.contains(&asset.id.as_str())
-            || !valid_https_source_url(&asset.url)
+            || !valid_first_party_source_url(&asset.url, &asset.sha256)
             || !valid_sha256(&asset.sha256)
             || asset.size == 0
             || asset.upstream_revision.trim().is_empty()
@@ -334,7 +334,7 @@ pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
                 size,
                 upstream_revision,
             } => {
-                if !valid_https_source_url(url)
+                if !valid_first_party_source_url(url, sha256)
                     || !valid_sha256(sha256)
                     || *size == 0
                     || upstream_revision.trim().is_empty()
@@ -610,14 +610,20 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn valid_https_source_url(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("https://") else {
+fn valid_first_party_source_url(value: &str, sha256: &str) -> bool {
+    if !valid_sha256(sha256) {
+        return false;
+    }
+    let prefix = format!("https://download.myagents.io/models/speech/assets/sha256/{sha256}/");
+    let Some(filename) = value.strip_prefix(&prefix) else {
         return false;
     };
-    let host = rest.split('/').next().unwrap_or_default();
-    matches!(host, "github.com" | "raw.githubusercontent.com")
-        && !rest.contains(['\\', '\0'])
-        && !rest.split('/').any(|part| matches!(part, "." | ".."))
+    !filename.is_empty()
+        && filename.len() <= 192
+        && !filename.contains(['/', '\\', '\0'])
+        && filename
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn safe_relative_path(value: &str) -> bool {
@@ -691,10 +697,22 @@ mod tests {
             validate_source_lock_json(&traversal),
             Err(SourceLockError::InvalidAsset)
         ));
-        let host =
-            MODEL_PACK_SOURCE_LOCK.replacen("https://github.com/", "https://example.com/", 1);
+        let host = MODEL_PACK_SOURCE_LOCK.replacen(
+            "https://download.myagents.io/",
+            "https://example.com/",
+            1,
+        );
         assert_eq!(
             validate_source_lock_json(&host),
+            Err(SourceLockError::InvalidAsset)
+        );
+        let hash_path = MODEL_PACK_SOURCE_LOCK.replacen(
+            "assets/sha256/7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e/",
+            "assets/sha256/c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20/",
+            1,
+        );
+        assert_eq!(
+            validate_source_lock_json(&hash_path),
             Err(SourceLockError::InvalidAsset)
         );
     }
