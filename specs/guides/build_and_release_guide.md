@@ -208,6 +208,24 @@ Runtime set 是按平台分片补发的：macOS 主机默认发布 `darwin-arm64
 .\publish_managed_codex_runtime.ps1 -Yes
 ```
 
+### publish_speech_model_set.sh
+
+**用途**：把当前 App/Worker 已编译锁定的标准语音模型清单签名并发布到 R2。它只发布 `manifest-v1.json` 与 `manifest-v1.json.sig`，不会下载、重新打包或镜像模型；模型和许可仍从 `src-tauri/media-worker/model-pack-source-lock.json` 中锁定的上游 HTTPS 地址下载。
+
+本地可用 unsigned 模式验证输出路径与逐字节 identity，但该产物不能发布，也不会被 App 接受：
+
+```bash
+npm run package:speech-model-set -- --allow-unsigned
+```
+
+正式发布从 source lock 自动派生 immutable `packRevision`，复用现有 Tauri updater Minisign 私钥、R2 配置和 Cloudflare 域名；发布机需安装成熟的 `minisign` CLI，脚本会用 App 内同一 updater 公钥在上传前验签：
+
+```bash
+npm run publish:speech-model-set -- -y
+```
+
+发布脚本使用临时 staging 和两个显式 R2 immutable object，只补传远端缺失对象，绝不覆盖已存在对象。远端已有 manifest 必须与编译 source lock 逐字节一致，已有或新签名都必须通过 App updater 公钥验签；任何漂移都要求提升 `packRevision`。它不接受 revision、URL、asset 或 trust-root 覆盖，避免发布内容与客户端编译 lock 分叉。模型清单是独立资源发布动作，不应绑到每次桌面 App build；锁变化或首次启用新 revision 时必须先完成发布和真实安装 smoke。
+
 ### 可选「浏览器」Runtime 资源
 
 `myagents-browser` /「浏览器」直接下载 Playwright 锁定版本对应的官方 Chromium artifact。桌面 App 只包含 `@playwright/mcp` / Playwright 控制代码；MyAgents 不镜像、不重新打包、也不上传浏览器资源。`tauri:dev`、`tauri:build`、`build_macos.sh`、`build_windows.ps1` 和桌面发布脚本均不得访问 Playwright CDN 或下载 Chromium。
@@ -334,7 +352,7 @@ cargo metadata --manifest-path src-tauri/Cargo.toml --locked --no-deps --format-
 
 ### 4. 发布到 R2
 
-发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime，也不会处理「浏览器」Runtime。若本客户端版本锁定了新的 Codex runtime set，必须先确认对应平台资源已上传且 exact manifest 可读；若更新了 Browser runtime lock，则确认各平台官方 exact artifact 可读并完成 release-like 安装 smoke。
+发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime、Speech model set，也不会处理「浏览器」Runtime。若本客户端版本锁定了新的 Codex runtime set，必须先确认对应平台资源已上传且 exact manifest 可读；若更新了 Speech model source lock，则先运行独立的 `publish:speech-model-set`，确认固定 manifest/signature 可读并完成真实模型安装 smoke；若更新了 Browser runtime lock，则确认各平台官方 exact artifact 可读并完成 release-like 安装 smoke。
 
 ```bash
 ./publish_release.sh

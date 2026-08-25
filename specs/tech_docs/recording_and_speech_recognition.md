@@ -85,6 +85,8 @@ https://download.myagents.io/models/speech/sets/<pack-revision>/manifest-v1.json
 
 远端 manifest bytes 必须与 App/Worker 编译内 source lock 完全一致，签名才会被接受。远端 JSON 不能提供新的本地路径、host、模型或 native library。
 
+发布 owner 是根目录 `publish_speech_model_set.sh`：它调用 `scripts/package-speech-model-set.mjs` 在临时 staging 中原样复制编译 source lock，并复用 Tauri updater signer 生成 detached signature；随后只向既有 R2 immutable revision 路径补传缺失的两个固定对象。任何已有 manifest 必须逐字节等于 source lock，所有签名必须先通过 App updater 公钥验证，已存在对象绝不覆盖；发布器不下载或镜像模型、不重新计算业务 inventory，也不接受 revision/asset/URL 覆盖。完整 source lock 语义仍由 Rust/Worker 的同一解析与测试裁决。
+
 持久布局：
 
 ```text
