@@ -8,8 +8,8 @@
 use crate::model_pack_source::VerifiedModelPack;
 use crate::native_adapter::{
     ADAPTER_ABI_VERSION, AsrEngine, DiarizerEngine, NativeAdapterError, NativeApiV1,
-    NativeBuildIdentity, VadEngine, create_asr_engine, create_diarizer_engine, create_vad_engine,
-    validate_api,
+    NativeBuildIdentity, VadEngine, cluster_embeddings, create_asr_engine, create_diarizer_engine,
+    create_vad_engine, validate_api,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -537,6 +537,15 @@ impl LoadedNativeAdapter {
             &models.speaker_embedding_model,
         )
         .map_err(NativeBundleError::Adapter)
+    }
+
+    pub fn cluster_embeddings(
+        &self,
+        embeddings: &[Vec<f32>],
+        distance_threshold: f32,
+    ) -> Result<Vec<u32>, NativeBundleError> {
+        cluster_embeddings(self.api(), embeddings, distance_threshold)
+            .map_err(NativeBundleError::Adapter)
     }
 
     pub fn api(&self) -> &NativeApiV1 {

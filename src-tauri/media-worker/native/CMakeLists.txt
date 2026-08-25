@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 project(myagents_speech_adapter LANGUAGES CXX)
 
-foreach(required IN ITEMS MYAGENTS_SHERPA_INCLUDE_DIR MYAGENTS_SHERPA_LIBRARY_DIR)
+foreach(required IN ITEMS MYAGENTS_SHERPA_INCLUDE_DIR MYAGENTS_SHERPA_LIBRARY_DIR MYAGENTS_HCLUST_INCLUDE_DIR)
   if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
     message(FATAL_ERROR "${required} is required")
   endif()
@@ -16,6 +16,10 @@ target_compile_definitions(
 target_include_directories(
   myagents-speech-adapter
   PRIVATE "${MYAGENTS_SHERPA_INCLUDE_DIR}"
+)
+target_include_directories(
+  myagents-speech-adapter
+  SYSTEM PRIVATE "${MYAGENTS_HCLUST_INCLUDE_DIR}"
 )
 target_link_directories(
   myagents-speech-adapter

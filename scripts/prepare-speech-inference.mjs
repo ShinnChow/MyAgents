@@ -439,8 +439,7 @@ function cargoPackageRoot(packageName, expectedVersion) {
     ),
   );
   const packages = metadata.packages.filter(
-    (entry) =>
-      entry.name === packageName && entry.version === expectedVersion,
+    (entry) => entry.name === packageName && entry.version === expectedVersion,
   );
   if (packages.length !== 1) {
     throw new Error(
@@ -686,6 +685,12 @@ await withResourcePrepareLock(
       );
 
       const adapterBuild = join(buildRoot, 'adapter');
+      const hclustIncludeRoot = join(sherpaBuild, '_deps', 'hclust_cpp-src');
+      if (!existsSync(join(hclustIncludeRoot, 'fastcluster-all-in-one.h'))) {
+        throw new Error(
+          `Locked hclust-cpp headers are unavailable: ${hclustIncludeRoot}`,
+        );
+      }
       execFileSync(
         'cmake',
         [
@@ -696,6 +701,7 @@ await withResourcePrepareLock(
           '-DCMAKE_BUILD_TYPE=Release',
           `-DMYAGENTS_SHERPA_INCLUDE_DIR=${sherpaSource}`,
           `-DMYAGENTS_SHERPA_LIBRARY_DIR=${dirname(sherpaLibrary)}`,
+          `-DMYAGENTS_HCLUST_INCLUDE_DIR=${hclustIncludeRoot}`,
           ...configurePlatformArgs(),
         ],
         { stdio: 'inherit' },
@@ -825,6 +831,21 @@ await withResourcePrepareLock(
         join(libopusRoot, 'LICENSE'),
         join(legalRoot, 'LIBOPUS-SYS-LICENSE'),
       );
+      for (const [packageName, version, prefix] of [
+        ['hdbscan', speechLock.hdbscanVersion, 'HDBSCAN'],
+        ['kdtree', speechLock.kdtreeVersion, 'KDTREE'],
+        ['num-traits', speechLock.numTraitsVersion, 'NUM-TRAITS'],
+      ]) {
+        const packageRoot = cargoPackageRoot(packageName, version);
+        copyFileSync(
+          join(packageRoot, 'LICENSE-APACHE'),
+          join(legalRoot, `${prefix}-LICENSE-APACHE`),
+        );
+        copyFileSync(
+          join(packageRoot, 'LICENSE-MIT'),
+          join(legalRoot, `${prefix}-LICENSE-MIT`),
+        );
+      }
 
       function integrityFile(path) {
         return {

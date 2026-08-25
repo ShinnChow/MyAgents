@@ -40,6 +40,8 @@ export async function runMediaWorkerBatch({
   terminationGraceMs = 2_000,
   workloadId = defaultWorkloadId(mode),
   workerGeneration = 1,
+  onSpawn,
+  onResponse,
 }) {
   if (
     !workerPath ||
@@ -56,7 +58,9 @@ export async function runMediaWorkerBatch({
     typeof workloadId !== "string" ||
     workloadId.length === 0 ||
     !Number.isSafeInteger(workerGeneration) ||
-    workerGeneration <= 0
+    workerGeneration <= 0 ||
+    (onSpawn !== undefined && typeof onSpawn !== "function") ||
+    (onResponse !== undefined && typeof onResponse !== "function")
   ) {
     throw new Error("Invalid Media Worker batch client arguments");
   }
@@ -97,6 +101,7 @@ export async function runMediaWorkerBatch({
           );
         }
         responses.push(response);
+        onResponse?.(response);
         responseEvents.emit("response");
       }
     } catch (error) {
@@ -212,6 +217,7 @@ export async function runMediaWorkerBatch({
   }
 
   try {
+    onSpawn?.(child.pid);
     await write({
       type: "start",
       protocolVersion: PROTOCOL_VERSION,
@@ -324,10 +330,18 @@ export function summarizeMediaWorkerBatch(mode, result) {
 export function assertExpectedMediaWorkerBatch(mode, result) {
   const summary = summarizeMediaWorkerBatch(mode, result);
   const { counts, yielded } = summary;
+  const speakerTurnBatches = result.responses.filter(
+    (response) => response.type === "speaker_turn_batch",
+  );
+  const validSpeakerTurnBatches = speakerTurnBatches.every(
+    (response, index) =>
+      response.batchIndex === index &&
+      response.isLast === (index + 1 === speakerTurnBatches.length),
+  );
   const invalidComplete =
     ["complete", "attachment"].includes(mode) &&
     (!counts.transcript_segment ||
-      !counts.completed ||
+      counts.completed !== 1 ||
       counts.ready !== 1 ||
       counts.pong !== 1 ||
       (mode === "attachment" && counts.media_probed !== 1) ||
@@ -350,10 +364,11 @@ export function assertExpectedMediaWorkerBatch(mode, result) {
       counts.yielded);
   const invalidDiarization =
     mode === "diarization" &&
-    (!counts.completed ||
+    (counts.completed !== 1 ||
       counts.ready !== 1 ||
       counts.pong !== 1 ||
-      counts.speaker_turn_batch !== 1 ||
+      !counts.speaker_turn_batch ||
+      !validSpeakerTurnBatches ||
       counts.transcript_segment ||
       counts.yielded ||
       counts.failed);

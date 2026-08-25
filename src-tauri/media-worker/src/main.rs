@@ -187,6 +187,15 @@ fn run_record_diarization(
             identity: identity.clone(),
         },
     )?;
+    write_response(
+        writer,
+        WorkerResponse::Heartbeat {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            stage: WorkerStage::Decoding,
+            checkpoint: batch_checkpoint(&checkpoints),
+        },
+    )?;
 
     let config = BoundedDiarizationConfig::default();
     let window_samples =
@@ -234,11 +243,25 @@ fn run_record_diarization(
                     start_sample: window_start,
                     end_sample,
                 };
-                observations.0.push(
-                    diarizer
-                        .diarize_window(window, &pcm)
-                        .map_err(|_| "SPEECH_INFERENCE_FAILED")?,
-                );
+                let mut embedding_heartbeat_error = None;
+                let observation = diarizer
+                    .diarize_window(window, &pcm, || {
+                        embedding_heartbeat_error = write_response(
+                            writer,
+                            WorkerResponse::Heartbeat {
+                                protocol_version: PROTOCOL_VERSION,
+                                identity: identity.clone(),
+                                stage: WorkerStage::EmbeddingSpeakers,
+                                checkpoint: batch_checkpoint(&checkpoints),
+                            },
+                        )
+                        .err();
+                    })
+                    .map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+                if let Some(error) = embedding_heartbeat_error {
+                    return Err(error);
+                }
+                observations.0.push(observation);
                 pcm[..step_samples].zeroize();
                 pcm.drain(..step_samples);
                 window_start = window_start
@@ -246,6 +269,15 @@ fn run_record_diarization(
                     .ok_or("SPEECH_RESOURCE_LIMIT")?;
                 window_index = window_index.checked_add(1).ok_or("SPEECH_RESOURCE_LIMIT")?;
                 checkpoints[0].analysis_sample = window_start;
+                write_response(
+                    writer,
+                    WorkerResponse::Heartbeat {
+                        protocol_version: PROTOCOL_VERSION,
+                        identity: identity.clone(),
+                        stage: WorkerStage::Decoding,
+                        checkpoint: batch_checkpoint(&checkpoints),
+                    },
+                )?;
                 if poll_batch_control(identity, &controls, &checkpoints, writer)? {
                     return Ok(());
                 }
@@ -277,15 +309,29 @@ fn run_record_diarization(
             WorkerResponse::Heartbeat {
                 protocol_version: PROTOCOL_VERSION,
                 identity: identity.clone(),
-                stage: WorkerStage::EmbeddingSpeakers,
+                stage: WorkerStage::SegmentingSpeakers,
                 checkpoint: batch_checkpoint(&checkpoints),
             },
         )?;
-        observations.0.push(
-            diarizer
-                .diarize_window(window, &pcm)
-                .map_err(|_| "SPEECH_INFERENCE_FAILED")?,
-        );
+        let mut embedding_heartbeat_error = None;
+        let observation = diarizer
+            .diarize_window(window, &pcm, || {
+                embedding_heartbeat_error = write_response(
+                    writer,
+                    WorkerResponse::Heartbeat {
+                        protocol_version: PROTOCOL_VERSION,
+                        identity: identity.clone(),
+                        stage: WorkerStage::EmbeddingSpeakers,
+                        checkpoint: batch_checkpoint(&checkpoints),
+                    },
+                )
+                .err();
+            })
+            .map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+        if let Some(error) = embedding_heartbeat_error {
+            return Err(error);
+        }
+        observations.0.push(observation);
     }
     pcm.zeroize();
     checkpoints[0].analysis_sample = total_samples;
@@ -301,8 +347,33 @@ fn run_record_diarization(
             checkpoint: batch_checkpoint(&checkpoints),
         },
     )?;
-    let projection = consolidate_diarization(total_samples, &observations.0, config)
-        .map_err(map_diarization_error)?;
+    let mut reconciliation_heartbeat_error = None;
+    let projection = consolidate_diarization(
+        total_samples,
+        &observations.0,
+        config,
+        |embeddings, distance_threshold| {
+            adapter
+                .cluster_embeddings(embeddings, distance_threshold)
+                .map_err(|_| DiarizationError::InvalidClusterLabels)
+        },
+        || {
+            reconciliation_heartbeat_error = write_response(
+                writer,
+                WorkerResponse::Heartbeat {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    stage: WorkerStage::ReconcilingSpeakers,
+                    checkpoint: batch_checkpoint(&checkpoints),
+                },
+            )
+            .err();
+        },
+    )
+    .map_err(map_diarization_error)?;
+    if let Some(error) = reconciliation_heartbeat_error {
+        return Err(error);
+    }
     let turns = projection
         .segments
         .iter()
@@ -385,6 +456,15 @@ fn run_record_backfill(
         WorkerResponse::Ready {
             protocol_version: PROTOCOL_VERSION,
             identity: identity.clone(),
+        },
+    )?;
+    write_response(
+        writer,
+        WorkerResponse::Heartbeat {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            stage: WorkerStage::Decoding,
+            checkpoint: batch_checkpoint(&checkpoints),
         },
     )?;
 
@@ -792,7 +872,8 @@ fn map_diarization_error(error: DiarizationError) -> &'static str {
         | DiarizationError::WindowPlanMismatch
         | DiarizationError::DuplicateLocalSpeaker
         | DiarizationError::InvalidEmbedding
-        | DiarizationError::InvalidSegment => "SPEECH_INFERENCE_FAILED",
+        | DiarizationError::InvalidSegment
+        | DiarizationError::InvalidClusterLabels => "SPEECH_INFERENCE_FAILED",
     }
 }
 

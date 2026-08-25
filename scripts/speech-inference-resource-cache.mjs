@@ -15,7 +15,14 @@ export const REQUIRED_SPEECH_DEPENDENCY_IDS = [
 ];
 
 export const REQUIRED_SPEECH_LEGAL_FILES = [
+  'HDBSCAN-LICENSE-APACHE',
+  'HDBSCAN-LICENSE-MIT',
+  'KDTREE-LICENSE-APACHE',
+  'KDTREE-LICENSE-MIT',
   'LIBOPUS-LICENSE',
+  'LIBOPUS-SYS-LICENSE',
+  'NUM-TRAITS-LICENSE-APACHE',
+  'NUM-TRAITS-LICENSE-MIT',
   'OPUS2-LICENSE-APACHE',
   'OPUS2-LICENSE-MIT',
   'SHERPA-ONNX-LICENSE',
@@ -51,6 +58,9 @@ export function validateSpeechBuildLock(lock) {
     speech.onnxRuntimeUpstreamRevision.length === 0 ||
     speech.opus2Version !== '0.4.0' ||
     speech.libopusSysVersion !== '0.3.3' ||
+    speech.hdbscanVersion !== '0.12.0' ||
+    speech.kdtreeVersion !== '0.7.0' ||
+    speech.numTraitsVersion !== '0.2.19' ||
     !Number.isSafeInteger(speech.nativeIncrementHardLimitBytes) ||
     speech.nativeIncrementHardLimitBytes <= 0 ||
     speech.nativeIncrementHardLimitBytes > 80 * 1024 * 1024 ||

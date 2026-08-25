@@ -40,6 +40,9 @@
     "onnxRuntimeUpstreamRevision": "v1.28.0@da9b5e364c465de65c49d91e696cd6485270757f",
     "opus2Version": "0.4.0",
     "libopusSysVersion": "0.3.3",
+    "hdbscanVersion": "0.12.0",
+    "kdtreeVersion": "0.7.0",
+    "numTraitsVersion": "0.2.19",
     "nativeIncrementHardLimitBytes": 83886080,
     "source": {
       "url": "https://codeload.github.com/k2-fsa/sherpa-onnx/tar.gz/1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911",

@@ -8,8 +8,9 @@
 
 use crate::diarization::{LocalSegment, LocalSpeakerObservation, WindowObservation, WindowSpec};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CStr, CString, c_char, c_float};
+use std::ffi::{CStr, CString, c_char, c_float, c_void};
 use std::mem::size_of;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::ptr::NonNull;
 
@@ -19,9 +20,10 @@ pub const EMBEDDING_DIMENSION: u32 = 512;
 pub const MAX_PCM_CHUNK_SAMPLES: u32 = 5 * SAMPLE_RATE;
 pub const MAX_ASR_SAMPLES: u32 = 60 * SAMPLE_RATE;
 pub const MAX_TEXT_BYTES: u32 = 64 * 1024;
-pub const MAX_DIARIZATION_SAMPLES: u32 = 5 * 60 * SAMPLE_RATE;
+pub const MAX_DIARIZATION_SAMPLES: u32 = 68 * SAMPLE_RATE;
 pub const MAX_LOCAL_SPEAKERS: u32 = 32;
 pub const MAX_LOCAL_SEGMENTS: u32 = 16_384;
+pub const MAX_CLUSTER_EMBEDDINGS: u32 = 32;
 
 const SHERPA_ONNX_VERSION: &str = "1.13.6";
 const SHERPA_ONNX_COMMIT: &str = "1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911";
@@ -196,10 +198,13 @@ type VadReset = unsafe extern "C" fn(*mut NativeVad) -> NativeStatusCode;
 type CreateDiarizer =
     unsafe extern "C" fn(*const NativeDiarizerConfig, *mut *mut NativeDiarizer) -> NativeStatusCode;
 type DestroyDiarizer = unsafe extern "C" fn(*mut NativeDiarizer);
+type EmbeddingStarted = unsafe extern "C" fn(*mut c_void);
 type DiarizeWindow = unsafe extern "C" fn(
     *mut NativeDiarizer,
     *const c_float,
     u32,
+    Option<EmbeddingStarted>,
+    *mut c_void,
     *mut *mut NativeDiarizationResult,
 ) -> NativeStatusCode;
 type CopyDiarizationResult = unsafe extern "C" fn(
@@ -207,6 +212,8 @@ type CopyDiarizationResult = unsafe extern "C" fn(
     *mut NativeDiarizationOutput,
 ) -> NativeStatusCode;
 type DestroyDiarizationResult = unsafe extern "C" fn(*mut NativeDiarizationResult);
+type ClusterEmbeddings =
+    unsafe extern "C" fn(*const c_float, u32, c_float, *mut u32, u32, *mut u32) -> NativeStatusCode;
 
 #[repr(C)]
 pub struct NativeApiV1 {
@@ -227,6 +234,7 @@ pub struct NativeApiV1 {
     pub diarize_window: Option<DiarizeWindow>,
     pub copy_diarization_result: Option<CopyDiarizationResult>,
     pub destroy_diarization_result: Option<DestroyDiarizationResult>,
+    pub cluster_embeddings: Option<ClusterEmbeddings>,
 }
 
 impl NativeApiV1 {
@@ -249,6 +257,7 @@ impl NativeApiV1 {
             || self.diarize_window.is_none()
             || self.copy_diarization_result.is_none()
             || self.destroy_diarization_result.is_none()
+            || self.cluster_embeddings.is_none()
         {
             return Err(NativeAdapterError::MissingFunction);
         }
@@ -608,11 +617,32 @@ pub struct DiarizerEngine<'adapter> {
     handle: NonNull<NativeDiarizer>,
 }
 
+struct EmbeddingStartedContext<F> {
+    callback: Option<F>,
+    invoked: bool,
+    panicked: bool,
+}
+
+unsafe extern "C" fn embedding_started_trampoline<F: FnOnce()>(user_data: *mut c_void) {
+    if user_data.is_null() {
+        return;
+    }
+    // SAFETY: `diarize_window` passes this pointer only for the synchronous
+    // native call while the stack-owned context remains live.
+    let context = unsafe { &mut *user_data.cast::<EmbeddingStartedContext<F>>() };
+    let Some(callback) = context.callback.take() else {
+        return;
+    };
+    context.invoked = true;
+    context.panicked = catch_unwind(AssertUnwindSafe(callback)).is_err();
+}
+
 impl DiarizerEngine<'_> {
-    pub fn diarize_window(
+    pub fn diarize_window<F: FnOnce()>(
         &mut self,
         window: WindowSpec,
         samples: &[f32],
+        on_embedding_started: F,
     ) -> Result<WindowObservation, NativeAdapterError> {
         let expected_length = window
             .end_sample
@@ -625,8 +655,14 @@ impl DiarizerEngine<'_> {
             return Err(NativeAdapterError::InvalidOutput);
         }
         let mut result = std::ptr::null_mut();
+        let mut progress = EmbeddingStartedContext {
+            callback: Some(on_embedding_started),
+            invoked: false,
+            panicked: false,
+        };
         // SAFETY: The owned handle and bounded samples remain live; result is
-        // initialized by the adapter and released by the guard below.
+        // initialized by the adapter and released by the guard below. The
+        // progress context is stack-owned for the entire synchronous call.
         let code = unsafe {
             self.api
                 .diarize_window
@@ -634,6 +670,8 @@ impl DiarizerEngine<'_> {
                 self.handle.as_ptr(),
                 samples.as_ptr(),
                 samples.len() as u32,
+                Some(embedding_started_trampoline::<F>),
+                std::ptr::from_mut(&mut progress).cast(),
                 &mut result,
             )
         };
@@ -643,6 +681,9 @@ impl DiarizerEngine<'_> {
             api: self.api,
             handle: result,
         };
+        if !progress.invoked || progress.panicked {
+            return Err(NativeAdapterError::InvalidOutput);
+        }
         copy_window_observation(self.api, guard.handle, window, samples.len())
     }
 }
@@ -683,6 +724,59 @@ pub(crate) fn create_diarizer_engine<'adapter>(
     expect_status(code, NativeStatus::Ok)?;
     let handle = NonNull::new(handle).ok_or(NativeAdapterError::InvalidOutput)?;
     Ok(DiarizerEngine { api, handle })
+}
+
+pub(crate) fn cluster_embeddings(
+    api: &NativeApiV1,
+    embeddings: &[Vec<f32>],
+    distance_threshold: f32,
+) -> Result<Vec<u32>, NativeAdapterError> {
+    api.validate()?;
+    if embeddings.is_empty()
+        || embeddings.len() > MAX_CLUSTER_EMBEDDINGS as usize
+        || !distance_threshold.is_finite()
+        || !(0.01..=1.99).contains(&distance_threshold)
+        || embeddings.iter().any(|embedding| {
+            embedding.len() != EMBEDDING_DIMENSION as usize
+                || embedding.iter().any(|value| !value.is_finite())
+        })
+    {
+        return Err(NativeAdapterError::InvalidOutput);
+    }
+    let flat_len = embeddings
+        .len()
+        .checked_mul(EMBEDDING_DIMENSION as usize)
+        .ok_or(NativeAdapterError::InvalidOutput)?;
+    let mut flat = Vec::with_capacity(flat_len);
+    for embedding in embeddings {
+        flat.extend_from_slice(embedding);
+    }
+    let mut labels = vec![0_u32; embeddings.len()];
+    let mut speaker_count = 0_u32;
+    // SAFETY: All buffers are live for the synchronous call and their exact
+    // bounded capacities are provided to the verified adapter table.
+    let code = unsafe {
+        api.cluster_embeddings
+            .ok_or(NativeAdapterError::MissingFunction)?(
+            flat.as_ptr(),
+            embeddings.len() as u32,
+            distance_threshold,
+            labels.as_mut_ptr(),
+            labels.len() as u32,
+            &mut speaker_count,
+        )
+    };
+    expect_status(code, NativeStatus::Ok)?;
+    let distinct = labels.iter().copied().collect::<BTreeSet<_>>();
+    if speaker_count == 0
+        || speaker_count > embeddings.len() as u32
+        || labels.iter().any(|label| *label >= speaker_count)
+        || distinct.len() != speaker_count as usize
+        || distinct.iter().copied().ne(0..speaker_count)
+    {
+        return Err(NativeAdapterError::InvalidOutput);
+    }
+    Ok(labels)
 }
 
 struct NativeDiarizationGuard<'adapter> {
@@ -973,6 +1067,8 @@ mod tests {
         _: *mut NativeDiarizer,
         _: *const c_float,
         _: u32,
+        _: Option<EmbeddingStarted>,
+        _: *mut c_void,
         _: *mut *mut NativeDiarizationResult,
     ) -> NativeStatusCode {
         NativeStatus::Ok as NativeStatusCode
@@ -984,6 +1080,16 @@ mod tests {
         NativeStatus::Ok as NativeStatusCode
     }
     unsafe extern "C" fn stub_destroy_diarization(_: *mut NativeDiarizationResult) {}
+    unsafe extern "C" fn stub_cluster_embeddings(
+        _: *const c_float,
+        _: u32,
+        _: c_float,
+        _: *mut u32,
+        _: u32,
+        _: *mut u32,
+    ) -> NativeStatusCode {
+        NativeStatus::Ok as NativeStatusCode
+    }
 
     unsafe extern "C" fn create_fake_asr(
         _: *const NativeAsrConfig,
@@ -1067,8 +1173,14 @@ mod tests {
         _: *mut NativeDiarizer,
         _: *const c_float,
         _: u32,
+        embedding_started: Option<EmbeddingStarted>,
+        user_data: *mut c_void,
         out: *mut *mut NativeDiarizationResult,
     ) -> NativeStatusCode {
+        if let Some(embedding_started) = embedding_started {
+            // SAFETY: The wrapper supplies its live synchronous callback context.
+            unsafe { embedding_started(user_data) };
+        }
         // SAFETY: The wrapper passes a live output pointer.
         unsafe { *out = NonNull::<NativeDiarizationResult>::dangling().as_ptr() };
         NativeStatus::Ok as NativeStatusCode
@@ -1113,6 +1225,44 @@ mod tests {
         NativeStatus::Ok as NativeStatusCode
     }
 
+    unsafe extern "C" fn fake_cluster_embeddings(
+        embeddings: *const c_float,
+        embedding_count: u32,
+        _: c_float,
+        labels: *mut u32,
+        label_capacity: u32,
+        speaker_count: *mut u32,
+    ) -> NativeStatusCode {
+        if embeddings.is_null()
+            || labels.is_null()
+            || speaker_count.is_null()
+            || label_capacity < embedding_count
+        {
+            return NativeStatus::InvalidArgument as NativeStatusCode;
+        }
+        let mut labels_by_dimension = BTreeMap::new();
+        for row in 0..embedding_count as usize {
+            let start = row * EMBEDDING_DIMENSION as usize;
+            // SAFETY: The wrapper supplies `embedding_count` complete rows.
+            let embedding = unsafe {
+                std::slice::from_raw_parts(embeddings.add(start), EMBEDDING_DIMENSION as usize)
+            };
+            let dominant = embedding
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            let next = labels_by_dimension.len() as u32;
+            let label = *labels_by_dimension.entry(dominant).or_insert(next);
+            // SAFETY: Capacity is checked above for every row.
+            unsafe { *labels.add(row) = label };
+        }
+        // SAFETY: Non-null output pointer is checked above.
+        unsafe { *speaker_count = labels_by_dimension.len() as u32 };
+        NativeStatus::Ok as NativeStatusCode
+    }
+
     fn complete_api() -> NativeApiV1 {
         NativeApiV1 {
             struct_size: size_of::<NativeApiV1>() as u32,
@@ -1132,6 +1282,7 @@ mod tests {
             diarize_window: Some(stub_diarize_window),
             copy_diarization_result: Some(stub_copy_diarization),
             destroy_diarization_result: Some(stub_destroy_diarization),
+            cluster_embeddings: Some(stub_cluster_embeddings),
         }
     }
 
@@ -1147,7 +1298,7 @@ mod tests {
         assert_eq!(size_of::<NativeLocalSpeaker>(), 4);
         assert_eq!(size_of::<NativeLocalSegment>(), 24);
         assert_eq!(size_of::<NativeDiarizationOutput>(), 56);
-        assert_eq!(size_of::<NativeApiV1>(), 128);
+        assert_eq!(size_of::<NativeApiV1>(), 136);
     }
 
     #[test]
@@ -1184,6 +1335,7 @@ mod tests {
         api.create_diarizer = Some(create_fake_diarizer);
         api.diarize_window = Some(fake_diarize_window);
         api.copy_diarization_result = Some(fake_copy_diarization);
+        api.cluster_embeddings = Some(fake_cluster_embeddings);
         let root = tempfile::tempdir().unwrap();
 
         let mut asr = create_asr_engine(
@@ -1210,6 +1362,7 @@ mod tests {
             &root.path().join("embedding.onnx"),
         )
         .unwrap();
+        let mut embedding_started = false;
         let observation = diarizer
             .diarize_window(
                 WindowSpec {
@@ -1218,11 +1371,22 @@ mod tests {
                     end_sample: 30,
                 },
                 &[0.0; 10],
+                || embedding_started = true,
             )
             .unwrap();
+        assert!(embedding_started);
         assert_eq!(observation.speakers.len(), 2);
         assert_eq!(observation.speakers[0].local_speaker, 3);
         assert_eq!(observation.speakers[0].segments[0].end_sample, 4);
         assert_eq!(observation.speakers[1].embedding[1], 1.0);
+
+        let mut first = vec![0.0; EMBEDDING_DIMENSION as usize];
+        first[0] = 1.0;
+        let mut second = vec![0.0; EMBEDDING_DIMENSION as usize];
+        second[1] = 1.0;
+        assert_eq!(
+            cluster_embeddings(&api, &[first.clone(), first, second], 0.5,).unwrap(),
+            vec![0, 0, 1]
+        );
     }
 }

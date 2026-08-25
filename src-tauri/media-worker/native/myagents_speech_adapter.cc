@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "fastcluster-all-in-one.h"  // NOLINT
 #include "sherpa-onnx/c-api/c-api.h"
 
 #ifndef MYAGENTS_SHERPA_ONNX_COMMIT
@@ -30,7 +31,7 @@ static_assert(sizeof(MyAgentsSpeechDiarizerConfig) == 48);
 static_assert(sizeof(MyAgentsSpeechLocalSpeaker) == 4);
 static_assert(sizeof(MyAgentsSpeechLocalSegment) == 24);
 static_assert(sizeof(MyAgentsSpeechDiarizationOutput) == 56);
-static_assert(sizeof(MyAgentsSpeechAdapterApiV1) == 128);
+static_assert(sizeof(MyAgentsSpeechAdapterApiV1) == 136);
 
 namespace {
 
@@ -428,7 +429,9 @@ void DestroyDiarizer(MyAgentsSpeechDiarizer *diarizer) {
 
 MyAgentsSpeechStatus DiarizeWindow(
     MyAgentsSpeechDiarizer *diarizer, const float *samples,
-    uint32_t sample_count, MyAgentsSpeechDiarizationResult **out) {
+    uint32_t sample_count,
+    MyAgentsSpeechEmbeddingStartedCallback embedding_started, void *user_data,
+    MyAgentsSpeechDiarizationResult **out) {
   if (out == nullptr) return MYAGENTS_SPEECH_STATUS_INVALID_ARGUMENT;
   *out = nullptr;
   if (diarizer == nullptr || diarizer->diarizer == nullptr ||
@@ -495,6 +498,7 @@ MyAgentsSpeechStatus DiarizeWindow(
     result->embeddings.reserve(grouped.size() *
                                MYAGENTS_SPEECH_EMBEDDING_DIMENSION);
     std::map<int32_t, bool> ready_speakers;
+    if (embedding_started != nullptr) embedding_started(user_data);
     for (const auto &[speaker, speaker_segments] : grouped) {
       const auto *stream =
           SherpaOnnxSpeakerEmbeddingExtractorCreateStream(diarizer->extractor);
@@ -607,6 +611,95 @@ void DestroyDiarizationResult(MyAgentsSpeechDiarizationResult *result) {
   delete result;
 }
 
+MyAgentsSpeechStatus ClusterEmbeddings(const float *embeddings,
+                                       uint32_t embedding_count,
+                                       float distance_threshold,
+                                       uint32_t *labels,
+                                       uint32_t label_capacity,
+                                       uint32_t *speaker_count) {
+  if (embeddings == nullptr || embedding_count == 0 ||
+      embedding_count > MYAGENTS_SPEECH_MAX_CLUSTER_EMBEDDINGS ||
+      !ValidFiniteRange(distance_threshold, 0.01f, 1.99f) ||
+      labels == nullptr || label_capacity < embedding_count ||
+      speaker_count == nullptr) {
+    return MYAGENTS_SPEECH_STATUS_INVALID_ARGUMENT;
+  }
+  try {
+    if (embedding_count == 1) {
+      labels[0] = 0;
+      *speaker_count = 1;
+      return MYAGENTS_SPEECH_STATUS_OK;
+    }
+    std::vector<double> norms(embedding_count, 0.0);
+    for (uint32_t row = 0; row != embedding_count; ++row) {
+      const float *embedding =
+          embeddings + row * MYAGENTS_SPEECH_EMBEDDING_DIMENSION;
+      double squared_norm = 0.0;
+      for (uint32_t column = 0;
+           column != MYAGENTS_SPEECH_EMBEDDING_DIMENSION; ++column) {
+        if (!std::isfinite(embedding[column])) {
+          return MYAGENTS_SPEECH_STATUS_INVALID_ARGUMENT;
+        }
+        squared_norm += static_cast<double>(embedding[column]) *
+                        static_cast<double>(embedding[column]);
+      }
+      if (!std::isfinite(squared_norm) ||
+          squared_norm <= std::numeric_limits<double>::epsilon()) {
+        return MYAGENTS_SPEECH_STATUS_INVALID_ARGUMENT;
+      }
+      norms[row] = std::sqrt(squared_norm);
+    }
+
+    const size_t distance_count =
+        static_cast<size_t>(embedding_count) * (embedding_count - 1) / 2;
+    std::vector<double> distances(distance_count);
+    size_t distance_index = 0;
+    for (uint32_t left = 0; left != embedding_count; ++left) {
+      const float *left_embedding =
+          embeddings + left * MYAGENTS_SPEECH_EMBEDDING_DIMENSION;
+      for (uint32_t right = left + 1; right != embedding_count; ++right) {
+        const float *right_embedding =
+            embeddings + right * MYAGENTS_SPEECH_EMBEDDING_DIMENSION;
+        double dot = 0.0;
+        for (uint32_t column = 0;
+             column != MYAGENTS_SPEECH_EMBEDDING_DIMENSION; ++column) {
+          dot += static_cast<double>(left_embedding[column]) *
+                 static_cast<double>(right_embedding[column]);
+        }
+        const double similarity =
+            std::clamp(dot / (norms[left] * norms[right]), -1.0, 1.0);
+        distances[distance_index++] = std::max(0.0, 1.0 - similarity);
+      }
+    }
+
+    std::vector<int32_t> merge(2 * (embedding_count - 1));
+    std::vector<double> height(embedding_count - 1);
+    std::vector<int32_t> native_labels(embedding_count);
+    fastclustercpp::hclust_fast(
+        static_cast<int32_t>(embedding_count), distances.data(),
+        fastclustercpp::HCLUST_METHOD_COMPLETE, merge.data(), height.data());
+    fastclustercpp::cutree_cdist(
+        static_cast<int32_t>(embedding_count), merge.data(), height.data(),
+        distance_threshold, native_labels.data());
+
+    uint32_t maximum_label = 0;
+    for (uint32_t row = 0; row != embedding_count; ++row) {
+      if (native_labels[row] < 0 ||
+          native_labels[row] >= static_cast<int32_t>(embedding_count)) {
+        return MYAGENTS_SPEECH_STATUS_INFERENCE_ERROR;
+      }
+      labels[row] = static_cast<uint32_t>(native_labels[row]);
+      maximum_label = std::max(maximum_label, labels[row]);
+    }
+    *speaker_count = maximum_label + 1;
+    return MYAGENTS_SPEECH_STATUS_OK;
+  } catch (const std::bad_alloc &) {
+    return MYAGENTS_SPEECH_STATUS_RESOURCE_LIMIT;
+  } catch (...) {
+    return MYAGENTS_SPEECH_STATUS_INFERENCE_ERROR;
+  }
+}
+
 const MyAgentsSpeechAdapterApiV1 kApi = {
     sizeof(MyAgentsSpeechAdapterApiV1),
     MYAGENTS_SPEECH_ADAPTER_ABI_VERSION,
@@ -625,6 +718,7 @@ const MyAgentsSpeechAdapterApiV1 kApi = {
     DiarizeWindow,
     CopyDiarizationResult,
     DestroyDiarizationResult,
+    ClusterEmbeddings,
 };
 
 }  // namespace

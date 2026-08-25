@@ -1,23 +1,25 @@
-use std::collections::{BTreeMap, HashMap};
-use zeroize::{Zeroize, Zeroizing};
+use hdbscan::{DistanceMetric, Hdbscan, HdbscanHyperParams};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use zeroize::Zeroizing;
 
 pub const SPEAKER_EMBEDDING_DIMENSION: usize = 512;
 pub const DEFAULT_SAMPLE_RATE: u32 = 16_000;
-pub const DEFAULT_WINDOW_SAMPLES: u64 = 5 * 60 * DEFAULT_SAMPLE_RATE as u64;
-pub const DEFAULT_OVERLAP_SAMPLES: u64 = 10 * DEFAULT_SAMPLE_RATE as u64;
+pub const DEFAULT_WINDOW_SAMPLES: u64 = 68 * DEFAULT_SAMPLE_RATE as u64;
+pub const DEFAULT_OVERLAP_SAMPLES: u64 = 11 * DEFAULT_SAMPLE_RATE as u64;
 
 const MAX_WINDOWS: usize = 512;
 const MAX_LOCAL_SPEAKERS_PER_WINDOW: usize = 32;
 const MAX_SEGMENTS_PER_WINDOW: usize = 16_384;
 const MAX_GLOBAL_PROTOTYPES: usize = 2_048;
+const GLOBAL_MIN_CLUSTER_SIZE: usize = 2;
+const GLOBAL_MIN_SAMPLES: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoundedDiarizationConfig {
     pub window_samples: u64,
     pub overlap_samples: u64,
     pub window_merge_distance: f32,
-    pub global_cluster_distance: f32,
-    pub global_min_samples: usize,
+    pub global_same_speaker_distance: f32,
 }
 
 impl Default for BoundedDiarizationConfig {
@@ -26,8 +28,7 @@ impl Default for BoundedDiarizationConfig {
             window_samples: DEFAULT_WINDOW_SAMPLES,
             overlap_samples: DEFAULT_OVERLAP_SAMPLES,
             window_merge_distance: 0.75,
-            global_cluster_distance: 0.50,
-            global_min_samples: 3,
+            global_same_speaker_distance: 0.50,
         }
     }
 }
@@ -88,6 +89,7 @@ pub enum DiarizationError {
     DuplicateLocalSpeaker,
     InvalidEmbedding,
     InvalidSegment,
+    InvalidClusterLabels,
 }
 
 #[derive(Debug, Clone)]
@@ -146,11 +148,17 @@ pub fn bounded_window_plan(
 /// The worker may persist window observations between model invocations; this
 /// final pass is therefore independent of media duration except for fixed
 /// prototype and segment ceilings.
-pub fn consolidate_diarization(
+pub fn consolidate_diarization<F, G>(
     total_samples: u64,
     observations: &[WindowObservation],
     config: BoundedDiarizationConfig,
-) -> Result<DiarizationProjection, DiarizationError> {
+    mut cluster_embeddings: F,
+    on_reconciling_started: G,
+) -> Result<DiarizationProjection, DiarizationError>
+where
+    F: FnMut(&[Vec<f32>], f32) -> Result<Vec<u32>, DiarizationError>,
+    G: FnOnce(),
+{
     let planned = bounded_window_plan(total_samples, config)?;
     if observations.len() != planned.len()
         || observations
@@ -199,7 +207,12 @@ pub fn consolidate_diarization(
             .checked_add(window_segments)
             .ok_or(DiarizationError::ResourceLimit)?;
 
-        let window_prototypes = complete_link_prototypes(&embeddings, config.window_merge_distance);
+        let window_prototypes = if embeddings.is_empty() {
+            Vec::new()
+        } else {
+            let labels = cluster_embeddings(&embeddings, config.window_merge_distance)?;
+            labeled_prototypes(&embeddings, &labels)?
+        };
         if prototypes.len().saturating_add(window_prototypes.len()) > MAX_GLOBAL_PROTOTYPES {
             return Err(DiarizationError::ResourceLimit);
         }
@@ -220,16 +233,8 @@ pub fn consolidate_diarization(
         }
     }
 
-    let global_labels = density_cluster(
-        &prototypes,
-        config.global_cluster_distance,
-        config.global_min_samples,
-    );
-    let speaker_count = global_labels
-        .iter()
-        .copied()
-        .max()
-        .map_or(0, |label| label + 1);
+    let global_labels = global_cluster_labels(&prototypes, config.global_same_speaker_distance)?;
+    on_reconciling_started();
 
     let mut assignments = Vec::new();
     for (prototype_index, identity) in identities.iter().enumerate() {
@@ -296,8 +301,23 @@ pub fn consolidate_diarization(
     });
     segments = merge_adjacent_same_speaker(segments);
 
+    let mut compact_labels = BTreeMap::new();
+    for segment in &segments {
+        let next_label = compact_labels.len() as u32;
+        compact_labels
+            .entry(segment.global_speaker)
+            .or_insert(next_label);
+    }
+    for segment in &mut segments {
+        segment.global_speaker = compact_labels[&segment.global_speaker];
+    }
+    assignments.retain(|assignment| compact_labels.contains_key(&assignment.global_speaker));
+    for assignment in &mut assignments {
+        assignment.global_speaker = compact_labels[&assignment.global_speaker];
+    }
+
     Ok(DiarizationProjection {
-        speaker_count,
+        speaker_count: compact_labels.len() as u32,
         assignments,
         segments,
     })
@@ -309,9 +329,7 @@ fn validate_config(config: BoundedDiarizationConfig) -> Result<(), DiarizationEr
         || config.overlap_samples >= config.window_samples
         || config.overlap_samples > DEFAULT_OVERLAP_SAMPLES
         || !valid_distance(config.window_merge_distance)
-        || !valid_distance(config.global_cluster_distance)
-        || config.global_min_samples == 0
-        || config.global_min_samples > MAX_GLOBAL_PROTOTYPES
+        || !valid_distance(config.global_same_speaker_distance)
     {
         return Err(DiarizationError::InvalidConfiguration);
     }
@@ -338,53 +356,143 @@ fn normalized_embedding(values: &[f32]) -> Result<Vec<f32>, DiarizationError> {
     Ok(values.iter().map(|value| *value / norm).collect())
 }
 
-fn complete_link_prototypes(embeddings: &[Vec<f32>], threshold: f32) -> Vec<WindowPrototype> {
-    let mut clusters = embeddings
-        .iter()
-        .enumerate()
-        .map(|(index, embedding)| WindowPrototype {
-            embedding: embedding.clone(),
-            members: vec![index],
-        })
-        .collect::<Vec<_>>();
-
-    loop {
-        let mut closest = None;
-        for left in 0..clusters.len() {
-            for right in (left + 1)..clusters.len() {
-                let distance = complete_link_distance(
-                    &clusters[left].members,
-                    &clusters[right].members,
-                    embeddings,
-                );
-                if distance <= threshold
-                    && closest.is_none_or(|(_, _, closest_distance)| distance < closest_distance)
-                {
-                    closest = Some((left, right, distance));
-                }
-            }
-        }
-        let Some((left, right, _)) = closest else {
-            break;
-        };
-        let mut right_cluster = clusters.remove(right);
-        right_cluster.embedding.zeroize();
-        clusters[left].members.extend(right_cluster.members);
-        clusters[left].members.sort_unstable();
-        clusters[left].embedding.zeroize();
-        clusters[left].embedding = normalized_centroid(&clusters[left].members, embeddings);
+fn labeled_prototypes(
+    embeddings: &[Vec<f32>],
+    labels: &[u32],
+) -> Result<Vec<WindowPrototype>, DiarizationError> {
+    validate_cluster_labels(embeddings.len(), labels)?;
+    let mut members_by_label = BTreeMap::<u32, Vec<usize>>::new();
+    for (index, label) in labels.iter().copied().enumerate() {
+        members_by_label.entry(label).or_default().push(index);
     }
-    clusters
+    Ok(members_by_label
+        .into_values()
+        .map(|members| WindowPrototype {
+            embedding: normalized_centroid(&members, embeddings),
+            members,
+        })
+        .collect())
 }
 
-fn complete_link_distance(left: &[usize], right: &[usize], embeddings: &[Vec<f32>]) -> f32 {
-    left.iter()
-        .flat_map(|&left_index| {
-            right.iter().map(move |&right_index| {
-                cosine_distance(&embeddings[left_index], &embeddings[right_index])
+fn validate_cluster_labels(embedding_count: usize, labels: &[u32]) -> Result<(), DiarizationError> {
+    if labels.len() != embedding_count {
+        return Err(DiarizationError::InvalidClusterLabels);
+    }
+    let distinct = labels.iter().copied().collect::<BTreeSet<_>>();
+    if distinct
+        .iter()
+        .copied()
+        .ne(0..u32::try_from(distinct.len()).map_err(|_| DiarizationError::ResourceLimit)?)
+    {
+        return Err(DiarizationError::InvalidClusterLabels);
+    }
+    Ok(())
+}
+
+/// Discovers Record-wide speaker groups without assuming a speaker count or a
+/// single density threshold. HDBSCAN owns the generic density clustering; the
+/// only product-specific policy here is how to project its explicit noise
+/// points into a complete transcript speaker timeline.
+fn global_cluster_labels(
+    prototypes: &[Vec<f32>],
+    same_speaker_distance: f32,
+) -> Result<Vec<u32>, DiarizationError> {
+    match prototypes.len() {
+        0 => return Ok(Vec::new()),
+        1 => return Ok(vec![0]),
+        2 => {
+            return Ok(
+                if cosine_distance(&prototypes[0], &prototypes[1]) <= same_speaker_distance {
+                    vec![0, 0]
+                } else {
+                    vec![0, 1]
+                },
+            );
+        }
+        _ => {}
+    }
+
+    let hyper_parameters = HdbscanHyperParams::builder()
+        .min_cluster_size(GLOBAL_MIN_CLUSTER_SIZE)
+        .min_samples(GLOBAL_MIN_SAMPLES)
+        .allow_single_cluster(true)
+        .epsilon(f64::from((2.0 * same_speaker_distance).sqrt()))
+        .dist_metric(DistanceMetric::Euclidean)
+        .build();
+    let raw_labels = Hdbscan::new(prototypes, hyper_parameters)
+        .cluster()
+        .map_err(|_| DiarizationError::InvalidClusterLabels)?;
+    if raw_labels.len() != prototypes.len() || raw_labels.iter().any(|label| *label < -1) {
+        return Err(DiarizationError::InvalidClusterLabels);
+    }
+
+    let mut compact_by_raw = BTreeMap::new();
+    let mut labels = vec![u32::MAX; prototypes.len()];
+    let mut members = Vec::<Vec<usize>>::new();
+    for (index, raw_label) in raw_labels.iter().copied().enumerate() {
+        if raw_label < 0 {
+            continue;
+        }
+        let next_label = compact_by_raw.len() as u32;
+        let compact = *compact_by_raw.entry(raw_label).or_insert(next_label);
+        if members.len() <= compact as usize {
+            members.resize_with(compact as usize + 1, Vec::new);
+        }
+        members[compact as usize].push(index);
+        labels[index] = compact;
+    }
+    let centroids = members
+        .iter()
+        .map(|cluster_members| normalized_centroid(cluster_members, prototypes))
+        .collect::<Vec<_>>();
+
+    let mut next_unique_label = centroids.len() as u32;
+    for (index, label) in labels.iter_mut().enumerate() {
+        if *label != u32::MAX {
+            continue;
+        }
+        let nearest = centroids
+            .iter()
+            .enumerate()
+            .map(|(cluster, centroid)| {
+                (
+                    cluster as u32,
+                    cosine_distance(&prototypes[index], centroid),
+                )
             })
+            .min_by(
+                |(left_label, left_distance), (right_label, right_distance)| {
+                    left_distance
+                        .total_cmp(right_distance)
+                        .then_with(|| left_label.cmp(right_label))
+                },
+            );
+        if let Some((cluster, distance)) = nearest
+            && distance <= same_speaker_distance
+        {
+            *label = cluster;
+        } else {
+            *label = next_unique_label;
+            next_unique_label = next_unique_label
+                .checked_add(1)
+                .ok_or(DiarizationError::ResourceLimit)?;
+        }
+    }
+    let labels = compact_cluster_labels(&labels);
+    validate_cluster_labels(prototypes.len(), &labels)?;
+    Ok(labels)
+}
+
+fn compact_cluster_labels(labels: &[u32]) -> Vec<u32> {
+    let mut compact = BTreeMap::new();
+    labels
+        .iter()
+        .copied()
+        .map(|label| {
+            let next = compact.len() as u32;
+            *compact.entry(label).or_insert(next)
         })
-        .fold(0.0_f32, f32::max)
+        .collect()
 }
 
 fn normalized_centroid(members: &[usize], embeddings: &[Vec<f32>]) -> Vec<f32> {
@@ -403,100 +511,6 @@ fn normalized_centroid(members: &[usize], embeddings: &[Vec<f32>]) -> Vec<f32> {
         *value /= norm;
     }
     centroid
-}
-
-fn density_cluster(embeddings: &[Vec<f32>], threshold: f32, min_samples: usize) -> Vec<u32> {
-    if embeddings.is_empty() {
-        return Vec::new();
-    }
-    let row_count = embeddings.len();
-    let mut distances = vec![0.0_f32; row_count * row_count];
-    let mut neighbor_counts = vec![1_usize; row_count];
-    for left in 0..row_count {
-        for right in (left + 1)..row_count {
-            let distance = cosine_distance(&embeddings[left], &embeddings[right]);
-            distances[left * row_count + right] = distance;
-            distances[right * row_count + left] = distance;
-            if distance <= threshold {
-                neighbor_counts[left] += 1;
-                neighbor_counts[right] += 1;
-            }
-        }
-    }
-
-    let mut components = UnionFind::new(row_count);
-    for left in 0..row_count {
-        if neighbor_counts[left] < min_samples {
-            continue;
-        }
-        for right in (left + 1)..row_count {
-            if neighbor_counts[right] >= min_samples
-                && distances[left * row_count + right] <= threshold
-            {
-                components.unite(left, right);
-            }
-        }
-    }
-
-    let mut assignments = vec![usize::MAX; row_count];
-    let mut sparse_rows = Vec::new();
-    for row in 0..row_count {
-        if neighbor_counts[row] >= min_samples {
-            assignments[row] = components.find(row);
-            continue;
-        }
-        let mut best = None;
-        for candidate in 0..row_count {
-            if neighbor_counts[candidate] < min_samples {
-                continue;
-            }
-            let distance = distances[row * row_count + candidate];
-            if distance <= threshold
-                && best.is_none_or(|(_, best_distance)| distance < best_distance)
-            {
-                best = Some((candidate, distance));
-            }
-        }
-        if let Some((candidate, _)) = best {
-            assignments[row] = components.find(candidate);
-        } else {
-            sparse_rows.push(row);
-        }
-    }
-
-    let mut sparse_clusters: Vec<Vec<usize>> = Vec::new();
-    for row in sparse_rows {
-        let mut best = None;
-        for (cluster_index, cluster) in sparse_clusters.iter().enumerate() {
-            let distance = cluster
-                .iter()
-                .map(|&member| cosine_distance(&embeddings[row], &embeddings[member]))
-                .fold(0.0_f32, f32::max);
-            if distance <= threshold
-                && best.is_none_or(|(_, best_distance)| distance < best_distance)
-            {
-                best = Some((cluster_index, distance));
-            }
-        }
-        let cluster_index = best.map_or_else(
-            || {
-                sparse_clusters.push(Vec::new());
-                sparse_clusters.len() - 1
-            },
-            |(cluster_index, _)| cluster_index,
-        );
-        sparse_clusters[cluster_index].push(row);
-        assignments[row] = row_count + cluster_index;
-    }
-
-    let mut compact = HashMap::new();
-    assignments
-        .into_iter()
-        .map(|assignment| {
-            let next = compact.len() as u32;
-            *compact.entry(assignment).or_insert(next)
-        })
-        .collect()
 }
 
 fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
@@ -528,43 +542,6 @@ fn merge_adjacent_same_speaker(segments: Vec<GlobalSpeakerSegment>) -> Vec<Globa
     merged
 }
 
-#[derive(Debug)]
-struct UnionFind {
-    parent: Vec<usize>,
-    rank: Vec<u8>,
-}
-
-impl UnionFind {
-    fn new(size: usize) -> Self {
-        Self {
-            parent: (0..size).collect(),
-            rank: vec![0; size],
-        }
-    }
-
-    fn find(&mut self, value: usize) -> usize {
-        if self.parent[value] != value {
-            self.parent[value] = self.find(self.parent[value]);
-        }
-        self.parent[value]
-    }
-
-    fn unite(&mut self, left: usize, right: usize) {
-        let mut left = self.find(left);
-        let mut right = self.find(right);
-        if left == right {
-            return;
-        }
-        if self.rank[left] < self.rank[right] {
-            std::mem::swap(&mut left, &mut right);
-        }
-        self.parent[right] = left;
-        if self.rank[left] == self.rank[right] {
-            self.rank[left] += 1;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +571,27 @@ mod tests {
             .collect()
     }
 
+    fn test_cluster(
+        embeddings: &[Vec<f32>],
+        _distance_threshold: f32,
+    ) -> Result<Vec<u32>, DiarizationError> {
+        let mut speaker_labels = BTreeMap::new();
+        Ok(embeddings
+            .iter()
+            .map(|embedding| {
+                let dominant_dimension = embedding
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                let speaker = dominant_dimension / 2;
+                let next_label = speaker_labels.len() as u32;
+                *speaker_labels.entry(speaker).or_insert(next_label)
+            })
+            .collect())
+    }
+
     #[test]
     fn frozen_short_corpora_keep_record_wide_speaker_identity() {
         let config = BoundedDiarizationConfig {
@@ -603,9 +601,14 @@ mod tests {
         };
         let plan = bounded_window_plan(5_000, config).unwrap();
         for expected in [4, 2, 2, 2] {
-            let projection =
-                consolidate_diarization(5_000, &observation_for_plan(&plan, expected), config)
-                    .unwrap();
+            let projection = consolidate_diarization(
+                5_000,
+                &observation_for_plan(&plan, expected),
+                config,
+                test_cluster,
+                || {},
+            )
+            .unwrap();
             assert_eq!(projection.speaker_count, expected as u32);
             for local_speaker in 0..expected as u32 {
                 let labels = projection
@@ -617,6 +620,16 @@ mod tests {
                 assert!(labels.windows(2).all(|pair| pair[0] == pair[1]));
             }
         }
+    }
+
+    #[test]
+    fn default_window_plan_keeps_eight_hours_within_the_window_budget() {
+        let total_samples = 8 * 60 * 60 * DEFAULT_SAMPLE_RATE as u64;
+        let plan = bounded_window_plan(total_samples, BoundedDiarizationConfig::default()).unwrap();
+        assert_eq!(plan.len(), 506);
+        assert!(plan.len() <= MAX_WINDOWS);
+        assert_eq!(plan.first().unwrap().start_sample, 0);
+        assert_eq!(plan.last().unwrap().end_sample, total_samples);
     }
 
     #[test]
@@ -641,7 +654,8 @@ mod tests {
                 }],
             })
             .collect::<Vec<_>>();
-        let projection = consolidate_diarization(50_000, &observations, config).unwrap();
+        let projection =
+            consolidate_diarization(50_000, &observations, config, test_cluster, || {}).unwrap();
         assert_eq!(projection.speaker_count, 1);
     }
 
@@ -654,8 +668,14 @@ mod tests {
         };
         let plan = bounded_window_plan(1_900, config).unwrap();
         assert_eq!(plan.len(), 2);
-        let projection =
-            consolidate_diarization(1_900, &observation_for_plan(&plan, 4), config).unwrap();
+        let projection = consolidate_diarization(
+            1_900,
+            &observation_for_plan(&plan, 4),
+            config,
+            test_cluster,
+            || {},
+        )
+        .unwrap();
         assert_eq!(projection.speaker_count, 4);
         for local_speaker in 0..4 {
             let labels = projection
@@ -679,7 +699,8 @@ mod tests {
         let plan = bounded_window_plan(2_800, config).unwrap();
         let mut observations = observation_for_plan(&plan, 1);
         observations[2].speakers.clear();
-        let projection = consolidate_diarization(2_800, &observations, config).unwrap();
+        let projection =
+            consolidate_diarization(2_800, &observations, config, test_cluster, || {}).unwrap();
         assert_eq!(projection.speaker_count, 1);
         assert_eq!(projection.assignments.len(), 2);
         assert_eq!(
@@ -717,7 +738,8 @@ mod tests {
                 },
             ],
         }];
-        let projection = consolidate_diarization(1_000, &observations, config).unwrap();
+        let projection =
+            consolidate_diarization(1_000, &observations, config, test_cluster, || {}).unwrap();
         assert_eq!(projection.speaker_count, 1);
         assert_eq!(projection.assignments.len(), 2);
         assert_eq!(
@@ -727,23 +749,129 @@ mod tests {
     }
 
     #[test]
-    fn non_core_bridge_cannot_join_two_dense_speaker_components() {
-        let point = |degrees: f32| {
-            let radians = degrees.to_radians();
-            let mut values = vec![0.0; SPEAKER_EMBEDDING_DIMENSION];
-            values[0] = radians.cos();
-            values[1] = radians.sin();
-            values
+    fn rejects_invalid_cluster_labels() {
+        let config = BoundedDiarizationConfig {
+            window_samples: 1_000,
+            overlap_samples: 100,
+            ..BoundedDiarizationConfig::default()
         };
-        let points = [-20.0, -10.0, 0.0, 10.0, 70.0, 80.0, 90.0, 100.0, 40.0]
-            .into_iter()
-            .map(point)
-            .collect::<Vec<_>>();
+        let plan = bounded_window_plan(1_000, config).unwrap();
+        assert_eq!(
+            consolidate_diarization(
+                1_000,
+                &observation_for_plan(&plan, 2),
+                config,
+                |_, _| Ok(vec![2, 2]),
+                || {},
+            ),
+            Err(DiarizationError::InvalidClusterLabels)
+        );
+    }
 
-        let labels = density_cluster(&points, 0.1341, 4);
-        assert!(labels[..4].iter().all(|label| *label == labels[0]));
-        assert!(labels[4..8].iter().all(|label| *label == labels[4]));
-        assert_ne!(labels[0], labels[4]);
+    #[test]
+    fn delegates_only_window_duplicate_consolidation_to_native_hclust() {
+        let config = BoundedDiarizationConfig {
+            window_samples: 1_000,
+            overlap_samples: 100,
+            ..BoundedDiarizationConfig::default()
+        };
+        let plan = bounded_window_plan(1_000, config).unwrap();
+        let mut observed = Vec::new();
+        let mut reconciling_started = false;
+        consolidate_diarization(
+            1_000,
+            &observation_for_plan(&plan, 1),
+            config,
+            |embeddings, _| {
+                observed.push(embeddings.len());
+                Ok(vec![0; embeddings.len()])
+            },
+            || reconciling_started = true,
+        )
+        .unwrap();
+        assert_eq!(observed, vec![1]);
+        assert!(reconciling_started);
+    }
+
+    #[test]
+    fn hdbscan_discovers_record_wide_speakers_across_many_windows() {
+        let prototypes = (0..4)
+            .flat_map(|speaker| {
+                (0..12).map(move |sample| embedding(speaker, (sample as f32 - 5.5) * 0.025))
+            })
+            .map(|values| normalized_embedding(&values).unwrap())
+            .collect::<Vec<_>>();
+        let labels = global_cluster_labels(&prototypes, 0.50).unwrap();
+        assert_eq!(labels.iter().copied().collect::<BTreeSet<_>>().len(), 4);
+        for speaker in 0..4 {
+            assert!(
+                labels[speaker * 12..(speaker + 1) * 12]
+                    .iter()
+                    .all(|label| *label == labels[speaker * 12])
+            );
+        }
+    }
+
+    #[test]
+    fn hdbscan_keeps_a_far_noise_prototype_as_anonymous_speaker() {
+        let mut prototypes = (0..2)
+            .flat_map(|speaker| (0..6).map(move |sample| embedding(speaker, sample as f32 * 0.02)))
+            .map(|values| normalized_embedding(&values).unwrap())
+            .collect::<Vec<_>>();
+        prototypes.push(normalized_embedding(&embedding(2, 0.0)).unwrap());
+        let labels = global_cluster_labels(&prototypes, 0.50).unwrap();
+        assert_eq!(labels.iter().copied().collect::<BTreeSet<_>>().len(), 3);
+        assert!(labels[..6].iter().all(|label| *label == labels[0]));
+        assert!(labels[6..12].iter().all(|label| *label == labels[6]));
+        assert_ne!(labels[0], labels[6]);
+        assert_ne!(labels[0], labels[12]);
+        assert_ne!(labels[6], labels[12]);
+    }
+
+    #[test]
+    fn drops_overlap_only_speakers_and_compacts_terminal_labels() {
+        let config = BoundedDiarizationConfig {
+            window_samples: 1_000,
+            overlap_samples: 100,
+            ..BoundedDiarizationConfig::default()
+        };
+        let plan = bounded_window_plan(1_900, config).unwrap();
+        let observations = vec![
+            WindowObservation {
+                window: plan[0],
+                speakers: vec![LocalSpeakerObservation {
+                    local_speaker: 0,
+                    embedding: embedding(0, 0.0),
+                    segments: vec![LocalSegment {
+                        start_sample: 0,
+                        end_sample: 900,
+                    }],
+                }],
+            },
+            WindowObservation {
+                window: plan[1],
+                speakers: vec![LocalSpeakerObservation {
+                    local_speaker: 7,
+                    embedding: embedding(1, 0.0),
+                    segments: vec![LocalSegment {
+                        start_sample: 0,
+                        end_sample: 40,
+                    }],
+                }],
+            },
+        ];
+        let projection =
+            consolidate_diarization(1_900, &observations, config, test_cluster, || {}).unwrap();
+        assert_eq!(projection.speaker_count, 1);
+        assert_eq!(projection.assignments.len(), 1);
+        assert_eq!(projection.assignments[0].window_index, 0);
+        assert_eq!(projection.assignments[0].global_speaker, 0);
+        assert!(
+            projection
+                .segments
+                .iter()
+                .all(|segment| segment.global_speaker == 0)
+        );
     }
 
     #[test]
@@ -751,13 +879,18 @@ mod tests {
         let config = BoundedDiarizationConfig {
             window_samples: 1_000,
             overlap_samples: 100,
-            global_min_samples: 2,
             ..BoundedDiarizationConfig::default()
         };
         let plan = bounded_window_plan(1_900, config).unwrap();
         assert_eq!(plan.len(), 2, "fully covered duration has no tail window");
-        let projection =
-            consolidate_diarization(1_900, &observation_for_plan(&plan, 1), config).unwrap();
+        let projection = consolidate_diarization(
+            1_900,
+            &observation_for_plan(&plan, 1),
+            config,
+            test_cluster,
+            || {},
+        )
+        .unwrap();
         assert_eq!(
             projection.segments,
             vec![GlobalSpeakerSegment {
@@ -794,7 +927,7 @@ mod tests {
                 }],
             }];
             assert_eq!(
-                consolidate_diarization(1_000, &observations, config),
+                consolidate_diarization(1_000, &observations, config, test_cluster, || {}),
                 Err(DiarizationError::InvalidEmbedding)
             );
         }
@@ -814,6 +947,8 @@ mod tests {
                     speakers: too_many_speakers,
                 }],
                 config,
+                test_cluster,
+                || {},
             ),
             Err(DiarizationError::ResourceLimit)
         );
@@ -834,8 +969,10 @@ mod tests {
                 speakers: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let first = consolidate_diarization(1_900, &observations, config).unwrap();
-        let second = consolidate_diarization(1_900, &observations, config).unwrap();
+        let first =
+            consolidate_diarization(1_900, &observations, config, test_cluster, || {}).unwrap();
+        let second =
+            consolidate_diarization(1_900, &observations, config, test_cluster, || {}).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.speaker_count, 0);
         assert!(first.assignments.is_empty());

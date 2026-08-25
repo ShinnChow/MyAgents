@@ -15,6 +15,7 @@ name = "myagents-media-worker"
 path = "src/main.rs"
 
 [dependencies]
+hdbscan = { version = "=0.12.0", default-features = false, features = ["serial"] }
 libloading = "0.9.0"
 myagents-media-worker-protocol = { path = "../media-worker-protocol" }
 opus2 = { version = "=0.4.0", default-features = false, features = ["backend-libopus", "bundled", "static"] }

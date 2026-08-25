@@ -496,6 +496,9 @@ test('speech inference builds a signed exact native inventory around the shared 
   assert.equal(speech.onnxRuntimeVersion, '1.28.0');
   assert.equal(speech.opus2Version, '0.4.0');
   assert.equal(speech.libopusSysVersion, '0.3.3');
+  assert.equal(speech.hdbscanVersion, '0.12.0');
+  assert.equal(speech.kdtreeVersion, '0.7.0');
+  assert.equal(speech.numTraitsVersion, '0.2.19');
   assert.equal(speech.nativeIncrementHardLimitBytes, 80 * 1024 * 1024);
   assert.match(speech.source.sha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(speech.dependencies.map(({ id }) => id).sort(), [

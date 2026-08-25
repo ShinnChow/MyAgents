@@ -29,9 +29,10 @@ extern "C" {
 #define MYAGENTS_SPEECH_MAX_ASR_SAMPLES (60u * MYAGENTS_SPEECH_SAMPLE_RATE)
 #define MYAGENTS_SPEECH_MAX_TEXT_BYTES (64u * 1024u)
 #define MYAGENTS_SPEECH_MAX_DIARIZATION_SAMPLES \
-  (5u * 60u * MYAGENTS_SPEECH_SAMPLE_RATE)
+  (68u * MYAGENTS_SPEECH_SAMPLE_RATE)
 #define MYAGENTS_SPEECH_MAX_LOCAL_SPEAKERS 32u
 #define MYAGENTS_SPEECH_MAX_LOCAL_SEGMENTS 16384u
+#define MYAGENTS_SPEECH_MAX_CLUSTER_EMBEDDINGS 32u
 
 typedef enum MyAgentsSpeechStatus {
   MYAGENTS_SPEECH_STATUS_OK = 0,
@@ -132,6 +133,7 @@ typedef struct MyAgentsSpeechVad MyAgentsSpeechVad;
 typedef struct MyAgentsSpeechDiarizer MyAgentsSpeechDiarizer;
 typedef struct MyAgentsSpeechDiarizationResult
     MyAgentsSpeechDiarizationResult;
+typedef void (*MyAgentsSpeechEmbeddingStartedCallback)(void *user_data);
 
 typedef struct MyAgentsSpeechAdapterApiV1 {
   uint32_t struct_size;
@@ -164,12 +166,18 @@ typedef struct MyAgentsSpeechAdapterApiV1 {
   void (*destroy_diarizer)(MyAgentsSpeechDiarizer *diarizer);
   MyAgentsSpeechStatus (*diarize_window)(
       MyAgentsSpeechDiarizer *diarizer, const float *samples,
-      uint32_t sample_count, MyAgentsSpeechDiarizationResult **out);
+      uint32_t sample_count,
+      MyAgentsSpeechEmbeddingStartedCallback embedding_started,
+      void *user_data, MyAgentsSpeechDiarizationResult **out);
   MyAgentsSpeechStatus (*copy_diarization_result)(
       const MyAgentsSpeechDiarizationResult *result,
       MyAgentsSpeechDiarizationOutput *out);
   void (*destroy_diarization_result)(
       MyAgentsSpeechDiarizationResult *result);
+  MyAgentsSpeechStatus (*cluster_embeddings)(
+      const float *embeddings, uint32_t embedding_count,
+      float distance_threshold, uint32_t *labels, uint32_t label_capacity,
+      uint32_t *speaker_count);
 } MyAgentsSpeechAdapterApiV1;
 
 MYAGENTS_SPEECH_EXPORT const MyAgentsSpeechAdapterApiV1 *

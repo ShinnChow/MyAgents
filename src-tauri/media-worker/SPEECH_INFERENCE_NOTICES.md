@@ -12,6 +12,8 @@ The native speech bundle is built from the exact revisions recorded in
   Apache-2.0, BSD-3-Clause, MIT, MPL-2.0, and upstream notice terms;
 - `opus2` 0.4.0, `libopus_sys` 0.3.3, and bundled libopus, under their
   corresponding Apache-2.0, MIT, and BSD-style terms;
+- `hdbscan` 0.12.0 and its `kdtree` 0.7.0 / `num-traits` 0.2.19 dependency
+  graph, under MIT OR Apache-2.0, for Record-wide speaker clustering;
 - MyAgents media Worker and stable speech adapter ABI, under AGPL-3.0-only.
 
 The adjacent `legal/` inventory contains the exact license files copied from
