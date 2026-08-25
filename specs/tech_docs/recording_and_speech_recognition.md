@@ -37,6 +37,16 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 
 引入或保留底层 primitive 时，必须在 PRD 执行台账记录候选依赖、许可证/target、关键契约与可复现能力缺口；没有缺口就使用依赖，不保留双实现或 feature flag。
 
+## 版本化质量基准
+
+模型质量 release pool 使用 `scripts/speech-quality-corpus-source-lock.json` 作为 corpus source of truth。它固定 AISHELL-1 普通话近讲、AISHELL-4 普通话远场会议、ASCEND 中英混说和 AMI 英文会议的 upstream revision、URL、bytes、SHA-256、许可证、选样窗口与完整 prepared manifest SHA-256；runner 不接受 prepared manifest 自行声明来源。cache/output 在下载前按物理路径拒绝仓库内目录及 symlink/junction escape，原始语料和带正文的 prepared manifest 不进入 App bundle、Git、日志或遥测。
+
+准备入口 `scripts/prepare-speech-quality-corpus.mjs` 继续复用 native resource 的 `acquireLockedResource` 内容寻址下载与离线 cache，不实现第二套 downloader。PyArrow `21.0.0`（Apache-2.0）、Praatio `6.2.0`（MIT）、JiWER、MeetEval 与 WeText 均使用 PEP 723 + uv 原生 lock 固定直接、传递包与 artifact hash，`--offline` 同时约束语料和 Python 环境。FFmpeg `8.0.1` 使用 bitexact mux/codec flag 并去除 metadata；任何工具或输出漂移都会因完整 prepared manifest hash 不符而 fail closed，同一锁连续准备必须得到 byte-identical 的 28 个音频及 manifest。FFmpeg 只生成测试输入，不随 App 分发，也不改变产品附件解码继续使用 Symphonia、内部 Record 继续使用固定 Ogg Opus profile 的边界。
+
+执行入口 `scripts/speech-quality-benchmark.mjs` 直接复用 `media-worker-batch-client.mjs` 驱动同一个正式 Worker/native manifest/共享 ORT/模型 manifest，不建立 benchmark-only 推理路径。CER/WER 委托 JiWER `4.0.0`，DER 委托 MeetEval `0.4.3`，中文数字、全半角与标点归一化委托 WeText `0.1.6`。每个 case 后复核音频与四个 runtime，结束前再复核全部 corpus、source lock、manifest、runner、协议客户端、进程树 helper、指标脚本和 uv lock；`uv → Python/FFmpeg` 按现有跨平台政策以 POSIX process group 或 Windows `taskkill /T` 有界收敛。报告只保存这些 hash、环境、计数、耗时、错误分解和 rate，不保存 reference 或 hypothesis 正文。
+
+2026-08-25 Apple M1、16 GiB、固定 `sensevoice-2024-07-17-v1` 首轮冻结结果为：普通话近讲 CER `2.53%`、普通话会议 CER `11.96%`、英文会议 WER `25.75%`、两段四人会议按 scored speaker seconds 聚合 DER `22.47%`，8 个中英混说样本为 `0` 个整段漏识别，全部通过 PRD 门槛。该报告证明 7.2 的 ASR/DER 质量阈值，不替代 live final latency、2/8 小时可靠性、采集 CPU 或五 target 正式安装包门槛。
+
 ## Durable speech job
 
 job metadata 位于：
