@@ -13,10 +13,10 @@
 	  TCC usage description for cuse (computer-use MCP child process).
 
 	  AppleEvents is required for window focus/activation and AppleScript
-	  helpers (e.g. WeChat scroll fallback). Screen Recording and Accessibility
-	  prompts are system-generated with no Info.plist key, and are inherited
-	  by child processes that share the parent app's code signature — so
-	  granting them once to MyAgents.app covers cuse automatically.
+	  helpers (e.g. WeChat scroll fallback). Screen Recording requires the
+	  NSScreenCaptureUsageDescription below. Accessibility has no Info.plist
+	  usage key. Child processes that share the parent app's code signature
+	  inherit the corresponding TCC grants from MyAgents.app.
 	-->
 	<key>NSAppleEventsUsageDescription</key>
 	<string>MyAgents 需要控制其他应用，以便 AI 为你激活窗口、运行 AppleScript 并完成桌面自动化任务。</string>
@@ -24,5 +24,7 @@
 	<string>MyAgents 需要使用麦克风，以便按你的操作录制会议声音并保存在本机。</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>MyAgents 需要采集系统音频，以便按你的操作完整录制会议并保存在本机。</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>MyAgents 需要屏幕录制权限，以便在你主动截图时获取屏幕内容，或在会议录音时使用 ScreenCaptureKit 采集系统声音；会议录音不会保存屏幕画面。</string>
 </dict>
 </plist>

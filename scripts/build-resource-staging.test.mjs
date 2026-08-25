@@ -60,6 +60,107 @@ const documentResourceLock = JSON.parse(
 const tauriConfig = JSON.parse(
   readFileSync(resolve(repoRoot, 'src-tauri/tauri.conf.json'), 'utf8'),
 );
+const macInfoPlist = readFileSync(
+  resolve(repoRoot, 'src-tauri/Info.plist'),
+  'utf8',
+);
+const macInfoPlistEnglish = readFileSync(
+  resolve(repoRoot, 'src-tauri/infoplist/en.lproj/InfoPlist.strings'),
+  'utf8',
+);
+const macInfoPlistChinese = readFileSync(
+  resolve(repoRoot, 'src-tauri/infoplist/zh-Hans.lproj/InfoPlist.strings'),
+  'utf8',
+);
+
+const recordingPrivacyKeys = [
+  'NSMicrophoneUsageDescription',
+  'NSAudioCaptureUsageDescription',
+  'NSScreenCaptureUsageDescription',
+];
+
+function withoutComments(source) {
+  return source
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+}
+
+function assertRecordingPrivacyDeclarations(infoPlist, ...localizations) {
+  const plist = withoutComments(infoPlist);
+  const stringsFiles = localizations.map(withoutComments);
+  for (const key of recordingPrivacyKeys) {
+    const plistKeys = [...plist.matchAll(new RegExp(`<key>${key}</key>`, 'g'))];
+    assert.equal(plistKeys.length, 1, `${key} must occur once in Info.plist`);
+    const plistMatches = [
+      ...plist.matchAll(
+        new RegExp(`<key>${key}</key>\\s*<string>([^<]*)</string>`, 'g'),
+      ),
+    ];
+    assert.equal(plistMatches.length, 1, `${key} must have a string value`);
+    assert.ok(plistMatches[0][1].trim(), `${key} must not be empty`);
+    for (const stringsFile of stringsFiles) {
+      const assignments = [
+        ...stringsFile.matchAll(new RegExp(`^\\s*${key}\\s*=`, 'gm')),
+      ];
+      assert.equal(
+        assignments.length,
+        1,
+        `${key} must occur once in each InfoPlist.strings`,
+      );
+      const assignment = new RegExp(
+        `^\\s*${key}\\s*=\\s*"((?:[^"\\\\]|\\\\.)*)";\\s*$`,
+        'gm',
+      );
+      const matches = [...stringsFile.matchAll(assignment)];
+      assert.equal(
+        matches.length,
+        1,
+        `${key} must have a string value in each InfoPlist.strings`,
+      );
+      assert.ok(matches[0][1].trim(), `${key} localization must not be empty`);
+    }
+  }
+}
+
+test('macOS recording privacy declarations survive source and localization staging', () => {
+  assertRecordingPrivacyDeclarations(
+    macInfoPlist,
+    macInfoPlistEnglish,
+    macInfoPlistChinese,
+  );
+});
+
+test('macOS recording privacy contract rejects commented or empty declarations', () => {
+  const key = 'NSScreenCaptureUsageDescription';
+  assert.throws(() =>
+    assertRecordingPrivacyDeclarations(
+      macInfoPlist.replace(
+        new RegExp(`(<key>${key}</key>\\s*<string>[^<]+</string>)`),
+        '<!-- $1 -->',
+      ),
+      macInfoPlistEnglish,
+      macInfoPlistChinese,
+    ),
+  );
+  assert.throws(() =>
+    assertRecordingPrivacyDeclarations(
+      macInfoPlist,
+      macInfoPlistEnglish.replace(
+        new RegExp(`^(${key}\\s*=\\s*)"[^"]+";`, 'm'),
+        '$1"";',
+      ),
+      macInfoPlistChinese,
+    ),
+  );
+  assert.throws(() =>
+    assertRecordingPrivacyDeclarations(
+      macInfoPlist,
+      `${macInfoPlistEnglish}\n${key} = "";\n`,
+      macInfoPlistChinese,
+    ),
+  );
+});
 
 test('bundled workspace templates are committed, clean, and setup-independent', () => {
   const templateRoot = resolve(repoRoot, 'bundled-workspaces', 'mino');
