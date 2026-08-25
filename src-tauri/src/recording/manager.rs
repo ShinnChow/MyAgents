@@ -37,6 +37,11 @@ use crate::{ulog_info, ulog_warn};
 
 const MIN_RECORDING_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const MONITOR_INTERVAL: Duration = Duration::from_secs(10);
+const CAPTURE_RECOVERY_ATTEMPTS: usize = 5;
+#[cfg(not(test))]
+const CAPTURE_RECOVERY_BACKOFF: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const CAPTURE_RECOVERY_BACKOFF: Duration = Duration::from_millis(10);
 const COMPLETED_OPERATION_LIMIT: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,6 +150,7 @@ struct ActiveRecording {
     pause_started: Option<Instant>,
     paused_wall_ms: u64,
     pause_count: usize,
+    capture_plan: CapturePlan,
     sources: Vec<PreparedSource>,
     source_activity: Vec<(AudioTrackKind, CaptureActivity)>,
     warnings: Vec<RecordingWarning>,
@@ -153,6 +159,7 @@ struct ActiveRecording {
     archives: Vec<TrackArchiveHandle>,
     analyses: Vec<TrackAnalysisHandle>,
     live_transcription: bool,
+    live_analysis_enabled: bool,
     _wake_lock: Option<WakeLock>,
 }
 
@@ -737,6 +744,7 @@ impl RecordingManager {
             pause_started: None,
             paused_wall_ms: 0,
             pause_count: 0,
+            capture_plan: plan.clone(),
             sources: plan.sources.clone(),
             source_activity: Vec::new(),
             warnings,
@@ -745,6 +753,7 @@ impl RecordingManager {
             archives,
             analyses,
             live_transcription,
+            live_analysis_enabled: live_transcription,
             _wake_lock: wake_lock,
         };
         let preparing_snapshot = preparing.snapshot();
@@ -950,7 +959,7 @@ impl RecordingManager {
             media_ms,
             paused_started_at,
             analysis_controls,
-            live_transcription,
+            live_analysis_enabled,
             record_id,
         ) = {
             let mut state = self.state.lock().await;
@@ -984,7 +993,7 @@ impl RecordingManager {
                 .map(|analysis| (analysis.track, analysis.control()))
                 .collect::<Vec<_>>();
             for (_, control) in &analysis_controls {
-                control.set_accepting(!pause);
+                control.set_accepting(!pause && active.live_analysis_enabled);
             }
             (
                 active
@@ -996,7 +1005,7 @@ impl RecordingManager {
                 active.media_duration_ms(),
                 active.pause_started,
                 analysis_controls,
-                active.live_transcription,
+                active.live_analysis_enabled,
                 active.record_id.clone(),
             )
         };
@@ -1023,7 +1032,7 @@ impl RecordingManager {
             return Err(error);
         }
 
-        if pause && live_transcription {
+        let live_boundary_ok = if pause && live_analysis_enabled {
             let checkpoint =
                 match tokio::task::spawn_blocking(move || checkpoint_analyses(&analysis_controls))
                     .await
@@ -1040,16 +1049,30 @@ impl RecordingManager {
                                 record_id,
                                 error
                             );
+                            false
+                        } else {
+                            true
                         }
+                    } else {
+                        ulog_warn!(
+                            "[recording] live pause owner unavailable recordId={}",
+                            record_id
+                        );
+                        false
                     }
                 }
-                Err(error) => ulog_warn!(
-                    "[recording] analysis pause checkpoint failed recordId={} error={}",
-                    record_id,
-                    error
-                ),
+                Err(error) => {
+                    ulog_warn!(
+                        "[recording] analysis pause checkpoint failed recordId={} error={}",
+                        record_id,
+                        error
+                    );
+                    false
+                }
             }
-        }
+        } else {
+            true
+        };
 
         let status = if pause {
             CaptureStatus::Paused
@@ -1084,6 +1107,9 @@ impl RecordingManager {
             }
             active.revision = updated.revision;
             active.capture_status = status;
+            if !live_boundary_ok {
+                active.live_analysis_enabled = false;
+            }
             let journal_result = if pause {
                 active.media_before_segment_ms = media_ms;
                 active.segment_started = None;
@@ -1295,11 +1321,19 @@ impl RecordingManager {
         let session = active.session.take();
         let archives = std::mem::take(&mut active.archives);
         let analyses = std::mem::take(&mut active.analyses);
-        let settled = tokio::task::spawn_blocking(move || {
+        let settled = match tokio::task::spawn_blocking(move || {
             settle_capture_resources(session, archives, analyses)
         })
         .await
-        .map_err(|error| format!("recording finalization panicked: {error}"))?;
+        {
+            Ok(settled) => settled,
+            Err(error) => {
+                let error = format!("recording finalization panicked: {error}");
+                self.release_failed_settlement(generation, &active.record_id, &error)
+                    .await;
+                return Err(error);
+            }
+        };
 
         let finalizing_record = self
             .record_store
@@ -1379,6 +1413,8 @@ impl RecordingManager {
                     active.record_id,
                     error
                 );
+                self.release_failed_settlement(generation, &active.record_id, &error)
+                    .await;
                 return Err(error);
             }
         };
@@ -1511,6 +1547,364 @@ impl RecordingManager {
         Ok(terminal_snapshot)
     }
 
+    async fn release_failed_settlement(&self, generation: u64, record_id: &str, error: &str) {
+        let released = {
+            let mut state = self.state.lock().await;
+            match state.slot.take() {
+                Some(RecordingSlot::Settling(snapshot)) if snapshot.generation == generation => {
+                    Some(snapshot)
+                }
+                other => {
+                    state.slot = other;
+                    None
+                }
+            }
+        };
+        if let Some(snapshot) = released {
+            self.emit_change(snapshot, false);
+        }
+        ulog_warn!(
+            "[recording] released failed settlement for startup recovery recordId={} generation={} error={}",
+            record_id,
+            generation,
+            error
+        );
+    }
+
+    async fn recover_capture(
+        self: &Arc<Self>,
+        generation: u64,
+        failed_source: AudioTrackKind,
+        error_code: String,
+    ) {
+        let _operation = self.operation_gate.lock().await;
+        let Some((
+            old_session,
+            capture_plan,
+            sinks,
+            prior_status,
+            media_ms,
+            analysis_controls,
+            live_analysis_enabled,
+            record_id,
+            frozen_snapshot,
+            repaired_tracks,
+        )) = ({
+            let mut state = self.state.lock().await;
+            let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
+                return;
+            };
+            if active.generation != generation
+                || !matches!(
+                    active.capture_status,
+                    CaptureStatus::Recording | CaptureStatus::Paused
+                )
+            {
+                return;
+            }
+
+            let prior_status = active.capture_status;
+            let media_ms = active.media_duration_ms();
+            for archive in &active.archives {
+                archive.sink.set_accepting(false);
+            }
+            let analysis_controls = active
+                .analyses
+                .iter()
+                .map(|analysis| (analysis.track, analysis.control()))
+                .collect::<Vec<_>>();
+            for (_, control) in &analysis_controls {
+                control.set_accepting(false);
+            }
+            if prior_status == CaptureStatus::Recording {
+                active.media_before_segment_ms = media_ms;
+                active.segment_started = None;
+            }
+            let (sinks, source_activity) = capture_sinks(&active.archives, &active.analyses);
+            active.source_activity = source_activity;
+            let repaired_tracks = active
+                .capture_plan
+                .sources
+                .iter()
+                .map(|source| format!("{:?}", source.track).to_ascii_lowercase())
+                .collect();
+            Some((
+                active.session.take(),
+                active.capture_plan.clone(),
+                sinks,
+                prior_status,
+                media_ms,
+                analysis_controls,
+                active.live_analysis_enabled,
+                active.record_id.clone(),
+                active.snapshot(),
+                repaired_tracks,
+            ))
+        })
+        else {
+            return;
+        };
+        self.emit_change(frozen_snapshot, true);
+
+        if let Some(old_session) = old_session {
+            let stop_result = tokio::task::spawn_blocking(move || {
+                old_session
+                    .lock()
+                    .map_err(|_| "capture session lock poisoned".to_string())?
+                    .stop()
+            })
+            .await;
+            match stop_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => ulog_warn!(
+                    "[recording] failed capture session stop before reopen recordId={} error={}",
+                    record_id,
+                    error
+                ),
+                Err(error) => ulog_warn!(
+                    "[recording] capture session stop panicked before reopen recordId={} error={}",
+                    record_id,
+                    error
+                ),
+            }
+        }
+
+        let gap_result = {
+            let mut state = self.state.lock().await;
+            match state.slot.as_mut() {
+                Some(RecordingSlot::Live(active))
+                    if active.generation == generation && active.capture_status == prior_status =>
+                {
+                    active.journal.append(
+                        now_ms(),
+                        media_ms,
+                        LifecycleEvent::DeviceGap {
+                            source: format!("{failed_source:?}").to_ascii_lowercase(),
+                            error_code,
+                        },
+                    )
+                }
+                Some(_) => Err("recording changed during capture recovery".to_string()),
+                None => Err("recording ended during capture recovery".to_string()),
+            }
+        };
+        if let Err(error) = gap_result {
+            ulog_warn!(
+                "[recording] capture gap commit failed recordId={} error={}",
+                record_id,
+                error
+            );
+            if let Err(settle_error) = self
+                .settle_generation_locked(
+                    generation,
+                    CaptureStatus::Interrupted,
+                    RecordingFinishReason::RecordingJournalCommitFailed,
+                    None,
+                )
+                .await
+            {
+                ulog_warn!(
+                    "[recording] capture gap failure settlement failed recordId={} error={}",
+                    record_id,
+                    settle_error
+                );
+            }
+            return;
+        }
+
+        let resume_live_analysis = if live_analysis_enabled {
+            let checkpoint =
+                tokio::task::spawn_blocking(move || checkpoint_analyses(&analysis_controls)).await;
+            match checkpoint {
+                Ok(Ok(offsets)) => {
+                    if let Some(speech) = speech_recognition::global() {
+                        if let Err(error) = speech.flush_record_live(&record_id, offsets) {
+                            ulog_warn!(
+                                "[recording] live device-gap flush failed recordId={} error={}",
+                                record_id,
+                                error
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        ulog_warn!(
+                            "[recording] live device-gap owner unavailable recordId={}",
+                            record_id
+                        );
+                        false
+                    }
+                }
+                Ok(Err(error)) => {
+                    ulog_warn!(
+                        "[recording] analysis device-gap checkpoint failed recordId={} error={}",
+                        record_id,
+                        error
+                    );
+                    false
+                }
+                Err(error) => {
+                    ulog_warn!(
+                        "[recording] analysis device-gap checkpoint panicked recordId={} error={}",
+                        record_id,
+                        error
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
+        let mut reopened = None;
+        for attempt in 1..=CAPTURE_RECOVERY_ATTEMPTS {
+            if attempt > 1 {
+                tokio::time::sleep(CAPTURE_RECOVERY_BACKOFF).await;
+            }
+            let backend = self.backend.clone();
+            let plan = capture_plan.clone();
+            let attempt_sinks = sinks.clone();
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let open_result = tokio::task::spawn_blocking(move || {
+                let mut session = backend.open(&plan, attempt_sinks, event_tx)?;
+                if prior_status == CaptureStatus::Paused {
+                    if let Err(error) = session.pause() {
+                        let _ = session.stop();
+                        return Err(error);
+                    }
+                }
+                Ok(session)
+            })
+            .await;
+            match open_result {
+                Ok(Ok(session)) => {
+                    reopened = Some((session, event_rx));
+                    break;
+                }
+                Ok(Err(error)) => ulog_warn!(
+                    "[recording] capture reopen attempt failed recordId={} attempt={}/{} error={}",
+                    record_id,
+                    attempt,
+                    CAPTURE_RECOVERY_ATTEMPTS,
+                    error
+                ),
+                Err(error) => ulog_warn!(
+                    "[recording] capture reopen attempt panicked recordId={} attempt={}/{} error={}",
+                    record_id,
+                    attempt,
+                    CAPTURE_RECOVERY_ATTEMPTS,
+                    error
+                ),
+            }
+        }
+
+        let Some((session, event_rx)) = reopened else {
+            if let Err(error) = self
+                .settle_generation_locked(
+                    generation,
+                    CaptureStatus::Interrupted,
+                    RecordingFinishReason::DeviceFatal,
+                    None,
+                )
+                .await
+            {
+                ulog_warn!(
+                    "[recording] exhausted capture recovery settlement failed recordId={} error={}",
+                    record_id,
+                    error
+                );
+            }
+            return;
+        };
+        let session = Arc::new(StdMutex::new(session));
+        let snapshot_result = {
+            let mut state = self.state.lock().await;
+            match state.slot.as_mut() {
+                Some(RecordingSlot::Live(active))
+                    if active.generation == generation && active.capture_status == prior_status =>
+                {
+                    match active.journal.append(
+                        now_ms(),
+                        media_ms,
+                        LifecycleEvent::RecoveryCommitted {
+                            repaired_tracks,
+                            reason: "device_reopened".to_string(),
+                        },
+                    ) {
+                        Ok(_) => {
+                            active.session = Some(session.clone());
+                            active.live_analysis_enabled &= resume_live_analysis;
+                            if prior_status == CaptureStatus::Recording {
+                                active.segment_started = Some(Instant::now());
+                                for archive in &active.archives {
+                                    archive.sink.set_accepting(true);
+                                }
+                                for analysis in &active.analyses {
+                                    analysis
+                                        .control()
+                                        .set_accepting(active.live_analysis_enabled);
+                                }
+                            }
+                            Ok(active.snapshot())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Some(_) => Err("recording changed during capture recovery".to_string()),
+                None => Err("recording ended during capture recovery".to_string()),
+            }
+        };
+        match snapshot_result {
+            Ok(snapshot) => {
+                self.emit_change(snapshot, true);
+                self.spawn_monitor(generation, event_rx);
+            }
+            Err(error) => {
+                ulog_warn!(
+                    "[recording] capture recovery commit failed recordId={} error={}",
+                    record_id,
+                    error
+                );
+                let stop_result = tokio::task::spawn_blocking(move || {
+                    session
+                        .lock()
+                        .map_err(|_| "capture session lock poisoned".to_string())?
+                        .stop()
+                })
+                .await;
+                match stop_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => ulog_warn!(
+                        "[recording] recovered capture cleanup failed recordId={} error={}",
+                        record_id,
+                        error
+                    ),
+                    Err(error) => ulog_warn!(
+                        "[recording] recovered capture cleanup panicked recordId={} error={}",
+                        record_id,
+                        error
+                    ),
+                }
+                if let Err(settle_error) = self
+                    .settle_generation_locked(
+                        generation,
+                        CaptureStatus::Interrupted,
+                        RecordingFinishReason::DeviceFatal,
+                        None,
+                    )
+                    .await
+                {
+                    ulog_warn!(
+                        "[recording] recovery commit failure settlement failed recordId={} error={}",
+                        record_id,
+                        settle_error
+                    );
+                }
+            }
+        }
+    }
+
     fn spawn_monitor(
         self: &Arc<Self>,
         generation: u64,
@@ -1525,17 +1919,16 @@ impl RecordingManager {
                     event = events.recv() => {
                         let Some(event) = event else { break; };
                         let Some(manager) = manager.upgrade() else { break; };
-                        manager.record_capture_event(generation, &event).await;
-                        if matches!(event, CaptureEvent::Fatal { .. }) {
-                            let _ = manager
-                                .settle_generation(
-                                    generation,
-                                    CaptureStatus::Interrupted,
-                                    RecordingFinishReason::DeviceFatal,
-                                    None,
-                                )
-                                .await;
-                            break;
+                        match &event {
+                            CaptureEvent::DeviceGap { .. } => {
+                                manager.record_capture_event(generation, &event).await;
+                            }
+                            CaptureEvent::Fatal { track, code } => {
+                                manager
+                                    .recover_capture(generation, *track, code.clone())
+                                    .await;
+                                break;
+                            }
                         }
                     }
                     _ = interval.tick() => {
@@ -2094,7 +2487,7 @@ pub async fn cmd_recording_stop(
 mod tests {
     use super::*;
     use crate::record::RecordStore;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::thread::JoinHandle;
     use tempfile::tempdir;
 
@@ -2194,6 +2587,53 @@ mod tests {
             _events: mpsc::UnboundedSender<CaptureEvent>,
         ) -> Result<Box<dyn CaptureSession>, String> {
             Ok(Box::new(FakeSession::start(sinks)))
+        }
+    }
+
+    struct RecoveringBackend {
+        open_count: AtomicUsize,
+        recovery_failures: usize,
+    }
+
+    impl RecoveringBackend {
+        fn new(recovery_failures: usize) -> Self {
+            Self {
+                open_count: AtomicUsize::new(0),
+                recovery_failures,
+            }
+        }
+
+        fn open_count(&self) -> usize {
+            self.open_count.load(Ordering::Acquire)
+        }
+    }
+
+    impl CaptureBackend for RecoveringBackend {
+        fn preflight(&self, selection: CaptureSelection) -> Result<CapturePlan, String> {
+            FakeBackend.preflight(selection)
+        }
+
+        fn open(
+            &self,
+            _plan: &CapturePlan,
+            sinks: CaptureSinks,
+            events: mpsc::UnboundedSender<CaptureEvent>,
+        ) -> Result<Box<dyn CaptureSession>, String> {
+            let open_index = self.open_count.fetch_add(1, Ordering::AcqRel);
+            if open_index > 0 && open_index <= self.recovery_failures {
+                return Err("RECORDING_DEVICE_CHANGED".to_string());
+            }
+            let session = FakeSession::start(sinks);
+            if open_index == 0 {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    let _ = events.send(CaptureEvent::Fatal {
+                        track: AudioTrackKind::Microphone,
+                        code: "CPAL_DEVICECHANGED".to_string(),
+                    });
+                });
+            }
+            Ok(Box::new(session))
         }
     }
 
@@ -2323,6 +2763,376 @@ mod tests {
             .artifacts
             .iter()
             .all(|artifact| artifact.kind == "audio/ogg-opus" && artifact.size_bytes > 0));
+    }
+
+    #[tokio::test]
+    async fn transient_device_failure_reopens_same_generation_without_counting_gap() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let backend = Arc::new(RecoveringBackend::new(1));
+        let manager = RecordingManager::with_backend(store.clone(), backend.clone(), false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-recover".to_string(),
+                selection: CaptureSelection {
+                    microphone: true,
+                    system: true,
+                },
+            })
+            .await
+            .unwrap();
+        let workspace = store
+            .audio_workspace_path(&started.snapshot.record_id)
+            .await
+            .unwrap();
+
+        let recovered_entries = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let entries =
+                    LifecycleJournal::read_entries(&workspace, &started.snapshot.record_id)
+                        .unwrap();
+                if entries.iter().any(|entry| {
+                    matches!(
+                        &entry.event,
+                        LifecycleEvent::RecoveryCommitted { reason, .. }
+                            if reason == "device_reopened"
+                    )
+                }) {
+                    break entries;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capture should recover within the bounded attempts");
+        assert_eq!(backend.open_count(), 3);
+
+        let gap_media_ms = recovered_entries
+            .iter()
+            .find_map(|entry| {
+                matches!(&entry.event, LifecycleEvent::DeviceGap { .. }).then_some(entry.media_ms)
+            })
+            .unwrap();
+        let recovery_media_ms = recovered_entries
+            .iter()
+            .find_map(|entry| {
+                matches!(
+                    &entry.event,
+                    LifecycleEvent::RecoveryCommitted { reason, .. }
+                        if reason == "device_reopened"
+                )
+                .then_some(entry.media_ms)
+            })
+            .unwrap();
+        assert_eq!(recovery_media_ms, gap_media_ms);
+        let repaired_tracks = recovered_entries
+            .iter()
+            .find_map(|entry| match &entry.event {
+                LifecycleEvent::RecoveryCommitted {
+                    repaired_tracks,
+                    reason,
+                } if reason == "device_reopened" => Some(repaired_tracks.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(repaired_tracks, vec!["microphone", "system"]);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let active = manager.snapshot().await.unwrap();
+        assert_eq!(active.generation, started.snapshot.generation);
+        assert_eq!(active.capture_status, CaptureStatus::Recording);
+        let stopped = manager
+            .stop(RecordingCommandInput {
+                record_id: active.record_id,
+                expected_revision: active.revision,
+                operation_id: "stop-recovered".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stopped.capture_status, CaptureStatus::Ready);
+        let record = store.get(&stopped.record_id).await.unwrap();
+        assert_eq!(record.artifacts.len(), 2);
+        assert!(record
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.size_bytes > 0));
+    }
+
+    #[tokio::test]
+    async fn recovery_gap_commit_failure_interrupts_without_reopening_devices() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let backend = Arc::new(RecoveringBackend::new(0));
+        let manager = RecordingManager::with_backend(store.clone(), backend.clone(), false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-gap-commit-failure".to_string(),
+                selection: CaptureSelection {
+                    microphone: true,
+                    system: false,
+                },
+            })
+            .await
+            .unwrap();
+        let workspace = store
+            .audio_workspace_path(&started.snapshot.record_id)
+            .await
+            .unwrap();
+        let journal_path = workspace.join("lifecycle.jsonl");
+        let original_permissions = fs::metadata(&journal_path).unwrap().permissions();
+        let mut read_only_permissions = original_permissions.clone();
+        read_only_permissions.set_readonly(true);
+        fs::set_permissions(&journal_path, read_only_permissions).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let interrupted = store
+                    .get(&started.snapshot.record_id)
+                    .await
+                    .and_then(|record| record.audio)
+                    .is_some_and(|audio| audio.capture_status == CaptureStatus::Interrupted);
+                if interrupted && manager.snapshot().await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("journal failure should interrupt and release the capture slot");
+
+        assert_eq!(backend.open_count(), 1);
+        let record = store.get(&started.snapshot.record_id).await.unwrap();
+        assert_eq!(
+            record.audio.as_ref().unwrap().capture_status,
+            CaptureStatus::Interrupted
+        );
+        assert_eq!(record.artifacts.len(), 1);
+
+        fs::set_permissions(&journal_path, original_permissions).unwrap();
+        let entries = LifecycleJournal::read_entries(&workspace, &record.id).unwrap();
+        assert!(!entries.iter().any(|entry| matches!(
+            &entry.event,
+            LifecycleEvent::DeviceGap { .. } | LifecycleEvent::RecoveryCommitted { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn live_boundary_failure_keeps_analysis_closed_after_recovery() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let backend = Arc::new(RecoveringBackend::new(0));
+        let manager = RecordingManager::with_backend(store.clone(), backend, false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-live-boundary-failure".to_string(),
+                selection: CaptureSelection {
+                    microphone: true,
+                    system: false,
+                },
+            })
+            .await
+            .unwrap();
+        let workspace = store
+            .audio_workspace_path(&started.snapshot.record_id)
+            .await
+            .unwrap();
+        let analysis = TrackAnalysisHandle::start(
+            AudioTrackKind::Microphone,
+            workspace.join(analysis_spool_relative_path(AudioTrackKind::Microphone).unwrap()),
+            super::super::audio::SourceFormat {
+                sample_rate: 48_000,
+                channels: 1,
+            },
+        )
+        .unwrap();
+        {
+            let mut state = manager.state.lock().await;
+            let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
+                panic!("recording should be live");
+            };
+            active.analyses.push(analysis);
+            active.live_transcription = true;
+            active.live_analysis_enabled = true;
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = manager.state.lock().await;
+                if let Some(RecordingSlot::Live(active)) = state.slot.as_ref() {
+                    if active.session.is_some() && !active.live_analysis_enabled {
+                        assert_eq!(active.analyses[0].sink.push_f32(&[0.5; 480]), 0);
+                        return;
+                    }
+                }
+                drop(state);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed live boundary should degrade analysis without losing archive capture");
+
+        let active = manager.snapshot().await.unwrap();
+        let stopped = manager
+            .stop(RecordingCommandInput {
+                record_id: active.record_id,
+                expected_revision: active.revision,
+                operation_id: "stop-live-boundary-failure".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stopped.capture_status, CaptureStatus::Ready);
+        assert_eq!(
+            store.get(&stopped.record_id).await.unwrap().artifacts.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_capture_recovers_without_advancing_media_time() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let backend = Arc::new(RecoveringBackend::new(0));
+        let manager = RecordingManager::with_backend(store, backend.clone(), false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-paused-recovery".to_string(),
+                selection: CaptureSelection {
+                    microphone: true,
+                    system: false,
+                },
+            })
+            .await
+            .unwrap();
+        let paused = manager
+            .pause(RecordingCommandInput {
+                record_id: started.snapshot.record_id,
+                expected_revision: started.snapshot.revision,
+                operation_id: "pause-before-recovery".to_string(),
+            })
+            .await
+            .unwrap();
+        let frozen_media_ms = paused.media_duration_ms;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = manager.snapshot().await.unwrap();
+                if snapshot.capture_status == CaptureStatus::Paused && backend.open_count() >= 2 {
+                    let state = manager.state.lock().await;
+                    if matches!(
+                        state.slot.as_ref(),
+                        Some(RecordingSlot::Live(active)) if active.session.is_some()
+                    ) {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("paused capture should reopen in the paused state");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let recovered = manager.snapshot().await.unwrap();
+        assert_eq!(recovered.capture_status, CaptureStatus::Paused);
+        assert_eq!(recovered.media_duration_ms, frozen_media_ms);
+
+        let resumed = manager
+            .resume(RecordingCommandInput {
+                record_id: recovered.record_id,
+                expected_revision: recovered.revision,
+                operation_id: "resume-after-recovery".to_string(),
+            })
+            .await
+            .unwrap();
+        let stopped = manager
+            .stop(RecordingCommandInput {
+                record_id: resumed.record_id,
+                expected_revision: resumed.revision,
+                operation_id: "stop-paused-recovery".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stopped.capture_status, CaptureStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn settlement_error_releases_only_the_matching_generation() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let manager = RecordingManager::with_backend(store, Arc::new(FakeBackend), false);
+        let snapshot = RecordingSnapshot {
+            record_id: "failed-settlement".to_string(),
+            revision: 1,
+            generation: 7,
+            capture_status: CaptureStatus::Finalizing,
+            started_at_wall_time: 1,
+            media_duration_ms: 10,
+            paused_wall_ms: 0,
+            sources: Vec::new(),
+            source_activity: Vec::new(),
+            warnings: Vec::new(),
+        };
+        manager.state.lock().await.slot = Some(RecordingSlot::Settling(snapshot));
+
+        manager
+            .release_failed_settlement(7, "failed-settlement", "injected failure")
+            .await;
+
+        assert!(manager.snapshot().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn exhausted_device_recovery_safely_interrupts_and_releases_slot() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let backend = Arc::new(RecoveringBackend::new(usize::MAX));
+        let manager = RecordingManager::with_backend(store.clone(), backend.clone(), false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-unrecoverable".to_string(),
+                selection: CaptureSelection {
+                    microphone: true,
+                    system: false,
+                },
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let interrupted = store
+                    .get(&started.snapshot.record_id)
+                    .await
+                    .and_then(|record| record.audio)
+                    .is_some_and(|audio| audio.capture_status == CaptureStatus::Interrupted);
+                if interrupted && manager.snapshot().await.is_none() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("failed recovery should release the global slot");
+        assert_eq!(backend.open_count(), 1 + CAPTURE_RECOVERY_ATTEMPTS);
+        assert!(manager.snapshot().await.is_none());
+
+        let record = store.get(&started.snapshot.record_id).await.unwrap();
+        assert_eq!(
+            record.audio.as_ref().unwrap().capture_status,
+            CaptureStatus::Interrupted
+        );
+        assert_eq!(record.artifacts.len(), 1);
+        let workspace = store.audio_workspace_path(&record.id).await.unwrap();
+        let entries = LifecycleJournal::read_entries(&workspace, &record.id).unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| matches!(&entry.event, LifecycleEvent::DeviceGap { .. })));
+        assert!(!entries.iter().any(|entry| {
+            matches!(
+                &entry.event,
+                LifecycleEvent::RecoveryCommitted { reason, .. }
+                    if reason == "device_reopened"
+            )
+        }));
     }
 
     #[tokio::test]

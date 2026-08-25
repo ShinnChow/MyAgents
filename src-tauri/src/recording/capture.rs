@@ -62,6 +62,7 @@ impl From<CaptureFormat> for SourceFormat {
     }
 }
 
+#[derive(Clone)]
 pub struct CapturePlan {
     pub sources: Vec<PreparedSource>,
     pub warnings: Vec<String>,
@@ -95,6 +96,7 @@ pub enum CaptureEvent {
     Fatal { track: AudioTrackKind, code: String },
 }
 
+#[derive(Clone)]
 pub struct CaptureSinks {
     pub microphone: Option<CaptureTrackSink>,
     pub system: Option<CaptureTrackSink>,

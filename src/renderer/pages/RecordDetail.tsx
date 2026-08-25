@@ -196,7 +196,6 @@ export default function RecordDetail({
   >({});
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showSourceSettings, setShowSourceSettings] = useState(false);
-  const [clockNow, setClockNow] = useState(() => Date.now());
   const [playbackTrack, setPlaybackTrack] = useState<
     'microphone' | 'system' | 'mixed'
   >('mixed');
@@ -302,19 +301,12 @@ export default function RecordDetail({
     return () => controller.abort();
   }, [onRecordingSnapshotChange, recordId, refresh]);
 
-  const isRecording = snapshot?.captureStatus === 'recording';
   const isPaused = snapshot?.captureStatus === 'paused';
   const ownsCaptureSlot =
     !!snapshot &&
     ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(
       snapshot.captureStatus,
     );
-
-  useEffect(() => {
-    if (!isActive || !isRecording) return;
-    const timer = window.setInterval(() => setClockNow(Date.now()), 500);
-    return () => window.clearInterval(timer);
-  }, [isActive, isRecording]);
 
   useEffect(() => {
     if (!isActive || !ownsCaptureSlot) return;
@@ -342,13 +334,8 @@ export default function RecordDetail({
     return () => window.clearInterval(timer);
   }, [isActive, ownsCaptureSlot, recordId]);
 
-  const mediaDurationMs = useMemo(() => {
-    if (!snapshot) return record?.audio?.mediaDurationMs ?? 0;
-    if (!isRecording) return snapshot.mediaDurationMs;
-    const projected =
-      clockNow - snapshot.startedAtWallTime - snapshot.pausedWallMs;
-    return Math.max(snapshot.mediaDurationMs, projected);
-  }, [clockNow, isRecording, record?.audio?.mediaDurationMs, snapshot]);
+  const mediaDurationMs =
+    snapshot?.mediaDurationMs ?? record?.audio?.mediaDurationMs ?? 0;
 
   const currentMediaMs = useCallback(
     () => (ownsCaptureSlot ? mediaDurationMs : playbackMs),
@@ -1018,6 +1005,9 @@ export default function RecordDetail({
   const systemAudioDowngraded = snapshot?.warnings.some(
     (warning) => warning.code === 'RECORDING_SYSTEM_AUDIO_UNAVAILABLE',
   );
+  const wakeLockUnavailable = snapshot?.warnings.some(
+    (warning) => warning.code === 'RECORDING_WAKE_LOCK_UNAVAILABLE',
+  );
   const statusLabel =
     captureStatus === 'recording'
       ? t('records.recording')
@@ -1166,7 +1156,10 @@ export default function RecordDetail({
       <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(320px,2fr)] grid-rows-[84px_minmax(0,1fr)] gap-x-5 px-5 pb-5 max-lg:grid-cols-1 max-lg:grid-rows-[84px_minmax(280px,1fr)_minmax(300px,1fr)]">
         <section className="col-start-1 row-start-1 flex h-[84px] items-center gap-5 rounded-[var(--radius-lg)] bg-[var(--ink)] px-5 text-[var(--paper)] shadow-sm">
           <div className="min-w-[92px]">
-            <div className="font-mono text-2xl font-semibold tabular-nums">
+            <div
+              className="font-mono text-2xl font-semibold tabular-nums"
+              data-testid="recording-media-duration"
+            >
               {formatDuration(mediaDurationMs)}
             </div>
             <div className="mt-1 text-xs opacity-65">
@@ -1200,6 +1193,15 @@ export default function RecordDetail({
             {systemAudioDowngraded && (
               <span className="truncate text-xs text-[var(--warning)]">
                 {t('records.systemAudioDowngraded')}
+              </span>
+            )}
+            {wakeLockUnavailable && (
+              <span
+                role="status"
+                className="truncate text-xs text-[var(--warning)]"
+                title={t('records.wakeLockUnavailable')}
+              >
+                {t('records.wakeLockUnavailable')}
               </span>
             )}
           </div>

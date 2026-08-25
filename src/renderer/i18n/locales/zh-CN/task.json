@@ -98,6 +98,7 @@
     "microphoneUnavailable": "默认麦克风不可用。请检查设备连接和系统麦克风权限。",
     "systemAudioUnavailable": "当前系统声音来源不可用。可以关闭系统声音后使用麦克风录音。",
     "systemAudioDowngraded": "系统声音不可用，本次仅录麦克风",
+    "wakeLockUnavailable": "无法阻止系统自动休眠；录音仍会继续，但休眠期间可能中断。",
     "recordingDiskLow": "可用磁盘空间不足，暂时无法安全开始录音。",
     "openMicrophoneSettings": "打开麦克风权限设置",
     "openScreenSettings": "打开屏幕录制权限设置",

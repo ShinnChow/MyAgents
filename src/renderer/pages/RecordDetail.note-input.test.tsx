@@ -232,6 +232,47 @@ describe('RecordDetail note input', () => {
     expect(await screen.findByLabelText(/37%/)).toBeInTheDocument();
   });
 
+  it('renders the manager media clock without projecting wall time', async () => {
+    const now = vi
+      .spyOn(Date, 'now')
+      .mockReturnValue(SNAPSHOT.startedAtWallTime + 500_000);
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    expect(
+      await screen.findByTestId('recording-media-duration'),
+    ).toHaveTextContent('00:10');
+    now.mockRestore();
+  });
+
+  it('shows the non-blocking warning when the recording wake lock is unavailable', async () => {
+    const warningSnapshot = {
+      ...SNAPSHOT,
+      warnings: [{ code: 'RECORDING_WAKE_LOCK_UNAVAILABLE' }],
+    };
+    mocks.recordingSnapshot.mockResolvedValue(warningSnapshot);
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={warningSnapshot}
+      />,
+    );
+
+    expect(
+      await screen.findByText(
+        /无法阻止系统自动休眠|Could not prevent automatic sleep/,
+      ),
+    ).toHaveAttribute('role', 'status');
+  });
+
   it('builds cross-platform export names from the safe title without Record identity', () => {
     expect(
       safeRecordExportBaseName('  Roadmap: Q3/Q4?  ', 'Untitled record'),

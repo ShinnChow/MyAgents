@@ -18,6 +18,8 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 - Launcher 的 Chat/Record mode 共用输入主区域；text/audio Record 进入同一个任务中心列表。文字创建仍写 `RecordStore`，开始录音必须先取得 `RecordingManager` 唯一采集槽。
 - audio Record detail 是单实例顶部 Tab。同一 `recordId` 只聚焦，不重复打开；持久 Tab snapshot 只保存 `id/view/recordId/title`，恢复前用 `RecordStore.get` 验证。Record 不存在时同一 Tab 退回 Record 列表；Tab 不拥有 Session/Sidecar，也不持久化录音 snapshot、播放 seek 或电平。
 - active recording 的 pause/resume/stop、笔记与 Mark 都在详情页完成。待提交笔记在关闭 Tab、退出 App、安装更新重启前必须先 flush；失败则阻止该关闭动作，不能把输入框当持久 authority。
+- capture fatal event 由同一个 `RecordingManager` operation gate 先关闭 archive/analysis admission、停止旧 session 并冻结媒体时钟，再 durable commit `DeviceGap`；gap 提交失败时不重开设备。随后以固定五次、500 ms 间隔重开 admission 时冻结的 exact `CapturePlan`。live boundary 建立失败只关闭后续实时 analysis，永久 Ogg archive 继续并在 stop 后走既有 backfill 收敛，不能跨 gap 拼接 VAD 状态。成功后沿同一 Record/generation 继续并在 lifecycle 记录 recovery；耗尽后走现有 `interrupted` safe settlement。恢复不会重新 preflight 当前默认设备、热接管不同 identity/格式，也不建立第二个设备 watcher。Renderer 的录音计时、笔记和 Mark 锚点只消费 Manager `mediaDurationMs`，不得用墙钟绕过 pause/recovery freeze。极端 settlement worker/manifest 失败时必须释放 exact generation 的内存槽，保留 durable `stopping/finalizing` 供既有启动恢复处理。
+- 录音接纳后由 `RecordingManager` 独立持有 wake lock；获取失败不阻止录音，但 snapshot 与 lifecycle 保留 `RECORDING_WAKE_LOCK_UNAVAILABLE`，Record Detail 显示非阻塞警告。它只防止 idle sleep，不承诺合盖、用户主动睡眠、OS 强制休眠或断电期间继续采集。
 - 没有 transcript 的历史音频在转录区域显示“开始转录”。只有用户点击后才调用 `cmd_speech_record_transcribe`；安装模型、打开详情或启动 App 都不会自动扫描历史 Record。
 - 本期人工纠错只覆盖 speaker rename、merge 与 exact segment reassign。原始 transcript revision 保留，override 单独持久化并在 projection/export/search 时合成；不提供任意字词改写。
 - 托盘只消费 `RecordingManager` projection：录音中 icon 增加状态圆点，菜单出现“正在录音...”，点击打开 exact Record Tab。托盘不拥有录音状态或导航 history。

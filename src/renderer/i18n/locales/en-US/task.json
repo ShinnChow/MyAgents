@@ -98,6 +98,7 @@
     "microphoneUnavailable": "The default microphone is unavailable. Check the device and the system microphone permission.",
     "systemAudioUnavailable": "System audio is unavailable. Turn it off to continue with microphone-only recording.",
     "systemAudioDowngraded": "System audio unavailable; this recording is microphone-only",
+    "wakeLockUnavailable": "Could not prevent automatic sleep. Recording continues, but may be interrupted if the system sleeps.",
     "recordingDiskLow": "There is not enough free disk space to start recording safely.",
     "openMicrophoneSettings": "Open microphone privacy settings",
     "openScreenSettings": "Open Screen Recording settings",
