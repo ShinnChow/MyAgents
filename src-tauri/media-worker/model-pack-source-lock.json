@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "packId": "local-standard-speech",
-  "packRevision": "sensevoice-2024-07-17-v1",
+  "packRevision": "local-standard-speech-v1",
   "sourceDownloadBytes": 209767948,
   "installedModelBytes": 280896862,
   "downloadHardLimitBytes": 314572800,

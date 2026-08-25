@@ -210,7 +210,7 @@ Runtime set 是按平台分片补发的：macOS 主机默认发布 `darwin-arm64
 
 ### publish_speech_model_set.sh
 
-**用途**：把当前 App/Worker 已编译锁定的标准语音模型清单签名并发布到 R2。它只发布 `manifest-v1.json` 与 `manifest-v1.json.sig`，不会下载、重新打包或镜像模型；模型和许可仍从 `src-tauri/media-worker/model-pack-source-lock.json` 中锁定的上游 HTTPS 地址下载。
+**用途**：把当前 App/Worker 已编译锁定的标准语音模型清单签名并发布到 R2。它只发布 `manifest.json` 与 `manifest.json.sig`，不会下载、重新打包或镜像模型；模型和许可仍从 `src-tauri/media-worker/model-pack-source-lock.json` 中锁定的上游 HTTPS 地址下载。目录中的 `local-standard-speech-v1` 是 pack revision，JSON 内的 `schemaVersion: 1` 是 manifest schema，因此文件名不重复带 `-v1`。
 
 本地可用 unsigned 模式验证输出路径与逐字节 identity，但该产物不能发布，也不会被 App 接受：
 

@@ -122,8 +122,8 @@ require_command minisign "macOS: brew install minisign."
 
 echo "Speech model revision: ${PACK_REVISION}"
 echo "Files:"
-echo "  manifest-v1.json"
-echo "  manifest-v1.json.sig"
+echo "  manifest.json"
+echo "  manifest.json.sig"
 echo "Target: ${PUBLIC_BASE_URL}/"
 if [ "$YES" -ne 1 ]; then
     read -r -p "Upload? (Y/n): " reply
@@ -135,7 +135,7 @@ fi
 
 PACKAGE_DIR=$(mktemp -d)
 SET_DIR="${PACKAGE_DIR}/sets/${PACK_REVISION}"
-MANIFEST_PATH="${SET_DIR}/manifest-v1.json"
+MANIFEST_PATH="${SET_DIR}/manifest.json"
 SIGNATURE_PATH="${MANIFEST_PATH}.sig"
 TAURI_SIGNING_PRIVATE_KEY="$TAURI_SIGNING_PRIVATE_KEY" \
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" \
@@ -186,7 +186,7 @@ fi
 
 REMOTE_MANIFEST_EXISTS=0
 REMOTE_SIGNATURE_EXISTS=0
-for filename in manifest-v1.json manifest-v1.json.sig; do
+for filename in manifest.json manifest.json.sig; do
     url="${PUBLIC_BASE_URL}/${filename}"
     if ! http_code=$(curl -sS -o /dev/null -w "%{http_code}" -I "$url"); then
         echo "Error: cannot determine whether ${url} exists" >&2
@@ -195,11 +195,11 @@ for filename in manifest-v1.json manifest-v1.json.sig; do
     case "$http_code" in
         404) ;;
         200)
-            if [ "$filename" = "manifest-v1.json" ]; then
-                curl -fsSL "$url" -o "${VERIFY_DIR}/remote-manifest-v1.json"
+            if [ "$filename" = "manifest.json" ]; then
+                curl -fsSL "$url" -o "${VERIFY_DIR}/remote-manifest.json"
                 REMOTE_MANIFEST_EXISTS=1
             else
-                curl -fsSL "$url" -o "${VERIFY_DIR}/remote-manifest-v1.json.sig"
+                curl -fsSL "$url" -o "${VERIFY_DIR}/remote-manifest.json.sig"
                 REMOTE_SIGNATURE_EXISTS=1
             fi
             ;;
@@ -210,12 +210,12 @@ for filename in manifest-v1.json manifest-v1.json.sig; do
     esac
 done
 
-if [ "$REMOTE_MANIFEST_EXISTS" -eq 1 ] && ! cmp -s "$MANIFEST_PATH" "${VERIFY_DIR}/remote-manifest-v1.json"; then
+if [ "$REMOTE_MANIFEST_EXISTS" -eq 1 ] && ! cmp -s "$MANIFEST_PATH" "${VERIFY_DIR}/remote-manifest.json"; then
     echo "Error: immutable remote manifest differs; publish a new packRevision" >&2
     exit 1
 fi
 if [ "$REMOTE_SIGNATURE_EXISTS" -eq 1 ]; then
-    decode_signature "${VERIFY_DIR}/remote-manifest-v1.json.sig" "${VERIFY_DIR}/remote-manifest.minisig"
+    decode_signature "${VERIFY_DIR}/remote-manifest.json.sig" "${VERIFY_DIR}/remote-manifest.minisig"
     if ! minisign -Vm "$MANIFEST_PATH" -x "${VERIFY_DIR}/remote-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
         echo "Error: immutable remote signature is invalid; publish a new packRevision" >&2
         exit 1
@@ -245,10 +245,10 @@ EOF
 
     RCLONE_ARGS=(--config="$RCLONE_CONFIG" --s3-no-check-bucket --progress --immutable)
     if [ "$REMOTE_MANIFEST_EXISTS" -eq 0 ]; then
-        rclone "${RCLONE_ARGS[@]}" copyto "$MANIFEST_PATH" "${R2_TARGET}manifest-v1.json"
+        rclone "${RCLONE_ARGS[@]}" copyto "$MANIFEST_PATH" "${R2_TARGET}manifest.json"
     fi
     if [ "$REMOTE_SIGNATURE_EXISTS" -eq 0 ]; then
-        rclone "${RCLONE_ARGS[@]}" copyto "$SIGNATURE_PATH" "${R2_TARGET}manifest-v1.json.sig"
+        rclone "${RCLONE_ARGS[@]}" copyto "$SIGNATURE_PATH" "${R2_TARGET}manifest.json.sig"
     fi
 else
     echo "Immutable speech model revision is already published; no upload needed."
@@ -258,22 +258,22 @@ if { [ "$REMOTE_MANIFEST_EXISTS" -eq 0 ] || [ "$REMOTE_SIGNATURE_EXISTS" -eq 0 ]
     purge_response=$(curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/purge_cache" \
         -H "Authorization: Bearer ${CF_API_TOKEN}" \
         -H "Content-Type: application/json" \
-        -d "{\"files\":[\"${PUBLIC_BASE_URL}/manifest-v1.json\",\"${PUBLIC_BASE_URL}/manifest-v1.json.sig\"]}")
+        -d "{\"files\":[\"${PUBLIC_BASE_URL}/manifest.json\",\"${PUBLIC_BASE_URL}/manifest.json.sig\"]}")
     if ! echo "$purge_response" | grep -q '"success":true'; then
         echo "Warning: Cloudflare purge did not report success" >&2
     fi
 fi
 
-curl -fsSL "${PUBLIC_BASE_URL}/manifest-v1.json" -o "${VERIFY_DIR}/manifest-v1.json"
-curl -fsSL "${PUBLIC_BASE_URL}/manifest-v1.json.sig" -o "${VERIFY_DIR}/manifest-v1.json.sig"
-cmp -s "$SOURCE_LOCK" "${VERIFY_DIR}/manifest-v1.json" || {
+curl -fsSL "${PUBLIC_BASE_URL}/manifest.json" -o "${VERIFY_DIR}/manifest.json"
+curl -fsSL "${PUBLIC_BASE_URL}/manifest.json.sig" -o "${VERIFY_DIR}/manifest.json.sig"
+cmp -s "$SOURCE_LOCK" "${VERIFY_DIR}/manifest.json" || {
     echo "Error: published manifest bytes do not match the compiled source lock" >&2
     exit 1
 }
-decode_signature "${VERIFY_DIR}/manifest-v1.json.sig" "${VERIFY_DIR}/published-manifest.minisig"
-if ! minisign -Vm "${VERIFY_DIR}/manifest-v1.json" -x "${VERIFY_DIR}/published-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
+decode_signature "${VERIFY_DIR}/manifest.json.sig" "${VERIFY_DIR}/published-manifest.minisig"
+if ! minisign -Vm "${VERIFY_DIR}/manifest.json" -x "${VERIFY_DIR}/published-manifest.minisig" -P "$UPDATER_PUBKEY" >/dev/null; then
     echo "Error: published signature does not match the App updater public key" >&2
     exit 1
 fi
 
-echo "Speech model manifest published: ${PUBLIC_BASE_URL}/manifest-v1.json"
+echo "Speech model manifest published: ${PUBLIC_BASE_URL}/manifest.json"

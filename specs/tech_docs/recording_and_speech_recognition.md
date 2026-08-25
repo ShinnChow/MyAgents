@@ -50,6 +50,8 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 
 2026-08-25 Apple M1、16 GiB、固定 `local-standard-speech / sensevoice-2024-07-17-v1` 最终冻结结果为：普通话近讲 CER `2.53%`、普通话会议 CER `11.96%`、英文会议 WER `25.75%`、两段四人会议按 scored speaker seconds 聚合 DER `22.47%`，8 个中英混说样本为 `0` 个整段漏识别，全部通过 PRD 门槛。同一报告的 Worker ready 为 `1,508.153 ms`；cold 首句最后有效语音→VAD 确认 `2,442.567 ms`、VAD→final `327.078 ms`、总计 `2,769.645 ms`；14 个 warm 样本的最后有效语音→final p50/p95 为 `2,652.264 / 3,049.730 ms`，其中 VAD→final p50/p95 为 `217.078 / 258.411 ms`。15 个片段均覆盖各自最后有效语音采样，并在 stop 前以一个稳定 final 发布，无 partial 和 terminal flush；这些值只作为该固定环境的测量证据，不构成产品 SLA。该报告关闭 7.2 的 ASR/DER 质量与 live final/cold 测量门槛，不替代 2/8 小时 capture/backfill、采集 CPU 或五 target 正式安装包门槛。
 
+2026-08-26 首次发布前将上述同一组模型字节的 pack revision 从 `sensevoice-2024-07-17-v1` 收敛为 `local-standard-speech-v1`；所有 asset URL、size 和 SHA-256 不变，因此已冻结的质量结果仍适用，这项 identity-only rename 不单独重跑质量基准。
+
 ## Durable speech job
 
 job metadata 位于：
@@ -83,7 +85,7 @@ Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact�
 
 ## 用户模型包
 
-当前 pack identity 固定为 `local-standard-speech / sensevoice-2024-07-17-v1`。编译期 source lock 位于 `src-tauri/media-worker/model-pack-source-lock.json`，固定：
+当前 pack identity 固定为 `local-standard-speech / local-standard-speech-v1`。编译期 source lock 位于 `src-tauri/media-worker/model-pack-source-lock.json`，固定：
 
 - 四项上游下载 asset 与各自 URL、revision、size、SHA-256、格式和许可；
 - 五个实际推理文件的 archive source path、安装相对路径、size 与 SHA-256；
@@ -96,8 +98,8 @@ Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact�
 远端发布面固定为：
 
 ```text
-https://download.myagents.io/models/speech/sets/<pack-revision>/manifest-v1.json
-https://download.myagents.io/models/speech/sets/<pack-revision>/manifest-v1.json.sig
+https://download.myagents.io/models/speech/sets/<pack-revision>/manifest.json
+https://download.myagents.io/models/speech/sets/<pack-revision>/manifest.json.sig
 ```
 
 远端 manifest bytes 必须与 App/Worker 编译内 source lock 完全一致，签名才会被接受。远端 JSON 不能提供新的本地路径、host、模型或 native library。

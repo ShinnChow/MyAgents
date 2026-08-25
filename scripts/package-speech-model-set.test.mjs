@@ -170,7 +170,7 @@ test("speech model packager publishes the exact compiled source-lock bytes", () 
       root,
       "sets",
       source.packRevision,
-      "manifest-v1.json",
+      "manifest.json",
     );
     assert.deepEqual(readFileSync(manifestPath), sourceBytes);
     assert.equal(existsSync(`${manifestPath}.sig`), false);
@@ -250,7 +250,7 @@ test(
       assert.equal(result.status, 0, result.stderr);
       assert.deepEqual(
         readFileSync(fixture.rcloneLog, "utf8").trim().split("\n"),
-        ["manifest-v1.json", "manifest-v1.json.sig"],
+        ["manifest.json", "manifest.json.sig"],
       );
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
@@ -280,7 +280,7 @@ test(
   () => {
     const fixture = createPublisherFixture();
     try {
-      writeFileSync(join(fixture.remoteDir, "manifest-v1.json"), "different\n");
+      writeFileSync(join(fixture.remoteDir, "manifest.json"), "different\n");
       const result = runPublisher(fixture);
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /immutable remote manifest differs/);

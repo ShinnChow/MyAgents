@@ -117,7 +117,7 @@ function main() {
   const args = parseArgs(process.argv.slice(2));
   const { bytes, lock } = readSourceLock();
   const setDir = join(args.outDir, "sets", lock.packRevision);
-  const manifestPath = join(setDir, "manifest-v1.json");
+  const manifestPath = join(setDir, "manifest.json");
   const signaturePath = `${manifestPath}.sig`;
   ensurePlainDirectory(args.outDir);
   ensurePlainDirectory(join(args.outDir, "sets"));
@@ -145,7 +145,7 @@ function main() {
   } else {
     console.log(`[speech-models] wrote ${signaturePath}`);
     console.log(
-      `[speech-models] publish only manifest-v1.json and manifest-v1.json.sig to R2 path models/speech/sets/${lock.packRevision}/`,
+      `[speech-models] publish only manifest.json and manifest.json.sig to R2 path models/speech/sets/${lock.packRevision}/`,
     );
   }
 }

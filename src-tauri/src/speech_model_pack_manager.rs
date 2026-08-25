@@ -753,10 +753,7 @@ async fn fetch_verified_release_manifest(
     client: &reqwest::Client,
     plan: &ModelPackInstallPlan,
 ) -> Result<String, &'static str> {
-    let manifest_url = format!(
-        "{MODEL_SETS_BASE_URL}/{}/manifest-v1.json",
-        plan.pack_revision
-    );
+    let manifest_url = release_manifest_url(&plan.pack_revision);
     let signature_url = format!("{manifest_url}.sig");
     let manifest = fetch_limited_bytes(
         client,
@@ -784,6 +781,10 @@ async fn fetch_verified_release_manifest(
     crate::resource_signature::verify_minisign_bytes(&manifest, signature, "speech model manifest")
         .map_err(|_| "SPEECH_RESOURCE_SIGNATURE_INVALID")?;
     Ok(signature.to_string())
+}
+
+fn release_manifest_url(pack_revision: &str) -> String {
+    format!("{MODEL_SETS_BASE_URL}/{pack_revision}/manifest.json")
 }
 
 async fn fetch_limited_bytes(
@@ -1408,6 +1409,14 @@ mod tests {
         assert_eq!(plan.source_download_bytes, 209_767_948);
         assert_eq!(total_download_bytes(&plan), 209_785_686);
         assert!(total_download_bytes(&plan) <= plan.download_hard_limit_bytes);
+    }
+
+    #[test]
+    fn release_manifest_url_uses_pack_revision_without_schema_suffix() {
+        assert_eq!(
+            release_manifest_url("local-standard-speech-v1"),
+            "https://download.myagents.io/models/speech/sets/local-standard-speech-v1/manifest.json"
+        );
     }
 
     #[test]

@@ -225,7 +225,7 @@ pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
     let lock: SourceLock = serde_json::from_str(json).map_err(|_| SourceLockError::InvalidJson)?;
     if lock.schema_version != 1
         || lock.pack_id != "local-standard-speech"
-        || lock.pack_revision != "sensevoice-2024-07-17-v1"
+        || lock.pack_revision != "local-standard-speech-v1"
         || lock.download_hard_limit_bytes != 300 * 1024 * 1024
     {
         return Err(SourceLockError::InvalidIdentity);
