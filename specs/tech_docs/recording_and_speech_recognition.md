@@ -125,7 +125,9 @@ https://download.myagents.io/models/speech/sets/<pack-revision>/manifest-v1.json
 
 ## 状态与错误
 
-Tauri 提供 `cmd_speech_model_pack_status/install/remove`。状态为 `not_installed | installing | removing | ready`，另带 `usable`、active/available revision、公开资源字节数与结构化 `lastErrorCode`。主要错误族：
+Tauri 提供 `cmd_speech_model_pack_status/install/remove`。状态为 `not_installed | checking | downloading | verifying | installing | removing | ready | update_available | error`，另带 `usable`、active/available revision、公开资源字节数与结构化 `lastErrorCode`。只读 status 只检查本地 owner，不联网；显式安装依次投影第一方清单/签名核验、固定资源下载、安全解包与文件校验、真实模型加载及原子激活，只有下载阶段展示 bytes/百分比。App revision 变化后，旧 pack 只有在本地 manifest 仍能通过 App updater trust root 验签且 identity 与 pointer 一致时才投影 `update_available`，但 `usable=false`、绝不交给 Worker；损坏或伪造 pointer 投影 `error`。
+
+这些状态只是现有 `SpeechModelPackManager` operation 与持久 pointer 的投影，不是新的持久状态机。Renderer 在操作期间轮询同一 command；没有第二套 downloader、事件 owner、安装授权或错误 store。主要错误族：
 
 - `SPEECH_NATIVE_RUNTIME_UNAVAILABLE`：随包 Worker/native/shared ORT 不完整；
 - `SPEECH_RESOURCE_NETWORK`：固定网络路径不可用或跳转 host 不允许；

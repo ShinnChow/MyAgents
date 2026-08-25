@@ -289,9 +289,14 @@ export interface RecordExportResult {
 
 export type SpeechModelPackStatusKind =
   | 'not_installed'
+  | 'checking'
+  | 'downloading'
+  | 'verifying'
   | 'installing'
   | 'removing'
-  | 'ready';
+  | 'ready'
+  | 'update_available'
+  | 'error';
 
 export interface SpeechModelPackStatus {
   status: SpeechModelPackStatusKind;

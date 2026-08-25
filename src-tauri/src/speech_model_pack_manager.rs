@@ -38,15 +38,21 @@ const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_PROBE_STDERR_BYTES: u64 = 64 * 1024;
 const ACTIVE_POINTER_SCHEMA_VERSION: u32 = 1;
+const MODEL_PACK_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const ACTIVATION_DURABILITY_WARNING: &str = "SPEECH_RESOURCE_ACTIVATION_DURABILITY_UNCONFIRMED";
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SpeechModelPackStatusKind {
     NotInstalled,
+    Checking,
+    Downloading,
+    Verifying,
     Installing,
     Removing,
     Ready,
+    UpdateAvailable,
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -79,9 +85,20 @@ struct ActivePointer {
     activated_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignedPackIdentity {
+    schema_version: u32,
+    pack_id: String,
+    pack_revision: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Operation {
     Idle,
+    Checking,
+    Downloading,
+    Verifying,
     Installing,
     Removing,
 }
@@ -121,6 +138,12 @@ impl SpeechModelPackManager {
         cleanup_abandoned_operation_dirs(&models_root.join("private"))?;
 
         let (active, active_pointer, last_error_code) = match read_active_pointer(&models_root) {
+            Ok(Some(pointer)) if pointer.pack_revision != plan.pack_revision => {
+                match verify_previous_revision_pointer(&models_root, &pointer, &plan.pack_id) {
+                    Ok(()) => (None, Some(pointer), None),
+                    Err(code) => (None, Some(pointer), Some(code.to_string())),
+                }
+            }
             Ok(Some(pointer)) => {
                 match verify_pointer_and_pack(&models_root, &pointer, &plan.pack_revision) {
                     Ok((active, pointer)) => (Some(active), Some(pointer), None),
@@ -157,15 +180,48 @@ impl SpeechModelPackManager {
     pub fn status(&self) -> SpeechModelPackStatus {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let status = match state.operation {
+            Operation::Checking => SpeechModelPackStatusKind::Checking,
+            Operation::Downloading => SpeechModelPackStatusKind::Downloading,
+            Operation::Verifying => SpeechModelPackStatusKind::Verifying,
             Operation::Installing => SpeechModelPackStatusKind::Installing,
             Operation::Removing => SpeechModelPackStatusKind::Removing,
+            Operation::Idle
+                if state
+                    .last_error_code
+                    .as_deref()
+                    .is_some_and(|code| code != ACTIVATION_DURABILITY_WARNING) =>
+            {
+                SpeechModelPackStatusKind::Error
+            }
             Operation::Idle if state.active.is_some() => SpeechModelPackStatusKind::Ready,
+            Operation::Idle
+                if state
+                    .active_pointer
+                    .as_ref()
+                    .is_some_and(|pointer| pointer.pack_revision != self.plan.pack_revision) =>
+            {
+                SpeechModelPackStatusKind::UpdateAvailable
+            }
             Operation::Idle => SpeechModelPackStatusKind::NotInstalled,
         };
+        let active_revision = state
+            .active
+            .as_ref()
+            .map(|pack| pack.revision.clone())
+            .or_else(|| {
+                if status == SpeechModelPackStatusKind::UpdateAvailable {
+                    state
+                        .active_pointer
+                        .as_ref()
+                        .map(|pointer| pointer.pack_revision.clone())
+                } else {
+                    None
+                }
+            });
         SpeechModelPackStatus {
             status,
             usable: state.active.is_some(),
-            active_revision: state.active.as_ref().map(|pack| pack.revision.clone()),
+            active_revision,
             available_revision: self.plan.pack_revision.clone(),
             downloaded_bytes: state.downloaded_bytes,
             total_download_bytes: total_download_bytes(&self.plan),
@@ -230,7 +286,7 @@ impl SpeechModelPackManager {
             {
                 true
             } else {
-                state.operation = Operation::Installing;
+                state.operation = Operation::Checking;
                 state.downloaded_bytes = 0;
                 state.last_error_code = None;
                 self.cancelled.store(false, Ordering::Release);
@@ -347,6 +403,7 @@ impl SpeechModelPackManager {
             .map_err(|_| "SPEECH_RESOURCE_NETWORK")?;
         let signature = fetch_verified_release_manifest(&client, &self.plan).await?;
         self.ensure_not_cancelled()?;
+        self.set_install_stage(Operation::Downloading)?;
 
         let operation_id = Uuid::new_v4().simple().to_string();
         let private_root = self.models_root.join("private");
@@ -400,6 +457,7 @@ impl SpeechModelPackManager {
                 .await?;
             downloaded_legal.insert(legal.id.clone(), destination);
         }
+        self.set_install_stage(Operation::Verifying)?;
 
         let plan = self.plan.clone();
         let staging = staging_root.to_path_buf();
@@ -416,6 +474,7 @@ impl SpeechModelPackManager {
         crate::durable_fs::sync_directory(staging_root)
             .map_err(|_| "SPEECH_RESOURCE_STORE_WRITE_FAILED")?;
         verify_installed_pack(&manifest_path).map_err(|_| "SPEECH_RESOURCE_PACK_INVALID")?;
+        self.set_install_stage(Operation::Installing)?;
         self.probe_model_pack(&manifest_path).await?;
         self.ensure_not_cancelled()?;
 
@@ -657,6 +716,15 @@ impl SpeechModelPackManager {
         if state.downloaded_bytes > self.plan.download_hard_limit_bytes {
             return Err("SPEECH_RESOURCE_DOWNLOAD_INVALID");
         }
+        Ok(())
+    }
+
+    fn set_install_stage(&self, stage: Operation) -> Result<(), &'static str> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        state.operation = stage;
         Ok(())
     }
 
@@ -1007,6 +1075,55 @@ fn read_active_pointer(models_root: &Path) -> Result<Option<ActivePointer>, &'st
     Ok(Some(pointer))
 }
 
+/// Recognizes a previously installed first-party revision without making it
+/// executable in the current App. The current source lock remains the only
+/// authority that can produce an `ActivatedModelPack`.
+fn verify_previous_revision_pointer(
+    models_root: &Path,
+    pointer: &ActivePointer,
+    expected_pack_id: &str,
+) -> Result<(), &'static str> {
+    if pointer.schema_version != ACTIVE_POINTER_SCHEMA_VERSION
+        || !valid_pack_directory_name(&pointer.directory_name)
+        || pointer.manifest_signature.is_empty()
+        || pointer.manifest_signature.len() as u64 > MAX_SIGNATURE_BYTES
+        || chrono::DateTime::parse_from_rfc3339(&pointer.activated_at).is_err()
+    {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+
+    let pack_root = models_root.join("packs").join(&pointer.directory_name);
+    ensure_plain_directory(&pack_root).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    let manifest_path = pack_root.join("manifest.json");
+    let metadata = fs::symlink_metadata(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+    let manifest = fs::read(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    if pointer.manifest_sha256 != format!("{:x}", Sha256::digest(&manifest)) {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+    crate::resource_signature::verify_minisign_bytes(
+        &manifest,
+        &pointer.manifest_signature,
+        "speech model manifest",
+    )
+    .map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    let identity: SignedPackIdentity =
+        serde_json::from_slice(&manifest).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    if identity.schema_version != MODEL_PACK_MANIFEST_SCHEMA_VERSION
+        || identity.pack_id != expected_pack_id
+        || identity.pack_revision != pointer.pack_revision
+    {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+    Ok(())
+}
+
 fn verify_pointer_and_pack(
     models_root: &Path,
     pointer: &ActivePointer,
@@ -1291,6 +1408,111 @@ mod tests {
         assert_eq!(plan.source_download_bytes, 209_767_948);
         assert_eq!(total_download_bytes(&plan), 209_785_686);
         assert!(total_download_bytes(&plan) <= plan.download_hard_limit_bytes);
+    }
+
+    #[test]
+    fn status_projects_install_stages_update_and_error() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SpeechModelPackManager::initialize(
+            root.path().join("models"),
+            root.path().join("worker"),
+            root.path().join("native.json"),
+            None,
+            LocalComputeCoordinator::new(),
+        )
+        .unwrap();
+
+        for (operation, expected) in [
+            (Operation::Checking, SpeechModelPackStatusKind::Checking),
+            (
+                Operation::Downloading,
+                SpeechModelPackStatusKind::Downloading,
+            ),
+            (Operation::Verifying, SpeechModelPackStatusKind::Verifying),
+            (Operation::Installing, SpeechModelPackStatusKind::Installing),
+            (Operation::Removing, SpeechModelPackStatusKind::Removing),
+        ] {
+            manager.state.lock().unwrap().operation = operation;
+            assert_eq!(manager.status().status, expected);
+        }
+
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.operation = Operation::Idle;
+            state.active_pointer = Some(ActivePointer {
+                schema_version: ACTIVE_POINTER_SCHEMA_VERSION,
+                pack_revision: "previous-revision".into(),
+                directory_name: "pack-0123456789abcdef0123456789abcdef".into(),
+                manifest_sha256: "0".repeat(64),
+                manifest_signature: "unused-after-initialization".into(),
+                activated_at: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+        let update = manager.status();
+        assert_eq!(update.status, SpeechModelPackStatusKind::UpdateAvailable);
+        assert!(!update.usable);
+        assert_eq!(update.active_revision.as_deref(), Some("previous-revision"));
+
+        manager.state.lock().unwrap().last_error_code = Some("SPEECH_RESOURCE_NETWORK".into());
+        assert_eq!(manager.status().status, SpeechModelPackStatusKind::Error);
+
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.active = Some(ActivatedModelPack {
+                revision: manager.plan.pack_revision.clone(),
+                manifest_path: root.path().join("models/active-manifest.json"),
+            });
+            state.last_error_code = Some("SPEECH_RESOURCE_REMOVE_FAILED".into());
+        }
+        let removal_error = manager.status();
+        assert_eq!(removal_error.status, SpeechModelPackStatusKind::Error);
+        assert!(removal_error.usable);
+    }
+
+    #[test]
+    fn unsigned_previous_revision_is_error_not_update_available() {
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path().join("models");
+        let directory_name = "pack-0123456789abcdef0123456789abcdef";
+        let pack_root = models.join("packs").join(directory_name);
+        fs::create_dir_all(&pack_root).unwrap();
+        let plan = install_plan().unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": MODEL_PACK_MANIFEST_SCHEMA_VERSION,
+            "packId": plan.pack_id,
+            "packRevision": "previous-revision"
+        }))
+        .unwrap();
+        fs::write(pack_root.join("manifest.json"), &manifest).unwrap();
+        let pointer = ActivePointer {
+            schema_version: ACTIVE_POINTER_SCHEMA_VERSION,
+            pack_revision: "previous-revision".into(),
+            directory_name: directory_name.into(),
+            manifest_sha256: format!("{:x}", Sha256::digest(&manifest)),
+            manifest_signature: "not-a-valid-signature".into(),
+            activated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        fs::write(
+            models.join("active.json"),
+            serde_json::to_vec(&pointer).unwrap(),
+        )
+        .unwrap();
+
+        let manager = SpeechModelPackManager::initialize(
+            models,
+            root.path().join("worker"),
+            root.path().join("native.json"),
+            None,
+            LocalComputeCoordinator::new(),
+        )
+        .unwrap();
+        let status = manager.status();
+        assert_eq!(status.status, SpeechModelPackStatusKind::Error);
+        assert!(!status.usable);
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some("SPEECH_RESOURCE_CORRUPT")
+        );
     }
 
     #[test]

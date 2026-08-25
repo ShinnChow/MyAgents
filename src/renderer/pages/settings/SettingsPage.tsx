@@ -1124,7 +1124,13 @@ export default function Settings({
   useEffect(() => {
     if (
       !speechModelPackStatus ||
-      !['installing', 'removing'].includes(speechModelPackStatus.status)
+      ![
+        'checking',
+        'downloading',
+        'verifying',
+        'installing',
+        'removing',
+      ].includes(speechModelPackStatus.status)
     )
       return;
     const interval = window.setInterval(() => {
@@ -1138,7 +1144,7 @@ export default function Settings({
     speechModelPackOperationRef.current = true;
     setSpeechModelPackStatus((current) =>
       current
-        ? { ...current, status: 'installing', lastErrorCode: undefined }
+        ? { ...current, status: 'checking', lastErrorCode: undefined }
         : current,
     );
     try {

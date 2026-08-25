@@ -23,7 +23,14 @@ export function SpeechModelResourceControls({
   onRemove,
 }: SpeechModelResourceControlsProps) {
   const { t } = useTranslation('settings');
-  const busy = ['installing', 'removing'].includes(status?.status ?? '');
+  const busy = [
+    'checking',
+    'downloading',
+    'verifying',
+    'installing',
+    'removing',
+  ].includes(status?.status ?? '');
+  const downloading = status?.status === 'downloading';
   const downloadPercent =
     status && status.totalDownloadBytes > 0
       ? Math.max(
@@ -39,11 +46,18 @@ export function SpeechModelResourceControls({
   const hasActivationWarning =
     status?.lastErrorCode === ACTIVATION_DURABILITY_WARNING;
   const error =
-    status?.lastErrorCode && !hasActivationWarning
-      ? t(`toolbox.speechResource.errors.${status.lastErrorCode}`, {
-          defaultValue: t('toolbox.speechResource.errors.default'),
-        })
+    status?.status === 'error' && !hasActivationWarning
+      ? status.lastErrorCode
+        ? t(`toolbox.speechResource.errors.${status.lastErrorCode}`, {
+            defaultValue: t('toolbox.speechResource.errors.default'),
+          })
+        : t('toolbox.speechResource.errors.default')
       : null;
+  const removeError =
+    status?.status === 'error' &&
+    ['SPEECH_RESOURCE_CHANGED', 'SPEECH_RESOURCE_REMOVE_FAILED'].includes(
+      status.lastErrorCode ?? '',
+    );
 
   return (
     <div className="mt-3 border-t border-[var(--line)] pt-3">
@@ -70,26 +84,42 @@ export function SpeechModelResourceControls({
             role="status"
             aria-live="polite"
           >
-            {t(`toolbox.speechResource.states.${status?.status ?? 'checking'}`)}
+            {status
+              ? t(`toolbox.speechResource.states.${status.status}`)
+              : t('toolbox.speechResource.loading')}
           </p>
           <p
             className="mt-0.5 truncate text-[var(--ink-muted)]"
-            title={status?.activeRevision ?? status?.availableRevision}
+            title={
+              status?.status === 'update_available'
+                ? `${status.activeRevision ?? '—'} → ${status.availableRevision}`
+                : (status?.activeRevision ?? status?.availableRevision)
+            }
           >
             sherpa-onnx · SenseVoice
-            {status?.activeRevision ? ` · ${status.activeRevision}` : ''}
+            {status?.status === 'update_available'
+              ? ` · ${status.activeRevision ?? '—'} → ${status.availableRevision}`
+              : status?.activeRevision
+                ? ` · ${status.activeRevision}`
+                : ''}
           </p>
         </div>
 
-        {status?.status === 'ready' ? (
+        {status?.status === 'ready' || removeError ? (
           <button
             type="button"
             onClick={onRemove}
             disabled={busy}
             className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-[var(--line)] px-2 py-1 text-xs font-medium text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--danger)] disabled:cursor-wait disabled:opacity-60"
           >
-            <Trash2 className="h-3.5 w-3.5" />
-            {t('toolbox.speechResource.remove')}
+            {removeError ? (
+              <RefreshCw className="h-3.5 w-3.5" />
+            ) : (
+              <Trash2 className="h-3.5 w-3.5" />
+            )}
+            {removeError
+              ? t('toolbox.speechResource.retryRemove')
+              : t('toolbox.speechResource.remove')}
           </button>
         ) : !busy && status ? (
           <button
@@ -104,24 +134,29 @@ export function SpeechModelResourceControls({
             )}
             {error
               ? t('toolbox.speechResource.retry')
-              : t('toolbox.speechResource.install')}
+              : status.status === 'update_available'
+                ? t('toolbox.speechResource.update')
+                : t('toolbox.speechResource.install')}
           </button>
         ) : null}
       </div>
 
-      {busy && (
+      {busy && status && (
         <div className="mt-2 space-y-1.5">
           <div className="flex items-center justify-between gap-3 text-xs text-[var(--ink-muted)]">
             <span>
-              {status?.status === 'removing'
-                ? t('toolbox.speechResource.removing')
-                : t('toolbox.speechResource.downloading')}
+              {downloading
+                ? t('toolbox.speechResource.downloadProgress', {
+                    downloaded: formatBytes(status.downloadedBytes),
+                    total: formatBytes(status.totalDownloadBytes),
+                  })
+                : t(`toolbox.speechResource.progress.${status.status}`)}
             </span>
-            {status?.status === 'installing' && (
+            {downloading && (
               <span className="font-mono">{downloadPercent}%</span>
             )}
           </div>
-          {status?.status === 'installing' && (
+          {downloading && (
             <div
               className="h-1.5 overflow-hidden rounded-full bg-[var(--paper-inset)]"
               role="progressbar"
