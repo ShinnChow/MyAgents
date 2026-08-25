@@ -140,6 +140,76 @@ def run_ffmpeg(source: Path, output: Path, start: float, duration: float, ogg: b
     subprocess.run(arguments, check=True)
 
 
+def run_ffmpeg_live_latency(
+    source: Path,
+    output: Path,
+    start: float,
+    speech_duration: float,
+    trailing_silence: float,
+    sample_rate: int,
+) -> int:
+    if (
+        not math.isfinite(start)
+        or not math.isfinite(speech_duration)
+        or not math.isfinite(trailing_silence)
+        or start < 0
+        or speech_duration <= 0
+        or trailing_silence < 0.5
+        or sample_rate != 16_000
+    ):
+        raise ValueError("Invalid live latency crop window")
+    speech_samples = round(speech_duration * sample_rate)
+    trailing_samples = round(trailing_silence * sample_rate)
+    total_samples = speech_samples + trailing_samples
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start:.6f}",
+            "-t",
+            f"{speech_duration:.6f}",
+            "-i",
+            str(source),
+            "-map",
+            "0:a:0",
+            "-map_metadata",
+            "-1",
+            "-fflags",
+            "+bitexact",
+            "-af",
+            f"apad=pad_dur={trailing_silence:.6f}",
+            "-t",
+            f"{total_samples / sample_rate:.6f}",
+            "-ac",
+            "1",
+            "-ar",
+            str(sample_rate),
+            "-c:a",
+            "pcm_s16le",
+            "-flags:a",
+            "+bitexact",
+            str(output),
+        ],
+        check=True,
+    )
+    with wave.open(str(output), "rb") as audio:
+        if (
+            audio.getnchannels() != 1
+            or audio.getframerate() != sample_rate
+            or audio.getsampwidth() != 2
+            or audio.getnframes() != total_samples
+        ):
+            raise ValueError("Live latency fixture shape drifted")
+        audio.setpos(speech_samples)
+        if any(audio.readframes(trailing_samples)):
+            raise ValueError("Live latency fixture trailing silence drifted")
+    return total_samples
+
+
 def source_evidence(path: Path) -> tuple[int, str]:
     metadata = path.stat()
     if not path.is_file() or path.is_symlink() or metadata.st_size <= 0:
@@ -457,13 +527,127 @@ def ami_turns(
     return turns
 
 
+def ami_word_entries(archive: zipfile.ZipFile, meeting: str) -> list[dict]:
+    entries = []
+    for speaker in "ABCD":
+        payload = archive.read(f"words/{meeting}.{speaker}.words.xml")
+        root = ET.fromstring(payload)
+        for element in root.iter("w"):
+            text = (element.text or "").strip()
+            if element.attrib.get("punc") == "true" or not text:
+                continue
+            entries.append(
+                {
+                    "speaker": speaker,
+                    "start": float(element.attrib["starttime"]),
+                    "end": float(element.attrib["endtime"]),
+                    "text": text,
+                }
+            )
+    entries.sort(key=lambda item: (item["start"], item["end"], item["speaker"]))
+    return entries
+
+
+def prepare_ami_live_latency(
+    root: Path,
+    audio_path: Path,
+    archive: zipfile.ZipFile,
+    windows: list[dict],
+    config: dict,
+) -> list[dict]:
+    sample_rate = config.get("sampleRate")
+    trailing_silence = config.get("trailingSilenceSeconds")
+    if (
+        sample_rate != 16_000
+        or not isinstance(trailing_silence, (int, float))
+        or not math.isfinite(trailing_silence)
+        or trailing_silence < 0.5
+        or not windows
+    ):
+        raise ValueError("Invalid live latency benchmark configuration")
+    by_meeting = {}
+    cases = []
+    ids = set()
+    for selection in windows:
+        case_id = selection.get("id")
+        meeting = selection.get("meeting")
+        speaker = selection.get("speaker")
+        first_word = selection.get("firstWordSeconds")
+        last_word_end = selection.get("lastWordEndSeconds")
+        leading_context = selection.get("leadingContextSeconds")
+        if (
+            not isinstance(case_id, str)
+            or not SAFE_ID.fullmatch(case_id)
+            or case_id in ids
+            or not isinstance(meeting, str)
+            or not SAFE_ID.fullmatch(meeting)
+            or speaker not in {"A", "B", "C", "D"}
+            or not all(
+                isinstance(value, (int, float)) and math.isfinite(value)
+                for value in (first_word, last_word_end, leading_context)
+            )
+            or first_word < 0
+            or last_word_end <= first_word
+            or leading_context <= 0
+            or first_word < leading_context
+        ):
+            raise ValueError("Invalid AMI live latency selection")
+        ids.add(case_id)
+        if meeting not in by_meeting:
+            by_meeting[meeting] = ami_word_entries(archive, meeting)
+        words = by_meeting[meeting]
+        selected_words = [
+            word
+            for word in words
+            if word["speaker"] == speaker
+            and word["start"] >= first_word - 0.001
+            and word["end"] <= last_word_end + 0.001
+        ]
+        if (
+            not selected_words
+            or abs(min(word["start"] for word in selected_words) - first_word) > 0.001
+            or abs(max(word["end"] for word in selected_words) - last_word_end) > 0.001
+            or any(
+                word["start"] < last_word_end and word["end"] > last_word_end
+                for word in words
+            )
+        ):
+            raise ValueError(f"AMI live latency annotation drifted: {case_id}")
+        crop_start = first_word - leading_context
+        speech_duration = last_word_end - crop_start
+        output = root / "audio" / f"{case_id}.wav"
+        total_samples = run_ffmpeg_live_latency(
+            audio_path,
+            output,
+            crop_start,
+            speech_duration,
+            trailing_silence,
+            sample_rate,
+        )
+        source_bytes, source_sha256 = source_evidence(output)
+        cases.append(
+            {
+                "id": case_id,
+                "sourcePath": output.relative_to(root).as_posix(),
+                "sourceBytes": source_bytes,
+                "sourceSha256": source_sha256,
+                "sampleRate": sample_rate,
+                "lastValidSpeechSample": round(speech_duration * sample_rate),
+                "totalSamples": total_samples,
+            }
+        )
+    return cases
+
+
 def prepare_ami(
     root: Path,
     audio_path: Path,
     annotation_path: Path,
     asr_window: dict,
     diarization_window: dict,
-) -> list[dict]:
+    live_windows: list[dict],
+    live_config: dict,
+) -> tuple[list[dict], list[dict]]:
     if asr_window["meeting"] != diarization_window["meeting"]:
         raise ValueError("AMI benchmark windows must use one meeting")
     meeting = asr_window["meeting"]
@@ -484,7 +668,7 @@ def prepare_ami(
         True,
     )
     with zipfile.ZipFile(annotation_path) as archive:
-        return [
+        cases = [
             asr_case(
                 root,
                 "ami-english-meeting",
@@ -514,6 +698,14 @@ def prepare_ami(
                 20 * 60 * 1000,
             ),
         ]
+        live_cases = prepare_ami_live_latency(
+            root,
+            audio_path,
+            archive,
+            live_windows,
+            live_config,
+        )
+        return cases, live_cases
 
 
 def main() -> None:
@@ -558,19 +750,21 @@ def main() -> None:
             selections["ascendUtterances"],
         )
     )
-    cases.extend(
-        prepare_ami(
-            output,
-            Path(arguments.ami_audio),
-            Path(arguments.ami_annotations),
-            selections["amiAsrWindow"],
-            selections["amiDiarizationWindow"],
-        )
+    ami_cases, live_latency_cases = prepare_ami(
+        output,
+        Path(arguments.ami_audio),
+        Path(arguments.ami_annotations),
+        selections["amiAsrWindow"],
+        selections["amiDiarizationWindow"],
+        selections["amiLiveLatencyWindows"],
+        source_lock["liveLatencyBenchmark"],
     )
+    cases.extend(ami_cases)
     manifest = {
         "schemaVersion": 1,
         "corpusVersion": source_lock["corpusVersion"],
         "cases": cases,
+        "liveLatencyCases": live_latency_cases,
     }
     manifest_path = output / "prepared-corpus.json"
     with manifest_path.open("x", encoding="utf8") as destination:

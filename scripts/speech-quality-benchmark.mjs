@@ -1,18 +1,34 @@
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
+  cpSync,
   createReadStream,
   lstatSync,
+  mkdtempSync,
   readFileSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
-import { arch, cpus, platform, release, totalmem } from "node:os";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { arch, cpus, platform, release, tmpdir, totalmem } from "node:os";
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+} from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   assertExpectedMediaWorkerBatch,
   runMediaWorkerBatch,
 } from "./media-worker-batch-client.mjs";
+import {
+  assertExpectedMediaWorkerLive,
+  readPcm16Wave,
+  runMediaWorkerLive,
+} from "./media-worker-live-client.mjs";
 import {
   spawnSpeechQualityProcess,
   waitForSpeechQualityProcess,
@@ -121,7 +137,10 @@ function validateCorpusManifest(manifest) {
     !SAFE_ID.test(manifest.corpusVersion) ||
     !Array.isArray(manifest.cases) ||
     manifest.cases.length === 0 ||
-    manifest.cases.length > 10_000
+    manifest.cases.length > 10_000 ||
+    !Array.isArray(manifest.liveLatencyCases) ||
+    manifest.liveLatencyCases.length === 0 ||
+    manifest.liveLatencyCases.length > 100
   ) {
     throw new Error("Prepared speech quality corpus manifest is invalid");
   }
@@ -171,6 +190,68 @@ function validateCorpusManifest(manifest) {
       }
     }
   }
+  const liveIds = new Set();
+  for (const entry of manifest.liveLatencyCases) {
+    if (
+      !entry ||
+      typeof entry !== "object" ||
+      !SAFE_ID.test(entry.id ?? "") ||
+      liveIds.has(entry.id) ||
+      !isSafeRelativePath(entry.sourcePath) ||
+      !SHA256.test(entry.sourceSha256 ?? "") ||
+      !Number.isSafeInteger(entry.sourceBytes) ||
+      entry.sourceBytes <= 0 ||
+      entry.sampleRate !== SAMPLE_RATE ||
+      !Number.isSafeInteger(entry.lastValidSpeechSample) ||
+      !Number.isSafeInteger(entry.totalSamples) ||
+      entry.lastValidSpeechSample <= 0 ||
+      entry.totalSamples <= entry.lastValidSpeechSample ||
+      entry.totalSamples > 60 * SAMPLE_RATE
+    ) {
+      throw new Error("Prepared live latency corpus case is invalid");
+    }
+    liveIds.add(entry.id);
+  }
+}
+
+function validateLiveLatencyConfig(config, liveCaseCount) {
+  if (
+    !config ||
+    typeof config !== "object" ||
+    config.sampleRate !== SAMPLE_RATE ||
+    !Number.isSafeInteger(config.frameSamples) ||
+    config.frameSamples <= 0 ||
+    config.frameSamples > 5 * SAMPLE_RATE ||
+    !Number.isSafeInteger(config.warmRepeats) ||
+    config.warmRepeats < 2 ||
+    config.warmRepeats > 100 ||
+    !Number.isFinite(config.trailingSilenceSeconds) ||
+    config.trailingSilenceSeconds < 0.5 ||
+    !config.vadParameters ||
+    typeof config.vadParameters !== "object" ||
+    !Number.isFinite(config.vadParameters.threshold) ||
+    !Number.isFinite(config.vadParameters.minSilenceSeconds) ||
+    !Number.isFinite(config.vadParameters.minSpeechSeconds) ||
+    !Number.isFinite(config.vadParameters.maxSpeechSeconds) ||
+    !Number.isSafeInteger(config.vadParameters.windowSamples) ||
+    liveCaseCount * config.warmRepeats < 10
+  ) {
+    throw new Error("Speech live latency benchmark configuration is invalid");
+  }
+}
+
+function percentile(values, percentage) {
+  if (values.length === 0) {
+    throw new Error("Speech live latency percentile has no observations");
+  }
+  const sorted = [...values].sort((left, right) => left - right);
+  const index = Math.max(0, Math.ceil((sorted.length * percentage) / 100) - 1);
+  return sorted[Math.min(index, sorted.length - 1)];
+}
+
+function latencyPercentiles(measurements, field) {
+  const values = measurements.map((measurement) => measurement[field]);
+  return { p50Ms: percentile(values, 50), p95Ms: percentile(values, 95) };
 }
 
 async function runJsonCommand(command, args, input, timeoutMs) {
@@ -315,12 +396,38 @@ if (
     "Prepared speech quality corpus does not match the current source lock",
   );
 }
+validateLiveLatencyConfig(
+  sourceLock.liveLatencyBenchmark,
+  manifest.liveLatencyCases.length,
+);
+const liveConfig = sourceLock.liveLatencyBenchmark;
 const runtimePaths = {
   worker: resolve(workerPath),
   nativeManifest: resolve(nativeManifestPath),
   onnxRuntime: resolve(onnxRuntimePath),
   modelManifest: resolve(modelManifestPath),
 };
+const nativeManifestEvidence = readBoundedJson(
+  runtimePaths.nativeManifest,
+  "Native manifest",
+);
+if (
+  nativeManifestEvidence.value.schemaVersion !== 1 ||
+  !isSafeRelativePath(nativeManifestEvidence.value.files?.mediaWorker?.path)
+) {
+  throw new Error("Speech benchmark native manifest identity is invalid");
+}
+const modelManifestEvidence = readBoundedJson(
+  runtimePaths.modelManifest,
+  "Model manifest",
+);
+if (
+  modelManifestEvidence.value.schemaVersion !== 1 ||
+  !SAFE_ID.test(modelManifestEvidence.value.packId ?? "") ||
+  !SAFE_ID.test(modelManifestEvidence.value.packRevision ?? "")
+) {
+  throw new Error("Speech benchmark model manifest identity is invalid");
+}
 
 async function snapshotRegularFile(label, path) {
   const metadata = lstatSync(path);
@@ -341,9 +448,38 @@ async function verifySnapshot(snapshot) {
   }
 }
 
+async function materializeExecutionSnapshot(snapshot, destination, mode) {
+  const bytes = readFileSync(snapshot.path);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  if (bytes.length !== snapshot.bytes || sha256 !== snapshot.sha256) {
+    throw new Error(
+      `Speech benchmark input drifted before private execution: ${snapshot.label}`,
+    );
+  }
+  writeFileSync(destination, bytes, { flag: "wx", mode });
+  await verifyExecutionSnapshot(snapshot, destination);
+  return destination;
+}
+
+async function verifyExecutionSnapshot(snapshot, destination) {
+  const privateSnapshot = await snapshotRegularFile(
+    `private:${snapshot.label}`,
+    destination,
+  );
+  if (
+    privateSnapshot.bytes !== snapshot.bytes ||
+    privateSnapshot.sha256 !== snapshot.sha256
+  ) {
+    throw new Error(
+      `Speech benchmark private execution copy drifted: ${snapshot.label}`,
+    );
+  }
+}
+
 const scriptPaths = {
   benchmark: fileURLToPath(import.meta.url),
   batchClient: resolve(scriptRoot, "media-worker-batch-client.mjs"),
+  liveClient: resolve(scriptRoot, "media-worker-live-client.mjs"),
   processTree: resolve(scriptRoot, "speech-quality-process-tree.mjs"),
   metrics: resolve(scriptRoot, "speech-quality-metrics.py"),
   metricsLock: resolve(scriptRoot, "speech-quality-metrics.py.lock"),
@@ -352,6 +488,16 @@ const snapshots = [];
 const runtimeSnapshots = [];
 for (const [label, path] of Object.entries(runtimePaths)) {
   const snapshot = await snapshotRegularFile(label, path);
+  if (
+    (label === "nativeManifest" &&
+      (snapshot.bytes !== nativeManifestEvidence.bytes ||
+        snapshot.sha256 !== nativeManifestEvidence.sha256)) ||
+    (label === "modelManifest" &&
+      (snapshot.bytes !== modelManifestEvidence.bytes ||
+        snapshot.sha256 !== modelManifestEvidence.sha256))
+  ) {
+    throw new Error(`Speech benchmark ${label} drifted while reading`);
+  }
   snapshots.push(snapshot);
   runtimeSnapshots.push(snapshot);
 }
@@ -371,6 +517,52 @@ snapshots.push({
   sha256: manifestEvidence.sha256,
 });
 
+const snapshotByLabelBeforeRun = Object.fromEntries(
+  snapshots.map((snapshot) => [snapshot.label, snapshot]),
+);
+const executionRoot = mkdtempSync(
+  join(tmpdir(), "myagents-speech-quality-run-"),
+);
+chmodSync(executionRoot, 0o700);
+const cleanupExecutionRoot = () => {
+  rmSync(executionRoot, { recursive: true, force: true, maxRetries: 3 });
+};
+process.once("exit", cleanupExecutionRoot);
+const executionNativeRoot = join(executionRoot, "native-bundle");
+cpSync(dirname(runtimePaths.nativeManifest), executionNativeRoot, {
+  recursive: true,
+  force: false,
+  errorOnExist: true,
+  dereference: false,
+});
+const privateNativeManifest = join(
+  executionNativeRoot,
+  basename(runtimePaths.nativeManifest),
+);
+const privateWorker = resolve(
+  executionNativeRoot,
+  nativeManifestEvidence.value.files.mediaWorker.path,
+);
+await verifyExecutionSnapshot(
+  snapshotByLabelBeforeRun.nativeManifest,
+  privateNativeManifest,
+);
+await verifyExecutionSnapshot(snapshotByLabelBeforeRun.worker, privateWorker);
+const executionPaths = {
+  worker: privateWorker,
+  nativeManifest: privateNativeManifest,
+  metrics: await materializeExecutionSnapshot(
+    snapshotByLabelBeforeRun.metrics,
+    join(executionRoot, basename(scriptPaths.metrics)),
+    0o600,
+  ),
+};
+await materializeExecutionSnapshot(
+  snapshotByLabelBeforeRun.metricsLock,
+  join(executionRoot, basename(scriptPaths.metricsLock)),
+  0o600,
+);
+
 const preparedCases = [];
 for (const entry of manifest.cases) {
   const source = resolveCorpusFile(corpusRoot, entry.sourcePath);
@@ -388,14 +580,43 @@ for (const entry of manifest.cases) {
   preparedCases.push({ entry, source, snapshot });
 }
 
+const preparedLiveCases = [];
+for (const entry of manifest.liveLatencyCases) {
+  const source = resolveCorpusFile(corpusRoot, entry.sourcePath);
+  const snapshot = await snapshotRegularFile(
+    `corpus:${entry.id}`,
+    source.absolute,
+  );
+  if (
+    snapshot.bytes !== entry.sourceBytes ||
+    snapshot.sha256 !== entry.sourceSha256
+  ) {
+    throw new Error(
+      `Prepared live latency corpus bytes drifted for ${entry.id}`,
+    );
+  }
+  const samples = readPcm16Wave(source.absolute);
+  if (
+    samples.length !== entry.totalSamples ||
+    entry.totalSamples - entry.lastValidSpeechSample !==
+      Math.round(liveConfig.trailingSilenceSeconds * SAMPLE_RATE)
+  ) {
+    throw new Error(
+      `Prepared live latency sample count drifted for ${entry.id}`,
+    );
+  }
+  snapshots.push(snapshot);
+  preparedLiveCases.push({ entry, snapshot, samples });
+}
+
 const metricRequest = { asr: [], diarization: [] };
 const caseEvidence = [];
 for (const [index, { entry, source, snapshot }] of preparedCases.entries()) {
   const mode = entry.kind === "asr" ? "attachment" : "diarization";
   const startedAt = performance.now();
   const result = await runMediaWorkerBatch({
-    workerPath: runtimePaths.worker,
-    nativeManifestPath: runtimePaths.nativeManifest,
+    workerPath: executionPaths.worker,
+    nativeManifestPath: executionPaths.nativeManifest,
     onnxRuntimePath: runtimePaths.onnxRuntime,
     modelManifestPath: runtimePaths.modelManifest,
     sourcePath: source.absolute,
@@ -441,9 +662,89 @@ for (const [index, { entry, source, snapshot }] of preparedCases.entries()) {
   }
 }
 
+const liveSampleCount =
+  preparedLiveCases.reduce((count, { samples }) => count + samples.length, 0) *
+  liveConfig.warmRepeats;
+const liveSamples = new Int16Array(liveSampleCount);
+const measurementWindows = [];
+let liveOffset = 0;
+for (let repeat = 0; repeat < liveConfig.warmRepeats; repeat += 1) {
+  for (const { entry, samples } of preparedLiveCases) {
+    const startSample = liveOffset;
+    liveSamples.set(samples, startSample);
+    liveOffset += samples.length;
+    measurementWindows.push({
+      id: `${entry.id}-r${repeat + 1}`,
+      startSample,
+      endSample: liveOffset,
+      lastValidSpeechSample: startSample + entry.lastValidSpeechSample,
+    });
+  }
+}
+const liveDurationMs = Math.ceil((liveSamples.length * 1_000) / SAMPLE_RATE);
+const liveResult = await runMediaWorkerLive({
+  workerPath: executionPaths.worker,
+  nativeManifestPath: executionPaths.nativeManifest,
+  onnxRuntimePath: runtimePaths.onnxRuntime,
+  modelManifestPath: runtimePaths.modelManifest,
+  samples: liveSamples,
+  measurementWindows,
+  frameSamples: liveConfig.frameSamples,
+  realtime: true,
+  timeoutMs: liveDurationMs + 5 * 60 * 1_000,
+  workloadId: "quality_live_latency",
+  workerGeneration: preparedCases.length + 1,
+});
+const liveSummary = assertExpectedMediaWorkerLive(
+  liveResult,
+  measurementWindows.length,
+);
+for (const { snapshot } of preparedLiveCases) await verifySnapshot(snapshot);
+for (const runtimeSnapshot of runtimeSnapshots) {
+  await verifySnapshot(runtimeSnapshot);
+}
+const coldMeasurement = liveSummary.measurements[0];
+const warmMeasurements = liveSummary.measurements.slice(1);
+const liveLatency = {
+  measurementMethod:
+    "capture clock starts at Worker spawn; committed PCM catches up after ready; triggering input_ack follows VAD accept; transcript_segment receipt is final",
+  sampleRate: liveConfig.sampleRate,
+  frameSamples: liveConfig.frameSamples,
+  warmRepeats: liveConfig.warmRepeats,
+  trailingSilenceSeconds: liveConfig.trailingSilenceSeconds,
+  vadParameters: liveConfig.vadParameters,
+  streamDurationMs: liveDurationMs,
+  workerReadyMs: liveSummary.workerReadyMs,
+  sources: preparedLiveCases.map(({ entry }) => ({
+    id: entry.id,
+    sourceBytes: entry.sourceBytes,
+    sourceSha256: entry.sourceSha256,
+    lastValidSpeechSample: entry.lastValidSpeechSample,
+    totalSamples: entry.totalSamples,
+  })),
+  responseCounts: liveSummary.counts,
+  workerMetrics: liveSummary.completedMetrics,
+  coldFirstSentence: coldMeasurement,
+  warm: {
+    measurementCount: warmMeasurements.length,
+    lastSpeechToVad: latencyPercentiles(warmMeasurements, "lastSpeechToVadMs"),
+    vadToSegmentFinal: latencyPercentiles(
+      warmMeasurements,
+      "vadToSegmentFinalMs",
+    ),
+    lastSpeechToSegmentFinal: latencyPercentiles(
+      warmMeasurements,
+      "lastSpeechToSegmentFinalMs",
+    ),
+  },
+  measurements: liveSummary.measurements,
+  stableFinalOnly: true,
+  pass: true,
+};
+
 const metrics = await runJsonCommand(
   "uv",
-  ["run", "--locked", scriptPaths.metrics],
+  ["run", "--locked", executionPaths.metrics],
   metricRequest,
   METRIC_TIMEOUT_MS,
 );
@@ -465,6 +766,7 @@ const report = {
   benchmarkScripts: {
     benchmarkSha256: snapshotByLabel.benchmark.sha256,
     batchClientSha256: snapshotByLabel.batchClient.sha256,
+    liveClientSha256: snapshotByLabel.liveClient.sha256,
     processTreeSha256: snapshotByLabel.processTree.sha256,
     metricsSha256: snapshotByLabel.metrics.sha256,
     metricsLockSha256: snapshotByLabel.metricsLock.sha256,
@@ -481,6 +783,8 @@ const report = {
     nativeManifestSha256: snapshotByLabel.nativeManifest.sha256,
     onnxRuntimeSha256: snapshotByLabel.onnxRuntime.sha256,
     modelManifestSha256: snapshotByLabel.modelManifest.sha256,
+    modelPackId: modelManifestEvidence.value.packId,
+    modelPackRevision: modelManifestEvidence.value.packRevision,
     metricToolVersions: metrics.toolVersions,
   },
   cases: caseEvidence,
@@ -488,14 +792,17 @@ const report = {
     asr: metrics.asr,
     diarization: metrics.diarization,
   },
+  liveLatency,
   gates,
-  pass: gates.every((gate) => gate.pass),
+  pass: gates.every((gate) => gate.pass) && liveLatency.pass,
 };
 writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, {
   encoding: "utf8",
   flag: "wx",
   mode: 0o600,
 });
+process.removeListener("exit", cleanupExecutionRoot);
+cleanupExecutionRoot();
 console.log(
   JSON.stringify({
     reportPath: resolve(reportPath),

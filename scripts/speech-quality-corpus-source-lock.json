@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "corpusVersion": "myagents-speech-quality-v1",
-  "preparedManifestSha256": "e8ff041fb6faeef7e88db91e9920f90e9e2f1b56caeaea256346e925ad78092b",
+  "preparedManifestSha256": "b0817942aad1c8cb847bf1b259fbd782e1fd8e553ef49a8e851b2080c208cc42",
   "tools": {
     "python": "3.12",
     "pyarrow": "21.0.0",
@@ -10,6 +10,19 @@
     "meeteval": "0.4.3",
     "wetext": "0.1.6",
     "ffmpeg": "8.0.1"
+  },
+  "liveLatencyBenchmark": {
+    "sampleRate": 16000,
+    "frameSamples": 320,
+    "warmRepeats": 5,
+    "trailingSilenceSeconds": 3,
+    "vadParameters": {
+      "threshold": 0.25,
+      "minSilenceSeconds": 0.5,
+      "minSpeechSeconds": 0.25,
+      "maxSpeechSeconds": 30,
+      "windowSamples": 512
+    }
   },
   "sources": {
     "aishell1Audio": {
@@ -133,6 +146,32 @@
       "startSeconds": 55,
       "durationSeconds": 120,
       "collarSeconds": 0.25
-    }
+    },
+    "amiLiveLatencyWindows": [
+      {
+        "id": "ami-live-d002",
+        "meeting": "ES2002a",
+        "speaker": "D",
+        "firstWordSeconds": 82.08,
+        "lastWordEndSeconds": 84.46,
+        "leadingContextSeconds": 0.25
+      },
+      {
+        "id": "ami-live-c000",
+        "meeting": "ES2002a",
+        "speaker": "C",
+        "firstWordSeconds": 85.99,
+        "lastWordEndSeconds": 88.71,
+        "leadingContextSeconds": 0.25
+      },
+      {
+        "id": "ami-live-b005",
+        "meeting": "ES2002a",
+        "speaker": "B",
+        "firstWordSeconds": 104.89,
+        "lastWordEndSeconds": 106.58,
+        "leadingContextSeconds": 0.25
+      }
+    ]
   }
 }

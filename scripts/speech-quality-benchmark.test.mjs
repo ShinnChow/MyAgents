@@ -19,6 +19,10 @@ import {
   summarizeMediaWorkerBatch,
 } from "./media-worker-batch-client.mjs";
 import {
+  assertExpectedMediaWorkerLive,
+  runMediaWorkerLive,
+} from "./media-worker-live-client.mjs";
+import {
   spawnSpeechQualityProcess,
   terminateSpeechQualityProcessTree,
   waitForSpeechQualityProcess,
@@ -109,6 +113,47 @@ test("speech quality source lock pins licensed, bounded corpus bytes", () => {
   ]);
   assert.equal(new Set(sourceLock.selections.aishell1Utterances).size, 16);
   assert.equal(new Set(sourceLock.selections.ascendUtterances).size, 8);
+  assert.equal(sourceLock.selections.amiLiveLatencyWindows.length, 3);
+  assert.deepEqual(sourceLock.liveLatencyBenchmark, {
+    sampleRate: 16_000,
+    frameSamples: 320,
+    warmRepeats: 5,
+    trailingSilenceSeconds: 3,
+    vadParameters: {
+      threshold: 0.25,
+      minSilenceSeconds: 0.5,
+      minSpeechSeconds: 0.25,
+      maxSpeechSeconds: 30,
+      windowSamples: 512,
+    },
+  });
+});
+
+test("live latency lock matches the production VAD configuration", () => {
+  const rustSource = readFileSync(
+    join(repoRoot, "src-tauri/media-worker/src/native_adapter.rs"),
+    "utf8",
+  );
+  const nativeSource = readFileSync(
+    join(repoRoot, "src-tauri/media-worker/native/myagents_speech_adapter.cc"),
+    "utf8",
+  );
+  const vad = sourceLock.liveLatencyBenchmark.vadParameters;
+  assert.ok(rustSource.includes(`threshold: ${vad.threshold},`));
+  assert.ok(
+    rustSource.includes(`min_silence_seconds: ${vad.minSilenceSeconds},`),
+  );
+  assert.ok(
+    rustSource.includes(`min_speech_seconds: ${vad.minSpeechSeconds},`),
+  );
+  assert.ok(
+    rustSource.includes(`max_speech_seconds: ${vad.maxSpeechSeconds}.0,`),
+  );
+  assert.ok(
+    nativeSource.includes(
+      `constexpr uint32_t kVadWindowSamples = ${vad.windowSamples};`,
+    ),
+  );
 });
 
 test("speech quality Python locks pin direct and transitive artifacts", () => {
@@ -225,6 +270,130 @@ test("shared batch client rejects a false successful terminal", () => {
   );
 });
 
+test(
+  "shared live client measures the triggering ACK before stable final",
+  { skip: process.platform === "win32" },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "myagents-live-client-"));
+    const worker = join(root, "fixture-worker.mjs");
+    writeFileSync(
+      worker,
+      `#!/usr/bin/env node
+let buffered = Buffer.alloc(0);
+let identity;
+let sourceSamples = 0;
+let emitted = false;
+function send(value) {
+  const json = Buffer.from(JSON.stringify(value));
+  const payload = Buffer.concat([Buffer.from([1]), json]);
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(payload.length);
+  process.stdout.write(Buffer.concat([prefix, payload]));
+}
+process.stdin.on("data", chunk => {
+  buffered = Buffer.concat([buffered, chunk]);
+  while (buffered.length >= 4) {
+    const length = buffered.readUInt32BE(0);
+    if (buffered.length < 4 + length) break;
+    const payload = buffered.subarray(4, 4 + length);
+    buffered = buffered.subarray(4 + length);
+    if (payload[0] === 1) {
+      const command = JSON.parse(payload.subarray(1));
+      identity = command.identity;
+      if (command.type === "start") {
+        setTimeout(() => send({type:"ready", protocolVersion:1, identity}), 100);
+      } else if (command.type === "finalize") {
+        send({type:"completed", protocolVersion:1, identity, metrics:{sourceSamples,segments:1,speakers:0,elapsedMs:1,peakWorkingBytes:null}});
+      }
+      continue;
+    }
+    const sequence = Number(payload.readBigUInt64BE(14));
+    const startSample = Number(payload.readBigUInt64BE(22));
+    const sampleCount = payload.readUInt32BE(30);
+    const endSample = startSample + sampleCount;
+    sourceSamples += sampleCount;
+    send({type:"input_ack", protocolVersion:1, identity, track:"microphone", sequence, endSample});
+    if (!emitted && endSample >= 320) {
+      emitted = true;
+      const segmentEndSample = identity.workloadId.endsWith("_invalid") ? 300 : 320;
+      send({type:"transcript_segment", protocolVersion:1, identity, segmentId:"segment-1", track:"microphone", startSample:0, endSample:segmentEndSample, text:"fixture transcript", language:"en", revision:1});
+    }
+    send({type:"heartbeat", protocolVersion:1, identity, stage:"vad", checkpoint:{streams:[{track:"microphone",lastAckSequence:sequence,analysisSample:endSample}],analysisSample:endSample}});
+  }
+});
+process.stdin.on("end", () => process.exit(0));
+`,
+    );
+    chmodSync(worker, 0o700);
+    const options = {
+      workerPath: worker,
+      nativeManifestPath: "fixture-native",
+      onnxRuntimePath: "fixture-ort",
+      modelManifestPath: "fixture-model",
+      samples: new Int16Array(640),
+      measurementWindows: [
+        {
+          id: "fixture-r1",
+          startSample: 0,
+          endSample: 640,
+          lastValidSpeechSample: 320,
+        },
+      ],
+      frameSamples: 320,
+      realtime: true,
+      timeoutMs: 2_000,
+    };
+    await assert.rejects(
+      runMediaWorkerLive({
+        ...options,
+        workloadId: "quality_fixture_invalid",
+      }),
+      /did not produce one stable segment/,
+    );
+    const result = await runMediaWorkerLive({
+      ...options,
+      workloadId: "quality_fixture",
+    });
+    const summary = assertExpectedMediaWorkerLive(result, 1);
+    assert.equal(summary.measurements.length, 1);
+    assert.equal(summary.measurements[0].cold, true);
+    assert.ok(summary.workerReadyMs >= 75);
+    assert.ok(summary.measurements[0].lastSpeechToVadMs >= 50);
+    assert.ok(summary.measurements[0].vadToSegmentFinalMs >= 0);
+    assert.equal(JSON.stringify(summary).includes("fixture transcript"), false);
+    rmSync(root, { recursive: true, force: true });
+  },
+);
+
+test(
+  "shared live client bounds a SIGTERM-resistant Worker",
+  { skip: process.platform === "win32" },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "myagents-live-timeout-"));
+    const worker = join(root, "stubborn-worker.mjs");
+    writeFileSync(
+      worker,
+      "#!/usr/bin/env node\nprocess.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);\n",
+    );
+    chmodSync(worker, 0o700);
+    const startedAt = performance.now();
+    await assert.rejects(
+      runMediaWorkerLive({
+        workerPath: worker,
+        nativeManifestPath: "fixture-native",
+        onnxRuntimePath: "fixture-ort",
+        modelManifestPath: "fixture-model",
+        samples: new Int16Array(320),
+        timeoutMs: 100,
+        terminationGraceMs: 100,
+      }),
+      /timed out after 100 ms/,
+    );
+    assert.ok(performance.now() - startedAt < 2_000);
+    rmSync(root, { recursive: true, force: true });
+  },
+);
+
 test("quality runner rejects a prepared manifest that self-attests easier cases", () => {
   const root = mkdtempSync(join(tmpdir(), "myagents-quality-lock-drift-"));
   const manifest = join(root, "prepared-corpus.json");
@@ -245,6 +414,17 @@ test("quality runner rejects a prepared manifest that self-attests easier cases"
           sourceSha256: "1".repeat(64),
           timeoutMs: 1_000,
           reference: "fixture",
+        },
+      ],
+      liveLatencyCases: [
+        {
+          id: "fixture-live",
+          sourcePath: "fixture-live.wav",
+          sourceBytes: 1,
+          sourceSha256: "2".repeat(64),
+          sampleRate: 16_000,
+          lastValidSpeechSample: 16_000,
+          totalSamples: 32_000,
         },
       ],
     }),
