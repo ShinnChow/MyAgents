@@ -91,6 +91,8 @@ Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact�
 - 总下载预算和 300 MiB 硬上限；
 - App updater 同一 Minisign trust root 与 detached signature 要求。
 
+2026-08-26 对 3D-Speaker `ERes2Net-base 200k` 做了候选核验：官方 ONNX 为 `39,593,765` bytes、SHA-256 `e2d2048292e055f7b61cdec3db010503f35369b245bf0b3bbad021c9a91e4053`，在当前随 App 发布的 sherpa `1.13.6` + ORT `1.28.0` 上可加载并输出 512 维 embedding，ABI 与资源预算可兼容。但 Sherpa 官方 diarization 组合仍使用当前 `speech_eres2net_base_sv_zh-cn_3dspeaker_16k@v1.0.1`，候选没有在本项目固定 corpus 上证明 DER 更好；因此当前 source lock 和默认 pack 不变。`ERes2NetV2` 为 192 维，本期不为候选模型改写固定 512 维 adapter ABI或增加并行模型分支。
+
 远端发布面固定为：
 
 ```text
