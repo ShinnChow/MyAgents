@@ -232,6 +232,106 @@ describe('RecordDetail note input', () => {
     expect(await screen.findByLabelText(/37%/)).toBeInTheDocument();
   });
 
+  it('stacks microphone and system activity as two live meter rows', async () => {
+    const dualSourceSnapshot: RecordingSnapshot = {
+      ...SNAPSHOT,
+      sources: [
+        ...SNAPSHOT.sources,
+        {
+          track: 'system',
+          label: 'System audio',
+          format: { channels: 2, sampleRate: 48_000 },
+        },
+      ],
+      sourceActivity: [
+        ...SNAPSHOT.sourceActivity,
+        { track: 'system', levelPercent: 52 },
+      ],
+    };
+    mocks.recordingSnapshot.mockResolvedValue(dualSourceSnapshot);
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={dualSourceSnapshot}
+      />,
+    );
+
+    const meters = await screen.findByTestId('recording-source-meters');
+    expect(meters).toHaveClass('flex-col');
+    expect(
+      meters.querySelectorAll('[data-testid="recording-source-meter"]'),
+    ).toHaveLength(2);
+  });
+
+  it('keeps the live failure recovery notice visible after stable segments exist', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        transcriptionStatus: 'failed',
+      },
+    });
+    mocks.recordTranscript.mockResolvedValue({
+      schemaVersion: 1,
+      recordId: RECORD.id,
+      projectionRevision: 1,
+      state: 'failed',
+      sampleRate: 16_000,
+      provenance: {
+        provider: 'sherpa-onnx',
+        modelPackRevision: 'test',
+        onnxRuntimeVersion: 'test',
+      },
+      segments: [
+        {
+          segmentId: 'stable-before-failure',
+          track: 'microphone',
+          startSample: 0,
+          endSample: 8_000,
+          text: '已经稳定转写的内容',
+          revision: 1,
+        },
+      ],
+    });
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    expect(await screen.findByText('已经稳定转写的内容')).toBeInTheDocument();
+    expect(
+      await screen.findByText(
+        /录音仍在安全保存.*停止后会自动重新处理|recording is still being saved safely.*processed again after you stop/i,
+      ),
+    ).toHaveAttribute('role', 'status');
+  });
+
+  it('keeps the completed playback timeline inside one dedicated progress control', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready',
+        transcriptionStatus: 'ready',
+        mediaDurationMs: 31_000,
+      },
+    });
+    mocks.recordingSnapshot.mockResolvedValue(null);
+
+    render(<RecordDetail recordId={RECORD.id} isActive />);
+
+    expect(
+      await screen.findByTestId('recording-playback-progress'),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText(/音量|Volume/)).not.toBeInTheDocument();
+  });
+
   it('renders the manager media clock without projecting wall time', async () => {
     const now = vi
       .spyOn(Date, 'now')

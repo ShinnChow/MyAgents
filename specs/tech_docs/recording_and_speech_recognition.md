@@ -77,7 +77,7 @@ Worker 结果只有同时满足 exact `(jobId, generation)`、协议 shape、业
 
 资源在录音 admission 时已 ready 才会接纳 live workload；缺资源的录音只做权威 Ogg Opus 归档。模型包后续安装只改变 capability，不扫描或自动排队这些历史 Record。
 
-每个 physical track 的 callback 经一个固定 fan-out 先写 archive ring，再写可选 analysis ring。两个后台 writer 共用 `rubato` adapter；analysis 只落一份固定路径的 16 kHz mono raw PCM16 spool，不自创媒体容器。`SpeechRecognitionManager` 只读取已 `flush + sync_data` 的 committed sample，逐个有界 binary frame 发给 exact-generation Worker，并校验 ACK、heartbeat checkpoint、segment revision 和 terminal metrics。Worker response 使用 bounded reader channel 和 120 秒基础设施超时；超时只重启当前 live generation，不影响 archive。
+每个 physical track 的 callback 经一个固定 fan-out 先写 archive ring，再写可选 analysis ring。ring 的单次读取边界不保证落在 interleaved channel frame 边界；两个后台 writer 共用的 streaming `rubato` adapter 必须跨读取保留未完整的 source frame，只允许在整条输入结束时拒绝真正残缺的 frame。analysis 只落一份固定路径的 16 kHz mono raw PCM16 spool，不自创媒体容器。`SpeechRecognitionManager` 只读取已 `flush + sync_data` 的 committed sample，逐个有界 binary frame 发给 exact-generation Worker，并校验 ACK、heartbeat checkpoint、segment revision 和 terminal metrics。Worker response 使用 bounded reader channel 和 120 秒基础设施超时；超时只重启当前 live generation，不影响 archive。
 
 Pause 先停止两个 ring 的 admission，再暂停设备；analysis writer 排空、刷新 resampler 并 fsync 后，Manager 以每轨 exact sample boundary 发送 `Flush`。Worker 在该边界强制结束 VAD 句段、发布稳定整句并重置 VAD，不写虚假静音，也不把 wall pause 算入媒体时间。Resume 从同一 append-only spool 继续。
 
@@ -131,7 +131,7 @@ https://download.myagents.io/models/speech/assets/sha256/<sha256>/<filename>
 3. 从固定第一方地址取得 manifest/signature，验证 byte identity 与 updater Minisign trust root。
 4. 顺序下载锁定 asset 到 0700 private 目录中的 0600 `create_new` 文件；每个响应只允许 HTTPS `download.myagents.io` 固定 host，逐 chunk 执行 exact size、SHA-256 与总下载硬上限。
 5. Rust 内置的 pure-Rust bzip2 decoder + tar reader 只选择 source lock 白名单文件。archive 中任意 traversal、重复路径、symlink 或 special entry 都让整个 staging 失败；运行时不调用系统 tar、Python 或用户 PATH。
-6. manifest 最后写入；Worker/Manager 都要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。
+6. manifest 最后写入；Manager 在安装、激活与 queued pipeline 的执行边界要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。同步 live admission 只接受由该完整激活流程产生的内存 snapshot，避免在开始录音的交互热路径重复读取整个 pack；Worker 每次实际执行仍独立重开并校验 exact manifest、模型与 legal 文件后才加载模型。
 7. 取得 `SpeechModelValidation` compute lease，让当前随包 Worker 依次真实创建并释放 ASR、VAD 和 diarizer engine。高优先级 workload 到达时 kill exact probe tree、释放 lease 后重试。
 8. staging 以 no-replace directory rename 发布到唯一 pack 目录，最后 atomic replace `active.json`。rename 前明确失败会删除新 pack并保持旧 pointer；rename 已可见但 parent-directory sync 失败时绝不删除 pointer 已引用的 pack，状态保留新 active 并报告 `SPEECH_RESOURCE_ACTIVATION_DURABILITY_UNCONFIRMED`。
 

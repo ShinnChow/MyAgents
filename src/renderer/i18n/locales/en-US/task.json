@@ -122,6 +122,8 @@
     "mixed": "Mixed",
     "transcript": "Transcript",
     "transcriptLive": "Stable sentences appear after natural pauses",
+    "transcriptLiveFailed": "Live transcription is temporarily unavailable",
+    "transcriptLiveFailedHint": "Live transcription hit a problem. Audio is still being saved safely and will be processed again after you stop.",
     "transcriptPending": "Audio is saved. Transcript processing is in progress.",
     "transcriptEmpty": "No transcript yet",
     "startTranscription": "Start transcription",

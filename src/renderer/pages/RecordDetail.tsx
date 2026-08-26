@@ -201,7 +201,6 @@ export default function RecordDetail({
   >('mixed');
   const [playing, setPlaying] = useState(false);
   const [playbackMs, setPlaybackMs] = useState(0);
-  const [volume, setVolume] = useState(1);
   const audioRef = useRef<HTMLAudioElement>(null);
   const snapshotRef = useRef(snapshot);
   const noteAnchorRef = useRef<number | null>(null);
@@ -1002,6 +1001,8 @@ export default function RecordDetail({
 
   const captureStatus = snapshot?.captureStatus ?? record?.audio?.captureStatus;
   const transcriptionStatus = record?.audio?.transcriptionStatus;
+  const liveTranscriptionFailed =
+    ownsCaptureSlot && transcriptionStatus === 'failed';
   const systemAudioDowngraded = snapshot?.warnings.some(
     (warning) => warning.code === 'RECORDING_SYSTEM_AUDIO_UNAVAILABLE',
   );
@@ -1027,6 +1028,21 @@ export default function RecordDetail({
                 ].includes(transcriptionStatus)
               ? t('records.processing')
               : t('records.complete');
+  const statusDotClass =
+    captureStatus === 'recording'
+      ? 'bg-[var(--error)]'
+      : captureStatus === 'interrupted' ||
+          captureStatus === 'failed' ||
+          transcriptionStatus === 'failed'
+        ? 'bg-[var(--error)]'
+        : ownsCaptureSlot
+          ? 'bg-[var(--warning)]'
+          : 'bg-[var(--success)]';
+  const playbackDurationMs = record?.audio?.mediaDurationMs ?? 0;
+  const playbackPercent = Math.min(
+    100,
+    Math.max(0, (playbackMs / Math.max(1, playbackDurationMs)) * 100),
+  );
   const showManualTranscription =
     !transcript &&
     !ownsCaptureSlot &&
@@ -1138,10 +1154,9 @@ export default function RecordDetail({
           className="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-[var(--ink-muted)]"
           role="status"
           aria-live="polite"
+          data-status={captureStatus ?? transcriptionStatus}
         >
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${ownsCaptureSlot ? 'bg-[var(--error)]' : 'bg-[var(--success)]'}`}
-          />
+          <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
           {statusLabel}
         </span>
         <DropdownMenu
@@ -1154,89 +1169,98 @@ export default function RecordDetail({
       </header>
 
       <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(320px,2fr)] grid-rows-[84px_minmax(0,1fr)] gap-x-5 px-5 pb-5 max-lg:grid-cols-1 max-lg:grid-rows-[84px_minmax(280px,1fr)_minmax(300px,1fr)]">
-        <section className="col-start-1 row-start-1 flex h-[84px] items-center gap-5 rounded-[var(--radius-lg)] bg-[var(--ink)] px-5 text-[var(--paper)] shadow-sm">
-          <div className="min-w-[92px]">
-            <div
-              className="font-mono text-2xl font-semibold tabular-nums"
-              data-testid="recording-media-duration"
-            >
-              {formatDuration(mediaDurationMs)}
-            </div>
-            <div className="mt-1 text-xs opacity-65">
-              {isPaused ? t('records.paused') : statusLabel}
-            </div>
-          </div>
-          <div className="flex min-w-0 flex-1 items-center gap-3 overflow-hidden">
-            {(snapshot?.sources ?? []).map((source) => {
-              const level =
-                snapshot?.sourceActivity.find(
-                  (activity) => activity.track === source.track,
-                )?.levelPercent ?? 0;
-              return (
-                <span
-                  key={source.track}
-                  className="inline-flex min-w-0 items-center gap-1.5 text-xs opacity-80"
-                  aria-label={`${t(`records.${source.track}`)} ${level}%`}
-                >
-                  <span className="h-1.5 w-10 shrink-0 overflow-hidden rounded-full bg-[var(--paper)]/20">
-                    <span
-                      className="block h-full rounded-full bg-[var(--success)] transition-[width] duration-150"
-                      style={{ width: `${level}%` }}
-                    />
-                  </span>
-                  <span className="truncate">
-                    {t(`records.${source.track}`)}
-                  </span>
-                </span>
-              );
-            })}
-            {systemAudioDowngraded && (
-              <span className="truncate text-xs text-[var(--warning)]">
-                {t('records.systemAudioDowngraded')}
-              </span>
-            )}
-            {wakeLockUnavailable && (
-              <span
-                role="status"
-                className="truncate text-xs text-[var(--warning)]"
-                title={t('records.wakeLockUnavailable')}
-              >
-                {t('records.wakeLockUnavailable')}
-              </span>
-            )}
-          </div>
+        <section className="col-start-1 row-start-1 flex h-[84px] items-center gap-5 overflow-hidden rounded-[var(--radius-lg)] bg-[var(--ink)] px-5 text-[var(--paper)] shadow-sm">
           {ownsCaptureSlot ? (
-            <div className="flex shrink-0 items-center gap-2">
-              <button
-                type="button"
-                onClick={() => void runControl(isPaused ? 'resume' : 'pause')}
-                disabled={
-                  busyAction !== null ||
-                  !['recording', 'paused'].includes(
-                    snapshot?.captureStatus ?? '',
-                  )
-                }
-                className="inline-flex h-9 items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--paper)]/12 px-3 text-sm font-medium transition-colors hover:bg-[var(--paper)]/20 disabled:opacity-40"
+            <>
+              <div className="min-w-[92px]">
+                <div
+                  className="font-mono text-2xl font-semibold tabular-nums"
+                  data-testid="recording-media-duration"
+                >
+                  {formatDuration(mediaDurationMs)}
+                </div>
+                <div className="mt-1 text-xs opacity-65">
+                  {isPaused ? t('records.paused') : statusLabel}
+                </div>
+              </div>
+              <div
+                className="flex min-w-0 flex-1 flex-col justify-center gap-2 overflow-hidden"
+                data-testid="recording-source-meters"
               >
-                {isPaused ? (
-                  <Play className="h-4 w-4" />
-                ) : (
-                  <Pause className="h-4 w-4" />
+                {(snapshot?.sources ?? []).map((source) => {
+                  const level =
+                    snapshot?.sourceActivity.find(
+                      (activity) => activity.track === source.track,
+                    )?.levelPercent ?? 0;
+                  return (
+                    <div
+                      key={source.track}
+                      data-testid="recording-source-meter"
+                      className="grid min-w-0 grid-cols-[64px_minmax(48px,1fr)_32px] items-center gap-2 text-xs"
+                      aria-label={`${t(`records.${source.track}`)} ${level}%`}
+                    >
+                      <span className="truncate opacity-75">
+                        {t(`records.${source.track}`)}
+                      </span>
+                      <span className="h-1.5 min-w-0 overflow-hidden rounded-full bg-[var(--paper)]/20">
+                        <span
+                          className="block h-full rounded-full bg-[var(--success)] transition-[width] duration-150"
+                          style={{ width: `${level}%` }}
+                        />
+                      </span>
+                      <span className="text-right font-mono tabular-nums opacity-55">
+                        {level}%
+                      </span>
+                    </div>
+                  );
+                })}
+                {systemAudioDowngraded && (
+                  <span className="truncate text-xs text-[var(--warning)]">
+                    {t('records.systemAudioDowngraded')}
+                  </span>
                 )}
-                {isPaused ? t('records.resume') : t('records.pause')}
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleStop()}
-                disabled={busyAction !== null || !snapshot}
-                className="inline-flex h-9 items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--error)] px-3 text-sm font-semibold text-[var(--on-error)] transition-opacity hover:opacity-90 disabled:opacity-40"
-              >
-                <Square className="h-3.5 w-3.5 fill-current" />
-                {t('records.stop')}
-              </button>
-            </div>
+                {wakeLockUnavailable && (
+                  <span
+                    role="status"
+                    className="truncate text-xs text-[var(--warning)]"
+                    title={t('records.wakeLockUnavailable')}
+                  >
+                    {t('records.wakeLockUnavailable')}
+                  </span>
+                )}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void runControl(isPaused ? 'resume' : 'pause')}
+                  disabled={
+                    busyAction !== null ||
+                    !['recording', 'paused'].includes(
+                      snapshot?.captureStatus ?? '',
+                    )
+                  }
+                  className="inline-flex h-9 items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--paper)]/12 px-3 text-sm font-medium transition-colors hover:bg-[var(--paper)]/20 disabled:opacity-40"
+                >
+                  {isPaused ? (
+                    <Play className="h-4 w-4" />
+                  ) : (
+                    <Pause className="h-4 w-4" />
+                  )}
+                  {isPaused ? t('records.resume') : t('records.pause')}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleStop()}
+                  disabled={busyAction !== null || !snapshot}
+                  className="inline-flex h-9 items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--error)] px-3 text-sm font-semibold text-[var(--on-error)] transition-opacity hover:opacity-90 disabled:opacity-40"
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                  {t('records.stop')}
+                </button>
+              </div>
+            </>
           ) : (
-            <div className="flex min-w-0 flex-1 items-center gap-3">
+            <div className="flex min-w-0 flex-1 items-center gap-4">
               <button
                 type="button"
                 disabled={!audioSrc}
@@ -1257,36 +1281,35 @@ export default function RecordDetail({
                   <Play className="ml-0.5 h-4 w-4" />
                 )}
               </button>
-              <input
-                type="range"
-                min={0}
-                max={Math.max(1, record?.audio?.mediaDurationMs ?? 1)}
-                value={Math.min(
-                  playbackMs,
-                  record?.audio?.mediaDurationMs ?? 0,
-                )}
-                onChange={(event) => seekTo(Number(event.target.value))}
-                className="min-w-0 flex-1 accent-[var(--accent-warm)]"
-                aria-label={t('records.duration')}
-              />
-              <span className="shrink-0 text-xs tabular-nums opacity-70">
+              <span className="w-[92px] shrink-0 font-mono text-xs tabular-nums opacity-70">
                 {formatDuration(playbackMs)} /{' '}
-                {formatDuration(record?.audio?.mediaDurationMs ?? 0)}
+                {formatDuration(playbackDurationMs)}
               </span>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={volume}
-                onChange={(event) => {
-                  const next = Number(event.target.value);
-                  setVolume(next);
-                  if (audioRef.current) audioRef.current.volume = next;
-                }}
-                className="w-20 accent-[var(--accent-warm)]"
-                aria-label={t('records.volume')}
-              />
+              <div
+                className="relative h-5 min-w-[120px] flex-1"
+                data-testid="recording-playback-progress"
+              >
+                <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 overflow-hidden rounded-full bg-[var(--paper)]/20">
+                  <span
+                    className="block h-full rounded-full bg-[var(--accent-warm)]"
+                    style={{ width: `${playbackPercent}%` }}
+                  />
+                </div>
+                <span
+                  aria-hidden="true"
+                  className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--paper)] shadow-sm"
+                  style={{ left: `${playbackPercent}%` }}
+                />
+                <input
+                  type="range"
+                  min={0}
+                  max={Math.max(1, playbackDurationMs)}
+                  value={Math.min(playbackMs, playbackDurationMs)}
+                  onChange={(event) => seekTo(Number(event.target.value))}
+                  className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                  aria-label={t('records.duration')}
+                />
+              </div>
               {tracks.length > 1 && (
                 <CustomSelect
                   value={selectedTrack}
@@ -1295,7 +1318,7 @@ export default function RecordDetail({
                     setPlaybackTrack(value as typeof playbackTrack)
                   }
                   compact
-                  className="w-28 [&>button]:border-0 [&>button]:bg-[var(--paper)]/12 [&>button]:text-white"
+                  className="w-24 shrink-0 [&>button]:border-0 [&>button]:bg-[var(--paper)]/12 [&>button]:text-white"
                   popoverMinWidth={120}
                   ariaLabel={t('records.tracks')}
                 />
@@ -1334,20 +1357,30 @@ export default function RecordDetail({
               {t('records.transcript')}
             </h2>
             <span className="text-xs text-[var(--ink-muted)]">
-              {ownsCaptureSlot
-                ? t('records.transcriptLive')
-                : transcriptionStatus &&
-                    [
-                      'queued',
-                      'live',
-                      'lagging',
-                      'recovering',
-                      'finalizing',
-                    ].includes(transcriptionStatus)
-                  ? t('records.transcriptPending')
-                  : null}
+              {liveTranscriptionFailed
+                ? t('records.transcriptLiveFailed')
+                : ownsCaptureSlot
+                  ? t('records.transcriptLive')
+                  : transcriptionStatus &&
+                      [
+                        'queued',
+                        'live',
+                        'lagging',
+                        'recovering',
+                        'finalizing',
+                      ].includes(transcriptionStatus)
+                    ? t('records.transcriptPending')
+                    : null}
             </span>
           </div>
+          {liveTranscriptionFailed && (
+            <div
+              role="status"
+              className="mb-3 rounded-[var(--radius-md)] bg-[var(--warning)]/10 px-3 py-2 text-sm text-[var(--ink-secondary)]"
+            >
+              {t('records.transcriptLiveFailedHint')}
+            </div>
+          )}
           {transcript?.segments.length ? (
             <div
               className="min-h-0 flex-1"
@@ -1369,7 +1402,7 @@ export default function RecordDetail({
                 />
               )}
             </div>
-          ) : showManualTranscription ? (
+          ) : liveTranscriptionFailed ? null : showManualTranscription ? (
             <div className="flex min-h-48 flex-col items-center justify-center rounded-[var(--radius-lg)] bg-[var(--paper-inset)] p-6 text-center">
               <p className="text-sm text-[var(--ink-secondary)]">
                 {t('records.transcriptEmpty')}

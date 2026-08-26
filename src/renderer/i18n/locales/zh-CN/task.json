@@ -122,6 +122,8 @@
     "mixed": "混合",
     "transcript": "转写",
     "transcriptLive": "自然停顿后生成稳定句子",
+    "transcriptLiveFailed": "实时转写暂不可用",
+    "transcriptLiveFailedHint": "实时转写遇到问题，录音仍在安全保存；停止后会自动重新处理。",
     "transcriptPending": "音频已保存，正在处理转写",
     "transcriptEmpty": "尚无转写内容",
     "startTranscription": "开始转录",

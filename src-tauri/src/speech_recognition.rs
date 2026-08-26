@@ -629,21 +629,33 @@ impl SpeechRecognitionManager {
     }
 
     fn execution_resources(&self) -> Result<SpeechExecutionResources, &'static str> {
+        if !plain_file(&self.worker_path) || !plain_file(&self.native_manifest_path) {
+            return Err("SPEECH_NATIVE_RUNTIME_UNAVAILABLE");
+        }
         let active = self
             .model_pack
             .active_pack()
             .ok_or("SPEECH_MODEL_PACK_UNAVAILABLE")?;
-        let pipeline = SpeechPipelineSnapshot {
-            provider: "local".into(),
-            model_pack_revision: active.revision,
-            onnx_runtime_version: self
-                .runtime_identity
-                .as_ref()
-                .ok_or("SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?
-                .version()
-                .to_string(),
-        };
-        self.execution_resources_for_pipeline(&pipeline)
+        let runtime = self
+            .runtime_identity
+            .as_ref()
+            .ok_or("SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
+        // The activated pack was fully verified before entering this in-memory
+        // state. Admission only snapshots that identity; every media Worker
+        // independently re-opens and hashes the exact pack before model use.
+        // Re-hashing hundreds of MiB here would block recording start/stop
+        // without adding an execution boundary check.
+        Ok(SpeechExecutionResources {
+            worker_path: self.worker_path.clone(),
+            native_manifest_path: self.native_manifest_path.clone(),
+            onnx_runtime_path: runtime.path().to_path_buf(),
+            model_pack_manifest_path: active.manifest_path,
+            provenance: RecordSpeechProvenance {
+                provider: "local".into(),
+                model_pack_revision: active.revision,
+                onnx_runtime_version: runtime.version().to_string(),
+            },
+        })
     }
 
     fn execution_resources_for_pipeline(
@@ -992,7 +1004,6 @@ impl SpeechRecognitionManager {
         record_id: &str,
     ) -> Result<SpeechJob, String> {
         validate_job_id(record_id).map_err(str::to_string)?;
-        let resources = self.execution_resources().map_err(str::to_string)?;
         let record = self
             .record_store
             .get(record_id)
@@ -1040,9 +1051,11 @@ impl SpeechRecognitionManager {
             if state.queue.len() + state.agent_admission_reservations >= MAX_PENDING_JOBS {
                 return Err("SPEECH_QUEUE_FULL".to_string());
             }
-            self.model_pack
-                .resolve_revision(&resources.provenance.model_pack_revision)
-                .map_err(str::to_string)?;
+            // Keep resource selection inside the same manager lock that makes
+            // the queued job visible. Model removal takes this lock first, so
+            // it can neither invalidate the snapshot before admission nor
+            // pass the in-use check after the job is admitted.
+            let resources = self.execution_resources().map_err(str::to_string)?;
             let now = Utc::now();
             let job = SpeechJob {
                 schema_version: JOB_SCHEMA_VERSION,
@@ -1098,7 +1111,6 @@ impl SpeechRecognitionManager {
     ) -> Result<(), String> {
         validate_job_id(record_id).map_err(str::to_string)?;
         validate_live_sources(&sources)?;
-        let resources = self.execution_resources().map_err(str::to_string)?;
         let record = self
             .record_store
             .get(record_id)
@@ -1119,7 +1131,7 @@ impl SpeechRecognitionManager {
             return Err("SPEECH_ANALYSIS_SOURCE_INVALID".to_string());
         }
         let control = Arc::new(LiveControl::default());
-        {
+        let resources = {
             let mut state = self
                 .state
                 .lock()
@@ -1130,6 +1142,7 @@ impl SpeechRecognitionManager {
             if state.live_sessions.contains_key(record_id) || !state.live_sessions.is_empty() {
                 return Err("SPEECH_RECORD_LIVE_ALREADY_ACTIVE".to_string());
             }
+            let resources = self.execution_resources().map_err(str::to_string)?;
             state.live_sessions.insert(
                 record_id.to_string(),
                 LiveSessionRegistration {
@@ -1137,7 +1150,8 @@ impl SpeechRecognitionManager {
                     tracks,
                 },
             );
-        }
+            resources
+        };
         let journal = match self
             .record_store
             .begin_live_transcript(record_id, resources.provenance.clone())
@@ -1325,6 +1339,14 @@ impl SpeechRecognitionManager {
                 crate::ulog_error!(
                     "[speech] live journal failure commit failed recordId={} error={}",
                     record_id,
+                    error
+                );
+            }
+            if let Err(error) = self.project_live_failure_if_owned(&record_id, &control) {
+                crate::ulog_warn!(
+                    "[speech] live failure projection failed recordId={} code={} error={}",
+                    record_id,
+                    code,
                     error
                 );
             }
@@ -1775,6 +1797,36 @@ impl SpeechRecognitionManager {
         if let Ok(mut state) = self.state.lock() {
             state.live_sessions.remove(record_id);
         }
+    }
+
+    fn project_live_failure_if_owned(
+        &self,
+        record_id: &str,
+        control: &Arc<LiveControl>,
+    ) -> Result<bool, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        let Some(session) = state.live_sessions.get(record_id) else {
+            return Ok(false);
+        };
+        if !Arc::ptr_eq(&session.control, control) {
+            return Ok(false);
+        }
+        let control_state = control
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        if control_state.cancelled || control_state.finish.is_some() {
+            return Ok(false);
+        }
+        tauri::async_runtime::block_on(self.record_store.update_audio_processing_status(
+            record_id,
+            Some(TranscriptionStatus::Failed),
+            None,
+        ))?;
+        Ok(true)
     }
 
     fn fail_admission(&self, job_id: &str, code: &str) {
@@ -5952,6 +6004,54 @@ mod tests {
         assert_eq!(projection.segments.len(), 1);
         assert_eq!(projection.segments[0].segment_id, "live-microphone-0-8000");
         assert_eq!(projection.segments[0].text, "private live transcript");
+    }
+
+    #[test]
+    fn finished_live_session_cannot_overwrite_queued_backfill_status() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(&root);
+        let record = tauri::async_runtime::block_on(manager.record_store.create_audio(
+            AudioRecordCreateInput {
+                title: "Live failure ordering".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Live,
+            },
+        ))
+        .unwrap();
+        let control = Arc::new(LiveControl::default());
+        manager.state.lock().unwrap().live_sessions.insert(
+            record.id.clone(),
+            LiveSessionRegistration {
+                control: control.clone(),
+                tracks: vec![AudioTrackKind::Microphone],
+            },
+        );
+
+        manager
+            .finish_record_live(
+                &record.id,
+                vec![RecordTranscriptTrackOffset {
+                    track: AudioTrackKind::Microphone,
+                    sample: 0,
+                }],
+            )
+            .unwrap();
+        tauri::async_runtime::block_on(manager.record_store.update_audio_processing_status(
+            &record.id,
+            Some(TranscriptionStatus::Queued),
+            None,
+        ))
+        .unwrap();
+
+        assert!(!manager
+            .project_live_failure_if_owned(&record.id, &control)
+            .unwrap());
+        let persisted =
+            tauri::async_runtime::block_on(manager.record_store.get(&record.id)).unwrap();
+        assert_eq!(
+            persisted.audio.unwrap().transcription_status,
+            TranscriptionStatus::Queued
+        );
     }
 
     #[tokio::test]

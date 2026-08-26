@@ -148,7 +148,13 @@ impl RealtimeTrackSink {
 }
 
 fn peak_percent(peak: f32) -> u8 {
-    (peak.clamp(0.0, 1.0) * 100.0).round() as u8
+    const FLOOR_DB: f32 = -60.0;
+    let peak = peak.clamp(0.0, 1.0);
+    if peak <= 0.0 {
+        return 0;
+    }
+    let decibels = 20.0 * peak.log10();
+    (((decibels - FLOOR_DB) / -FLOOR_DB).clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
 pub(super) struct RealtimeRingParts {
@@ -200,6 +206,7 @@ pub(super) struct StreamingAudioResampler {
     resampler: Option<SincFixedIn<f32>>,
     input_planes: Vec<Vec<f32>>,
     output_planes: Vec<Vec<f32>>,
+    pending_input_frame: Vec<f32>,
     pending_frames: usize,
     input_frames: u64,
     emitted_frames: u64,
@@ -229,6 +236,7 @@ impl StreamingAudioResampler {
                 resampler: None,
                 input_planes: Vec::new(),
                 output_planes: Vec::new(),
+                pending_input_frame: Vec::with_capacity(input_channels),
                 pending_frames: 0,
                 input_frames: 0,
                 emitted_frames: 0,
@@ -264,6 +272,7 @@ impl StreamingAudioResampler {
             resampler: Some(resampler),
             input_planes,
             output_planes,
+            pending_input_frame: Vec::with_capacity(input_channels),
             pending_frames: 0,
             input_frames: 0,
             emitted_frames: 0,
@@ -272,29 +281,37 @@ impl StreamingAudioResampler {
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<(), String> {
-        if input.len() % self.input_channels != 0 {
-            return Err("audio input is not aligned to source channels".to_string());
+        let mut remaining = input;
+        if !self.pending_input_frame.is_empty() {
+            let needed = self.input_channels - self.pending_input_frame.len();
+            let taken = needed.min(remaining.len());
+            self.pending_input_frame
+                .extend_from_slice(&remaining[..taken]);
+            remaining = &remaining[taken..];
+            if self.pending_input_frame.len() == self.input_channels {
+                let mixed = mix_frame(&self.pending_input_frame, self.output_channels);
+                self.pending_input_frame.fill(0.0);
+                self.pending_input_frame.clear();
+                self.process_mixed_frame(mixed, output)?;
+            } else {
+                return Ok(());
+            }
         }
-        for frame in input.chunks_exact(self.input_channels) {
+
+        let mut frames = remaining.chunks_exact(self.input_channels);
+        for frame in &mut frames {
             let mixed = mix_frame(frame, self.output_channels);
-            self.input_frames = self.input_frames.saturating_add(1);
-            if self.resampler.is_none() {
-                output.extend_from_slice(&mixed[..self.output_channels]);
-                self.emitted_frames = self.emitted_frames.saturating_add(1);
-                continue;
-            }
-            for (channel, value) in mixed[..self.output_channels].iter().enumerate() {
-                self.input_planes[channel][self.pending_frames] = *value;
-            }
-            self.pending_frames += 1;
-            if self.pending_frames == RESAMPLER_CHUNK_FRAMES {
-                self.process_full_chunk(output, None)?;
-            }
+            self.process_mixed_frame(mixed, output)?;
         }
+        self.pending_input_frame
+            .extend_from_slice(frames.remainder());
         Ok(())
     }
 
     pub fn finish(&mut self, output: &mut Vec<f32>) -> Result<(), String> {
+        if !self.pending_input_frame.is_empty() {
+            return Err("audio input ended inside a source channel frame".to_string());
+        }
         let target_frames = self.expected_output_frames();
         if self.resampler.is_none() {
             return if self.emitted_frames == target_frames {
@@ -323,6 +340,27 @@ impl StreamingAudioResampler {
         }
         if self.emitted_frames != target_frames {
             return Err("audio resampler duration drifted".to_string());
+        }
+        Ok(())
+    }
+
+    fn process_mixed_frame(
+        &mut self,
+        mixed: [f32; 2],
+        output: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        self.input_frames = self.input_frames.saturating_add(1);
+        if self.resampler.is_none() {
+            output.extend_from_slice(&mixed[..self.output_channels]);
+            self.emitted_frames = self.emitted_frames.saturating_add(1);
+            return Ok(());
+        }
+        for (channel, value) in mixed[..self.output_channels].iter().enumerate() {
+            self.input_planes[channel][self.pending_frames] = *value;
+        }
+        self.pending_frames += 1;
+        if self.pending_frames == RESAMPLER_CHUNK_FRAMES {
+            self.process_full_chunk(output, None)?;
         }
         Ok(())
     }
@@ -383,6 +421,7 @@ fn mix_frame(frame: &[f32], output_channels: usize) -> [f32; 2] {
 
 impl Drop for StreamingAudioResampler {
     fn drop(&mut self) {
+        self.pending_input_frame.fill(0.0);
         for plane in &mut self.input_planes {
             plane.fill(0.0);
         }
@@ -422,6 +461,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn streaming_resampler_preserves_multichannel_frames_split_across_reads() {
+        let mut resampler = StreamingAudioResampler::new(
+            SourceFormat {
+                sample_rate: 48_000,
+                channels: 2,
+            },
+            48_000,
+            1,
+        )
+        .unwrap();
+        let mut output = Vec::new();
+
+        resampler.process(&[0.2], &mut output).unwrap();
+        assert!(output.is_empty());
+        resampler.process(&[0.4, 0.6], &mut output).unwrap();
+        assert!((output[0] - 0.3).abs() < f32::EPSILON);
+        resampler.process(&[0.8], &mut output).unwrap();
+        resampler.finish(&mut output).unwrap();
+
+        assert_eq!(output.len(), 2);
+        assert!((output[0] - 0.3).abs() < f32::EPSILON);
+        assert!((output[1] - 0.7).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn capture_activity_uses_a_perceptual_audio_scale() {
+        assert_eq!(peak_percent(0.0), 0);
+        assert_eq!(peak_percent(1.0), 100);
+        assert!(peak_percent(0.05) >= 50);
+        assert!(peak_percent(0.01) >= 30);
+        assert!(peak_percent(0.001) <= 1);
     }
 
     #[test]
@@ -479,7 +552,7 @@ mod tests {
         .unwrap();
         let oversized = vec![0.1; 8_002];
         let peak = parts.sink.push_f32(&oversized);
-        assert_eq!(peak, 10);
+        assert_eq!(peak, 67);
         assert_eq!(parts.overrun_samples.load(Ordering::Relaxed), 2);
     }
 
@@ -493,7 +566,7 @@ mod tests {
         let mut source = vec![0.1; 16_002];
         source[16_001] = 0.2;
         let peak = parts.sink.push_f32(&source);
-        assert_eq!(peak, 10, "dropped samples must not affect activity");
+        assert_eq!(peak, 67, "dropped samples must not affect activity");
         assert_eq!(parts.overrun_samples.load(Ordering::Relaxed), 2);
         assert_eq!(parts.consumer.occupied_len() % 2, 0);
     }
