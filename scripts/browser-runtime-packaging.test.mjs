@@ -64,13 +64,26 @@ test('every supported target pins one official headed Chromium artifact', () => 
   }
 });
 
-test('Browser resources have no build-time packager or Tauri bundle entry', () => {
+test('Browser release resources contain pinned control code but no Chromium artifact', () => {
   const tauriConfig = JSON.parse(readFileSync(join(repoRoot, 'src-tauri/tauri.conf.json'), 'utf8'));
   const releaseWorkflow = readFileSync(join(repoRoot, '.github/workflows/release.yml'), 'utf8');
   assert.equal(rootPackage.scripts['package:browser-runtime'], undefined);
   assert.equal(existsSync(join(repoRoot, 'scripts/package-browser-runtime.mjs')), false);
   assert.doesNotMatch(rootPackage.scripts['tauri:build'], /browser|playwright/i);
   assert.doesNotMatch(rootPackage.scripts['tauri:dev'], /browser|playwright/i);
-  assert.equal(Object.keys(tauriConfig.bundle.resources).some((path) => /browser|playwright/i.test(path)), false);
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(tauriConfig.bundle.resources)
+        .filter(([source, destination]) => /playwright/i.test(`${source}\n${destination}`)),
+    ),
+    {
+      '../src-tauri/resources/playwright-control/@playwright/mcp': 'node_modules/@playwright/mcp',
+      '../src-tauri/resources/playwright-control/playwright': 'node_modules/playwright',
+      '../src-tauri/resources/playwright-control/playwright-core': 'node_modules/playwright-core',
+    },
+  );
+  assert.equal(existsSync(join(repoRoot, 'node_modules/playwright/.local-browsers')), false);
+  assert.equal(existsSync(join(repoRoot, 'node_modules/playwright-core/.local-browsers')), false);
+  assert.equal(existsSync(join(repoRoot, 'src-tauri/resources/browser')), false);
   assert.doesNotMatch(releaseWorkflow, /prepare-playwright-runtime|playwright-browsers|package:browser-runtime/);
 });

@@ -58,7 +58,7 @@ function harness(
   const registry = new BrowserContextRegistry({
     readIdentity: vi.fn(async () => ({ revision: 1, state: EMPTY_STATE })),
     checkpointIdentity,
-    browserType: { launch } as unknown as BrowserType,
+    loadBrowserType: vi.fn(async () => ({ launch } as unknown as BrowserType)),
     resolveResource: vi.fn(async () => ({
       revision: 'chromium-1212',
       executablePath: '/managed/chromium',
@@ -171,7 +171,7 @@ describe('BrowserContextRegistry', () => {
         state,
         conflictCount: 0,
       })),
-      browserType: { launch } as unknown as BrowserType,
+      loadBrowserType: vi.fn(async () => ({ launch } as unknown as BrowserType)),
       resolveResource,
     });
 
@@ -245,7 +245,9 @@ describe('BrowserContextRegistry', () => {
     const registry = new BrowserContextRegistry({
       readIdentity: vi.fn(async () => ({ revision: 1, state: EMPTY_STATE })),
       checkpointIdentity,
-      browserType: { launch: vi.fn(async () => browser) } as unknown as BrowserType,
+      loadBrowserType: vi.fn(async () => ({
+        launch: vi.fn(async () => browser),
+      } as unknown as BrowserType)),
       resolveResource: vi.fn(async () => ({
         revision: 'chromium-1212',
         executablePath: '/managed/chromium',

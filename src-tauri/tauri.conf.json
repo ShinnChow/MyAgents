@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "MyAgents",
-  "version": "0.4.10",
+  "version": "0.4.11",
   "identifier": "com.myagents.app",
   "build": {
     "frontendDist": "../dist",
@@ -49,6 +49,9 @@
       "../src-tauri/resources/sharp-runtime": "sharp-runtime",
       "../src-tauri/resources/tsx-runtime": "tsx-runtime",
       "../src-tauri/resources/nodejs": "nodejs",
+      "../src-tauri/resources/playwright-control/@playwright/mcp": "node_modules/@playwright/mcp",
+      "../src-tauri/resources/playwright-control/playwright": "node_modules/playwright",
+      "../src-tauri/resources/playwright-control/playwright-core": "node_modules/playwright-core",
       "../src/shared": "shared",
       "../bundled-skills": "bundled-skills",
       "../bundled-agents": "bundled-agents",

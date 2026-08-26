@@ -83,12 +83,18 @@ jobs:
           mkdir -p src-tauri/resources/tsx-runtime
           mkdir -p src-tauri/resources/nodejs
           mkdir -p src-tauri/resources/speech-inference
+          mkdir -p src-tauri/resources/playwright-control/@playwright/mcp
+          mkdir -p src-tauri/resources/playwright-control/playwright
+          mkdir -p src-tauri/resources/playwright-control/playwright-core
           printf 'console.log("ci server-dist placeholder");\n' > src-tauri/resources/server-dist.js
           printf 'console.log("ci plugin-bridge placeholder");\n' > src-tauri/resources/plugin-bridge-dist.mjs
           printf 'ci placeholder\n' > src-tauri/resources/claude-agent-sdk/.ci-placeholder
           printf 'ci placeholder\n' > src-tauri/resources/sharp-runtime/.ci-placeholder
           printf 'ci placeholder\n' > src-tauri/resources/tsx-runtime/.ci-placeholder
           printf 'ci placeholder\n' > src-tauri/resources/nodejs/.ci-placeholder
+          printf 'ci placeholder\n' > src-tauri/resources/playwright-control/@playwright/mcp/.ci-placeholder
+          printf 'ci placeholder\n' > src-tauri/resources/playwright-control/playwright/.ci-placeholder
+          printf 'ci placeholder\n' > src-tauri/resources/playwright-control/playwright-core/.ci-placeholder
           mkdir -p src-tauri/binaries
           printf '#!/usr/bin/env sh\nexit 0\n' > src-tauri/binaries/cuse-x86_64-unknown-linux-gnu
           chmod +x src-tauri/binaries/cuse-x86_64-unknown-linux-gnu
@@ -117,6 +123,9 @@ jobs:
             'src-tauri/resources/nodejs',
             'src-tauri/resources/speech-inference',
             'src-tauri/resources/cli',
+            'src-tauri/resources/playwright-control/@playwright/mcp',
+            'src-tauri/resources/playwright-control/playwright',
+            'src-tauri/resources/playwright-control/playwright-core',
             'src-tauri/binaries'
           )
           foreach ($directory in $resourceDirs) {
@@ -129,6 +138,9 @@ jobs:
           Set-Content src-tauri/resources/tsx-runtime/.ci-placeholder 'ci placeholder'
           Set-Content src-tauri/resources/nodejs/.ci-placeholder 'ci placeholder'
           Set-Content src-tauri/resources/cli/.ci-placeholder 'ci placeholder'
+          Set-Content src-tauri/resources/playwright-control/@playwright/mcp/.ci-placeholder 'ci placeholder'
+          Set-Content src-tauri/resources/playwright-control/playwright/.ci-placeholder 'ci placeholder'
+          Set-Content src-tauri/resources/playwright-control/playwright-core/.ci-placeholder 'ci placeholder'
           Set-Content src-tauri/resources/vcruntime140.dll 'ci placeholder'
           Set-Content src-tauri/resources/vcruntime140_1.dll 'ci placeholder'
           Set-Content src-tauri/binaries/cuse-x86_64-pc-windows-msvc.exe 'ci placeholder'

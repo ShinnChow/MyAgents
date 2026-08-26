@@ -228,7 +228,7 @@ npm run publish:speech-model-set -- -y
 
 ### 可选「浏览器」Runtime 资源
 
-`myagents-browser` /「浏览器」直接下载 Playwright 锁定版本对应的官方 Chromium artifact。桌面 App 只包含 `@playwright/mcp` / Playwright 控制代码；MyAgents 不镜像、不重新打包、也不上传浏览器资源。`tauri:dev`、`tauri:build`、`build_macos.sh`、`build_windows.ps1` 和桌面发布脚本均不得访问 Playwright CDN 或下载 Chromium。
+`myagents-browser` /「浏览器」直接下载 Playwright 锁定版本对应的官方 Chromium artifact。桌面 App 只包含 `@playwright/mcp` / Playwright 控制代码；三个锁定控制包以原生目录结构位于 `Resources/node_modules`，不合并进 ESM `server-dist.js`。MyAgents 不镜像、不重新打包、也不上传浏览器资源。`tauri:dev`、`tauri:build`、`build_macos.sh`、`build_windows.ps1` 和桌面发布脚本均不得访问 Playwright CDN 或下载 Chromium。
 
 唯一版本锁是 `src/shared/managed-browser-runtime.json`。它必须同时满足：
 
