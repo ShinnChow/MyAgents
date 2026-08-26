@@ -952,6 +952,7 @@ fn materialize_tar_reader(
             return Err("SPEECH_RESOURCE_ARCHIVE_INVALID");
         }
         let mut entry = entry.map_err(|_| "SPEECH_RESOURCE_ARCHIVE_INVALID")?;
+        let entry_type = entry.header().entry_type();
         let path = entry
             .path()
             .map_err(|_| "SPEECH_RESOURCE_ARCHIVE_INVALID")?;
@@ -959,10 +960,12 @@ fn materialize_tar_reader(
             .to_str()
             .ok_or("SPEECH_RESOURCE_ARCHIVE_INVALID")?
             .to_string();
-        if !safe_relative_path(&path) || !seen.insert(path.clone()) {
+        let path = normalized_archive_entry_path(&path, entry_type.is_dir())
+            .ok_or("SPEECH_RESOURCE_ARCHIVE_INVALID")?
+            .to_string();
+        if !seen.insert(path.clone()) {
             return Err("SPEECH_RESOURCE_ARCHIVE_INVALID");
         }
-        let entry_type = entry.header().entry_type();
         if entry_type.is_dir() {
             continue;
         }
@@ -1347,10 +1350,27 @@ fn resolve_staging_file(root: &Path, relative: &str) -> Result<PathBuf, &'static
 fn safe_relative_path(value: &str) -> bool {
     !value.is_empty()
         && !value.starts_with('/')
+        && !has_windows_drive_prefix(value)
         && !value.contains(['\\', '\0'])
         && value
             .split('/')
             .all(|part| !part.is_empty() && !matches!(part, "." | ".."))
+}
+
+fn has_windows_drive_prefix(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn normalized_archive_entry_path(value: &str, is_directory: bool) -> Option<&str> {
+    // A trailing separator is the canonical tar spelling for a directory. Strip
+    // exactly one before applying the same strict relative-path policy as files.
+    let normalized = if is_directory {
+        value.strip_suffix('/').unwrap_or(value)
+    } else {
+        value
+    };
+    safe_relative_path(normalized).then_some(normalized)
 }
 
 fn valid_pack_directory_name(value: &str) -> bool {
@@ -1643,6 +1663,7 @@ mod tests {
         let mut tar_bytes = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_bytes);
+            append_tar_directory(&mut builder, "bundle/");
             append_tar_file(&mut builder, "ignored.txt", b"ignored");
             append_tar_file(&mut builder, "model.bin", b"model");
             builder.finish().unwrap();
@@ -1658,6 +1679,29 @@ mod tests {
             b"model"
         );
         assert!(!root.path().join("staging/ignored.txt").exists());
+    }
+
+    #[test]
+    fn archive_path_normalization_only_accepts_a_directory_separator() {
+        assert_eq!(
+            normalized_archive_entry_path("bundle/", true),
+            Some("bundle")
+        );
+        assert_eq!(
+            normalized_archive_entry_path("bundle/model.bin", false),
+            Some("bundle/model.bin")
+        );
+        for (path, is_directory) in [
+            ("bundle/", false),
+            ("bundle//", true),
+            ("./", true),
+            ("../", true),
+            ("/bundle/", true),
+            ("C:/bundle/", true),
+            ("C:/bundle/model.bin", false),
+        ] {
+            assert_eq!(normalized_archive_entry_path(path, is_directory), None);
+        }
     }
 
     #[test]
@@ -1750,6 +1794,17 @@ mod tests {
         header.set_mode(0o600);
         header.set_cksum();
         builder.append_data(&mut header, path, bytes).unwrap();
+    }
+
+    fn append_tar_directory(builder: &mut tar::Builder<&mut Vec<u8>>, path: &str) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_mode(0o700);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, std::io::empty())
+            .unwrap();
     }
 
     fn append_unsafe_tar_file(builder: &mut tar::Builder<&mut Vec<u8>>, path: &[u8], bytes: &[u8]) {

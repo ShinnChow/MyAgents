@@ -20,7 +20,7 @@ function modelStatus(
 }
 
 describe('SpeechModelResourceControls', () => {
-  it('requires explicit installation while explaining the separate Agent switch', async () => {
+  it('keeps the not-installed state to one status-and-action row', async () => {
     const user = userEvent.setup();
     const onInstall = vi.fn();
     render(
@@ -31,7 +31,10 @@ describe('SpeechModelResourceControls', () => {
     );
 
     expect(screen.getByText('尚未安装本地模型')).toBeInTheDocument();
-    expect(screen.getByText(/上方开关只控制 Agent/)).toBeInTheDocument();
+    expect(screen.queryByText('ASR')).not.toBeInTheDocument();
+    expect(screen.queryByText(/sherpa-onnx/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/下载 280 MiB/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/上方开关只控制 Agent/)).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '安装模型' }));
     expect(onInstall).toHaveBeenCalledOnce();
   });
@@ -50,8 +53,8 @@ describe('SpeechModelResourceControls', () => {
       'aria-valuenow',
       '25',
     );
-    expect(screen.getByText(/70\.0 MiB \/ 280 MiB/)).toBeInTheDocument();
-    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(screen.queryByText(/70\.0 MiB \/ 280 MiB/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '安装中' })).toBeDisabled();
   });
 
   it.each([
@@ -61,9 +64,10 @@ describe('SpeechModelResourceControls', () => {
   ] as const)('projects the %s installation stage', (status, label) => {
     render(<SpeechModelResourceControls status={modelStatus({ status })} />);
 
-    expect(screen.getByText(label)).toBeInTheDocument();
-    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('progressbar', { name: label }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '安装中' })).toBeDisabled();
   });
 
   it('offers the available revision without treating the old pack as usable', async () => {
@@ -80,9 +84,7 @@ describe('SpeechModelResourceControls', () => {
       />,
     );
 
-    expect(
-      screen.getByText(/speech-pack-0 → speech-pack-1/),
-    ).toBeInTheDocument();
+    expect(screen.getByText('本地模型有可用更新')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '更新模型' }));
     expect(onInstall).toHaveBeenCalledOnce();
   });
@@ -140,10 +142,8 @@ describe('SpeechModelResourceControls', () => {
     expect(onRemove).toHaveBeenCalledOnce();
   });
 
-  it('removes a ready pack only through the resource action', async () => {
-    const user = userEvent.setup();
-    const onRemove = vi.fn();
-    render(
+  it('hides the complete resource area when the pack is ready', () => {
+    const { container } = render(
       <SpeechModelResourceControls
         status={modelStatus({
           status: 'ready',
@@ -151,12 +151,29 @@ describe('SpeechModelResourceControls', () => {
           activeRevision: 'speech-pack-1',
           downloadedBytes: 280 * 1024 * 1024,
         })}
-        onRemove={onRemove}
       />,
     );
 
-    expect(screen.getByText(/speech-pack-1/)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '移除' }));
-    expect(onRemove).toHaveBeenCalledOnce();
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('restores a recovery row for a ready pack with an activation warning', async () => {
+    const user = userEvent.setup();
+    const onInstall = vi.fn();
+    render(
+      <SpeechModelResourceControls
+        status={modelStatus({
+          status: 'ready',
+          usable: true,
+          activeRevision: 'speech-pack-1',
+          lastErrorCode: 'SPEECH_RESOURCE_ACTIVATION_DURABILITY_UNCONFIRMED',
+        })}
+        onInstall={onInstall}
+      />,
+    );
+
+    expect(screen.getByText(/系统未能确认目录同步完成/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重新安装' }));
+    expect(onInstall).toHaveBeenCalledOnce();
   });
 });
