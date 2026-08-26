@@ -106,14 +106,14 @@ source ~/.zshrc
     "macOS": {
       "signingIdentity": null,
       "minimumSystemVersion": "13.0",
-      "entitlements": null,
+      "entitlements": "Entitlements.plist",
       "exceptionDomain": null
     }
   }
 }
 ```
 
-> `signingIdentity: null` 表示使用环境变量 `APPLE_SIGNING_IDENTITY`
+> `signingIdentity: null` 表示使用环境变量 `APPLE_SIGNING_IDENTITY`。录音能力要求 `Entitlements.plist` 保留 `com.apple.security.device.audio-input = true`；修改 entitlement 后必须重新构建并启动新的 `.app`，前端热重载不会更新已有进程的签名。构建后应检查实际签名产物，而不只检查源码配置。
 
 ---
 
@@ -202,5 +202,6 @@ xcrun notarytool log <submission-id> --keychain-profile "notarytool-profile"
 - [ ] 创建 App Store Connect API 密钥
 - [ ] 配置环境变量
 - [ ] 运行带签名的构建
+- [ ] 用 `codesign -d --entitlements :- MyAgents.app` 确认录音 entitlement 已进入签名产物
 - [ ] 验证签名和公证
 - [ ] 测试在新 Mac 上安装

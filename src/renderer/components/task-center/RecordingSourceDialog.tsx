@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { createPortal } from 'react-dom';
 import { Mic, MonitorUp } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -73,25 +74,14 @@ export default function RecordingSourceDialog({
 
   const openPrivacySettings = useCallback(
     async (source: 'microphone' | 'system') => {
-      let target: string | null = null;
-      if (platform.includes('mac')) {
-        target =
-          source === 'microphone'
-            ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
-            : 'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture';
-      } else if (platform.includes('win') && source === 'microphone') {
-        target = 'ms-settings:privacy-microphone';
-      }
-      if (!target) return;
       try {
-        const { open } = await import('@tauri-apps/plugin-shell');
-        await open(target);
+        await invoke('cmd_open_recording_privacy_settings', { source });
         setSettingsError(false);
       } catch {
         setSettingsError(true);
       }
     },
-    [platform],
+    [],
   );
 
   const sourceOptions = [

@@ -4,6 +4,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import RecordingSourceDialog from './RecordingSourceDialog';
 
+const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }));
+
 describe('RecordingSourceDialog', () => {
   it('requires at least one source and returns the explicit selection', async () => {
     const user = userEvent.setup();
@@ -77,6 +81,63 @@ describe('RecordingSourceDialog', () => {
     expect(
       screen.queryByRole('button', { name: '打开麦克风权限设置' }),
     ).not.toBeInTheDocument();
+
+    platform.mockRestore();
+  });
+
+  it('opens the exact recording privacy setting through the trusted Tauri command', async () => {
+    const user = userEvent.setup();
+    const platform = vi
+      .spyOn(window.navigator, 'platform', 'get')
+      .mockReturnValue('MacIntel');
+    mocks.invoke.mockResolvedValue(undefined);
+
+    render(
+      <RecordingSourceDialog
+        mode="start"
+        initialSelection={{ microphone: true, system: true }}
+        error="RECORDING_MICROPHONE_PERMISSION_REQUIRED"
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+        onOpenSpeechSettings={vi.fn()}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole('button', { name: '打开麦克风权限设置' }),
+    );
+    expect(mocks.invoke).toHaveBeenCalledWith(
+      'cmd_open_recording_privacy_settings',
+      { source: 'microphone' },
+    );
+
+    platform.mockRestore();
+  });
+
+  it('keeps an opener failure visible to the user', async () => {
+    const user = userEvent.setup();
+    const platform = vi
+      .spyOn(window.navigator, 'platform', 'get')
+      .mockReturnValue('MacIntel');
+    mocks.invoke.mockRejectedValueOnce(new Error('open failed'));
+
+    render(
+      <RecordingSourceDialog
+        mode="start"
+        initialSelection={{ microphone: true, system: false }}
+        error="RECORDING_MICROPHONE_PERMISSION_REQUIRED"
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+        onOpenSpeechSettings={vi.fn()}
+      />,
+    );
+
+    await user.click(
+      screen.getByRole('button', { name: '打开麦克风权限设置' }),
+    );
+    expect(
+      screen.getByText('无法自动打开系统设置，请手动打开隐私与安全设置。'),
+    ).toBeInTheDocument();
 
     platform.mockRestore();
   });

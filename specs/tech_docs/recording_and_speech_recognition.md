@@ -164,7 +164,7 @@ Tauri 提供 `cmd_speech_model_pack_status/install/remove`。状态为 `not_inst
 ## 排障顺序
 
 1. 先在 `~/.myagents/logs/unified-<本地日期>.log` 搜索 `[record]`、`[recording]`、`[speech]` 与结构化错误码；不要要求用户上传音频或 transcript。
-2. 录音无法开始时先区分 `RECORDING_MICROPHONE_UNAVAILABLE`、`RECORDING_SCREEN_PERMISSION_REQUIRED`、`RECORDING_SYSTEM_AUDIO_UNAVAILABLE`、`RECORDING_PIPEWIRE_UNAVAILABLE` 与 `RECORDING_DEVICE_CHANGED`。权限或设备问题由平台 capture backend 处理，不通过重装模型修复。
+2. 录音无法开始时先区分 `RECORDING_MICROPHONE_PERMISSION_REQUIRED`、`RECORDING_MICROPHONE_UNAVAILABLE`、`RECORDING_SCREEN_PERMISSION_REQUIRED`、`RECORDING_SYSTEM_AUDIO_UNAVAILABLE`、`RECORDING_PIPEWIRE_UNAVAILABLE` 与 `RECORDING_DEVICE_CHANGED`。macOS 麦克风授权依赖 `Info.plist` 用途说明与签名产物中的 `com.apple.security.device.audio-input` entitlement；缺任一项时 TCC 都可能在弹窗前拒绝。entitlement 变更后必须重新构建并启动新的 `.app`，前端热重载不会改变旧进程的签名能力。权限或设备问题由平台 capture backend 处理，不通过重装模型修复。
 3. 音频已保存但没有转录时查看 Record 的 transcription status 与模型 pack status。资源未 ready 时安装/修复资源；历史 Record 仍需用户手动点击“开始转录”。
 4. Agent 看不到 job 时必须在原发起 Session 运行 `myagents speech list`；不要通过增加 `--sessionId` 或全局 list 绕过隔离。
 5. 资源准备或安装失败时依次核对 target native manifest、共享 ORT identity、第一方 manifest/signature、pack 文件 hash 与最小真实加载。不得回退系统 ORT、在线 ASR、用户 cache 或临时下载。

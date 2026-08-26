@@ -64,6 +64,10 @@ const macInfoPlist = readFileSync(
   resolve(repoRoot, 'src-tauri/Info.plist'),
   'utf8',
 );
+const macEntitlements = readFileSync(
+  resolve(repoRoot, 'src-tauri/Entitlements.plist'),
+  'utf8',
+);
 const macInfoPlistEnglish = readFileSync(
   resolve(repoRoot, 'src-tauri/infoplist/en.lproj/InfoPlist.strings'),
   'utf8',
@@ -123,11 +127,63 @@ function assertRecordingPrivacyDeclarations(infoPlist, ...localizations) {
   }
 }
 
+function assertRecordingPrivacyEntitlements(entitlements) {
+  const plist = withoutComments(entitlements);
+  const audioInputKeys = [
+    ...plist.matchAll(/<key>com\.apple\.security\.device\.audio-input<\/key>/g),
+  ];
+  assert.equal(
+    audioInputKeys.length,
+    1,
+    'macOS recording requires exactly one audio-input entitlement key',
+  );
+  const audioInput = [
+    ...plist.matchAll(
+      /<key>com\.apple\.security\.device\.audio-input<\/key>\s*<true\s*\/>/g,
+    ),
+  ];
+  assert.equal(
+    audioInput.length,
+    1,
+    'macOS recording requires one enabled audio-input entitlement',
+  );
+}
+
 test('macOS recording privacy declarations survive source and localization staging', () => {
   assertRecordingPrivacyDeclarations(
     macInfoPlist,
     macInfoPlistEnglish,
     macInfoPlistChinese,
+  );
+});
+
+test('macOS recording entitlement survives signing configuration', () => {
+  assertRecordingPrivacyEntitlements(macEntitlements);
+  assert.throws(() =>
+    assertRecordingPrivacyEntitlements(
+      macEntitlements.replace(
+        /(<key>com\.apple\.security\.device\.audio-input<\/key>\s*<true\s*\/>)/,
+        '<!-- $1 -->',
+      ),
+    ),
+  );
+  assert.throws(() =>
+    assertRecordingPrivacyEntitlements(
+      macEntitlements.replace(
+        /(<key>com\.apple\.security\.device\.audio-input<\/key>\s*)<true\s*\/>/,
+        '$1<false/>',
+      ),
+    ),
+  );
+  assert.throws(() =>
+    assertRecordingPrivacyEntitlements(
+      macEntitlements.replace(
+        '</dict>',
+        '  <key>com.apple.security.device.audio-input</key>\n' +
+          '  <false/>\n' +
+          '</dict>',
+      ),
+    ),
   );
 });
 
