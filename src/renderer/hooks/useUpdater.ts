@@ -52,14 +52,16 @@ interface UseUpdaterResult {
     preparing: boolean;
     /** Manually trigger an update check. Returns result for caller to show toast feedback. */
     checkForUpdate: () => Promise<CheckUpdateResult>;
-    /** Version of a pending update discovered on startup (Windows only, from disk) */
+    /** Version of a pending update discovered on startup (Windows/macOS, from disk) */
     pendingUpdateOnStartup: string | null;
     /** Dismiss the startup pending update dialog (keeps "Restart to Update" button visible) */
     dismissPendingUpdate: () => void;
 }
 
-// Detect Windows platform
+// Windows and macOS defer installation until the user's explicit restart action.
 const isWindows = typeof navigator !== 'undefined' && navigator.platform?.includes('Win');
+const isMac = typeof navigator !== 'undefined' && navigator.platform?.includes('Mac');
+const usesDeferredInstall = isWindows || isMac;
 
 // Periodic check interval: 30 minutes
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
@@ -75,7 +77,7 @@ export function useUpdater(): UseUpdaterResult {
     const [downloading, setDownloading] = useState(false);
     const [installing, setInstalling] = useState(false);
     const [preparing, setPreparing] = useState(false);
-    // Windows: version from disk-persisted pending update (shown as startup dialog)
+    // Windows/macOS: version from disk-persisted pending update (shown as startup dialog)
     const [pendingUpdateOnStartup, setPendingUpdateOnStartup] = useState<string | null>(null);
     const intervalRef = useRef<NodeJS.Timeout | null>(null);
     const updateReadyRef = useRef(false);
@@ -171,8 +173,8 @@ export function useUpdater(): UseUpdaterResult {
     // Restart app to apply the update.
     //
     // Returns the outcome so callers can show user feedback (toast).
-    // On success the renderer never resumes — the OS process exits via NSIS
-    // (Windows) or relaunch (macOS).
+    // On success the renderer never meaningfully resumes — Windows exits via
+    // NSIS and macOS requests a managed restart immediately after install.
     //
     // Important: on Windows we no longer call cmd_shutdown_for_update from
     // here. The Rust install_pending_update handles shutdown internally,
@@ -194,12 +196,13 @@ export function useUpdater(): UseUpdaterResult {
         installingRef.current = true;
         setInstalling(true);
 
-        // Windows: use install_pending_update which launches NSIS from saved bytes
-        // This avoids relaunch() which would just restart without applying the update
-        if (isWindows) {
+        // Windows/macOS install verified bytes persisted during the background
+        // download. macOS must not replace the live .app before this explicit
+        // action: TCC cannot prompt a process whose executable was unlinked.
+        if (usesDeferredInstall) {
             try {
                 await invoke('install_pending_update');
-                // install_pending_update calls exit(0) on Windows, so we won't reach here.
+                // Windows exits via NSIS; macOS immediately requests restart.
                 return 'ok';
             } catch (err) {
                 const errStr = String(err);
@@ -236,13 +239,7 @@ export function useUpdater(): UseUpdaterResult {
             }
         }
 
-        // macOS / Linux: relaunch picks up the already-installed update.
-        // On macOS the .app was swapped during silent download_and_install;
-        // on Linux the AppImage was overwritten in place. Either way the
-        // bytes are committed by the time we get here, so a failure below
-        // just means we couldn't gracefully reboot — far less severe than
-        // the Windows pre-shutdown failure mode. Sidecar shutdown still
-        // helps (releases child processes) but is best-effort.
+        // Linux: relaunch picks up the AppImage replaced during background install.
         try {
             await invoke('cmd_shutdown_for_update');
         } catch (err) {
@@ -310,10 +307,10 @@ export function useUpdater(): UseUpdaterResult {
         return () => ac.abort();
     }, []);
 
-    // Windows: check for pending update on disk at startup
+    // Windows/macOS: check for a pending update on disk at startup
     // If found, show a dialog prompting the user to install it
     useEffect(() => {
-        if (!isTauriEnvironment() || !isWindows) return;
+        if (!isTauriEnvironment() || !usesDeferredInstall) return;
 
         const checkPending = async () => {
             try {

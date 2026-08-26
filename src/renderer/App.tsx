@@ -5423,7 +5423,7 @@ export default function App() {
             />
           )}
 
-          {/* Windows: startup dialog for pending update from previous session.
+          {/* Windows/macOS: startup dialog for a deferred update from the previous session.
           Hidden while a silent download is replacing the pending bytes —
           confirming "安装" mid-replacement could land on inconsistent
           cache/disk state. Comes back into view automatically when the

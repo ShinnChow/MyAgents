@@ -22,6 +22,9 @@ function sourceErrorMessage(error: string, t: (key: string) => string): string {
   if (error.includes('RECORDING_SCREEN_PERMISSION_REQUIRED')) {
     return t('records.screenPermissionRequired');
   }
+  if (error.includes('RECORDING_MICROPHONE_PERMISSION_REQUIRED')) {
+    return t('records.microphonePermissionRequired');
+  }
   if (error.includes('RECORDING_MICROPHONE_UNAVAILABLE')) {
     return t('records.microphoneUnavailable');
   }
@@ -50,6 +53,14 @@ export default function RecordingSourceDialog({
   const [settingsError, setSettingsError] = useState(false);
   const hasSource = selection.microphone || selection.system;
   const platform = useMemo(() => navigator.platform.toLowerCase(), []);
+  const microphonePermissionError =
+    error?.includes('RECORDING_MICROPHONE_PERMISSION_REQUIRED') ||
+    error?.includes('RECORDING_MICROPHONE_UNAVAILABLE') ||
+    false;
+  const screenPermissionError =
+    error?.includes('RECORDING_SCREEN_PERMISSION_REQUIRED') ?? false;
+  const hasSpecificPermissionError =
+    microphonePermissionError || screenPermissionError;
 
   useCloseLayer(
     useCallback(() => {
@@ -116,44 +127,46 @@ export default function RecordingSourceDialog({
           >
             {t('records.recordingSources')}
           </h2>
-          <p className="mt-1 text-sm leading-relaxed text-[var(--ink-muted)]">
-            {t(
-              mode === 'start'
-                ? 'records.recordingSourcesStartHint'
-                : 'records.recordingSourcesNextHint',
-            )}
-          </p>
         </header>
 
         <div className="space-y-3 px-5 py-4">
-          {sourceOptions.map((option) => (
-            <label
-              key={option.key}
-              className="flex cursor-pointer items-start gap-3 rounded-[var(--radius-lg)] bg-[var(--paper-inset)] px-3 py-3"
-            >
-              <input
-                type="checkbox"
-                checked={selection[option.key]}
+          {sourceOptions.map((option) => {
+            const selected = selection[option.key];
+            return (
+              <button
+                key={option.key}
+                type="button"
+                role="checkbox"
+                aria-checked={selected}
                 disabled={busy}
-                onChange={(event) =>
+                onClick={() =>
                   setSelection((current) => ({
                     ...current,
-                    [option.key]: event.target.checked,
+                    [option.key]: !current[option.key],
                   }))
                 }
-                className="mt-0.5 h-4 w-4 accent-[var(--accent-warm)]"
-              />
-              <span className="min-w-0 flex-1">
-                <span className="flex items-center gap-2 text-sm font-semibold text-[var(--ink)]">
+                className={`flex w-full items-start gap-3 rounded-[var(--radius-lg)] border px-3 py-3 text-left transition-[background-color,border-color,transform] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 active:scale-[0.99] disabled:cursor-wait disabled:opacity-60 ${
+                  selected
+                    ? 'border-[var(--accent)] bg-[var(--accent-warm-subtle)]'
+                    : 'border-[var(--line)] bg-[var(--paper-inset)] hover:border-[var(--line-strong)]'
+                }`}
+              >
+                <span
+                  className={`mt-0.5 shrink-0 ${selected ? 'text-[var(--accent-warm)]' : 'text-[var(--ink-muted)]'}`}
+                >
                   {option.icon}
-                  {option.title}
                 </span>
-                <span className="mt-1 block text-xs leading-relaxed text-[var(--ink-muted)]">
-                  {option.description}
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-semibold text-[var(--ink)]">
+                    {option.title}
+                  </span>
+                  <span className="mt-1 block text-xs leading-relaxed text-[var(--ink-muted)]">
+                    {option.description}
+                  </span>
                 </span>
-              </span>
-            </label>
-          ))}
+              </button>
+            );
+          })}
 
           {!hasSource && (
             <p className="text-xs text-[var(--error)]" role="alert">
@@ -181,33 +194,41 @@ export default function RecordingSourceDialog({
             >
               {sourceErrorMessage(error, t)}
               <div className="mt-2 flex flex-wrap gap-3">
-                {platform.includes('mac') && selection.microphone && (
-                  <button
-                    type="button"
-                    onClick={() => void openPrivacySettings('microphone')}
-                    className="font-semibold hover:underline"
-                  >
-                    {t('records.openMicrophoneSettings')}
-                  </button>
-                )}
-                {platform.includes('mac') && selection.system && (
-                  <button
-                    type="button"
-                    onClick={() => void openPrivacySettings('system')}
-                    className="font-semibold hover:underline"
-                  >
-                    {t('records.openScreenSettings')}
-                  </button>
-                )}
-                {platform.includes('win') && selection.microphone && (
-                  <button
-                    type="button"
-                    onClick={() => void openPrivacySettings('microphone')}
-                    className="font-semibold hover:underline"
-                  >
-                    {t('records.openMicrophoneSettings')}
-                  </button>
-                )}
+                {platform.includes('mac') &&
+                  selection.microphone &&
+                  (!hasSpecificPermissionError ||
+                    microphonePermissionError) && (
+                    <button
+                      type="button"
+                      onClick={() => void openPrivacySettings('microphone')}
+                      className="font-semibold hover:underline"
+                    >
+                      {t('records.openMicrophoneSettings')}
+                    </button>
+                  )}
+                {platform.includes('mac') &&
+                  selection.system &&
+                  (!hasSpecificPermissionError || screenPermissionError) && (
+                    <button
+                      type="button"
+                      onClick={() => void openPrivacySettings('system')}
+                      className="font-semibold hover:underline"
+                    >
+                      {t('records.openScreenSettings')}
+                    </button>
+                  )}
+                {platform.includes('win') &&
+                  selection.microphone &&
+                  (!hasSpecificPermissionError ||
+                    microphonePermissionError) && (
+                    <button
+                      type="button"
+                      onClick={() => void openPrivacySettings('microphone')}
+                      className="font-semibold hover:underline"
+                    >
+                      {t('records.openMicrophoneSettings')}
+                    </button>
+                  )}
               </div>
               {settingsError && (
                 <p className="mt-2">{t('records.openPrivacySettingsFailed')}</p>

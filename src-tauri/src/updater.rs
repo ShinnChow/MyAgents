@@ -3,14 +3,16 @@
 //
 // Flow:
 // 1. App starts → wait 60s → cleanup stale Windows updater temp dirs → check for update
-// 2. If update available → silently download in background (user unaware)
+// 2. If update available → silently download and persist in background
 // 3. Download complete → emit event to show "Restart to Update" button in titlebar
 // 4. User clicks button → restart and apply update
-// 5. Or next app launch → update is automatically applied
+// 5. Or next app launch → pending update is offered again
 //
-// Windows-specific:
-// - download_and_install() launches NSIS installer which exit(0)s the process
-// - To avoid closing the app without consent, we split download/install:
+// Windows/macOS deferred install:
+// - Installing while the app is still in use either exits immediately (Windows)
+//   or replaces the running .app bundle (macOS). Both must happen only after
+//   explicit user action.
+// - We split download/install:
 //   download() saves bytes to disk, install() only runs on user action
 // - On next startup, check_pending_update detects saved bytes and prompts user
 
@@ -28,6 +30,10 @@ use crate::sidecar::ManagedSidecar;
 
 /// Global flag to prevent concurrent update checks/downloads
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+fn update_mutation_allowed(is_debug_build: bool) -> bool {
+    !is_debug_build
+}
 
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_UPDATER_TEMP_DIR_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -64,9 +70,8 @@ fn cache_update(update: Update) {
 /// Return a clone of the cached `Update` if its version matches `wanted`.
 /// Returns None if cache is empty or version differs (stale cache).
 ///
-/// Currently only used by the Windows install path (macOS install happens
-/// inline during `download_and_install`, so the cache is never read there).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+/// Used by the deferred Windows/macOS install path.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
 fn cached_update_for(wanted: &str) -> Option<Update> {
     let guard = LATEST_UPDATE.lock().ok()?;
     let cached = guard.as_ref()?;
@@ -78,14 +83,14 @@ fn cached_update_for(wanted: &str) -> Option<Update> {
 }
 
 /// Metadata persisted to disk alongside the update binary
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Serialize, serde::Deserialize)]
 struct PendingUpdateMeta {
     version: String,
 }
 
 /// Get the ~/.myagents/ directory path
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn get_myagents_dir() -> Result<std::path::PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
     Ok(home.join(".myagents"))
@@ -93,7 +98,7 @@ fn get_myagents_dir() -> Result<std::path::PathBuf, String> {
 
 /// Atomically save pending update bytes + metadata to disk
 /// Writes to .tmp first, then renames to avoid partial files
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn save_pending_update_to_disk(version: &str, bytes: &[u8]) -> Result<(), String> {
     let dir = get_myagents_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create dir: {}", e))?;
@@ -126,7 +131,7 @@ fn save_pending_update_to_disk(version: &str, bytes: &[u8]) -> Result<(), String
 /// are still set lets stale latest-wins decisions or stale cache hits
 /// re-introduce the cache==disk inconsistency this whole module is trying
 /// to prevent. Bundle the reset so callers can't forget.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn clear_pending_update_from_disk() {
     if let Ok(dir) = get_myagents_dir() {
         let _ = std::fs::remove_file(dir.join("pending_update.bin"));
@@ -140,7 +145,7 @@ fn clear_pending_update_from_disk() {
 }
 
 /// Read the version of the pending update from disk metadata (None if not present or corrupt)
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 fn read_pending_update_version() -> Option<String> {
     let dir = get_myagents_dir().ok()?;
     let meta_path = dir.join("pending_update.json");
@@ -447,6 +452,14 @@ fn build_updater_with_proxy(app: &AppHandle) -> Result<tauri_plugin_updater::Upd
 /// Check for updates on startup and silently download if available
 /// This is the main entry point called from setup hook
 pub async fn check_update_on_startup(app: AppHandle) {
+    if !update_mutation_allowed(cfg!(debug_assertions)) {
+        logger::info(
+            &app,
+            "[Updater] Automatic update mutation is disabled in development builds",
+        );
+        return;
+    }
+
     // Wait 60 seconds before checking — startup is heavy enough without an
     // updater HTTPS round-trip racing the user's first action. Periodic
     // checks (every 30 min) catch up after this initial window.
@@ -662,9 +675,12 @@ async fn check_and_download_silently(app: &AppHandle) -> Result<Option<String>, 
         }
     };
 
-    // Windows: download only (don't install) to avoid NSIS killing the process
-    // macOS: download_and_install is safe because .app replacement doesn't affect running process
-    #[cfg(target_os = "windows")]
+    // Windows/macOS: download and persist only. Installing on macOS replaces
+    // the running .app bundle; doing that in the background leaves macOS TCC
+    // unable to resolve the executable path until restart, so permission
+    // prompts silently fail. Installation belongs to the explicit restart
+    // action on both platforms.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         // Skip download if we already have this version cached on disk
         if let Some(cached_version) = read_pending_update_version() {
@@ -672,7 +688,7 @@ async fn check_and_download_silently(app: &AppHandle) -> Result<Option<String>, 
                 logger::info(
                     app,
                     format!(
-                        "[Updater] Windows: v{} already cached on disk, skipping re-download",
+                        "[Updater] v{} already cached on disk, skipping re-download",
                         version
                     ),
                 );
@@ -713,7 +729,7 @@ async fn check_and_download_silently(app: &AppHandle) -> Result<Option<String>, 
         logger::info(
             app,
             format!(
-                "[Updater] Windows: Downloaded {} bytes for v{}, saving to disk...",
+                "[Updater] Downloaded {} bytes for v{}, saving to disk...",
                 bytes.len(),
                 version
             ),
@@ -744,11 +760,8 @@ async fn check_and_download_silently(app: &AppHandle) -> Result<Option<String>, 
         cache_update(update.clone());
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
-        // Same UI mutex applies on macOS — relaunch path uses bytes installed
-        // by `download_and_install`, but during this window the .app on disk
-        // is being swapped, so a click that triggers `relaunch()` could race.
         let _ = app.emit(
             "updater:download-started",
             UpdateReadyInfo {
@@ -800,6 +813,10 @@ fn emit_update_ready(app: &AppHandle, version: &str) {
 pub async fn check_and_download_update(app: AppHandle) -> Result<bool, String> {
     logger::info(&app, "[Updater] Manual update check requested");
 
+    if !update_mutation_allowed(cfg!(debug_assertions)) {
+        return Err("UPDATER_DISABLED_IN_DEVELOPMENT".to_string());
+    }
+
     match check_and_download_silently(&app).await {
         Ok(Some(version)) => {
             logger::info(
@@ -824,17 +841,25 @@ pub fn restart_app(app: AppHandle) {
     app.request_restart();
 }
 
-/// Command: Check if a pending update exists on disk (for Windows startup prompt)
+/// Command: Check if a deferred update exists on disk (Windows/macOS startup prompt)
 /// Returns the version string if a pending update is ready AND newer than current, None otherwise
 #[tauri::command]
 pub fn check_pending_update(app: AppHandle) -> Option<String> {
-    #[cfg(not(target_os = "windows"))]
+    if !update_mutation_allowed(cfg!(debug_assertions)) {
+        logger::info(
+            &app,
+            "[Updater] Pending update install is disabled in development builds",
+        );
+        return None;
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = app;
         return None;
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         match read_pending_update_version() {
             Some(version) => {
@@ -878,14 +903,15 @@ pub fn check_pending_update(app: AppHandle) -> Option<String> {
     }
 }
 
-/// Command: Install a previously downloaded update (Windows only).
+/// Command: Install a previously downloaded update (Windows/macOS).
 ///
 /// Resolves the `Update` object (preferring an in-memory cache populated during
 /// background `check()` calls, falling back to a fresh `check()` with retries),
-/// then enters the update-quiesce gate, shuts down all process-owning surfaces
-/// (IM/Agent channels, terminals, browser webviews, sidecars, SDK/MCP children),
-/// verifies that update-blocking processes/files are gone, and finally calls
-/// `update.install(bytes)` which spawns the NSIS installer and calls `exit(0)`.
+/// Windows then enters the update-quiesce gate, shuts down process-owning
+/// surfaces, verifies update-blocking processes/files are gone, and launches
+/// NSIS. macOS installs the already-verified local bytes only after this
+/// explicit action and immediately requests a managed restart; this avoids
+/// unlinking the live app bundle during background download and breaking TCC.
 ///
 /// **Why the cache matters:** on a flaky/blocked network the legacy code path
 /// — which always required `updater.check().await` — silently failed because
@@ -903,7 +929,11 @@ pub async fn install_pending_update(
     terminal_state: State<'_, std::sync::Arc<crate::terminal::TerminalManager>>,
     browser_state: State<'_, std::sync::Arc<crate::browser::BrowserManager>>,
 ) -> Result<(), String> {
-    #[cfg(not(target_os = "windows"))]
+    if !update_mutation_allowed(cfg!(debug_assertions)) {
+        return Err("UPDATER_DISABLED_IN_DEVELOPMENT".to_string());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let _ = app;
         let _ = state;
@@ -911,10 +941,10 @@ pub async fn install_pending_update(
         let _ = agent_state;
         let _ = terminal_state;
         let _ = browser_state;
-        return Err("install_pending_update is only supported on Windows".to_string());
+        return Err("install_pending_update is unsupported on this platform".to_string());
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     {
         logger::info(&app, "[Updater] install_pending_update called");
 
@@ -977,47 +1007,74 @@ pub async fn install_pending_update(
             return Err("VERSION_MISMATCH".to_string());
         }
 
-        // Step 4: Now we're committed to installing. Enter update-quiesce and
-        // shut down every owner before NSIS is allowed to overwrite Node.js /
-        // SDK / bridge resources. This was previously done from
-        // the renderer BEFORE step 2, which meant a network failure would kill
-        // the user's session for nothing. Doing it here keeps the user's state
-        // intact on every failure path above.
-        let _update_shutdown_guard = crate::sidecar::begin_update_shutdown()?;
-        logger::info(
-            &app,
-            "[Updater] Quiescing app owners before NSIS install...",
-        );
-        crate::im::shutdown_all_channels_for_update(&im_state, &agent_state, &state).await;
-        let terminal_report = crate::terminal::close_all_terminals(terminal_state.inner()).await;
-        if !terminal_report.residual.is_empty() {
-            return Err(format!(
-                "UPDATE_TERMINALS_STILL_RUNNING: {}",
-                terminal_report.residual.join(" | ")
-            ));
+        #[cfg(target_os = "macos")]
+        {
+            // Installing replaces the on-disk .app. Keep the current bundle
+            // intact until the user's explicit restart action, then restart
+            // immediately after the local install succeeds so the process is
+            // never left interactively running from an unlinked executable.
+            let _ = state;
+            let _ = im_state;
+            let _ = agent_state;
+            let _ = terminal_state;
+            let _ = browser_state;
+            logger::info(
+                &app,
+                format!("[Updater] Installing macOS update v{}...", pending_version),
+            );
+            update
+                .install(bytes)
+                .map_err(|e| format!("Installation failed: {}", e))?;
+            logger::info(&app, "[Updater] macOS update installed; restarting now");
+            app.request_restart();
+            return Ok(());
         }
-        crate::browser::close_all_browsers(browser_state.inner(), &app).await;
-        crate::sidecar::shutdown_for_update_verified(&app, &state)?;
 
-        // Step 5: Install — spawns NSIS installer and calls exit(0).
-        // This function will NOT return on success.
-        //
-        // Do NOT clear pending_update.bin / pending_update.json before this
-        // call: if `install()` fails (e.g., extract/temp-write error after
-        // the bytes were written to disk), we want to keep the bytes around
-        // so the user can retry without re-downloading. On the success path
-        // the new app version replaces the old one and the next startup's
-        // `check_pending_update` clears stale-by-version entries automatically.
-        logger::info(
-            &app,
-            format!("[Updater] Installing v{}...", pending_version),
-        );
-        update
-            .install(bytes)
-            .map_err(|e| format!("Installation failed: {}", e))?;
+        #[cfg(target_os = "windows")]
+        {
+            // Step 4: Now we're committed to installing. Enter update-quiesce and
+            // shut down every owner before NSIS is allowed to overwrite Node.js /
+            // SDK / bridge resources. This was previously done from
+            // the renderer BEFORE step 2, which meant a network failure would kill
+            // the user's session for nothing. Doing it here keeps the user's state
+            // intact on every failure path above.
+            let _update_shutdown_guard = crate::sidecar::begin_update_shutdown()?;
+            logger::info(
+                &app,
+                "[Updater] Quiescing app owners before NSIS install...",
+            );
+            crate::im::shutdown_all_channels_for_update(&im_state, &agent_state, &state).await;
+            let terminal_report =
+                crate::terminal::close_all_terminals(terminal_state.inner()).await;
+            if !terminal_report.residual.is_empty() {
+                return Err(format!(
+                    "UPDATE_TERMINALS_STILL_RUNNING: {}",
+                    terminal_report.residual.join(" | ")
+                ));
+            }
+            crate::browser::close_all_browsers(browser_state.inner(), &app).await;
+            crate::sidecar::shutdown_for_update_verified(&app, &state)?;
 
-        // Unreachable on success (install_inner exit(0)s the process).
-        Ok(())
+            // Step 5: Install — spawns NSIS installer and calls exit(0).
+            // This function will NOT return on success.
+            //
+            // Do NOT clear pending_update.bin / pending_update.json before this
+            // call: if `install()` fails (e.g., extract/temp-write error after
+            // the bytes were written to disk), we want to keep the bytes around
+            // so the user can retry without re-downloading. On the success path
+            // the new app version replaces the old one and the next startup's
+            // `check_pending_update` clears stale-by-version entries automatically.
+            logger::info(
+                &app,
+                format!("[Updater] Installing v{}...", pending_version),
+            );
+            update
+                .install(bytes)
+                .map_err(|e| format!("Installation failed: {}", e))?;
+
+            // Unreachable on success (install_inner exit(0)s the process).
+            Ok(())
+        }
     }
 }
 
@@ -1029,7 +1086,7 @@ pub async fn install_pending_update(
 /// Maps tauri-plugin-updater errors to caller-friendly strings:
 /// - All attempts network-failed → `"NETWORK_ERROR"`
 /// - Server returned no update → `"VERSION_MISMATCH"` (and clears disk cache)
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 async fn resolve_update_with_retries(
     app: &AppHandle,
     expected_version: &str,
@@ -1223,6 +1280,12 @@ pub async fn test_update_connectivity(app: AppHandle) -> Result<String, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_mutation_is_disabled_only_for_development_builds() {
+        assert!(!update_mutation_allowed(true));
+        assert!(update_mutation_allowed(false));
+    }
 
     #[test]
     fn parses_windows_updater_temp_dir_names() {

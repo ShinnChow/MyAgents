@@ -18,13 +18,20 @@ describe('RecordingSourceDialog', () => {
       />,
     );
 
+    expect(
+      screen.queryByText(/确认本次录音要保存的声音/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /麦克风/ })).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
     await user.click(screen.getByRole('checkbox', { name: /麦克风/ }));
     await user.click(screen.getByRole('checkbox', { name: /系统声音/ }));
-    expect(screen.getByRole('button', { name: '录音' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: '开始录音' })).toBeDisabled();
     expect(screen.getByText('请至少选择一种录音来源。')).toBeInTheDocument();
 
     await user.click(screen.getByRole('checkbox', { name: /麦克风/ }));
-    await user.click(screen.getByRole('button', { name: '录音' }));
+    await user.click(screen.getByRole('button', { name: '开始录音' }));
     expect(onConfirm).toHaveBeenCalledWith({ microphone: true, system: false });
   });
 
@@ -45,10 +52,36 @@ describe('RecordingSourceDialog', () => {
     expect(screen.getByText(/仍会完整保存音频/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '打开语音识别设置' }));
     expect(onOpenSpeechSettings).toHaveBeenCalledOnce();
-    expect(screen.getByRole('button', { name: '录音' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '开始录音' })).toBeEnabled();
   });
 
-  it('describes saved source changes as applying to the next recording', () => {
+  it('shows only the system setting relevant to a macOS permission failure', () => {
+    const platform = vi
+      .spyOn(window.navigator, 'platform', 'get')
+      .mockReturnValue('MacIntel');
+
+    render(
+      <RecordingSourceDialog
+        mode="start"
+        initialSelection={{ microphone: true, system: true }}
+        error="RECORDING_SCREEN_PERMISSION_REQUIRED"
+        onConfirm={vi.fn()}
+        onCancel={vi.fn()}
+        onOpenSpeechSettings={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('button', { name: '打开屏幕录制权限设置' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: '打开麦克风权限设置' }),
+    ).not.toBeInTheDocument();
+
+    platform.mockRestore();
+  });
+
+  it('keeps settings mode concise while preserving its save action', () => {
     render(
       <RecordingSourceDialog
         mode="settings"
@@ -59,7 +92,7 @@ describe('RecordingSourceDialog', () => {
       />,
     );
 
-    expect(screen.getByText(/当前录音不会切换/)).toBeInTheDocument();
+    expect(screen.queryByText(/当前录音不会切换/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '保存设置' })).toBeEnabled();
   });
 });

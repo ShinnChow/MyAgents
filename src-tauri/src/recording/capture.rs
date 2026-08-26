@@ -224,6 +224,15 @@ impl CaptureBackend for PlatformCaptureBackend {
         if !selection.microphone && !selection.system {
             return Err("at least one recording source must be selected".to_string());
         }
+        #[cfg(target_os = "macos")]
+        {
+            if selection.microphone {
+                ensure_macos_microphone_access()?;
+            }
+            if selection.system {
+                ensure_macos_screen_capture_access()?;
+            }
+        }
         let host = capture_host()?;
         let microphone = if selection.microphone {
             let device = host
@@ -238,7 +247,7 @@ impl CaptureBackend for PlatformCaptureBackend {
         let (system_display_id, system_source) = if selection.system {
             use screencapturekit::prelude::SCShareableContent;
             let content = SCShareableContent::get()
-                .map_err(|error| format!("RECORDING_SCREEN_PERMISSION_REQUIRED: {error}"))?;
+                .map_err(|error| format!("RECORDING_SYSTEM_AUDIO_UNAVAILABLE {error}"))?;
             let display = content
                 .displays()
                 .into_iter()
@@ -374,6 +383,64 @@ impl CaptureBackend for PlatformCaptureBackend {
             stopped: false,
         }))
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_microphone_access() -> Result<(), String> {
+    use block2::RcBlock;
+    use objc2::runtime::Bool;
+    use objc2_av_foundation::{AVCaptureDevice, AVMediaTypeAudio};
+
+    let media_type = unsafe { AVMediaTypeAudio }
+        .ok_or_else(|| "RECORDING_MICROPHONE_UNAVAILABLE".to_string())?;
+    let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media_type) };
+    let granted = microphone_access_granted(status, || {
+        // Apple invokes this callback on an arbitrary queue. Preflight already
+        // runs on spawn_blocking, so waiting here keeps both the UI thread and
+        // audio callbacks free while retaining the Objective-C block.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let completion = RcBlock::new(move |granted: Bool| {
+            let _ = sender.send(granted.as_bool());
+        });
+        unsafe {
+            AVCaptureDevice::requestAccessForMediaType_completionHandler(media_type, &completion);
+        }
+        receiver.recv().unwrap_or(false)
+    });
+    granted
+        .then_some(())
+        .ok_or_else(|| "RECORDING_MICROPHONE_PERMISSION_REQUIRED".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn microphone_access_granted(
+    status: objc2_av_foundation::AVAuthorizationStatus,
+    request: impl FnOnce() -> bool,
+) -> bool {
+    use objc2_av_foundation::AVAuthorizationStatus;
+
+    match status {
+        AVAuthorizationStatus::Authorized => true,
+        AVAuthorizationStatus::NotDetermined => request(),
+        AVAuthorizationStatus::Denied | AVAuthorizationStatus::Restricted => false,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_screen_capture_access() -> Result<(), String> {
+    let access = core_graphics::access::ScreenCaptureAccess;
+    request_access_when_missing(|| access.preflight(), || access.request())
+        .then_some(())
+        .ok_or_else(|| "RECORDING_SCREEN_PERMISSION_REQUIRED".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn request_access_when_missing(
+    preflight: impl FnOnce() -> bool,
+    request: impl FnOnce() -> bool,
+) -> bool {
+    preflight() || request()
 }
 
 struct PlatformCaptureSession {
@@ -585,7 +652,14 @@ fn open_cpal_stream(
         ),
         _ => return Err("unsupported capture sample format".to_string()),
     }
-    .map_err(|error| format!("open {track:?} capture stream: {error}"))
+    .map_err(|error| {
+        if track == AudioTrackKind::Microphone && error.kind() == cpal::ErrorKind::PermissionDenied
+        {
+            "RECORDING_MICROPHONE_PERMISSION_REQUIRED".to_string()
+        } else {
+            format!("open {track:?} capture stream: {error}")
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -704,5 +778,62 @@ fn report_malformed_sck(events: &mpsc::UnboundedSender<CaptureEvent>, reported: 
             track: AudioTrackKind::System,
             code: "SCREEN_CAPTURE_KIT_UNEXPECTED_AUDIO_FORMAT".to_string(),
         });
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{microphone_access_granted, request_access_when_missing};
+    use objc2_av_foundation::AVAuthorizationStatus;
+    use std::cell::Cell;
+
+    #[test]
+    fn screen_capture_access_requests_only_when_preflight_is_missing() {
+        let request_called = Cell::new(false);
+        assert!(request_access_when_missing(
+            || true,
+            || {
+                request_called.set(true);
+                false
+            }
+        ));
+        assert!(!request_called.get());
+
+        assert!(request_access_when_missing(|| false, || true));
+        assert!(!request_access_when_missing(|| false, || false));
+    }
+
+    #[test]
+    fn microphone_access_requests_only_when_not_determined() {
+        let request_called = Cell::new(false);
+        assert!(microphone_access_granted(
+            AVAuthorizationStatus::Authorized,
+            || {
+                request_called.set(true);
+                false
+            }
+        ));
+        assert!(!request_called.get());
+
+        assert!(microphone_access_granted(
+            AVAuthorizationStatus::NotDetermined,
+            || true
+        ));
+        assert!(!microphone_access_granted(
+            AVAuthorizationStatus::NotDetermined,
+            || false
+        ));
+        assert!(!microphone_access_granted(
+            AVAuthorizationStatus::Denied,
+            || {
+                request_called.set(true);
+                true
+            }
+        ));
+        assert!(!request_called.get());
+        assert!(!microphone_access_granted(
+            AVAuthorizationStatus::Restricted,
+            || true
+        ));
     }
 }

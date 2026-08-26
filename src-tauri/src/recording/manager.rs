@@ -451,6 +451,12 @@ impl RecordingManager {
     ) -> Result<RecordingStartResult, String> {
         let selection = input.selection;
         let result = self.start_inner(input).await;
+        if let Err(error) = &result {
+            ulog_warn!(
+                "[recording] start failed code={}",
+                normalized_recording_error(error, "RECORDING_START_FAILED")
+            );
+        }
         let capability = speech_recognition::global().map(|manager| manager.capability_snapshot());
         let resource_state = match capability.as_ref().map(|value| value.resource_status) {
             Some(SpeechResourceStatus::Ready) => SpeechResourceState::Ready,
