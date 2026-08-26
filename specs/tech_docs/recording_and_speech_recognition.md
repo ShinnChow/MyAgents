@@ -79,6 +79,8 @@ Worker 结果只有同时满足 exact `(jobId, generation)`、协议 shape、业
 
 每个 physical track 的 callback 经一个固定 fan-out 先写 archive ring，再写可选 analysis ring。ring 的单次读取边界不保证落在 interleaved channel frame 边界；两个后台 writer 共用的 streaming `rubato` adapter 必须跨读取保留未完整的 source frame，只允许在整条输入结束时拒绝真正残缺的 frame。analysis 只落一份固定路径的 16 kHz mono raw PCM16 spool，不自创媒体容器。`SpeechRecognitionManager` 只读取已 `flush + sync_data` 的 committed sample，逐个有界 binary frame 发给 exact-generation Worker，并校验 ACK、heartbeat checkpoint、segment revision 和 terminal metrics。Worker response 使用 bounded reader channel 和 120 秒基础设施超时；超时只重启当前 live generation，不影响 archive。
 
+活跃录音中的单路开关仍由 `RecordingManager` 持有：它不热换设备、`CapturePlan` 或 source identity，只令对应 archive/analysis sink 在原回调时序中写入等长静音，并把该路电平归零。这样重新打开后继续同一 generation，双轨、transcript 与笔记共用的媒体时间线不会因关闭一路而压缩或错位。完成态若同时存在 microphone/system 而没有持久 `mixed` artifact，Renderer 直接同步播放两条 Range 数据流形成默认混合监听；单轨选择仍只播放对应物理轨，不为播放额外引入 mixer 进程或派生文件。
+
 Pause 先停止两个 ring 的 admission，再暂停设备；analysis writer 排空、刷新 resampler 并 fsync 后，Manager 以每轨 exact sample boundary 发送 `Flush`。Worker 在该边界强制结束 VAD 句段、发布稳定整句并重置 VAD，不写虚假静音，也不把 wall pause 算入媒体时间。Resume 从同一 append-only spool 继续。
 
 live revision 写入 `transcript/revisions.jsonl`，复用 `DurableRecordJournal`。Worker-local ID 不成为产品 identity；RecordStore 按 `track + start + end` 生成稳定 segment ID，同边界重算只递增 revision。generation 失败时从最后 durable segment end 重放，以重建尚未发布的 VAD pending state；每帧 ACK 仍即时校验，但不能仅从最后 ACK 继续，否则会丢掉已 ACK、尚未形成稳定句段的语音。

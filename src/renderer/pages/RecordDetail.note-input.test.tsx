@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   recordDiarization: vi.fn(),
   recordTimeline: vi.fn(),
   recordingSnapshot: vi.fn(),
+  recordingSetSourceEnabled: vi.fn(),
   speechModelPackStatus: vi.fn(),
 }));
 
@@ -32,6 +33,7 @@ vi.mock('@/api/recording', async (importOriginal) => {
     recordDiarization: mocks.recordDiarization,
     recordTimeline: mocks.recordTimeline,
     recordingSnapshot: mocks.recordingSnapshot,
+    recordingSetSourceEnabled: mocks.recordingSetSourceEnabled,
     speechModelPackStatus: mocks.speechModelPackStatus,
   };
 });
@@ -86,7 +88,7 @@ const SNAPSHOT: RecordingSnapshot = {
       format: { channels: 1, sampleRate: 48_000 },
     },
   ],
-  sourceActivity: [{ track: 'microphone', levelPercent: 37 }],
+  sourceActivity: [{ track: 'microphone', levelPercent: 37, enabled: true }],
   warnings: [],
 };
 
@@ -123,6 +125,18 @@ describe('RecordDetail note input', () => {
       items: [],
     });
     mocks.recordingSnapshot.mockResolvedValue(SNAPSHOT);
+    mocks.recordingSetSourceEnabled.mockImplementation(
+      async (
+        _snapshot: RecordingSnapshot,
+        track: string,
+        enabled: boolean,
+      ) => ({
+        ...SNAPSHOT,
+        sourceActivity: SNAPSHOT.sourceActivity.map((source) =>
+          source.track === track ? { ...source, enabled } : source,
+        ),
+      }),
+    );
     mocks.speechModelPackStatus.mockResolvedValue({ usable: true });
     mocks.recordAddNote.mockResolvedValue({
       recordId: RECORD.id,
@@ -149,6 +163,12 @@ describe('RecordDetail note input', () => {
 
     fireEvent.compositionEnd(input);
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
+    expect(mocks.recordAddNote).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    expect(mocks.recordAddNote).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 229 });
     expect(mocks.recordAddNote).not.toHaveBeenCalled();
 
     fireEvent.keyDown(input, { key: 'Enter' });
@@ -220,7 +240,7 @@ describe('RecordDetail note input', () => {
     expect(mocks.recordAddNote.mock.calls[0][0].text).toBe('退出前保存');
   });
 
-  it('renders the authoritative capture activity instead of a constant source dot', async () => {
+  it('renders the authoritative capture activity without a flashing percentage label', async () => {
     render(
       <RecordDetail
         recordId={RECORD.id}
@@ -229,7 +249,12 @@ describe('RecordDetail note input', () => {
       />,
     );
 
-    expect(await screen.findByLabelText(/37%/)).toBeInTheDocument();
+    expect(
+      await screen.findByRole('button', {
+        name: /麦克风.*录入中|Microphone.*included/i,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('37%')).not.toBeInTheDocument();
   });
 
   it('stacks microphone and system activity as two live meter rows', async () => {
@@ -245,7 +270,7 @@ describe('RecordDetail note input', () => {
       ],
       sourceActivity: [
         ...SNAPSHOT.sourceActivity,
-        { track: 'system', levelPercent: 52 },
+        { track: 'system', levelPercent: 52, enabled: true },
       ],
     };
     mocks.recordingSnapshot.mockResolvedValue(dualSourceSnapshot);
@@ -263,6 +288,30 @@ describe('RecordDetail note input', () => {
     expect(
       meters.querySelectorAll('[data-testid="recording-source-meter"]'),
     ).toHaveLength(2);
+  });
+
+  it('lets the user stop and restore one source without pausing the recording', async () => {
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: /麦克风.*录入中|Microphone.*included/i,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(mocks.recordingSetSourceEnabled).toHaveBeenCalledWith(
+        expect.objectContaining({ recordId: RECORD.id }),
+        'microphone',
+        false,
+      ),
+    );
   });
 
   it('keeps the live failure recovery notice visible after stable segments exist', async () => {
@@ -330,6 +379,168 @@ describe('RecordDetail note input', () => {
       await screen.findByTestId('recording-playback-progress'),
     ).toBeInTheDocument();
     expect(screen.queryByLabelText(/音量|Volume/)).not.toBeInTheDocument();
+  });
+
+  it('defaults dual physical tracks to real mixed playback with single-track choices', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready',
+        transcriptionStatus: 'ready',
+        mediaDurationMs: 31_000,
+        tracks: ['microphone', 'system'],
+      },
+    });
+    mocks.recordingSnapshot.mockResolvedValue(null);
+
+    render(<RecordDetail recordId={RECORD.id} isActive />);
+
+    expect(
+      await screen.findByRole('button', { name: /音轨|Tracks/i }),
+    ).toHaveTextContent(/混合|Mixed/i);
+    expect(screen.getByTestId('recording-primary-audio')).toHaveAttribute(
+      'src',
+      expect.stringContaining('/microphone.opus'),
+    );
+    expect(screen.getByTestId('recording-secondary-audio')).toHaveAttribute(
+      'src',
+      expect.stringContaining('/system.opus'),
+    );
+  });
+
+  it('keeps a pending seek position when switching tracks before metadata loads', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready',
+        transcriptionStatus: 'ready',
+        mediaDurationMs: 31_000,
+        tracks: ['microphone', 'system'],
+      },
+    });
+    mocks.recordingSnapshot.mockResolvedValue(null);
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive
+        seekMediaMs={9_000}
+        seekNonce={1}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: /音轨|Tracks/i }),
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: /系统声音|System audio/i }),
+    );
+    const primaryAudio = screen.getByTestId(
+      'recording-primary-audio',
+    ) as HTMLAudioElement;
+    fireEvent.loadedMetadata(primaryAudio);
+
+    expect(primaryAudio.currentTime).toBe(9);
+  });
+
+  it('does not reuse a stale pending seek after switching to a track with the same primary URL', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready',
+        transcriptionStatus: 'ready',
+        mediaDurationMs: 31_000,
+        tracks: ['microphone', 'system'],
+      },
+    });
+    mocks.recordingSnapshot.mockResolvedValue(null);
+
+    render(<RecordDetail recordId={RECORD.id} isActive />);
+
+    const primaryAudio = (await screen.findByTestId(
+      'recording-primary-audio',
+    )) as HTMLAudioElement;
+    Object.defineProperty(primaryAudio, 'readyState', {
+      configurable: true,
+      value: HTMLMediaElement.HAVE_METADATA,
+    });
+    primaryAudio.currentTime = 4;
+
+    fireEvent.click(screen.getByRole('button', { name: /音轨|Tracks/i }));
+    fireEvent.click(
+      await screen.findByRole('button', { name: /麦克风|Microphone/i }),
+    );
+    primaryAudio.currentTime = 7;
+
+    fireEvent.click(screen.getByRole('button', { name: /音轨|Tracks/i }));
+    fireEvent.click(
+      await screen.findByRole('button', { name: /系统声音|System audio/i }),
+    );
+    fireEvent.loadedMetadata(primaryAudio);
+
+    expect(primaryAudio.currentTime).toBe(7);
+  });
+
+  it('keeps the speaker badge and transcript text on the same first line', async () => {
+    mocks.recordTranscript.mockResolvedValue({
+      schemaVersion: 1,
+      recordId: RECORD.id,
+      projectionRevision: 1,
+      state: 'ready',
+      sampleRate: 16_000,
+      provenance: {
+        provider: 'sherpa-onnx',
+        modelPackRevision: 'test',
+        onnxRuntimeVersion: 'test',
+      },
+      segments: [
+        {
+          segmentId: 'inline-speaker',
+          track: 'microphone',
+          startSample: 0,
+          endSample: 16_000,
+          text: '今天怎么样。',
+          revision: 1,
+        },
+      ],
+    });
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    const line = await screen.findByTestId('transcript-speaker-line');
+    expect(line).toHaveTextContent(/\[.*\].*今天怎么样。/i);
+    expect(line).toHaveClass('flex');
+  });
+
+  it('keeps the status beside the title and note shortcuts inside one borderless composer', async () => {
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    const titleStatus = await screen.findByTestId('record-title-status');
+    expect(titleStatus).toContainElement(screen.getByRole('status'));
+
+    const composer = screen.getByTestId('recording-note-composer');
+    expect(composer).toContainElement(
+      screen.getByRole('button', { name: /标记重点|Mark highlight/i }),
+    );
+    expect(composer).toContainElement(
+      screen.getByRole('button', { name: /添加笔记|Add note/i }),
+    );
+    expect(composer).not.toHaveClass('border');
   });
 
   it('renders the manager media clock without projecting wall time', async () => {

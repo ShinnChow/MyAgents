@@ -128,6 +128,7 @@ pub struct CaptureTrackSink {
     archive: RealtimeTrackSink,
     analysis: Option<RealtimeTrackSink>,
     activity: CaptureActivity,
+    enabled: Arc<AtomicBool>,
 }
 
 impl CaptureTrackSink {
@@ -136,6 +137,7 @@ impl CaptureTrackSink {
             archive,
             analysis,
             activity: CaptureActivity::default(),
+            enabled: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -143,7 +145,26 @@ impl CaptureTrackSink {
         self.activity.clone()
     }
 
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.activity.set_level_percent(0);
+        }
+    }
+
     pub(crate) fn push_f32(&self, samples: &[f32]) {
+        if !self.enabled() {
+            self.activity.set_level_percent(0);
+            self.archive.push_silence(samples.len());
+            if let Some(analysis) = self.analysis.as_ref() {
+                analysis.push_silence(samples.len());
+            }
+            return;
+        }
         self.activity
             .set_level_percent(self.archive.push_f32(samples));
         if let Some(analysis) = self.analysis.as_ref() {
@@ -152,6 +173,14 @@ impl CaptureTrackSink {
     }
 
     fn push_i16(&self, samples: &[i16]) {
+        if !self.enabled() {
+            self.activity.set_level_percent(0);
+            self.archive.push_silence(samples.len());
+            if let Some(analysis) = self.analysis.as_ref() {
+                analysis.push_silence(samples.len());
+            }
+            return;
+        }
         self.activity
             .set_level_percent(self.archive.push_i16(samples));
         if let Some(analysis) = self.analysis.as_ref() {
@@ -160,6 +189,14 @@ impl CaptureTrackSink {
     }
 
     fn push_i32(&self, samples: &[i32]) {
+        if !self.enabled() {
+            self.activity.set_level_percent(0);
+            self.archive.push_silence(samples.len());
+            if let Some(analysis) = self.analysis.as_ref() {
+                analysis.push_silence(samples.len());
+            }
+            return;
+        }
         self.activity
             .set_level_percent(self.archive.push_i32(samples));
         if let Some(analysis) = self.analysis.as_ref() {
@@ -168,6 +205,14 @@ impl CaptureTrackSink {
     }
 
     fn push_i8(&self, samples: &[i8]) {
+        if !self.enabled() {
+            self.activity.set_level_percent(0);
+            self.archive.push_silence(samples.len());
+            if let Some(analysis) = self.analysis.as_ref() {
+                analysis.push_silence(samples.len());
+            }
+            return;
+        }
         self.activity
             .set_level_percent(self.archive.push_i8(samples));
         if let Some(analysis) = self.analysis.as_ref() {
@@ -176,6 +221,14 @@ impl CaptureTrackSink {
     }
 
     fn push_planar_f32(&self, planes: &[&[f32]]) {
+        if !self.enabled() {
+            self.activity.set_level_percent(0);
+            self.archive.push_planar_silence(planes);
+            if let Some(analysis) = self.analysis.as_ref() {
+                analysis.push_planar_silence(planes);
+            }
+            return;
+        }
         self.activity
             .set_level_percent(self.archive.push_planar_f32(planes));
         if let Some(analysis) = self.analysis.as_ref() {
@@ -380,7 +433,7 @@ impl CaptureBackend for PlatformCaptureBackend {
             streams,
             #[cfg(target_os = "macos")]
             screen_stream,
-            stopped: false,
+            state: CaptureRunState::Running,
         }))
     }
 }
@@ -443,16 +496,31 @@ fn request_access_when_missing(
     preflight() || request()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureRunState {
+    Running,
+    Paused,
+    Stopped,
+}
+
+impl CaptureRunState {
+    fn begin_stop(&mut self) -> bool {
+        let stop_running_devices = *self == Self::Running;
+        *self = Self::Stopped;
+        stop_running_devices
+    }
+}
+
 struct PlatformCaptureSession {
     streams: Vec<cpal::Stream>,
     #[cfg(target_os = "macos")]
     screen_stream: Option<screencapturekit::stream::SCStream>,
-    stopped: bool,
+    state: CaptureRunState,
 }
 
 impl CaptureSession for PlatformCaptureSession {
     fn pause(&mut self) -> Result<(), String> {
-        if self.stopped {
+        if self.state != CaptureRunState::Running {
             return Ok(());
         }
         for stream in &self.streams {
@@ -466,13 +534,20 @@ impl CaptureSession for PlatformCaptureSession {
                 .stop_capture()
                 .map_err(|error| format!("pause system audio capture: {error}"))?;
         }
+        self.state = CaptureRunState::Paused;
         Ok(())
     }
 
     fn resume(&mut self) -> Result<(), String> {
-        if self.stopped {
+        if self.state == CaptureRunState::Stopped {
             return Err("capture session already stopped".to_string());
         }
+        if self.state == CaptureRunState::Running {
+            return Ok(());
+        }
+        // If restarting only partially succeeds, settlement must still try to
+        // stop every device that may have resumed.
+        self.state = CaptureRunState::Running;
         for stream in &self.streams {
             stream
                 .play()
@@ -488,10 +563,9 @@ impl CaptureSession for PlatformCaptureSession {
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        if self.stopped {
+        if !self.state.begin_stop() {
             return Ok(());
         }
-        self.stopped = true;
         let mut failures = Vec::new();
         for stream in &self.streams {
             if let Err(error) = stream.pause() {
@@ -509,6 +583,42 @@ impl CaptureSession for PlatformCaptureSession {
         } else {
             Err(failures.join("; "))
         }
+    }
+}
+
+#[cfg(test)]
+mod capture_sink_tests {
+    use super::{CaptureRunState, CaptureTrackSink};
+    use crate::recording::audio::{create_realtime_ring, SourceFormat};
+    use ringbuf::traits::Consumer;
+
+    #[test]
+    fn disabled_source_writes_silence_without_shortening_its_timeline() {
+        let format = SourceFormat {
+            sample_rate: 48_000,
+            channels: 1,
+        };
+        let mut archive = create_realtime_ring(format, 1).unwrap();
+        let analysis = create_realtime_ring(format, 1).unwrap();
+        let sink = CaptureTrackSink::new(archive.sink.clone(), Some(analysis.sink));
+
+        sink.push_f32(&[0.5; 4]);
+        sink.set_enabled(false);
+        sink.push_f32(&[0.8; 4]);
+
+        let mut samples = [0.0; 8];
+        assert_eq!(archive.consumer.pop_slice(&mut samples), samples.len());
+        assert_eq!(&samples[..4], &[0.5; 4]);
+        assert_eq!(&samples[4..], &[0.0; 4]);
+        assert_eq!(sink.activity().level_percent(), 0);
+    }
+
+    #[test]
+    fn stopping_a_paused_session_does_not_stop_platform_streams_twice() {
+        let mut state = CaptureRunState::Paused;
+        assert!(!state.begin_stop());
+        assert_eq!(state, CaptureRunState::Stopped);
+        assert!(!state.begin_stop());
     }
 }
 

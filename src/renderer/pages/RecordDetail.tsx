@@ -28,6 +28,7 @@ import {
   recordMergeSpeakers,
   recordingPause,
   recordingResume,
+  recordingSetSourceEnabled,
   recordingSnapshot,
   recordingStop,
   recordStartTranscription,
@@ -202,6 +203,7 @@ export default function RecordDetail({
   const [playing, setPlaying] = useState(false);
   const [playbackMs, setPlaybackMs] = useState(0);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const secondaryAudioRef = useRef<HTMLAudioElement>(null);
   const snapshotRef = useRef(snapshot);
   const noteAnchorRef = useRef<number | null>(null);
   const noteStartedWallRef = useRef<number | null>(null);
@@ -319,7 +321,7 @@ export default function RecordDetail({
         .catch(() => undefined);
     };
     refreshSnapshot();
-    const timer = window.setInterval(refreshSnapshot, 400);
+    const timer = window.setInterval(refreshSnapshot, 500);
     return () => window.clearInterval(timer);
   }, [isActive, onRecordingSnapshotChange, ownsCaptureSlot, recordId]);
 
@@ -351,6 +353,28 @@ export default function RecordDetail({
           action === 'pause'
             ? await recordingPause(current)
             : await recordingResume(current);
+        setSnapshot(next);
+        onRecordingSnapshotChange?.(next);
+      } catch (error) {
+        toast.error(
+          t('records.controlFailed', {
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      } finally {
+        setBusyAction(null);
+      }
+    },
+    [onRecordingSnapshotChange, t, toast],
+  );
+
+  const runSourceControl = useCallback(
+    async (track: 'microphone' | 'system', enabled: boolean) => {
+      const current = snapshotRef.current;
+      if (!current) return;
+      setBusyAction(`source-${track}`);
+      try {
+        const next = await recordingSetSourceEnabled(current, track, enabled);
         setSnapshot(next);
         onRecordingSnapshotChange?.(next);
       } catch (error) {
@@ -713,15 +737,33 @@ export default function RecordDetail({
     () => record?.audio?.tracks ?? [],
     [record?.audio?.tracks],
   );
-  const selectedTrack = tracks.includes(playbackTrack)
+  const canMixPhysicalTracks =
+    tracks.includes('microphone') && tracks.includes('system');
+  const playbackTracks = useMemo<Array<typeof playbackTrack>>(() => {
+    const available = [...tracks];
+    if (canMixPhysicalTracks && !available.includes('mixed')) {
+      available.unshift('mixed');
+    }
+    return available;
+  }, [canMixPhysicalTracks, tracks]);
+  const selectedTrack = playbackTracks.includes(playbackTrack)
     ? playbackTrack
-    : tracks[0];
-  const audioSrc = selectedTrack
-    ? recordMediaUrl(recordId, selectedTrack)
+    : playbackTracks[0];
+  const selectedPhysicalTracks = useMemo<Array<typeof playbackTrack>>(() => {
+    if (selectedTrack !== 'mixed') return selectedTrack ? [selectedTrack] : [];
+    if (tracks.includes('mixed')) return ['mixed'];
+    if (canMixPhysicalTracks) return ['microphone', 'system'];
+    return tracks[0] ? [tracks[0]] : [];
+  }, [canMixPhysicalTracks, selectedTrack, tracks]);
+  const audioSrc = selectedPhysicalTracks[0]
+    ? recordMediaUrl(recordId, selectedPhysicalTracks[0])
+    : undefined;
+  const secondaryAudioSrc = selectedPhysicalTracks[1]
+    ? recordMediaUrl(recordId, selectedPhysicalTracks[1])
     : undefined;
   useEffect(() => {
     playbackSessionTrackedRef.current = false;
-  }, [audioSrc]);
+  }, [audioSrc, secondaryAudioSrc]);
 
   const trackPlaybackSession = useCallback(() => {
     if (playbackSessionTrackedRef.current) return;
@@ -742,8 +784,10 @@ export default function RecordDetail({
     const mediaMs = Math.max(0, seekMediaMs);
     setPlaybackMs(mediaMs);
     const audio = audioRef.current;
+    const secondaryAudio = secondaryAudioRef.current;
     if (audio && audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
       audio.currentTime = mediaMs / 1_000;
+      if (secondaryAudio) secondaryAudio.currentTime = mediaMs / 1_000;
       pendingSeekRef.current = null;
     } else {
       pendingSeekRef.current = mediaMs;
@@ -754,8 +798,62 @@ export default function RecordDetail({
     const audio = audioRef.current;
     if (!audio) return;
     audio.currentTime = mediaMs / 1_000;
+    if (secondaryAudioRef.current) {
+      secondaryAudioRef.current.currentTime = mediaMs / 1_000;
+    }
     setPlaybackMs(mediaMs);
   }, []);
+
+  const togglePlayback = useCallback(() => {
+    const audio = audioRef.current;
+    const secondaryAudio = secondaryAudioRef.current;
+    if (!audio) return;
+    if (!audio.paused) {
+      audio.pause();
+      secondaryAudio?.pause();
+      return;
+    }
+    if (secondaryAudio) secondaryAudio.currentTime = audio.currentTime;
+    const plays = [audio.play()];
+    if (secondaryAudio) plays.push(secondaryAudio.play());
+    void Promise.all(plays).catch(() => {
+      audio.pause();
+      secondaryAudio?.pause();
+    });
+  }, []);
+
+  const switchPlaybackTrack = useCallback(
+    (nextTrack: typeof playbackTrack) => {
+      const audio = audioRef.current;
+      const nextPrimaryTrack =
+        nextTrack === 'mixed'
+          ? tracks.includes('mixed')
+            ? 'mixed'
+            : canMixPhysicalTracks
+              ? 'microphone'
+              : tracks[0]
+          : nextTrack;
+      const primaryWillReload = selectedPhysicalTracks[0] !== nextPrimaryTrack;
+      const primaryReady =
+        audio?.readyState !== undefined &&
+        audio.readyState >= HTMLMediaElement.HAVE_METADATA;
+      const mediaMs =
+        pendingSeekRef.current ??
+        (audio && primaryReady
+          ? Math.max(0, audio.currentTime * 1_000)
+          : playbackMs);
+      audio?.pause();
+      secondaryAudioRef.current?.pause();
+      pendingSeekRef.current =
+        primaryWillReload || !primaryReady ? mediaMs : null;
+      if (!primaryWillReload && primaryReady && audio) {
+        audio.currentTime = mediaMs / 1_000;
+      }
+      setPlaying(false);
+      setPlaybackTrack(nextTrack);
+    },
+    [canMixPhysicalTracks, playbackMs, selectedPhysicalTracks, tracks],
+  );
 
   const speakerIdFor = useCallback(
     (segment: RecordTranscriptSegment): number | null => {
@@ -832,11 +930,11 @@ export default function RecordDetail({
   );
   const playbackTrackOptions = useMemo(
     () =>
-      tracks.map((track) => ({
+      playbackTracks.map((track) => ({
         value: track,
         label: t(`records.${track}`),
       })),
-    [t, tracks],
+    [playbackTracks, t],
   );
 
   const handleRenameSpeaker = useCallback(
@@ -961,7 +1059,10 @@ export default function RecordDetail({
               (segment.startSample * 1_000) / transcript.sampleRate,
             )}
           </button>
-          <div className="min-w-0">
+          <div
+            data-testid="transcript-speaker-line"
+            className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1"
+          >
             {currentSpeakerId !== null && activeSpeakers.length > 0 ? (
               <CustomSelect
                 value={String(currentSpeakerId)}
@@ -971,15 +1072,15 @@ export default function RecordDetail({
                 }
                 disabled={busyAction !== null}
                 compact
-                className="mb-1 w-fit min-w-28 [&>button]:border-0 [&>button]:bg-[var(--paper-inset)]"
+                className="w-fit min-w-24 shrink-0 self-start [&>button]:border-0 [&>button]:bg-[var(--paper-inset)] [&>button]:py-0.5"
                 ariaLabel={t('records.reassignSegmentSpeaker')}
               />
             ) : (
-              <span className="mb-1 inline-flex rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-1.5 py-0.5 text-xs font-medium text-[var(--ink-secondary)]">
-                {speakerFor(segment)}
+              <span className="inline-flex shrink-0 rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-1.5 py-0.5 text-xs font-medium text-[var(--ink-secondary)]">
+                [{speakerFor(segment)}]
               </span>
             )}
-            <p className="text-sm leading-relaxed text-[var(--ink)]">
+            <p className="min-w-0 flex-1 text-sm leading-relaxed text-[var(--ink)]">
               {segment.text}
             </p>
           </div>
@@ -1136,29 +1237,39 @@ export default function RecordDetail({
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden bg-[var(--paper)] text-[var(--ink)]">
       <header className="flex h-[52px] shrink-0 items-center gap-3 px-5">
-        <input
-          value={titleDraft}
-          onChange={(event) => {
-            titleDraftRef.current = event.target.value;
-            titleDirtyRef.current = true;
-            setTitleDraft(event.target.value);
-          }}
-          onBlur={() => queueMetadataSave(titleDraft, parseTagDraft(tagDraft))}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') event.currentTarget.blur();
-          }}
-          aria-label={t('records.titleLabel')}
-          className="min-w-0 flex-1 truncate bg-transparent text-base font-semibold text-[var(--ink)] outline-none"
-        />
-        <span
-          className="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-[var(--ink-muted)]"
-          role="status"
-          aria-live="polite"
-          data-status={captureStatus ?? transcriptionStatus}
+        <div
+          data-testid="record-title-status"
+          className="flex min-w-0 flex-1 items-center gap-2"
         >
-          <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
-          {statusLabel}
-        </span>
+          <input
+            value={titleDraft}
+            onChange={(event) => {
+              titleDraftRef.current = event.target.value;
+              titleDirtyRef.current = true;
+              setTitleDraft(event.target.value);
+            }}
+            onBlur={() =>
+              queueMetadataSave(titleDraft, parseTagDraft(tagDraft))
+            }
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') event.currentTarget.blur();
+            }}
+            aria-label={t('records.titleLabel')}
+            className="min-w-20 max-w-[calc(100%_-_88px)] truncate bg-transparent text-base font-semibold text-[var(--ink)] outline-none"
+            style={{
+              width: `${Math.min(48, Math.max(8, Array.from(titleDraft).length + 1))}ch`,
+            }}
+          />
+          <span
+            className="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-[var(--ink-muted)]"
+            role="status"
+            aria-live="polite"
+            data-status={captureStatus ?? transcriptionStatus}
+          >
+            <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
+            {statusLabel}
+          </span>
+        </div>
         <DropdownMenu
           sections={recordActionSections}
           size="md"
@@ -1188,30 +1299,65 @@ export default function RecordDetail({
                 data-testid="recording-source-meters"
               >
                 {(snapshot?.sources ?? []).map((source) => {
-                  const level =
-                    snapshot?.sourceActivity.find(
-                      (activity) => activity.track === source.track,
-                    )?.levelPercent ?? 0;
+                  const activity = snapshot?.sourceActivity.find(
+                    (candidate) => candidate.track === source.track,
+                  );
+                  const enabled = activity?.enabled ?? true;
+                  const level = enabled ? (activity?.levelPercent ?? 0) : 0;
+                  const sourceLabel = t(`records.${source.track}`);
                   return (
-                    <div
+                    <button
+                      type="button"
                       key={source.track}
                       data-testid="recording-source-meter"
-                      className="grid min-w-0 grid-cols-[64px_minmax(48px,1fr)_32px] items-center gap-2 text-xs"
-                      aria-label={`${t(`records.${source.track}`)} ${level}%`}
+                      aria-pressed={enabled}
+                      aria-label={t(
+                        enabled
+                          ? 'records.sourceEnabledLabel'
+                          : 'records.sourceDisabledLabel',
+                        { source: sourceLabel },
+                      )}
+                      title={t(
+                        enabled
+                          ? 'records.sourceEnabledHint'
+                          : 'records.sourceDisabledHint',
+                        { source: sourceLabel },
+                      )}
+                      disabled={
+                        busyAction !== null ||
+                        !['recording', 'paused'].includes(
+                          snapshot?.captureStatus ?? '',
+                        ) ||
+                        source.track === 'mixed'
+                      }
+                      onClick={() => {
+                        if (
+                          source.track === 'microphone' ||
+                          source.track === 'system'
+                        ) {
+                          void runSourceControl(source.track, !enabled);
+                        }
+                      }}
+                      className={`grid min-w-0 grid-cols-[72px_minmax(48px,1fr)_16px] items-center gap-2 rounded-[var(--radius-sm)] px-1 py-0.5 text-left text-xs transition-colors hover:bg-[var(--paper)]/10 disabled:cursor-default ${enabled ? '' : 'opacity-45'}`}
                     >
-                      <span className="truncate opacity-75">
-                        {t(`records.${source.track}`)}
+                      <span
+                        className={`truncate ${enabled ? 'opacity-80' : 'line-through'}`}
+                      >
+                        {sourceLabel}
                       </span>
                       <span className="h-1.5 min-w-0 overflow-hidden rounded-full bg-[var(--paper)]/20">
                         <span
-                          className="block h-full rounded-full bg-[var(--success)] transition-[width] duration-150"
-                          style={{ width: `${level}%` }}
+                          className="block h-full origin-left rounded-full bg-[var(--success)] transition-transform duration-300 ease-out"
+                          style={{ transform: `scaleX(${level / 100})` }}
                         />
                       </span>
-                      <span className="text-right font-mono tabular-nums opacity-55">
-                        {level}%
+                      <span
+                        aria-hidden="true"
+                        className="flex justify-end opacity-70"
+                      >
+                        {!enabled && <X className="h-3 w-3" />}
                       </span>
-                    </div>
+                    </button>
                   );
                 })}
                 {systemAudioDowngraded && (
@@ -1265,10 +1411,7 @@ export default function RecordDetail({
                 type="button"
                 disabled={!audioSrc}
                 onClick={() => {
-                  const audio = audioRef.current;
-                  if (!audio) return;
-                  if (audio.paused) void audio.play();
-                  else audio.pause();
+                  togglePlayback();
                 }}
                 className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--paper)] text-[var(--ink)] disabled:opacity-40"
                 aria-label={
@@ -1310,12 +1453,12 @@ export default function RecordDetail({
                   aria-label={t('records.duration')}
                 />
               </div>
-              {tracks.length > 1 && (
+              {playbackTracks.length > 1 && (
                 <CustomSelect
                   value={selectedTrack}
                   options={playbackTrackOptions}
                   onChange={(value) =>
-                    setPlaybackTrack(value as typeof playbackTrack)
+                    switchPlaybackTrack(value as typeof playbackTrack)
                   }
                   compact
                   className="w-24 shrink-0 [&>button]:border-0 [&>button]:bg-[var(--paper)]/12 [&>button]:text-white"
@@ -1328,6 +1471,7 @@ export default function RecordDetail({
           <audio
             ref={audioRef}
             src={audioSrc}
+            data-testid="recording-primary-audio"
             preload="metadata"
             onLoadedMetadata={(event) => {
               const pending = pendingSeekRef.current;
@@ -1342,13 +1486,34 @@ export default function RecordDetail({
             }}
             onPause={() => setPlaying(false)}
             onEnded={() => {
+              secondaryAudioRef.current?.pause();
               setPlaying(false);
               playbackSessionTrackedRef.current = false;
             }}
-            onTimeUpdate={(event) =>
-              setPlaybackMs(event.currentTarget.currentTime * 1_000)
-            }
+            onTimeUpdate={(event) => {
+              const currentTime = event.currentTarget.currentTime;
+              const secondaryAudio = secondaryAudioRef.current;
+              if (
+                secondaryAudio &&
+                Math.abs(secondaryAudio.currentTime - currentTime) > 0.12
+              ) {
+                secondaryAudio.currentTime = currentTime;
+              }
+              setPlaybackMs(currentTime * 1_000);
+            }}
           />
+          {secondaryAudioSrc && (
+            <audio
+              ref={secondaryAudioRef}
+              src={secondaryAudioSrc}
+              data-testid="recording-secondary-audio"
+              preload="metadata"
+              onLoadedMetadata={(event) => {
+                event.currentTarget.currentTime =
+                  audioRef.current?.currentTime ?? playbackMs / 1_000;
+              }}
+            />
+          )}
         </section>
 
         <section className="col-start-1 row-start-2 flex min-h-0 flex-col py-4 pr-2 max-lg:row-start-2">
@@ -1729,56 +1894,63 @@ export default function RecordDetail({
 
           {ownsCaptureSlot && (
             <div className="shrink-0 p-3 pt-2">
-              <textarea
-                value={noteDraft}
-                aria-label={t('records.notePlaceholder')}
-                onChange={(event) => {
-                  const next = event.target.value;
-                  if (next.trim() && noteAnchorRef.current === null) {
-                    noteAnchorRef.current = currentMediaMs();
-                    noteStartedWallRef.current = Date.now();
-                  } else if (!next.trim()) {
-                    noteAnchorRef.current = null;
-                    noteStartedWallRef.current = null;
-                  }
-                  setNoteDraft(next);
-                }}
-                onCompositionStart={() => {
-                  composingRef.current = true;
-                }}
-                onCompositionEnd={() => {
-                  composingRef.current = false;
-                }}
-                onKeyDown={(event) => {
-                  if (
-                    event.key === 'Enter' &&
-                    !event.shiftKey &&
-                    !composingRef.current
-                  ) {
-                    event.preventDefault();
-                    void submitNote();
-                  }
-                }}
-                placeholder={t('records.notePlaceholder')}
-                className="min-h-24 w-full resize-none rounded-[var(--radius-md)] bg-[var(--paper-inset)] px-3 py-2 text-sm leading-relaxed text-[var(--ink)] outline-none placeholder:text-[var(--ink-muted)] focus:ring-1 focus:ring-[var(--accent-warm)]"
-              />
-              <div className="mt-2 flex items-center justify-between">
-                <button
-                  type="button"
-                  onClick={() => void handleMark()}
-                  disabled={busyAction !== null}
-                  className="rounded-[var(--radius-md)] px-3 py-2 text-sm font-medium text-[var(--accent-warm)] hover:bg-[var(--accent-warm-subtle)] disabled:opacity-50"
-                >
-                  {t('records.mark')}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void submitNote()}
-                  disabled={!noteDraft.trim() || busyAction !== null}
-                  className="rounded-[var(--radius-md)] bg-[var(--button-primary-bg)] px-3 py-2 text-sm font-semibold text-[var(--button-primary-text)] hover:bg-[var(--button-primary-bg-hover)] disabled:opacity-40"
-                >
-                  {t('records.addNote')}
-                </button>
+              <div
+                data-testid="recording-note-composer"
+                className="rounded-[var(--radius-lg)] bg-[var(--paper-inset)] px-3 pb-2 pt-3 focus-within:ring-1 focus-within:ring-[var(--accent-warm)]"
+              >
+                <textarea
+                  value={noteDraft}
+                  aria-label={t('records.notePlaceholder')}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    if (next.trim() && noteAnchorRef.current === null) {
+                      noteAnchorRef.current = currentMediaMs();
+                      noteStartedWallRef.current = Date.now();
+                    } else if (!next.trim()) {
+                      noteAnchorRef.current = null;
+                      noteStartedWallRef.current = null;
+                    }
+                    setNoteDraft(next);
+                  }}
+                  onCompositionStart={() => {
+                    composingRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    composingRef.current = false;
+                  }}
+                  onKeyDown={(event) => {
+                    if (
+                      event.key === 'Enter' &&
+                      !event.shiftKey &&
+                      !composingRef.current &&
+                      !event.nativeEvent.isComposing &&
+                      event.keyCode !== 229
+                    ) {
+                      event.preventDefault();
+                      void submitNote();
+                    }
+                  }}
+                  placeholder={t('records.notePlaceholder')}
+                  className="min-h-20 w-full resize-none bg-transparent text-sm leading-relaxed text-[var(--ink)] outline-none placeholder:text-[var(--ink-muted)]"
+                />
+                <div className="mt-2 flex items-center justify-end gap-1">
+                  <button
+                    type="button"
+                    onClick={() => void handleMark()}
+                    disabled={busyAction !== null}
+                    className="rounded-[var(--radius-md)] px-3 py-1.5 text-sm font-medium text-[var(--accent-warm)] hover:bg-[var(--accent-warm-subtle)] disabled:opacity-50"
+                  >
+                    {t('records.mark')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void submitNote()}
+                    disabled={!noteDraft.trim() || busyAction !== null}
+                    className="rounded-[var(--radius-md)] bg-[var(--button-primary-bg)] px-3 py-1.5 text-sm font-semibold text-[var(--button-primary-text)] hover:bg-[var(--button-primary-bg-hover)] disabled:opacity-40"
+                  >
+                    {t('records.addNote')}
+                  </button>
+                </div>
               </div>
             </div>
           )}

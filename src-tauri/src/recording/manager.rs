@@ -17,8 +17,8 @@ use super::archive::{
     recover_ogg_opus_archive, ArchiveResult, TrackArchiveHandle, ARCHIVE_SAMPLE_RATE,
 };
 use super::capture::{
-    CaptureActivity, CaptureBackend, CaptureEvent, CapturePlan, CaptureSelection, CaptureSession,
-    CaptureSinks, CaptureTrackSink, PlatformCaptureBackend, PreparedSource,
+    CaptureBackend, CaptureEvent, CapturePlan, CaptureSelection, CaptureSession, CaptureSinks,
+    CaptureTrackSink, PlatformCaptureBackend, PreparedSource,
 };
 use super::lifecycle::{LifecycleEvent, LifecycleJournal};
 use crate::record::{
@@ -55,6 +55,7 @@ pub struct RecordingWarning {
 pub struct RecordingSourceActivity {
     pub track: AudioTrackKind,
     pub level_percent: u8,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,11 +106,21 @@ pub struct RecordingCommandInput {
     pub operation_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingSourceCommandInput {
+    pub record_id: String,
+    pub operation_id: String,
+    pub track: AudioTrackKind,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperationKind {
     Start,
     Pause,
     Resume,
+    SetSource,
     Stop,
 }
 
@@ -152,7 +163,7 @@ struct ActiveRecording {
     pause_count: usize,
     capture_plan: CapturePlan,
     sources: Vec<PreparedSource>,
-    source_activity: Vec<(AudioTrackKind, CaptureActivity)>,
+    source_sinks: Vec<(AudioTrackKind, CaptureTrackSink)>,
     warnings: Vec<RecordingWarning>,
     journal: LifecycleJournal,
     session: Option<Arc<StdMutex<Box<dyn CaptureSession>>>>,
@@ -187,15 +198,26 @@ impl ActiveRecording {
             ),
             sources: self.sources.clone(),
             source_activity: self
-                .source_activity
+                .sources
                 .iter()
-                .map(|(track, activity)| RecordingSourceActivity {
-                    track: *track,
-                    level_percent: if self.capture_status == CaptureStatus::Recording {
-                        activity.level_percent()
-                    } else {
-                        0
-                    },
+                .map(|source| {
+                    let sink = self
+                        .source_sinks
+                        .iter()
+                        .find(|(track, _)| *track == source.track)
+                        .map(|(_, sink)| sink);
+                    let enabled = sink.is_none_or(CaptureTrackSink::enabled);
+                    RecordingSourceActivity {
+                        track: source.track,
+                        level_percent: if self.capture_status == CaptureStatus::Recording && enabled
+                        {
+                            sink.map(|sink| sink.activity().level_percent())
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        },
+                        enabled,
+                    }
                 })
                 .collect(),
             warnings: self.warnings.clone(),
@@ -752,7 +774,7 @@ impl RecordingManager {
             pause_count: 0,
             capture_plan: plan.clone(),
             sources: plan.sources.clone(),
-            source_activity: Vec::new(),
+            source_sinks: Vec::new(),
             warnings,
             journal,
             session: None,
@@ -780,8 +802,8 @@ impl RecordingManager {
             let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
                 return Err("recording admission was superseded".to_string());
             };
-            let (sinks, source_activity) = capture_sinks(&active.archives, &active.analyses);
-            active.source_activity = source_activity;
+            let (sinks, source_sinks) = capture_sinks(&active.archives, &active.analyses);
+            active.source_sinks = source_sinks;
             sinks
         };
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -1206,6 +1228,58 @@ impl RecordingManager {
         .await
     }
 
+    pub async fn set_source_enabled(
+        self: &Arc<Self>,
+        input: RecordingSourceCommandInput,
+    ) -> Result<RecordingSnapshot, String> {
+        validate_operation_id(&input.operation_id)?;
+        if input.track == AudioTrackKind::Mixed {
+            return Err("RECORDING_SOURCE_NOT_PHYSICAL".to_string());
+        }
+        let _operation = self.operation_gate.lock().await;
+        {
+            let state = self.state.lock().await;
+            if let Some(result) =
+                operation_result(&state, &input.operation_id, OperationKind::SetSource)?
+            {
+                return Ok(result);
+            }
+        }
+        let snapshot = {
+            let mut state = self.state.lock().await;
+            let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
+                return Err("RECORDING_NOT_ACTIVE".to_string());
+            };
+            if active.record_id != input.record_id {
+                return Err("RECORDING_RECORD_MISMATCH".to_string());
+            }
+            if !matches!(
+                active.capture_status,
+                CaptureStatus::Recording | CaptureStatus::Paused
+            ) {
+                return Err("RECORDING_TRANSITION_NOT_ALLOWED".to_string());
+            }
+            let Some((_, sink)) = active
+                .source_sinks
+                .iter()
+                .find(|(track, _)| *track == input.track)
+            else {
+                return Err("RECORDING_SOURCE_NOT_ACTIVE".to_string());
+            };
+            sink.set_enabled(input.enabled);
+            let snapshot = active.snapshot();
+            remember_operation(
+                &mut state,
+                input.operation_id,
+                OperationKind::SetSource,
+                snapshot.clone(),
+            );
+            snapshot
+        };
+        self.emit_change(snapshot.clone(), true);
+        Ok(snapshot)
+    }
+
     pub async fn stop_for_app_exit(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operation_gate.lock().await;
         let generation = {
@@ -1626,8 +1700,21 @@ impl RecordingManager {
                 active.media_before_segment_ms = media_ms;
                 active.segment_started = None;
             }
-            let (sinks, source_activity) = capture_sinks(&active.archives, &active.analyses);
-            active.source_activity = source_activity;
+            let enabled_sources = active
+                .source_sinks
+                .iter()
+                .map(|(track, sink)| (*track, sink.enabled()))
+                .collect::<Vec<_>>();
+            let (sinks, source_sinks) = capture_sinks(&active.archives, &active.analyses);
+            for (track, sink) in &source_sinks {
+                if let Some((_, enabled)) = enabled_sources
+                    .iter()
+                    .find(|(enabled_track, _)| enabled_track == track)
+                {
+                    sink.set_enabled(*enabled);
+                }
+            }
+            active.source_sinks = source_sinks;
             let repaired_tracks = active
                 .capture_plan
                 .sources
@@ -2135,26 +2222,26 @@ fn checkpoint_analyses(
 fn capture_sinks(
     archives: &[TrackArchiveHandle],
     analyses: &[TrackAnalysisHandle],
-) -> (CaptureSinks, Vec<(AudioTrackKind, CaptureActivity)>) {
+) -> (CaptureSinks, Vec<(AudioTrackKind, CaptureTrackSink)>) {
     let mut sinks = CaptureSinks {
         microphone: None,
         system: None,
     };
-    let mut source_activity = Vec::new();
+    let mut source_sinks = Vec::new();
     for archive in archives {
         let analysis = analyses
             .iter()
             .find(|analysis| analysis.track == archive.track)
             .map(|analysis| analysis.sink.clone());
         let sink = CaptureTrackSink::new(archive.sink.clone(), analysis);
-        source_activity.push((archive.track, sink.activity()));
+        source_sinks.push((archive.track, sink.clone()));
         match archive.track {
             AudioTrackKind::Microphone => sinks.microphone = Some(sink),
             AudioTrackKind::System => sinks.system = Some(sink),
             _ => {}
         }
     }
-    (sinks, source_activity)
+    (sinks, source_sinks)
 }
 
 fn operation_result(
@@ -2482,6 +2569,14 @@ pub async fn cmd_recording_resume(
 }
 
 #[tauri::command]
+pub async fn cmd_recording_set_source_enabled(
+    state: tauri::State<'_, ManagedRecordingManager>,
+    input: RecordingSourceCommandInput,
+) -> Result<RecordingSnapshot, String> {
+    state.inner().set_source_enabled(input).await
+}
+
+#[tauri::command]
 pub async fn cmd_recording_stop(
     state: tauri::State<'_, ManagedRecordingManager>,
     input: RecordingCommandInput,
@@ -2759,6 +2854,113 @@ mod tests {
         assert_eq!(stopped.capture_status, CaptureStatus::Ready);
         assert!(manager.snapshot().await.is_none());
 
+        let record = store.get(&stopped.record_id).await.unwrap();
+        assert_eq!(
+            record.audio.as_ref().unwrap().capture_status,
+            CaptureStatus::Ready
+        );
+        assert_eq!(record.artifacts.len(), 2);
+        assert!(record
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.kind == "audio/ogg-opus" && artifact.size_bytes > 0));
+    }
+
+    #[tokio::test]
+    async fn one_source_can_be_excluded_and_restored_inside_the_same_generation() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let manager = RecordingManager::with_backend(store.clone(), Arc::new(FakeBackend), false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-source-toggle".to_string(),
+                selection: CaptureSelection {
+                    microphone: true,
+                    system: false,
+                },
+            })
+            .await
+            .unwrap();
+
+        let updated_record = store
+            .update_audio_metadata(crate::record::AudioRecordMetadataUpdateInput {
+                id: started.snapshot.record_id.clone(),
+                expected_revision: started.snapshot.revision,
+                title: "Renamed while recording".to_string(),
+                tags: vec!["meeting".to_string()],
+            })
+            .await
+            .unwrap();
+
+        let disabled = manager
+            .set_source_enabled(RecordingSourceCommandInput {
+                record_id: started.snapshot.record_id.clone(),
+                operation_id: "disable-microphone".to_string(),
+                track: AudioTrackKind::Microphone,
+                enabled: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(disabled.generation, started.snapshot.generation);
+        assert_eq!(disabled.source_activity.len(), 1);
+        assert!(!disabled.source_activity[0].enabled);
+        assert_eq!(disabled.source_activity[0].level_percent, 0);
+
+        let enabled = manager
+            .set_source_enabled(RecordingSourceCommandInput {
+                record_id: disabled.record_id.clone(),
+                operation_id: "enable-microphone".to_string(),
+                track: AudioTrackKind::Microphone,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(enabled.generation, started.snapshot.generation);
+        assert!(enabled.source_activity[0].enabled);
+
+        let stopped = manager
+            .stop(RecordingCommandInput {
+                record_id: enabled.record_id,
+                expected_revision: updated_record.revision,
+                operation_id: "stop-source-toggle".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stopped.capture_status, CaptureStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn stopping_while_paused_commits_ready_audio_artifacts() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let manager = RecordingManager::with_backend(store.clone(), Arc::new(FakeBackend), false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-paused-stop".to_string(),
+                selection: CaptureSelection::default(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        let paused = manager
+            .pause(RecordingCommandInput {
+                record_id: started.snapshot.record_id,
+                expected_revision: started.snapshot.revision,
+                operation_id: "pause-before-stop".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stopped = manager
+            .stop(RecordingCommandInput {
+                record_id: paused.record_id,
+                expected_revision: paused.revision,
+                operation_id: "stop-while-paused".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(stopped.capture_status, CaptureStatus::Ready);
         let record = store.get(&stopped.record_id).await.unwrap();
         assert_eq!(
             record.audio.as_ref().unwrap().capture_status,

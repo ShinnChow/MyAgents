@@ -723,6 +723,7 @@ pub fn run() {
             recording::manager::cmd_recording_start,
             recording::manager::cmd_recording_pause,
             recording::manager::cmd_recording_resume,
+            recording::manager::cmd_recording_set_source_enabled,
             recording::manager::cmd_recording_stop,
             recording::privacy_settings::cmd_open_recording_privacy_settings,
             // Task Center — Thought commands (v0.1.69)

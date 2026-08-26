@@ -83,6 +83,7 @@ export interface RecordingWarning {
 export interface RecordingSourceActivity {
   track: 'microphone' | 'system' | 'mixed';
   levelPercent: number;
+  enabled: boolean;
 }
 
 export interface RecordingSnapshot {

@@ -115,6 +115,20 @@ impl RealtimeTrackSink {
         peak_percent(peak)
     }
 
+    /// Preserve the source timeline while intentionally excluding its content.
+    /// This stays allocation-free on the realtime callback thread.
+    pub fn push_silence(&self, sample_count: usize) -> u8 {
+        self.push_converted(std::iter::repeat_n(0.0, sample_count))
+    }
+
+    pub fn push_planar_silence(&self, planes: &[&[f32]]) -> u8 {
+        if planes.len() != self.channels as usize || planes.is_empty() {
+            return 0;
+        }
+        let frames = planes.iter().map(|plane| plane.len()).min().unwrap_or(0);
+        self.push_silence(frames.saturating_mul(self.channels as usize))
+    }
+
     fn push_converted(&self, samples: impl ExactSizeIterator<Item = f32>) -> u8 {
         if !self.accepting.load(Ordering::Acquire) {
             return 0;

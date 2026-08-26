@@ -396,6 +396,47 @@ function recordingTabProjection(
   };
 }
 
+function sameRecordingTabProjection(
+  tab: Tab,
+  snapshot: RecordingSnapshot,
+): boolean {
+  const sameSources =
+    (tab.recordingSources?.length ?? 0) === snapshot.sources.length &&
+    (tab.recordingSources ?? []).every((source, index) => {
+      const next = snapshot.sources[index];
+      return (
+        source.track === next?.track &&
+        source.label === next.label &&
+        source.format.channels === next.format.channels &&
+        source.format.sampleRate === next.format.sampleRate
+      );
+    });
+  const sameSourceStates =
+    (tab.recordingSourceActivity?.length ?? 0) ===
+      snapshot.sourceActivity.length &&
+    (tab.recordingSourceActivity ?? []).every((source, index) => {
+      const next = snapshot.sourceActivity[index];
+      return source.track === next?.track && source.enabled === next.enabled;
+    });
+  const sameWarnings =
+    (tab.recordingWarnings?.length ?? 0) === snapshot.warnings.length &&
+    (tab.recordingWarnings ?? []).every(
+      (warning, index) => warning.code === snapshot.warnings[index]?.code,
+    );
+  return (
+    tab.recordingStatus === snapshot.captureStatus &&
+    tab.recordingStartedAtWallTime === snapshot.startedAtWallTime &&
+    tab.recordingPausedWallMs === snapshot.pausedWallMs &&
+    tab.recordingRevision === snapshot.revision &&
+    tab.recordingGeneration === snapshot.generation &&
+    sameSources &&
+    sameSourceStates &&
+    sameWarnings &&
+    (snapshot.captureStatus === 'recording' ||
+      tab.recordingMediaDurationMs === snapshot.mediaDurationMs)
+  );
+}
+
 // ============================================================
 // MemoizedTabContent — prevents re-rendering tabs whose props haven't changed.
 // When switching tabs, only the newly active and previously active tabs re-render.
@@ -574,6 +615,23 @@ export const MemoizedTabContent = memo(
       (sessionId: string) => claimSessionOpeningTransition(sessionId, tab.id),
       [claimSessionOpeningTransition, tab.id],
     );
+    const recordId = tab.recordId;
+    const handleRecordSnapshotChange = useCallback(
+      (next: RecordingSnapshot | null) => {
+        if (recordId) onRecordingSnapshotChange(recordId, next);
+      },
+      [onRecordingSnapshotChange, recordId],
+    );
+    const handleRecordTitleChange = useCallback(
+      (title: string) => {
+        if (recordId) onRecordTitleChange(recordId, title);
+      },
+      [onRecordTitleChange, recordId],
+    );
+    const handleRecordDeleted = useCallback(
+      () => onRecordDeleted(tab.id),
+      [onRecordDeleted, tab.id],
+    );
     return (
       <div
         className={`absolute inset-0 ${isActive ? '' : 'pointer-events-none invisible'}`}
@@ -625,14 +683,10 @@ export const MemoizedTabContent = memo(
                     }
                   : undefined
               }
-              onRecordingSnapshotChange={(next) =>
-                onRecordingSnapshotChange(tab.recordId!, next)
-              }
+              onRecordingSnapshotChange={handleRecordSnapshotChange}
               registerPendingNoteSubmitter={registerPendingRecordNoteSubmitter}
-              onTitleChange={(title) =>
-                onRecordTitleChange(tab.recordId!, title)
-              }
-              onDeleted={() => onRecordDeleted(tab.id)}
+              onTitleChange={handleRecordTitleChange}
+              onDeleted={handleRecordDeleted}
             />
           </Suspense>
         ) : kind === 'settings' || kind === 'capabilities' ? (
@@ -3818,6 +3872,13 @@ export default function App() {
         current.map((tab) => {
           if (tab.view !== 'record' || tab.recordId !== recordId) return tab;
           if (!snapshot) {
+            if (
+              tab.recordingStatus === undefined &&
+              tab.recordingMediaDurationMs === undefined &&
+              tab.recordingGeneration === undefined
+            ) {
+              return tab;
+            }
             return {
               ...tab,
               recordingStatus: undefined,
@@ -3831,6 +3892,7 @@ export default function App() {
               recordingWarnings: undefined,
             };
           }
+          if (sameRecordingTabProjection(tab, snapshot)) return tab;
           return { ...tab, ...recordingTabProjection(snapshot) };
         }),
       );

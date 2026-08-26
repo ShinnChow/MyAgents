@@ -74,6 +74,21 @@ export function recordingResume(
   return recordingMutation('cmd_recording_resume', snapshot);
 }
 
+export function recordingSetSourceEnabled(
+  snapshot: RecordingSnapshot,
+  track: 'microphone' | 'system',
+  enabled: boolean,
+): Promise<RecordingSnapshot> {
+  return command('cmd_recording_set_source_enabled', {
+    input: {
+      recordId: snapshot.recordId,
+      operationId: crypto.randomUUID(),
+      track,
+      enabled,
+    },
+  });
+}
+
 export function recordingStop(
   snapshot: RecordingSnapshot,
 ): Promise<RecordingSnapshot> {
