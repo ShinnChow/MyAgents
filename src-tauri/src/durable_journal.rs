@@ -217,6 +217,91 @@ where
     Ok(entries)
 }
 
+/// Read the currently durable prefix without repairing the file.
+///
+/// Active journals have a single append owner, so presentation readers must
+/// never truncate a tail that may have been appended after their EOF read.
+/// Recovery/repair remains owned by `DurableRecordJournal::open` before a new
+/// writer generation starts.
+pub(crate) fn read_valid_prefix<Event>(
+    path: &Path,
+    record_id: &str,
+    schema_version: u32,
+    max_line_bytes: usize,
+) -> Result<(Vec<DurableJournalEntry<Event>>, u64), String>
+where
+    Event: DeserializeOwned + Serialize,
+{
+    read_valid_suffix(path, record_id, schema_version, max_line_bytes, 0, 1)
+}
+
+/// Read complete, checksum-valid entries appended after a previously returned
+/// byte cursor. The cursor is presentation-only; an invalid/stale cursor fails
+/// and lets the caller fall back to a fresh authoritative prefix.
+pub(crate) fn read_valid_suffix<Event>(
+    path: &Path,
+    record_id: &str,
+    schema_version: u32,
+    max_line_bytes: usize,
+    byte_offset: u64,
+    expected_seq: u64,
+) -> Result<(Vec<DurableJournalEntry<Event>>, u64), String>
+where
+    Event: DeserializeOwned + Serialize,
+{
+    validate_configuration(record_id, schema_version, max_line_bytes)?;
+    ensure_regular_or_missing(path)?;
+    let file = File::open(path).map_err(|error| format!("open durable journal: {error}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("inspect durable journal: {error}"))?
+        .len();
+    if byte_offset > file_len || expected_seq == 0 {
+        return Err("durable journal cursor is invalid".to_string());
+    }
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(byte_offset))
+        .map_err(|error| format!("seek durable journal: {error}"))?;
+    let mut entries = Vec::new();
+    let mut line = Vec::new();
+    let mut valid_len = byte_offset;
+    let mut next_seq = expected_seq;
+    loop {
+        line.clear();
+        let count = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("read durable journal: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        // An append interrupted at the instant of this read is simply not part
+        // of the current projection. The next poll will read it from the same
+        // cursor once the writer has completed the line.
+        if count > max_line_bytes + 1 || !line.ends_with(b"\n") {
+            break;
+        }
+        let parsed: JournalLine<Event> = serde_json::from_slice(&line[..line.len() - 1])
+            .map_err(|_| "durable journal entry is invalid".to_string())?;
+        let checksum = body_checksum(&parsed.body)?;
+        if parsed.body.schema_version != schema_version || parsed.body.record_id != record_id {
+            return Err("durable journal identity/schema mismatch".to_string());
+        }
+        if parsed.body.seq != next_seq || parsed.checksum != checksum {
+            return Err("durable journal sequence/checksum mismatch".to_string());
+        }
+        valid_len = valid_len.saturating_add(count as u64);
+        next_seq = next_seq.saturating_add(1);
+        entries.push(DurableJournalEntry {
+            seq: parsed.body.seq,
+            wall_time_ms: parsed.body.wall_time_ms,
+            media_ms: parsed.body.media_ms,
+            event: parsed.body.event,
+        });
+    }
+    Ok((entries, valid_len))
+}
+
 fn body_checksum<Event>(body: &JournalBody<Event>) -> Result<String, String>
 where
     Event: Serialize,
@@ -321,5 +406,42 @@ mod tests {
         assert!(journal
             .append(10, 20, TestEvent::Text("x".repeat(512)))
             .is_err());
+    }
+
+    #[test]
+    fn read_only_cursor_returns_only_new_complete_entries() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("events.jsonl");
+        let mut journal =
+            DurableRecordJournal::open(path.clone(), "record-1", TEST_SCHEMA, TEST_LINE_LIMIT)
+                .unwrap();
+        journal.append(10, 20, TestEvent::Started).unwrap();
+
+        let (first, cursor) =
+            read_valid_prefix::<TestEvent>(&path, "record-1", TEST_SCHEMA, TEST_LINE_LIMIT)
+                .unwrap();
+        assert_eq!(first.len(), 1);
+        journal
+            .append(30, 40, TestEvent::Text("stable".into()))
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"schemaVersion\":")
+            .unwrap();
+
+        let (suffix, next_cursor) = read_valid_suffix::<TestEvent>(
+            &path,
+            "record-1",
+            TEST_SCHEMA,
+            TEST_LINE_LIMIT,
+            cursor,
+            2,
+        )
+        .unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert!(next_cursor > cursor);
+        assert!(std::fs::metadata(path).unwrap().len() > next_cursor);
     }
 }

@@ -702,6 +702,7 @@ pub fn run() {
             record::cmd_record_list,
             record::cmd_record_get,
             record::cmd_record_transcript,
+            record::cmd_record_transcript_delta,
             record::cmd_record_diarization,
             record::cmd_record_rename_speaker,
             record::cmd_record_merge_speakers,

@@ -35,6 +35,42 @@ vi.mock('@/components/Toast', () => ({
 
 vi.mock('./ThoughtInput', () => ({ ThoughtInput: () => <div /> }));
 
+vi.mock('react-virtuoso', () => ({
+  Virtuoso: ({
+    data,
+    itemContent,
+    computeItemKey,
+  }: {
+    data: Array<{
+      kind: string;
+      thought?: { id: string };
+      record?: RecordSummary;
+    }>;
+    itemContent: (
+      index: number,
+      item: {
+        kind: string;
+        thought?: { id: string };
+        record?: RecordSummary;
+      },
+    ) => React.ReactNode;
+    computeItemKey: (
+      index: number,
+      item: {
+        kind: string;
+        thought?: { id: string };
+        record?: RecordSummary;
+      },
+    ) => React.Key;
+  }) => (
+    <div data-testid="record-list-virtuoso">
+      {data.map((item, index) => (
+        <div key={computeItemKey(index, item)}>{itemContent(index, item)}</div>
+      ))}
+    </div>
+  ),
+}));
+
 const AUDIO_RECORD: RecordSummary = {
   id: 'record-search',
   kind: 'audio',
@@ -92,7 +128,7 @@ describe('ThoughtPanel Record search', () => {
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /Weekly sync/ }));
-    expect(onOpenRecord).toHaveBeenCalledWith(AUDIO_RECORD.id, 42_000);
+    expect(onOpenRecord).toHaveBeenCalledWith(AUDIO_RECORD.id, 42_000, false);
   });
 
   it('names every deleted audio artifact in the bulk confirmation', async () => {
@@ -105,5 +141,32 @@ describe('ThoughtPanel Record search', () => {
     expect(
       await screen.findByText(/音频、转写、笔记和重点标记/),
     ).toBeInTheDocument();
+  });
+
+  it('preserves the last usable records when one side of a refresh fails', async () => {
+    const { rerender } = render(<ThoughtPanel refreshKey="initial" />);
+    await screen.findByText(AUDIO_RECORD.title);
+
+    mocks.recordList.mockRejectedValueOnce(
+      new Error('record list unavailable'),
+    );
+    rerender(<ThoughtPanel refreshKey="retry" />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/暂时未能加载/);
+    expect(screen.getByText(AUDIO_RECORD.title)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /重试/ })).toBeEnabled();
+  });
+
+  it('does not carry active records into the archived view after a partial failure', async () => {
+    render(<ThoughtPanel />);
+    await screen.findByText(AUDIO_RECORD.title);
+
+    mocks.recordList.mockRejectedValueOnce(
+      new Error('archived records unavailable'),
+    );
+    fireEvent.click(screen.getByRole('button', { name: '已归档' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/暂时未能加载/);
+    expect(screen.queryByText(AUDIO_RECORD.title)).not.toBeInTheDocument();
   });
 });

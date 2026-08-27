@@ -431,6 +431,7 @@ export default memo(function BrandSection({
   // this handler never sees thought content anymore.
   const handleSend = useCallback(
     (text: string, images?: ImageAttachment[]) => {
+      if (recordingBusy) return;
       // Repackage staged cron config into the InitialMessageCron shape so
       // Chat's autoSend can dispatch to startCronTask without poking back
       // into the modal's `CronSettingsResult` schema. Schedule fallback
@@ -459,7 +460,7 @@ export default memo(function BrandSection({
         : undefined;
       onSend(text, images, cron);
     },
-    [onSend, stagedCron],
+    [onSend, recordingBusy, stagedCron],
   );
 
   // Cron config for the StatusBar — derived from staged (immutable while
@@ -656,7 +657,11 @@ export default memo(function BrandSection({
         // a free-floating headline. Top gap kept at mt-6 to preserve
         // breathing room from the brand slogan above.
         <div className="mt-6 mb-3">
-          <ModeSegment value={mode} onChange={setModeAndFocus} />
+          <ModeSegment
+            value={mode}
+            onChange={setModeAndFocus}
+            disabled={recordingBusy}
+          />
         </div>
       )}
 
@@ -688,7 +693,7 @@ export default memo(function BrandSection({
                 mode="launcher"
                 active={canAcceptFileDrop}
                 onSend={handleSend}
-                isLoading={!!isStarting}
+                isLoading={!!isStarting || recordingBusy}
                 provider={provider}
                 providers={providers}
                 selectedModel={selectedModel}

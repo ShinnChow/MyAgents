@@ -31,6 +31,7 @@ export type InputMode = 'chat' | 'record';
 interface ModeSegmentProps {
   value: InputMode;
   onChange: (mode: InputMode) => void;
+  disabled?: boolean;
   /** Optional slot on the right side (e.g. info tooltip). */
   suffix?: ReactNode;
   /**
@@ -47,6 +48,7 @@ export function ModeSegment({
   onChange,
   suffix,
   tabSwitchHint = false,
+  disabled = false,
 }: ModeSegmentProps) {
   const { t } = useTranslation('chat');
   const chatTitle = tabSwitchHint ? t('input.mode.switchToRecord') : undefined;
@@ -81,22 +83,24 @@ export function ModeSegment({
       <div className="inline-flex gap-0.5 rounded-[var(--radius-md)] bg-[var(--paper-inset)] p-[3px]">
         <button
           type="button"
+          disabled={disabled}
           onClick={() => onChange('chat')}
           onMouseDown={retainFocusOnMouseDown}
           aria-pressed={value === 'chat'}
           title={chatTitle}
-          className={`${baseBtn} ${value === 'chat' ? activeBtn : inactiveBtn}`}
+          className={`${baseBtn} disabled:cursor-wait disabled:opacity-50 ${value === 'chat' ? activeBtn : inactiveBtn}`}
         >
           <Sparkles className="h-3 w-3" strokeWidth={1.75} />
           {t('input.mode.chat')}
         </button>
         <button
           type="button"
+          disabled={disabled}
           onClick={() => onChange('record')}
           onMouseDown={retainFocusOnMouseDown}
           aria-pressed={value === 'record'}
           title={recordTitle}
-          className={`${baseBtn} ${value === 'record' ? activeBtn : inactiveBtn}`}
+          className={`${baseBtn} disabled:cursor-wait disabled:opacity-50 ${value === 'record' ? activeBtn : inactiveBtn}`}
         >
           <NotebookPen className="h-3 w-3" strokeWidth={1.75} />
           {t('input.mode.record')}

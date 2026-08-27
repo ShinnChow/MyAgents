@@ -11,6 +11,7 @@ import { CUSTOM_EVENTS } from '@/../shared/constants';
 import type { Thought } from '@/../shared/types/thought';
 import type { TaskCreateRequest } from '@/../shared/taskDiscussion';
 import type { PendingAppRoute } from '@/../shared/appRoute';
+import type { RecordingSnapshot } from '@/../shared/types/record';
 
 interface Props {
   isActive?: boolean;
@@ -24,7 +25,12 @@ interface Props {
   pendingIntent?: { autofocusSearch?: boolean; nonce: number } | null;
   pendingRoute?: PendingAppRoute | null;
   onRouteConsumed?: (generation: number) => void;
-  onOpenRecord?: (recordId: string, mediaMs?: number) => void;
+  onOpenRecord?: (
+    recordId: string,
+    mediaMs?: number,
+    activeRecording?: boolean,
+  ) => void;
+  activeRecordingSnapshot?: RecordingSnapshot | null;
 }
 
 export default function TaskCenter({
@@ -34,6 +40,7 @@ export default function TaskCenter({
   pendingRoute,
   onRouteConsumed,
   onOpenRecord,
+  activeRecordingSnapshot,
 }: Props) {
   const { t } = useTranslation('task');
 
@@ -145,6 +152,7 @@ export default function TaskCenter({
             // flicker on the thought input. (v0.1.69 cross-review W4)
             autoFocusInput={!!isActive && !pendingIntent?.autofocusSearch}
             onOpenRecord={onOpenRecord}
+            activeRecordingSnapshot={activeRecordingSnapshot}
           />
         </div>
 

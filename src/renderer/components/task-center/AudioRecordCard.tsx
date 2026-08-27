@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { Archive, ListChecks, Mic, Pause, Play, Trash2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { recordingSnapshot, recordMediaUrl } from '@/api/recording';
+import { recordMediaUrl } from '@/api/recording';
 import { hashPrivateIdentity } from '@/analytics/hash';
 import { track as trackAnalytics } from '@/analytics/tracker';
 import type {
@@ -10,10 +10,15 @@ import type {
   RecordingSnapshot,
 } from '@/../shared/types/record';
 import type { RecordSearchHit } from '@/api/searchClient';
+import { useToast } from '@/components/Toast';
 
 interface Props {
   record: RecordSummary;
-  onOpen: (recordId: string, mediaMs?: number) => void;
+  onOpen: (
+    recordId: string,
+    mediaMs?: number,
+    activeRecording?: boolean,
+  ) => void;
   onArchive: (recordId: string, archived: boolean) => void | Promise<void>;
   onDelete: (recordId: string) => void | Promise<void>;
   selectMode?: boolean;
@@ -21,6 +26,7 @@ interface Props {
   onToggleSelect?: () => void;
   onEnterSelectMode?: () => void;
   searchHit?: RecordSearchHit;
+  activeRecordingSnapshot?: RecordingSnapshot | null;
 }
 
 function formatDuration(value: number): string {
@@ -40,68 +46,57 @@ export function AudioRecordCard({
   onToggleSelect,
   onEnterSelectMode,
   searchHit,
+  activeRecordingSnapshot,
 }: Props) {
   const { t, i18n } = useTranslation('task');
+  const toast = useToast();
   const [playing, setPlaying] = useState(false);
-  const [activeSnapshot, setActiveSnapshot] =
-    useState<RecordingSnapshot | null>(null);
-  const [clockNow, setClockNow] = useState(() => Date.now());
   const audioRef = useRef<HTMLAudioElement>(null);
+  const secondaryAudioRef = useRef<HTMLAudioElement>(null);
+  const playbackErrorShownRef = useRef(false);
   const playbackSessionTrackedRef = useRef(false);
   const audio = record.audio;
-  const active = audio
+  const activeSnapshot =
+    activeRecordingSnapshot?.recordId === record.id
+      ? activeRecordingSnapshot
+      : null;
+  const effectiveCaptureStatus =
+    activeSnapshot?.captureStatus ?? audio?.captureStatus;
+  const active = effectiveCaptureStatus
     ? ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(
-        audio.captureStatus,
+        effectiveCaptureStatus,
       )
     : false;
-  useEffect(() => {
-    if (!active) return;
-    let cancelled = false;
-    const refresh = () => {
-      void recordingSnapshot()
-        .then((snapshot) => {
-          if (!cancelled) {
-            setActiveSnapshot(
-              snapshot?.recordId === record.id ? snapshot : null,
-            );
-          }
-        })
-        .catch(() => undefined);
-    };
-    refresh();
-    const snapshotTimer = window.setInterval(refresh, 1_500);
-    const clockTimer = window.setInterval(() => setClockNow(Date.now()), 500);
-    return () => {
-      cancelled = true;
-      window.clearInterval(snapshotTimer);
-      window.clearInterval(clockTimer);
-    };
-  }, [active, record.id]);
-  const displayedDurationMs = useMemo(() => {
-    const currentSnapshot = active ? activeSnapshot : null;
-    if (!currentSnapshot) return audio?.mediaDurationMs ?? 0;
-    if (currentSnapshot.captureStatus !== 'recording') {
-      return currentSnapshot.mediaDurationMs;
-    }
-    return Math.max(
-      currentSnapshot.mediaDurationMs,
-      clockNow -
-        currentSnapshot.startedAtWallTime -
-        currentSnapshot.pausedWallMs,
-    );
-  }, [active, activeSnapshot, audio?.mediaDurationMs, clockNow]);
+  const displayedDurationMs =
+    activeSnapshot?.mediaDurationMs ?? audio?.mediaDurationMs ?? 0;
   if (!audio) return null;
-  const track = audio.tracks.includes('mixed') ? 'mixed' : audio.tracks[0];
+  const physicalTracks = audio.tracks.includes('mixed')
+    ? (['mixed'] as const)
+    : audio.tracks.includes('microphone') && audio.tracks.includes('system')
+      ? (['microphone', 'system'] as const)
+      : audio.tracks[0]
+        ? ([audio.tracks[0]] as const)
+        : [];
+  const track = physicalTracks[0];
+  const secondaryTrack = physicalTracks[1];
+  const reportPlaybackError = () => {
+    audioRef.current?.pause();
+    secondaryAudioRef.current?.pause();
+    setPlaying(false);
+    if (playbackErrorShownRef.current) return;
+    playbackErrorShownRef.current = true;
+    toast.error(t('records.playbackFailed'));
+  };
   const status =
-    audio.captureStatus === 'recording'
+    effectiveCaptureStatus === 'recording'
       ? t('records.recording')
-      : audio.captureStatus === 'paused'
+      : effectiveCaptureStatus === 'paused'
         ? t('records.paused')
         : ['queued', 'live', 'lagging', 'recovering', 'finalizing'].includes(
               audio.transcriptionStatus,
             )
           ? t('records.processing')
-          : audio.captureStatus === 'failed' ||
+          : effectiveCaptureStatus === 'failed' ||
               audio.transcriptionStatus === 'failed'
             ? t('records.failed')
             : t('records.complete');
@@ -172,7 +167,9 @@ export function AudioRecordCard({
       ) : (
         <button
           type="button"
-          onClick={() => onOpen(record.id, searchHit?.mediaMs ?? undefined)}
+          onClick={() =>
+            onOpen(record.id, searchHit?.mediaMs ?? undefined, active)
+          }
           className="flex w-full min-w-0 items-start gap-3 text-left"
         >
           {summary}
@@ -187,8 +184,16 @@ export function AudioRecordCard({
               onClick={() => {
                 const element = audioRef.current;
                 if (!element) return;
-                if (element.paused) void element.play();
-                else element.pause();
+                if (element.paused) {
+                  const secondary = secondaryAudioRef.current;
+                  if (secondary) secondary.currentTime = element.currentTime;
+                  const plays = [element.play()];
+                  if (secondary) plays.push(secondary.play());
+                  void Promise.all(plays).catch(reportPlaybackError);
+                } else {
+                  element.pause();
+                  secondaryAudioRef.current?.pause();
+                }
               }}
               className="flex h-7 w-7 items-center justify-center rounded-full bg-[var(--paper-inset)] text-[var(--ink-secondary)] hover:text-[var(--accent-warm)]"
               aria-label={
@@ -258,9 +263,30 @@ export function AudioRecordCard({
             });
           }}
           onEnded={() => {
+            secondaryAudioRef.current?.pause();
             setPlaying(false);
             playbackSessionTrackedRef.current = false;
           }}
+          onTimeUpdate={(event) => {
+            const secondary = secondaryAudioRef.current;
+            if (
+              secondary &&
+              Math.abs(
+                secondary.currentTime - event.currentTarget.currentTime,
+              ) > 0.12
+            ) {
+              secondary.currentTime = event.currentTarget.currentTime;
+            }
+          }}
+          onError={reportPlaybackError}
+        />
+      )}
+      {secondaryTrack && (
+        <audio
+          ref={secondaryAudioRef}
+          src={recordMediaUrl(record.id, secondaryTrack)}
+          preload="none"
+          onError={reportPlaybackError}
         />
       )}
     </article>

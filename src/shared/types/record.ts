@@ -149,6 +149,20 @@ export interface RecordTranscriptSnapshot {
   segments: RecordTranscriptSegment[];
 }
 
+export interface RecordTranscriptCursor {
+  journalBytes: number;
+  projectionRevision: number;
+}
+
+export interface RecordTranscriptDelta {
+  recordId: string;
+  projectionRevision: number;
+  state: string;
+  upserts: RecordTranscriptSegment[];
+  resetSnapshot?: RecordTranscriptSnapshot;
+  cursor: RecordTranscriptCursor;
+}
+
 export interface RecordSpeakerTurn {
   startSample: number;
   endSample: number;

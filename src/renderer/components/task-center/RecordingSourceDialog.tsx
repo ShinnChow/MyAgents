@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { createPortal } from 'react-dom';
 import { Mic, MonitorUp } from 'lucide-react';
@@ -52,6 +52,7 @@ export default function RecordingSourceDialog({
   const [selection, setSelection] =
     useState<RecordingSourceSelection>(initialSelection);
   const [settingsError, setSettingsError] = useState(false);
+  const dialogRef = useRef<HTMLElement>(null);
   const hasSource = selection.microphone || selection.system;
   const platform = useMemo(() => navigator.platform.toLowerCase(), []);
   const microphonePermissionError =
@@ -70,6 +71,47 @@ export default function RecordingSourceDialog({
       return true;
     }, [busy, onCancel]),
     300,
+  );
+
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const frame = window.requestAnimationFrame(() => {
+      dialogRef.current
+        ?.querySelector<HTMLElement>('button:not(:disabled)')
+        ?.focus();
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      previouslyFocused?.focus();
+    };
+  }, []);
+
+  const handleDialogKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLElement>) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!busy) onCancel();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(
+        dialogRef.current?.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), [href], input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    },
+    [busy, onCancel],
   );
 
   const openPrivacySettings = useCallback(
@@ -105,9 +147,11 @@ export default function RecordingSourceDialog({
       className="z-[300] px-4"
     >
       <section
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="recording-source-dialog-title"
+        onKeyDown={handleDialogKeyDown}
         className="glass-panel w-full max-w-md overflow-hidden"
       >
         <header className="border-b border-[var(--line)] px-5 py-4">

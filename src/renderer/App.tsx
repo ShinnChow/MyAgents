@@ -432,8 +432,37 @@ function sameRecordingTabProjection(
     sameSources &&
     sameSourceStates &&
     sameWarnings &&
-    (snapshot.captureStatus === 'recording' ||
-      tab.recordingMediaDurationMs === snapshot.mediaDurationMs)
+    tab.recordingMediaDurationMs === snapshot.mediaDurationMs
+  );
+}
+
+function recordingSnapshotFromTab(tab: Tab): RecordingSnapshot | null {
+  if (!tab.recordId || !tab.recordingStatus) return null;
+  return {
+    recordId: tab.recordId,
+    revision: tab.recordingRevision ?? 0,
+    generation: tab.recordingGeneration ?? 0,
+    captureStatus: tab.recordingStatus,
+    startedAtWallTime: tab.recordingStartedAtWallTime ?? 0,
+    mediaDurationMs: tab.recordingMediaDurationMs ?? 0,
+    pausedWallMs: tab.recordingPausedWallMs ?? 0,
+    sources: tab.recordingSources ?? [],
+    sourceActivity: tab.recordingSourceActivity ?? [],
+    warnings: tab.recordingWarnings ?? [],
+  };
+}
+
+function isRecordingSnapshotOlder(
+  current: RecordingSnapshot,
+  next: RecordingSnapshot,
+): boolean {
+  return (
+    next.generation < current.generation ||
+    (next.generation === current.generation &&
+      next.revision < current.revision) ||
+    (next.generation === current.generation &&
+      next.revision === current.revision &&
+      next.mediaDurationMs < current.mediaDurationMs)
   );
 }
 
@@ -493,7 +522,13 @@ interface TabContentProps {
   ) => () => void;
   onRecordTitleChange: (recordId: string, title: string) => void;
   onRecordDeleted: (tabId: string) => void;
-  onOpenRecord: (recordId: string, mediaMs?: number, surface?: Surface) => void;
+  activeRecordingSnapshot?: RecordingSnapshot | null;
+  onOpenRecord: (
+    recordId: string,
+    mediaMs?: number,
+    surface?: Surface,
+    activeRecording?: boolean,
+  ) => void;
   // Chat callbacks
   onOpenHistorySession: (
     tabId: string,
@@ -567,6 +602,7 @@ export const MemoizedTabContent = memo(
     registerPendingRecordNoteSubmitter,
     onRecordTitleChange,
     onRecordDeleted,
+    activeRecordingSnapshot = null,
     onOpenRecord,
     onOpenHistorySession,
     onNewSession,
@@ -668,20 +704,7 @@ export const MemoizedTabContent = memo(
               seekMediaMs={tab.recordSeekMediaMs}
               seekNonce={tab.recordSeekNonce}
               initialRecordingSnapshot={
-                tab.recordingStatus
-                  ? {
-                      recordId: tab.recordId,
-                      revision: tab.recordingRevision ?? 0,
-                      generation: tab.recordingGeneration ?? 0,
-                      captureStatus: tab.recordingStatus,
-                      startedAtWallTime: tab.recordingStartedAtWallTime ?? 0,
-                      mediaDurationMs: tab.recordingMediaDurationMs ?? 0,
-                      pausedWallMs: tab.recordingPausedWallMs ?? 0,
-                      sources: tab.recordingSources ?? [],
-                      sourceActivity: tab.recordingSourceActivity ?? [],
-                      warnings: tab.recordingWarnings ?? [],
-                    }
-                  : undefined
+                recordingSnapshotFromTab(tab) ?? undefined
               }
               onRecordingSnapshotChange={handleRecordSnapshotChange}
               registerPendingNoteSubmitter={registerPendingRecordNoteSubmitter}
@@ -732,8 +755,9 @@ export const MemoizedTabContent = memo(
               currentSessionId={taskCenterCurrentSessionId}
               pendingRoute={taskPendingRoute ?? null}
               onRouteConsumed={onTaskRouteConsumed}
-              onOpenRecord={(recordId, mediaMs) =>
-                onOpenRecord(recordId, mediaMs, 'task_center')
+              activeRecordingSnapshot={activeRecordingSnapshot}
+              onOpenRecord={(recordId, mediaMs, activeRecording) =>
+                onOpenRecord(recordId, mediaMs, 'task_center', activeRecording)
               }
             />
           </Suspense>
@@ -853,6 +877,8 @@ export const MemoizedTabContent = memo(
       prev.updateDownloading === next.updateDownloading &&
       prev.updateInstalling === next.updateInstalling &&
       prev.updatePreparing === next.updatePreparing &&
+      (next.tab.view !== 'taskcenter' ||
+        prev.activeRecordingSnapshot === next.activeRecordingSnapshot) &&
       prev.sessionNotificationBadgeCounts ===
         next.sessionNotificationBadgeCounts &&
       // Reference equality — every App-owned Task Center intent/route
@@ -1455,6 +1481,9 @@ export default function App() {
 
   // Per-tab loading state (keyed by tabId)
   const [loadingTabs, setLoadingTabs] = useState<Record<string, boolean>>({});
+  const recordingAdmissionTabsRef = useRef(new Set<string>());
+  const recordingSnapshotEpochRef = useRef(0);
+  const recordingChangeSequenceRef = useRef(0);
   const [tabErrors, setTabErrors] = useState<Record<string, string | null>>({});
 
   // One app-exit confirmation owns both scheduler and recording lifecycle.
@@ -2336,6 +2365,7 @@ export default function App() {
   // No confirmation dialog: background completion keeps the Sidecar alive.
   const closeTabWithConfirmation = useCallback(
     async (tabId: string) => {
+      if (recordingAdmissionTabsRef.current.has(tabId)) return;
       const tab = tabsRef.current.find((t) => t.id === tabId);
 
       if (tab?.view === 'record' && tab.recordId) {
@@ -3477,9 +3507,7 @@ export default function App() {
     });
 
     const addedChatTargets = addedTargets.filter(
-      (
-        target,
-      ): target is Extract<ValidatedRestoreTarget, { kind: 'chat' }> =>
+      (target): target is Extract<ValidatedRestoreTarget, { kind: 'chat' }> =>
         target.kind === 'chat',
     );
     const results = await Promise.allSettled(
@@ -3868,6 +3896,7 @@ export default function App() {
 
   const handleRecordingSnapshotChange = useCallback(
     (recordId: string, snapshot: RecordingSnapshot | null) => {
+      recordingSnapshotEpochRef.current += 1;
       setTabs((current) =>
         current.map((tab) => {
           if (tab.view !== 'record' || tab.recordId !== recordId) return tab;
@@ -3891,6 +3920,13 @@ export default function App() {
               recordingSourceActivity: undefined,
               recordingWarnings: undefined,
             };
+          }
+          const currentSnapshot = recordingSnapshotFromTab(tab);
+          if (
+            currentSnapshot &&
+            isRecordingSnapshotOlder(currentSnapshot, snapshot)
+          ) {
+            return tab;
           }
           if (sameRecordingTabProjection(tab, snapshot)) return tab;
           return { ...tab, ...recordingTabProjection(snapshot) };
@@ -3968,7 +4004,14 @@ export default function App() {
       );
       const sourceTab = options.sourceTabId
         ? currentTabs.find(
-            (tab) => tab.id === options.sourceTabId && tab.view === 'launcher',
+            (tab) =>
+              tab.id === options.sourceTabId &&
+              (tab.view === 'launcher' || options.activeRecording),
+          )
+        : undefined;
+      const functionalTab = options.activeRecording
+        ? currentTabs.find(
+            (tab) => tab.view === 'launcher' || tab.view === 'taskcenter',
           )
         : undefined;
       const reusable =
@@ -3976,7 +4019,7 @@ export default function App() {
         (options.activeRecording &&
         (activeTab?.view === 'launcher' || activeTab?.view === 'taskcenter')
           ? activeTab
-          : undefined);
+          : functionalTab);
       const title = options.title ?? t('tabs.record');
       const recordTab: Tab = {
         id:
@@ -4006,10 +4049,15 @@ export default function App() {
         setActiveTabId(recordTab.id, nextTabs);
       } else {
         if (currentTabs.length >= MAX_TABS) {
-          toastRef.current.error(
-            t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }),
-          );
-          return false;
+          if (!options.activeRecording) {
+            toastRef.current.error(
+              t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }),
+            );
+            return false;
+          }
+          // The active capture must always keep a stop/save surface. When a
+          // full tab strip contains no reusable Launcher/Task Center tab, one
+          // bounded emergency Record tab is safer than replacing a live Chat.
         }
         openNewTabDeferred(recordTab);
       }
@@ -4027,6 +4075,7 @@ export default function App() {
 
   const handleStartRecording = useCallback(
     async (tabId: string, selection: RecordingSourceSelection) => {
+      recordingAdmissionTabsRef.current.add(tabId);
       setLoadingTabs((current) => ({ ...current, [tabId]: true }));
       try {
         const result = await recordingStart(selection);
@@ -4036,6 +4085,7 @@ export default function App() {
           activeRecording: true,
         });
       } finally {
+        recordingAdmissionTabsRef.current.delete(tabId);
         setLoadingTabs((current) => ({ ...current, [tabId]: false }));
       }
     },
@@ -4073,6 +4123,8 @@ export default function App() {
     void listenWithCleanup<RecordingChange>(
       'recording:changed',
       ({ payload }) => {
+        if (payload.sequence <= recordingChangeSequenceRef.current) return;
+        recordingChangeSequenceRef.current = payload.sequence;
         handleRecordingSnapshotChange(
           payload.recordId,
           payload.snapshot ?? null,
@@ -4090,10 +4142,53 @@ export default function App() {
     return () => controller.abort();
   }, [handleOpenRecord, handleRecordingSnapshotChange]);
 
+  const activeRecordingTab = tabs.find(
+    (tab) =>
+      tab.view === 'record' &&
+      tab.recordId &&
+      tab.recordingStatus &&
+      ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(
+        tab.recordingStatus,
+      ),
+  );
+  const activeRecordingRecordId = activeRecordingTab?.recordId;
+  const activeRecordingSnapshot = activeRecordingTab
+    ? recordingSnapshotFromTab(activeRecordingTab)
+    : null;
+  useEffect(() => {
+    if (!isTauriEnvironment() || !activeRecordingRecordId) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const refreshActiveRecording = async () => {
+      const epoch = recordingSnapshotEpochRef.current;
+      try {
+        const active = await recordingSnapshot();
+        if (cancelled || recordingSnapshotEpochRef.current !== epoch) return;
+        handleRecordingSnapshotChange(
+          activeRecordingRecordId,
+          active?.recordId === activeRecordingRecordId ? active : null,
+        );
+      } catch {
+        // Lifecycle events and the next authoritative poll remain available.
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(refreshActiveRecording, 500);
+        }
+      }
+    };
+    void refreshActiveRecording();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeRecordingRecordId, handleRecordingSnapshotChange]);
+
   useEffect(() => {
     if (!isTauriEnvironment()) return;
+    const epoch = recordingSnapshotEpochRef.current;
     void recordingSnapshot()
       .then((active) => {
+        if (recordingSnapshotEpochRef.current !== epoch) return;
         if (!active) return;
         const sourceTab = tabsRef.current.find(
           (tab) => tab.view === 'launcher',
@@ -5317,6 +5412,9 @@ export default function App() {
                   }
                   onRecordTitleChange={handleRecordTitleChange}
                   onRecordDeleted={handleRecordDeleted}
+                  activeRecordingSnapshot={
+                    tab.view === 'taskcenter' ? activeRecordingSnapshot : null
+                  }
                   onOpenRecord={handleOpenRecord}
                   onOpenHistorySession={handleOpenChatHistorySession}
                   onNewSession={handleNewSession}

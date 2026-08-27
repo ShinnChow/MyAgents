@@ -18,6 +18,8 @@ import type {
   RecordTimelineDeleteInput,
   RecordTimelineProjection,
   RecordTextExportInput,
+  RecordTranscriptCursor,
+  RecordTranscriptDelta,
   RecordTranscriptSnapshot,
   SpeechModelPackStatus,
 } from '@/../shared/types/record';
@@ -99,6 +101,13 @@ export function recordTranscript(
   id: string,
 ): Promise<RecordTranscriptSnapshot | null> {
   return command('cmd_record_transcript', { id });
+}
+
+export function recordTranscriptDelta(
+  id: string,
+  cursor?: RecordTranscriptCursor,
+): Promise<RecordTranscriptDelta | null> {
+  return command('cmd_record_transcript_delta', { id, cursor });
 }
 
 export function recordDiarization(

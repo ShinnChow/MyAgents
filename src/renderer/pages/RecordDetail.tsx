@@ -11,10 +11,12 @@ import {
   Play,
   Square,
   Trash2,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Virtuoso } from 'react-virtuoso';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import CustomSelect from '@/components/CustomSelect';
 
 import {
@@ -34,6 +36,7 @@ import {
   recordStartTranscription,
   recordTimeline,
   recordTranscript,
+  recordTranscriptDelta,
   recordReassignSegmentSpeaker,
   recordRenameSpeaker,
   recordUpdateAudioMetadata,
@@ -54,7 +57,9 @@ import type {
   RecordDiarizationProjection,
   RecordingChange,
   RecordingSnapshot,
+  RecordTimelineItem,
   RecordTimelineProjection,
+  RecordTranscriptCursor,
   RecordTranscriptSegment,
   RecordTranscriptSnapshot,
   SpeechModelPackStatus,
@@ -63,6 +68,10 @@ import { isTauriEnvironment } from '@/utils/browserMock';
 import { listenWithCleanup } from '@/utils/tauriListen';
 import { useConfig } from '@/hooks/useConfig';
 import { hashPrivateIdentity, track } from '@/analytics';
+import {
+  applyRecordTranscriptDelta,
+  reconcileRecordTranscriptSnapshot,
+} from '@/utils/recordTranscript';
 
 interface Props {
   recordId: string;
@@ -86,6 +95,7 @@ const EMPTY_TIMELINE: RecordTimelineProjection = {
 };
 
 const TRANSCRIPT_VIRTUALIZE_THRESHOLD = 100;
+const TIMELINE_VIRTUALIZE_THRESHOLD = 100;
 
 function formatDuration(value: number): string {
   const totalSeconds = Math.max(0, Math.floor(value / 1_000));
@@ -185,10 +195,16 @@ export default function RecordDetail({
   const [noteDraft, setNoteDraft] = useState('');
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [projectionError, setProjectionError] = useState<string | null>(null);
+  const [recordLoading, setRecordLoading] = useState(true);
   const [titleDraft, setTitleDraft] = useState('');
   const [tagDraft, setTagDraft] = useState('');
   const [editingNoteId, setEditingNoteId] = useState<string | null>(null);
   const [editingNoteDraft, setEditingNoteDraft] = useState('');
+  const [pendingTimelineFocus, setPendingTimelineFocus] = useState<
+    string | null
+  >(null);
+  const [highlightedItem, setHighlightedItem] = useState<string | null>(null);
   const [speakerNameDrafts, setSpeakerNameDrafts] = useState<
     Record<number, string>
   >({});
@@ -202,6 +218,8 @@ export default function RecordDetail({
   >('mixed');
   const [playing, setPlaying] = useState(false);
   const [playbackMs, setPlaybackMs] = useState(0);
+  const [playbackVolume, setPlaybackVolume] = useState(1);
+  const [playbackError, setPlaybackError] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const secondaryAudioRef = useRef<HTMLAudioElement>(null);
   const snapshotRef = useRef(snapshot);
@@ -215,68 +233,202 @@ export default function RecordDetail({
   const tagDirtyRef = useRef(false);
   const pendingSeekRef = useRef<number | null>(null);
   const playbackSessionTrackedRef = useRef(false);
+  const playbackErrorShownRef = useRef(false);
+  const refreshGenerationRef = useRef(0);
+  const snapshotEpochRef = useRef(0);
+  const recordingChangeSequenceRef = useRef(0);
+  const transcriptPollEpochRef = useRef(0);
+  const transcriptCursorRef = useRef<RecordTranscriptCursor | undefined>(
+    undefined,
+  );
+  const noteSubmitInFlightRef = useRef<Promise<boolean> | null>(null);
+  const noteDraftRef = useRef('');
+  const timelineScrollRef = useRef<HTMLDivElement>(null);
+  const timelineVirtuosoRef = useRef<VirtuosoHandle>(null);
+  const timelineItemRefs = useRef(new Map<string, HTMLDivElement>());
+  const transcriptScrollRef = useRef<HTMLDivElement>(null);
+  const transcriptItemRefs = useRef(new Map<string, HTMLElement>());
+  const transcriptVirtuosoRef = useRef<VirtuosoHandle>(null);
+  const pendingTranscriptFocusRef = useRef<string | null>(null);
+  const pendingTimelineVirtualFocusRef = useRef<string | null>(null);
+  const highlightTimerRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     snapshotRef.current = snapshot;
   }, [snapshot]);
 
-  const refresh = useCallback(async () => {
-    try {
+  useEffect(
+    () => () => {
+      if (highlightTimerRef.current !== undefined) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const applySnapshot = useCallback(
+    (next: RecordingSnapshot | null) => {
+      const owned = next?.recordId === recordId ? next : null;
+      const current = snapshotRef.current;
+      if (
+        current &&
+        owned &&
+        (owned.generation < current.generation ||
+          (owned.generation === current.generation &&
+            owned.revision < current.revision) ||
+          (owned.generation === current.generation &&
+            owned.revision === current.revision &&
+            owned.mediaDurationMs < current.mediaDurationMs))
+      ) {
+        return;
+      }
+      snapshotEpochRef.current += 1;
+      snapshotRef.current = owned;
+      setSnapshot(owned);
+      onRecordingSnapshotChange?.(owned);
+    },
+    [onRecordingSnapshotChange, recordId],
+  );
+
+  const requestSnapshot = useCallback(async () => {
+    const epoch = snapshotEpochRef.current;
+    const active = await recordingSnapshot();
+    if (snapshotEpochRef.current !== epoch) return;
+    applySnapshot(active?.recordId === recordId ? active : null);
+  }, [applySnapshot, recordId]);
+
+  const refresh = useCallback(
+    async (includeTranscript = true) => {
+      const generation = refreshGenerationRef.current + 1;
+      refreshGenerationRef.current = generation;
+      setRecordLoading(true);
       const [
-        nextRecord,
-        nextTranscript,
-        nextDiarization,
-        nextTimeline,
-        nextModelPack,
-      ] = await Promise.all([
+        recordResult,
+        transcriptResult,
+        diarizationResult,
+        timelineResult,
+        modelResult,
+      ] = await Promise.allSettled([
         recordGet(recordId),
-        recordTranscript(recordId),
+        includeTranscript
+          ? recordTranscript(recordId)
+          : Promise.resolve(undefined),
         recordDiarization(recordId),
         recordTimeline(recordId),
         speechModelPackStatus(),
       ]);
-      if (!nextRecord || nextRecord.kind !== 'audio') {
-        throw new Error('Record is not available');
+      if (refreshGenerationRef.current !== generation) return;
+
+      if (
+        recordResult.status === 'fulfilled' &&
+        recordResult.value?.kind === 'audio'
+      ) {
+        const nextRecord = recordResult.value;
+        setRecord(nextRecord);
+        if (!titleDirtyRef.current) {
+          titleDraftRef.current = nextRecord.title;
+          setTitleDraft(nextRecord.title);
+        }
+        if (!tagDirtyRef.current) {
+          const nextTagDraft = nextRecord.tags
+            .map((tag) => `#${tag}`)
+            .join(' ');
+          tagDraftRef.current = nextTagDraft;
+          setTagDraft(nextTagDraft);
+        }
+        setLoadError(null);
+        onTitleChange?.(nextRecord.title || t('records.untitled'));
+      } else {
+        const error =
+          recordResult.status === 'rejected'
+            ? recordResult.reason
+            : new Error('Record is not available');
+        setLoadError(error instanceof Error ? error.message : String(error));
       }
-      setRecord(nextRecord);
-      if (!titleDirtyRef.current) {
-        titleDraftRef.current = nextRecord.title;
-        setTitleDraft(nextRecord.title);
+
+      const projectionFailures: unknown[] = [];
+      if (includeTranscript) {
+        if (transcriptResult.status === 'fulfilled') {
+          transcriptPollEpochRef.current += 1;
+          transcriptCursorRef.current = undefined;
+          setTranscript((current) =>
+            reconcileRecordTranscriptSnapshot(
+              current,
+              transcriptResult.value ?? null,
+            ),
+          );
+        } else {
+          projectionFailures.push(transcriptResult.reason);
+        }
       }
-      if (!tagDirtyRef.current) {
-        const nextTagDraft = nextRecord.tags.map((tag) => `#${tag}`).join(' ');
-        tagDraftRef.current = nextTagDraft;
-        setTagDraft(nextTagDraft);
+      if (diarizationResult.status === 'fulfilled') {
+        const nextDiarization = diarizationResult.value;
+        setDiarization((current) =>
+          current &&
+          nextDiarization &&
+          current.projectionRevision > nextDiarization.projectionRevision
+            ? current
+            : nextDiarization,
+        );
+        setSpeakerNameDrafts(
+          Object.fromEntries(
+            (nextDiarization?.speakers ?? []).map((speaker) => [
+              speaker.speakerId,
+              speaker.customName ?? '',
+            ]),
+          ),
+        );
+      } else {
+        projectionFailures.push(diarizationResult.reason);
       }
-      setTranscript(nextTranscript);
-      setDiarization(nextDiarization);
-      setSpeakerNameDrafts(
-        Object.fromEntries(
-          (nextDiarization?.speakers ?? []).map((speaker) => [
-            speaker.speakerId,
-            speaker.customName ?? '',
-          ]),
-        ),
+      if (timelineResult.status === 'fulfilled') {
+        setTimeline((current) =>
+          current.revision > timelineResult.value.revision
+            ? current
+            : timelineResult.value,
+        );
+      } else {
+        projectionFailures.push(timelineResult.reason);
+      }
+      if (modelResult.status === 'fulfilled') {
+        setModelPack(modelResult.value);
+      } else {
+        projectionFailures.push(modelResult.reason);
+      }
+      setProjectionError(
+        projectionFailures.length > 0
+          ? projectionFailures[0] instanceof Error
+            ? projectionFailures[0].message
+            : String(projectionFailures[0])
+          : null,
       );
-      setTimeline(nextTimeline);
-      setModelPack(nextModelPack);
-      setLoadError(null);
-      onTitleChange?.(nextRecord.title || t('records.untitled'));
-    } catch (error) {
-      setLoadError(error instanceof Error ? error.message : String(error));
-    }
-  }, [onTitleChange, recordId, t]);
+      setRecordLoading(false);
+    },
+    [onTitleChange, recordId, t],
+  );
 
   useEffect(() => {
     void refresh();
-    void recordingSnapshot()
-      .then((active) => {
-        if (active?.recordId !== recordId) return;
-        setSnapshot(active);
-        onRecordingSnapshotChange?.(active);
-      })
-      .catch(() => undefined);
-  }, [onRecordingSnapshotChange, recordId, refresh]);
+    void requestSnapshot().catch(() => undefined);
+  }, [refresh, requestSnapshot]);
+
+  useEffect(() => {
+    const next = initialRecordingSnapshot;
+    if (!next || next.recordId !== recordId) return;
+    const current = snapshotRef.current;
+    if (
+      current &&
+      (next.generation < current.generation ||
+        (next.generation === current.generation &&
+          next.revision < current.revision) ||
+        (next.generation === current.generation &&
+          next.revision === current.revision &&
+          next.mediaDurationMs < current.mediaDurationMs))
+    ) {
+      return;
+    }
+    applySnapshot(next);
+  }, [applySnapshot, initialRecordingSnapshot, recordId]);
 
   useEffect(() => {
     if (!isTauriEnvironment()) return;
@@ -285,9 +437,10 @@ export default function RecordDetail({
       'recording:changed',
       ({ payload }) => {
         if (payload.recordId !== recordId) return;
+        if (payload.sequence <= recordingChangeSequenceRef.current) return;
+        recordingChangeSequenceRef.current = payload.sequence;
         const next = payload.snapshot ?? null;
-        setSnapshot(next);
-        onRecordingSnapshotChange?.(next);
+        applySnapshot(next);
         if (!next) void refresh();
       },
       controller.signal,
@@ -295,12 +448,16 @@ export default function RecordDetail({
     void listenWithCleanup<RecordChange>(
       'record:changed',
       ({ payload }) => {
-        if (payload.id === recordId) void refresh();
+        if (payload.id !== recordId) return;
+        // Notes and marks emit record:changed too. While capture is active,
+        // refresh metadata/timeline without resetting the incremental
+        // transcript cursor back to a full-journal read.
+        void refresh(!snapshotRef.current);
       },
       controller.signal,
     );
     return () => controller.abort();
-  }, [onRecordingSnapshotChange, recordId, refresh]);
+  }, [applySnapshot, recordId, refresh]);
 
   const isPaused = snapshot?.captureStatus === 'paused';
   const ownsCaptureSlot =
@@ -311,28 +468,34 @@ export default function RecordDetail({
 
   useEffect(() => {
     if (!isActive || !ownsCaptureSlot) return;
-    const refreshSnapshot = () => {
-      void recordingSnapshot()
-        .then((active) => {
-          if (active?.recordId !== recordId) return;
-          setSnapshot(active);
-          onRecordingSnapshotChange?.(active);
-        })
-        .catch(() => undefined);
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      const epoch = transcriptPollEpochRef.current;
+      try {
+        const delta = await recordTranscriptDelta(
+          recordId,
+          transcriptCursorRef.current,
+        );
+        if (cancelled || transcriptPollEpochRef.current !== epoch) return;
+        if (delta) {
+          transcriptCursorRef.current = delta.cursor;
+          setTranscript((current) =>
+            applyRecordTranscriptDelta(current, delta),
+          );
+        }
+      } catch {
+        // A later record:changed refresh remains the recovery path.
+      } finally {
+        if (!cancelled) timer = window.setTimeout(poll, 1_500);
+      }
     };
-    refreshSnapshot();
-    const timer = window.setInterval(refreshSnapshot, 500);
-    return () => window.clearInterval(timer);
-  }, [isActive, onRecordingSnapshotChange, ownsCaptureSlot, recordId]);
-
-  useEffect(() => {
-    if (!isActive || !ownsCaptureSlot) return;
-    const timer = window.setInterval(() => {
-      void recordTranscript(recordId)
-        .then(setTranscript)
-        .catch(() => undefined);
-    }, 1_500);
-    return () => window.clearInterval(timer);
+    void poll();
+    return () => {
+      cancelled = true;
+      transcriptPollEpochRef.current += 1;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [isActive, ownsCaptureSlot, recordId]);
 
   const mediaDurationMs =
@@ -353,8 +516,7 @@ export default function RecordDetail({
           action === 'pause'
             ? await recordingPause(current)
             : await recordingResume(current);
-        setSnapshot(next);
-        onRecordingSnapshotChange?.(next);
+        applySnapshot(next);
       } catch (error) {
         toast.error(
           t('records.controlFailed', {
@@ -365,7 +527,7 @@ export default function RecordDetail({
         setBusyAction(null);
       }
     },
-    [onRecordingSnapshotChange, t, toast],
+    [applySnapshot, t, toast],
   );
 
   const runSourceControl = useCallback(
@@ -375,8 +537,7 @@ export default function RecordDetail({
       setBusyAction(`source-${track}`);
       try {
         const next = await recordingSetSourceEnabled(current, track, enabled);
-        setSnapshot(next);
-        onRecordingSnapshotChange?.(next);
+        applySnapshot(next);
       } catch (error) {
         toast.error(
           t('records.controlFailed', {
@@ -387,55 +548,90 @@ export default function RecordDetail({
         setBusyAction(null);
       }
     },
-    [onRecordingSnapshotChange, t, toast],
+    [applySnapshot, t, toast],
   );
 
-  const submitNote = useCallback(async (): Promise<boolean> => {
-    const text = noteDraft.trim();
-    if (!text) return true;
+  const submitNote = useCallback((): Promise<boolean> => {
+    if (noteSubmitInFlightRef.current) return noteSubmitInFlightRef.current;
+    const text = noteDraftRef.current.trim();
+    if (!text) return Promise.resolve(true);
     const now = Date.now();
+    const anchorMediaMs = noteAnchorRef.current ?? currentMediaMs();
+    const startedAtWallTime = noteStartedWallRef.current ?? now;
+    const previousIds = new Set(
+      timeline.items.map((item) =>
+        item.type === 'note' ? item.noteId : item.markId,
+      ),
+    );
     setBusyAction('note');
-    try {
-      const next = await recordAddNote({
-        recordId,
-        operationId: crypto.randomUUID(),
-        anchorMediaMs: noteAnchorRef.current ?? currentMediaMs(),
-        startedAtWallTime: noteStartedWallRef.current ?? now,
-        submittedAtWallTime: now,
-        text,
+    const operation = recordAddNote({
+      recordId,
+      operationId: crypto.randomUUID(),
+      anchorMediaMs,
+      startedAtWallTime,
+      submittedAtWallTime: now,
+      text,
+    })
+      .then((next) => {
+        setTimeline(next);
+        if (noteDraftRef.current.trim() === text) {
+          noteDraftRef.current = '';
+          setNoteDraft('');
+          noteAnchorRef.current = null;
+          noteStartedWallRef.current = null;
+        }
+        const created = next.items.find(
+          (item) => item.type === 'note' && !previousIds.has(item.noteId),
+        );
+        if (created?.type === 'note') {
+          setPendingTimelineFocus(`note-${created.noteId}`);
+        }
+        toast.success(t('records.noteSaved'));
+        return true;
+      })
+      .catch((error) => {
+        toast.error(
+          t('records.noteSaveFailed', {
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+        return false;
+      })
+      .finally(() => {
+        if (noteSubmitInFlightRef.current === operation) {
+          noteSubmitInFlightRef.current = null;
+        }
+        setBusyAction(null);
       });
-      setTimeline(next);
-      setNoteDraft('');
-      noteAnchorRef.current = null;
-      noteStartedWallRef.current = null;
-      toast.success(t('records.noteSaved'));
-      return true;
-    } catch (error) {
-      toast.error(
-        t('records.noteSaveFailed', {
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      );
-      return false;
-    } finally {
-      setBusyAction(null);
+    noteSubmitInFlightRef.current = operation;
+    return operation;
+  }, [currentMediaMs, recordId, t, timeline.items, toast]);
+
+  const flushPendingNote = useCallback(async (): Promise<boolean> => {
+    // Closing/stopping may begin while note A is in flight and the user has
+    // already typed note B. Drain the current save, then persist whatever
+    // draft remains; the normal Enter path stays single-submit.
+    for (;;) {
+      const pending = noteSubmitInFlightRef.current;
+      if (pending && !(await pending)) return false;
+      if (!noteDraftRef.current.trim()) return true;
+      if (!(await submitNote())) return false;
     }
-  }, [currentMediaMs, noteDraft, recordId, t, toast]);
+  }, [submitNote]);
 
   useEffect(() => {
     if (!registerPendingNoteSubmitter) return;
-    return registerPendingNoteSubmitter(recordId, submitNote);
-  }, [recordId, registerPendingNoteSubmitter, submitNote]);
+    return registerPendingNoteSubmitter(recordId, flushPendingNote);
+  }, [flushPendingNote, recordId, registerPendingNoteSubmitter]);
 
   const handleStop = useCallback(async () => {
     const current = snapshotRef.current;
     if (!current) return;
-    if (noteDraft.trim() && !(await submitNote())) return;
+    if (!(await flushPendingNote())) return;
     setBusyAction('stop');
     try {
       const next = await recordingStop(current);
-      setSnapshot(null);
-      onRecordingSnapshotChange?.(next);
+      applySnapshot(next);
       await refresh();
     } catch (error) {
       toast.error(
@@ -446,20 +642,30 @@ export default function RecordDetail({
     } finally {
       setBusyAction(null);
     }
-  }, [noteDraft, onRecordingSnapshotChange, refresh, submitNote, t, toast]);
+  }, [applySnapshot, flushPendingNote, refresh, t, toast]);
 
   const handleMark = useCallback(async () => {
     setBusyAction('mark');
     try {
       const now = Date.now();
-      setTimeline(
-        await recordAddMark({
-          recordId,
-          operationId: crypto.randomUUID(),
-          mediaMs: currentMediaMs(),
-          wallTime: now,
-        }),
+      const previousIds = new Set(
+        timeline.items.map((item) =>
+          item.type === 'note' ? item.noteId : item.markId,
+        ),
       );
+      const next = await recordAddMark({
+        recordId,
+        operationId: crypto.randomUUID(),
+        mediaMs: currentMediaMs(),
+        wallTime: now,
+      });
+      setTimeline(next);
+      const created = next.items.find(
+        (item) => item.type === 'mark' && !previousIds.has(item.markId),
+      );
+      if (created?.type === 'mark') {
+        setPendingTimelineFocus(`mark-${created.markId}`);
+      }
     } catch (error) {
       toast.error(
         t('records.markFailed', {
@@ -469,7 +675,7 @@ export default function RecordDetail({
     } finally {
       setBusyAction(null);
     }
-  }, [currentMediaMs, recordId, t, toast]);
+  }, [currentMediaMs, recordId, t, timeline.items, toast]);
 
   const handleUpdateNote = useCallback(async () => {
     if (!editingNoteId || !editingNoteDraft.trim()) return;
@@ -763,7 +969,14 @@ export default function RecordDetail({
     : undefined;
   useEffect(() => {
     playbackSessionTrackedRef.current = false;
+    playbackErrorShownRef.current = false;
   }, [audioSrc, secondaryAudioSrc]);
+  useEffect(() => {
+    const audio = audioRef.current;
+    const secondary = secondaryAudioRef.current;
+    if (audio) audio.volume = playbackVolume;
+    if (secondary) secondary.volume = playbackVolume;
+  }, [audioSrc, playbackVolume, secondaryAudioSrc]);
 
   const trackPlaybackSession = useCallback(() => {
     if (playbackSessionTrackedRef.current) return;
@@ -804,6 +1017,116 @@ export default function RecordDetail({
     setPlaybackMs(mediaMs);
   }, []);
 
+  const focusPendingVirtualItem = useCallback(
+    (kind: 'transcript' | 'timeline') => {
+      window.requestAnimationFrame(() => {
+        const pendingRef =
+          kind === 'transcript'
+            ? pendingTranscriptFocusRef
+            : pendingTimelineVirtualFocusRef;
+        const itemRefs =
+          kind === 'transcript' ? transcriptItemRefs : timelineItemRefs;
+        const itemKey = pendingRef.current;
+        if (!itemKey) return;
+        const element = itemRefs.current.get(itemKey);
+        if (!element) return;
+        element.focus({ preventScroll: true });
+        pendingRef.current = null;
+      });
+    },
+    [],
+  );
+
+  const highlightAndFocus = useCallback(
+    (itemKey: string, mediaMs: number) => {
+      seekTo(mediaMs);
+      setHighlightedItem(itemKey);
+      if (highlightTimerRef.current !== undefined) {
+        window.clearTimeout(highlightTimerRef.current);
+      }
+      highlightTimerRef.current = window.setTimeout(() => {
+        setHighlightedItem((current) => (current === itemKey ? null : current));
+      }, 1_200);
+
+      if (itemKey.startsWith('transcript-')) {
+        const segmentId = itemKey.slice('transcript-'.length);
+        const segmentIndex = transcript?.segments.findIndex(
+          (segment) => segment.segmentId === segmentId,
+        );
+        if (
+          segmentIndex !== undefined &&
+          segmentIndex >= 0 &&
+          (transcript?.segments.length ?? 0) >= TRANSCRIPT_VIRTUALIZE_THRESHOLD
+        ) {
+          pendingTranscriptFocusRef.current = itemKey;
+          transcriptVirtuosoRef.current?.scrollToIndex({
+            index: segmentIndex,
+            align: 'center',
+          });
+          focusPendingVirtualItem('transcript');
+          return;
+        }
+        const container = transcriptScrollRef.current;
+        const element = transcriptItemRefs.current.get(itemKey);
+        if (container && element) {
+          container.scrollTo({
+            top: Math.max(0, element.offsetTop - container.clientHeight / 3),
+          });
+          element.focus({ preventScroll: true });
+        }
+        return;
+      }
+
+      const timelineIndex = timeline.items.findIndex((item) => {
+        const key =
+          item.type === 'note' ? `note-${item.noteId}` : `mark-${item.markId}`;
+        return key === itemKey;
+      });
+      if (
+        timelineIndex >= 0 &&
+        timeline.items.length >= TIMELINE_VIRTUALIZE_THRESHOLD
+      ) {
+        pendingTimelineVirtualFocusRef.current = itemKey;
+        timelineVirtuosoRef.current?.scrollToIndex({
+          index: timelineIndex,
+          align: 'center',
+        });
+        focusPendingVirtualItem('timeline');
+        return;
+      }
+
+      const container = timelineScrollRef.current;
+      const element = timelineItemRefs.current.get(itemKey);
+      if (container && element) {
+        container.scrollTo({
+          top: Math.max(0, element.offsetTop - 12),
+        });
+        element.focus({ preventScroll: true });
+      }
+    },
+    [focusPendingVirtualItem, seekTo, timeline.items, transcript?.segments],
+  );
+
+  useEffect(() => {
+    if (!pendingTimelineFocus) return;
+    const item = timeline.items.find((candidate) => {
+      const key =
+        candidate.type === 'note'
+          ? `note-${candidate.noteId}`
+          : `mark-${candidate.markId}`;
+      return key === pendingTimelineFocus;
+    });
+    if (!item) return;
+    const frame = window.requestAnimationFrame(() => {
+      highlightAndFocus(
+        pendingTimelineFocus,
+        item.type === 'note' ? item.anchorMediaMs : item.mediaMs,
+      );
+      setPendingTimelineFocus(null);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [highlightAndFocus, pendingTimelineFocus, timeline.items]);
+
   const togglePlayback = useCallback(() => {
     const audio = audioRef.current;
     const secondaryAudio = secondaryAudioRef.current;
@@ -819,8 +1142,14 @@ export default function RecordDetail({
     void Promise.all(plays).catch(() => {
       audio.pause();
       secondaryAudio?.pause();
+      setPlaying(false);
+      setPlaybackError(true);
+      if (!playbackErrorShownRef.current) {
+        playbackErrorShownRef.current = true;
+        toast.error(t('records.playbackFailed'));
+      }
     });
-  }, []);
+  }, [t, toast]);
 
   const switchPlaybackTrack = useCallback(
     (nextTrack: typeof playbackTrack) => {
@@ -844,6 +1173,8 @@ export default function RecordDetail({
           : playbackMs);
       audio?.pause();
       secondaryAudioRef.current?.pause();
+      playbackErrorShownRef.current = false;
+      setPlaybackError(false);
       pendingSeekRef.current =
         primaryWillReload || !primaryReady ? mediaMs : null;
       if (!primaryWillReload && primaryReady && audio) {
@@ -1043,21 +1374,24 @@ export default function RecordDetail({
     (segment: RecordTranscriptSegment) => {
       if (!transcript) return null;
       const currentSpeakerId = speakerIdFor(segment);
+      const mediaMs = (segment.startSample * 1_000) / transcript.sampleRate;
+      const itemKey = `transcript-${segment.segmentId}`;
       return (
         <article
           key={segment.segmentId}
-          className="mb-1.5 grid grid-cols-[64px_minmax(0,1fr)] gap-2 rounded-[var(--radius-md)] px-2 py-2 hover:bg-[var(--hover-bg)]"
+          tabIndex={-1}
+          ref={(element) => {
+            if (element) transcriptItemRefs.current.set(itemKey, element);
+            else transcriptItemRefs.current.delete(itemKey);
+          }}
+          className={`mb-1.5 grid grid-cols-[64px_minmax(0,1fr)] gap-2 rounded-[var(--radius-md)] px-2 py-2 transition-colors hover:bg-[var(--hover-bg)] ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
         >
           <button
             type="button"
-            onClick={() =>
-              seekTo((segment.startSample * 1_000) / transcript.sampleRate)
-            }
+            onClick={() => highlightAndFocus(itemKey, mediaMs)}
             className="text-left text-xs tabular-nums text-[var(--ink-muted)] hover:text-[var(--accent-warm)]"
           >
-            {formatDuration(
-              (segment.startSample * 1_000) / transcript.sampleRate,
-            )}
+            {formatDuration(mediaMs)}
           </button>
           <div
             data-testid="transcript-speaker-line"
@@ -1080,9 +1414,13 @@ export default function RecordDetail({
                 [{speakerFor(segment)}]
               </span>
             )}
-            <p className="min-w-0 flex-1 text-sm leading-relaxed text-[var(--ink)]">
+            <button
+              type="button"
+              onClick={() => highlightAndFocus(itemKey, mediaMs)}
+              className="min-w-0 flex-1 text-left text-sm leading-relaxed text-[var(--ink)]"
+            >
               {segment.text}
-            </p>
+            </button>
           </div>
         </article>
       );
@@ -1091,7 +1429,8 @@ export default function RecordDetail({
       activeSpeakers,
       busyAction,
       handleReassignSegment,
-      seekTo,
+      highlightAndFocus,
+      highlightedItem,
       speakerFor,
       speakerIdFor,
       speakerOptions,
@@ -1100,10 +1439,130 @@ export default function RecordDetail({
     ],
   );
 
+  const renderTimelineItem = useCallback(
+    (item: RecordTimelineItem) => {
+      const mediaMs = item.type === 'note' ? item.anchorMediaMs : item.mediaMs;
+      const itemId = item.type === 'note' ? item.noteId : item.markId;
+      const isEditing = item.type === 'note' && editingNoteId === item.noteId;
+      const itemKey = `${item.type}-${itemId}`;
+      return (
+        <div className="px-4 pb-3">
+          <div
+            ref={(element) => {
+              if (element) timelineItemRefs.current.set(itemKey, element);
+              else timelineItemRefs.current.delete(itemKey);
+            }}
+            tabIndex={-1}
+            className={`group grid w-full grid-cols-[48px_minmax(0,1fr)_auto] items-start gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-left text-sm leading-relaxed transition-colors ${item.type === 'mark' ? 'text-[var(--accent-warm)]' : 'text-[var(--ink)]'} ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
+          >
+            <button
+              type="button"
+              onClick={() => highlightAndFocus(itemKey, mediaMs)}
+              className="text-left text-xs tabular-nums text-[var(--ink-muted)] hover:text-[var(--accent-warm)]"
+              aria-label={t('records.seekTimeline', {
+                time: formatDuration(mediaMs),
+              })}
+            >
+              {formatDuration(mediaMs)}
+            </button>
+            {isEditing ? (
+              <textarea
+                autoFocus
+                value={editingNoteDraft}
+                onChange={(event) => setEditingNoteDraft(event.target.value)}
+                className="min-h-20 w-full resize-y rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-2 py-1.5 text-sm text-[var(--ink)] outline-none focus:ring-1 focus:ring-[var(--accent-warm)]"
+                aria-label={t('records.editNote')}
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={() => highlightAndFocus(itemKey, mediaMs)}
+                className="whitespace-pre-wrap break-words text-left"
+              >
+                {item.type === 'note' ? item.text : t('records.mark')}
+              </button>
+            )}
+            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
+              {isEditing ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => void handleUpdateNote()}
+                    disabled={busyAction !== null || !editingNoteDraft.trim()}
+                    className="rounded p-1 text-[var(--success)] hover:bg-[var(--paper-inset)] disabled:opacity-40"
+                    aria-label={t('records.saveNoteEdit')}
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingNoteId(null);
+                      setEditingNoteDraft('');
+                    }}
+                    disabled={busyAction !== null}
+                    className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)]"
+                    aria-label={t('records.cancelNoteEdit')}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </>
+              ) : (
+                <>
+                  {item.type === 'note' && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingNoteId(item.noteId);
+                        setEditingNoteDraft(item.text);
+                      }}
+                      disabled={busyAction !== null}
+                      className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] disabled:opacity-40"
+                      aria-label={t('records.editNote')}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void handleDeleteTimelineItem(item.type, itemId)
+                    }
+                    disabled={busyAction !== null}
+                    className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--danger)] disabled:opacity-40"
+                    aria-label={
+                      item.type === 'note'
+                        ? t('records.deleteNote')
+                        : t('records.deleteMark')
+                    }
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    },
+    [
+      busyAction,
+      editingNoteDraft,
+      editingNoteId,
+      handleDeleteTimelineItem,
+      handleUpdateNote,
+      highlightAndFocus,
+      highlightedItem,
+      t,
+    ],
+  );
+
   const captureStatus = snapshot?.captureStatus ?? record?.audio?.captureStatus;
   const transcriptionStatus = record?.audio?.transcriptionStatus;
   const liveTranscriptionFailed =
     ownsCaptureSlot && transcriptionStatus === 'failed';
+  const completedTranscriptionFailed =
+    !ownsCaptureSlot && transcriptionStatus === 'failed';
   const systemAudioDowngraded = snapshot?.warnings.some(
     (warning) => warning.code === 'RECORDING_SYSTEM_AUDIO_UNAVAILABLE',
   );
@@ -1111,34 +1570,38 @@ export default function RecordDetail({
     (warning) => warning.code === 'RECORDING_WAKE_LOCK_UNAVAILABLE',
   );
   const statusLabel =
-    captureStatus === 'recording'
-      ? t('records.recording')
-      : captureStatus === 'paused'
-        ? t('records.paused')
-        : captureStatus === 'interrupted'
-          ? t('records.interrupted')
-          : captureStatus === 'failed' || transcriptionStatus === 'failed'
-            ? t('records.failed')
-            : transcriptionStatus &&
-                [
-                  'queued',
-                  'live',
-                  'lagging',
-                  'recovering',
-                  'finalizing',
-                ].includes(transcriptionStatus)
-              ? t('records.processing')
-              : t('records.complete');
+    !captureStatus && !transcriptionStatus && recordLoading
+      ? t('records.loadingRecord')
+      : captureStatus === 'recording'
+        ? t('records.recording')
+        : captureStatus === 'paused'
+          ? t('records.paused')
+          : captureStatus === 'interrupted'
+            ? t('records.interrupted')
+            : captureStatus === 'failed' || transcriptionStatus === 'failed'
+              ? t('records.failed')
+              : transcriptionStatus &&
+                  [
+                    'queued',
+                    'live',
+                    'lagging',
+                    'recovering',
+                    'finalizing',
+                  ].includes(transcriptionStatus)
+                ? t('records.processing')
+                : t('records.complete');
   const statusDotClass =
-    captureStatus === 'recording'
-      ? 'bg-[var(--error)]'
-      : captureStatus === 'interrupted' ||
-          captureStatus === 'failed' ||
-          transcriptionStatus === 'failed'
+    !captureStatus && !transcriptionStatus && recordLoading
+      ? 'bg-[var(--ink-muted)]'
+      : captureStatus === 'recording'
         ? 'bg-[var(--error)]'
-        : ownsCaptureSlot
-          ? 'bg-[var(--warning)]'
-          : 'bg-[var(--success)]';
+        : captureStatus === 'interrupted' ||
+            captureStatus === 'failed' ||
+            transcriptionStatus === 'failed'
+          ? 'bg-[var(--error)]'
+          : ownsCaptureSlot
+            ? 'bg-[var(--warning)]'
+            : 'bg-[var(--success)]';
   const playbackDurationMs = record?.audio?.mediaDurationMs ?? 0;
   const playbackPercent = Math.min(
     100,
@@ -1148,6 +1611,38 @@ export default function RecordDetail({
     !transcript &&
     !ownsCaptureSlot &&
     (transcriptionStatus === 'not_started' || modelPack?.usable === true);
+  const playbackMarkers = useMemo(() => {
+    if (playbackDurationMs <= 0) return [];
+    const userMarkers = timeline.items.map((item) => ({
+      key: item.type === 'note' ? `note-${item.noteId}` : `mark-${item.markId}`,
+      mediaMs: item.type === 'note' ? item.anchorMediaMs : item.mediaMs,
+      kind: item.type,
+    }));
+    const transcriptMarkers = (transcript?.segments ?? []).map((segment) => ({
+      key: `transcript-${segment.segmentId}`,
+      mediaMs:
+        (segment.startSample * 1_000) /
+        Math.max(1, transcript?.sampleRate ?? 1),
+      kind: 'transcript' as const,
+    }));
+    const sample = <T,>(items: T[], limit: number): T[] => {
+      if (items.length <= limit) return items;
+      return Array.from(
+        { length: limit },
+        (_value, index) =>
+          items[
+            Math.floor((index * (items.length - 1)) / Math.max(1, limit - 1))
+          ],
+      );
+    };
+    return [
+      ...sample(userMarkers, 80),
+      ...sample(
+        transcriptMarkers,
+        Math.max(0, 160 - Math.min(80, userMarkers.length)),
+      ),
+    ];
+  }, [playbackDurationMs, timeline.items, transcript]);
   const recordActionSections = useMemo<DropdownMenuSection[]>(
     () => [
       {
@@ -1226,10 +1721,17 @@ export default function RecordDetail({
     ],
   );
 
-  if (loadError && !record) {
+  if (loadError && !record && !snapshot) {
     return (
-      <div className="flex h-full items-center justify-center bg-[var(--paper)] p-8 text-sm text-[var(--error)]">
-        {t('records.loadFailed', { message: loadError })}
+      <div className="flex h-full flex-col items-center justify-center gap-3 bg-[var(--paper)] p-8 text-sm text-[var(--error)]">
+        <span>{t('records.loadFailed', { message: loadError })}</span>
+        <button
+          type="button"
+          onClick={() => void refresh()}
+          className="font-semibold text-[var(--accent-warm)] hover:underline"
+        >
+          {t('records.retryLoad')}
+        </button>
       </div>
     );
   }
@@ -1279,11 +1781,11 @@ export default function RecordDetail({
         />
       </header>
 
-      <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(320px,2fr)] grid-rows-[84px_minmax(0,1fr)] gap-x-5 px-5 pb-5 max-lg:grid-cols-1 max-lg:grid-rows-[84px_minmax(280px,1fr)_minmax(300px,1fr)]">
-        <section className="col-start-1 row-start-1 flex h-[84px] items-center gap-5 overflow-hidden rounded-[var(--radius-lg)] bg-[var(--ink)] px-5 text-[var(--paper)] shadow-sm">
+      <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(320px,2fr)] grid-rows-[84px_minmax(0,1fr)] gap-x-5 px-5 pb-5 max-lg:grid-cols-1 max-lg:grid-rows-[auto_minmax(300px,55vh)_minmax(320px,65vh)] max-lg:gap-y-4 max-lg:overflow-y-auto">
+        <section className="col-start-1 row-start-1 flex h-[84px] items-center gap-5 overflow-hidden rounded-[var(--radius-lg)] bg-[var(--ink)] px-5 text-[var(--paper)] shadow-sm max-lg:grid max-lg:h-auto max-lg:min-h-[132px] max-lg:grid-cols-[92px_minmax(0,1fr)] max-lg:grid-rows-[auto_auto] max-lg:gap-x-4 max-lg:gap-y-2 max-lg:overflow-visible max-lg:py-3">
           {ownsCaptureSlot ? (
             <>
-              <div className="min-w-[92px]">
+              <div className="min-w-[92px] max-lg:col-start-1 max-lg:row-start-1">
                 <div
                   className="font-mono text-2xl font-semibold tabular-nums"
                   data-testid="recording-media-duration"
@@ -1295,7 +1797,7 @@ export default function RecordDetail({
                 </div>
               </div>
               <div
-                className="flex min-w-0 flex-1 flex-col justify-center gap-2 overflow-hidden"
+                className="flex min-w-0 flex-1 flex-col justify-center gap-2 overflow-hidden max-lg:col-start-2 max-lg:row-start-1"
                 data-testid="recording-source-meters"
               >
                 {(snapshot?.sources ?? []).map((source) => {
@@ -1375,7 +1877,7 @@ export default function RecordDetail({
                   </span>
                 )}
               </div>
-              <div className="flex shrink-0 items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2 max-lg:col-span-2 max-lg:row-start-2 max-lg:justify-end">
                 <button
                   type="button"
                   onClick={() => void runControl(isPaused ? 'resume' : 'pause')}
@@ -1406,7 +1908,7 @@ export default function RecordDetail({
               </div>
             </>
           ) : (
-            <div className="flex min-w-0 flex-1 items-center gap-4">
+            <div className="flex min-w-0 flex-1 items-center gap-4 max-lg:col-span-2 max-lg:flex-wrap">
               <button
                 type="button"
                 disabled={!audioSrc}
@@ -1443,14 +1945,75 @@ export default function RecordDetail({
                   className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--paper)] shadow-sm"
                   style={{ left: `${playbackPercent}%` }}
                 />
+                {playbackMarkers.map((marker) => {
+                  const markerPercent = Math.min(
+                    100,
+                    Math.max(
+                      0,
+                      (marker.mediaMs / Math.max(1, playbackDurationMs)) * 100,
+                    ),
+                  );
+                  return (
+                    <button
+                      key={marker.key}
+                      type="button"
+                      onClick={() =>
+                        highlightAndFocus(marker.key, marker.mediaMs)
+                      }
+                      className={`absolute top-1/2 z-20 h-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--paper)] ${
+                        marker.kind === 'mark'
+                          ? 'w-1.5 bg-[var(--warning)]'
+                          : marker.kind === 'note'
+                            ? 'w-1 bg-[var(--accent-warm)]'
+                            : 'w-px bg-[var(--paper)]/55'
+                      }`}
+                      style={{ left: `${markerPercent}%` }}
+                      aria-label={t(`records.${marker.kind}TimelineMarker`, {
+                        time: formatDuration(marker.mediaMs),
+                      })}
+                    />
+                  );
+                })}
                 <input
                   type="range"
                   min={0}
                   max={Math.max(1, playbackDurationMs)}
                   value={Math.min(playbackMs, playbackDurationMs)}
                   onChange={(event) => seekTo(Number(event.target.value))}
-                  className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                  className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
                   aria-label={t('records.duration')}
+                />
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPlaybackVolume((current) => (current > 0 ? 0 : 1))
+                  }
+                  className="text-[var(--paper)]/70 hover:text-[var(--paper)]"
+                  aria-label={
+                    playbackVolume > 0
+                      ? t('records.mutePlayback')
+                      : t('records.unmutePlayback')
+                  }
+                >
+                  {playbackVolume > 0 ? (
+                    <Volume2 className="h-4 w-4" />
+                  ) : (
+                    <VolumeX className="h-4 w-4" />
+                  )}
+                </button>
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={playbackVolume}
+                  onChange={(event) =>
+                    setPlaybackVolume(Number(event.target.value))
+                  }
+                  className="h-4 w-12 accent-[var(--accent-warm)]"
+                  aria-label={t('records.volume')}
                 />
               </div>
               {playbackTracks.length > 1 && (
@@ -1485,6 +2048,16 @@ export default function RecordDetail({
               trackPlaybackSession();
             }}
             onPause={() => setPlaying(false)}
+            onError={() => {
+              audioRef.current?.pause();
+              secondaryAudioRef.current?.pause();
+              setPlaying(false);
+              setPlaybackError(true);
+              if (!playbackErrorShownRef.current) {
+                playbackErrorShownRef.current = true;
+                toast.error(t('records.playbackFailed'));
+              }
+            }}
             onEnded={() => {
               secondaryAudioRef.current?.pause();
               setPlaying(false);
@@ -1512,7 +2085,22 @@ export default function RecordDetail({
                 event.currentTarget.currentTime =
                   audioRef.current?.currentTime ?? playbackMs / 1_000;
               }}
+              onError={() => {
+                audioRef.current?.pause();
+                secondaryAudioRef.current?.pause();
+                setPlaying(false);
+                setPlaybackError(true);
+                if (!playbackErrorShownRef.current) {
+                  playbackErrorShownRef.current = true;
+                  toast.error(t('records.playbackFailed'));
+                }
+              }}
             />
+          )}
+          {playbackError && (
+            <span className="sr-only" role="alert">
+              {t('records.playbackFailed')}
+            </span>
           )}
         </section>
 
@@ -1521,23 +2109,52 @@ export default function RecordDetail({
             <h2 className="text-sm font-semibold text-[var(--ink)]">
               {t('records.transcript')}
             </h2>
-            <span className="text-xs text-[var(--ink-muted)]">
+            <span
+              className="text-xs text-[var(--ink-muted)]"
+              role="status"
+              aria-live="polite"
+            >
               {liveTranscriptionFailed
                 ? t('records.transcriptLiveFailed')
-                : ownsCaptureSlot
-                  ? t('records.transcriptLive')
-                  : transcriptionStatus &&
-                      [
-                        'queued',
-                        'live',
-                        'lagging',
-                        'recovering',
-                        'finalizing',
-                      ].includes(transcriptionStatus)
-                    ? t('records.transcriptPending')
-                    : null}
+                : transcriptionStatus === 'lagging' ||
+                    transcript?.state === 'lagging'
+                  ? t('records.transcriptLagging')
+                  : transcriptionStatus === 'recovering' ||
+                      transcript?.state === 'recovering'
+                    ? t('records.transcriptRecovering')
+                    : ownsCaptureSlot
+                      ? t('records.transcriptLive')
+                      : transcriptionStatus &&
+                          [
+                            'queued',
+                            'live',
+                            'lagging',
+                            'recovering',
+                            'finalizing',
+                          ].includes(transcriptionStatus)
+                        ? t('records.transcriptPending')
+                        : null}
             </span>
           </div>
+          {(loadError || projectionError) && (
+            <div
+              role="alert"
+              className="mb-3 flex items-center justify-between gap-3 rounded-[var(--radius-md)] bg-[var(--warning-bg)] px-3 py-2 text-xs text-[var(--ink-secondary)]"
+            >
+              <span>
+                {t('records.loadFailed', {
+                  message: loadError ?? projectionError,
+                })}
+              </span>
+              <button
+                type="button"
+                onClick={() => void refresh()}
+                className="shrink-0 font-semibold text-[var(--accent-warm)] hover:underline"
+              >
+                {t('records.retryLoad')}
+              </button>
+            </div>
+          )}
           {liveTranscriptionFailed && (
             <div
               role="status"
@@ -1546,23 +2163,59 @@ export default function RecordDetail({
               {t('records.transcriptLiveFailedHint')}
             </div>
           )}
+          {completedTranscriptionFailed && (
+            <div
+              role="status"
+              className="mb-3 flex items-center justify-between gap-3 rounded-[var(--radius-md)] bg-[var(--warning)]/10 px-3 py-2 text-sm text-[var(--ink-secondary)]"
+            >
+              <span>{t('records.transcriptFailedHint')}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  if (modelPack?.usable) {
+                    void handleStartTranscription();
+                    return;
+                  }
+                  window.dispatchEvent(
+                    new CustomEvent(CUSTOM_EVENTS.OPEN_SETTINGS, {
+                      detail: {
+                        section: 'mcp',
+                        officialToolId: 'speech-recognition',
+                      },
+                    }),
+                  );
+                }}
+                disabled={busyAction !== null}
+                className="shrink-0 font-semibold text-[var(--accent-warm)] hover:underline disabled:opacity-50"
+              >
+                {modelPack?.usable
+                  ? t('records.retryTranscription')
+                  : t('records.openSpeechTool')}
+              </button>
+            </div>
+          )}
           {transcript?.segments.length ? (
             <div
               className="min-h-0 flex-1"
               aria-label={t('records.transcript')}
             >
               {transcript.segments.length < TRANSCRIPT_VIRTUALIZE_THRESHOLD ? (
-                <div className="h-full overflow-y-auto">
+                <div
+                  ref={transcriptScrollRef}
+                  className="h-full overflow-y-auto"
+                >
                   {transcript.segments.map(renderTranscriptSegment)}
                 </div>
               ) : (
                 <Virtuoso
+                  ref={transcriptVirtuosoRef}
                   data={transcript.segments}
                   computeItemKey={(_index, segment) => segment.segmentId}
                   itemContent={(_index, segment) =>
                     renderTranscriptSegment(segment)
                   }
                   increaseViewportBy={300}
+                  rangeChanged={() => focusPendingVirtualItem('transcript')}
                   className="h-full"
                 />
               )}
@@ -1613,283 +2266,217 @@ export default function RecordDetail({
         </section>
 
         <aside className="col-start-2 row-span-2 row-start-1 flex min-h-0 flex-col rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] shadow-xs max-lg:col-start-1 max-lg:row-span-1 max-lg:row-start-3">
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-4">
-            <h2 className="mb-3 text-sm font-semibold">{t('records.notes')}</h2>
+          <div className="flex min-h-0 flex-1 flex-col pt-4">
+            <h2 className="mb-3 px-4 text-sm font-semibold">
+              {t('records.notes')}
+            </h2>
             {timeline.items.length ? (
-              <div className="space-y-3 pb-4">
-                {timeline.items.map((item) => {
-                  const mediaMs =
-                    item.type === 'note' ? item.anchorMediaMs : item.mediaMs;
-                  const itemId =
-                    item.type === 'note' ? item.noteId : item.markId;
-                  const isEditing =
-                    item.type === 'note' && editingNoteId === item.noteId;
-                  return (
-                    <div
-                      key={`${item.type}-${itemId}`}
-                      className={`group grid w-full grid-cols-[48px_minmax(0,1fr)_auto] items-start gap-2 text-left text-sm leading-relaxed ${item.type === 'mark' ? 'text-[var(--accent-warm)]' : 'text-[var(--ink)]'}`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => seekTo(mediaMs)}
-                        className="text-left text-xs tabular-nums text-[var(--ink-muted)] hover:text-[var(--accent-warm)]"
-                        aria-label={t('records.seekTimeline', {
-                          time: formatDuration(mediaMs),
-                        })}
-                      >
-                        {formatDuration(mediaMs)}
-                      </button>
-                      {isEditing ? (
-                        <textarea
-                          autoFocus
-                          value={editingNoteDraft}
-                          onChange={(event) =>
-                            setEditingNoteDraft(event.target.value)
-                          }
-                          className="min-h-20 w-full resize-y rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-2 py-1.5 text-sm text-[var(--ink)] outline-none focus:ring-1 focus:ring-[var(--accent-warm)]"
-                          aria-label={t('records.editNote')}
-                        />
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => seekTo(mediaMs)}
-                          className="whitespace-pre-wrap break-words text-left"
-                        >
-                          {item.type === 'note' ? item.text : t('records.mark')}
-                        </button>
-                      )}
-                      <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
-                        {isEditing ? (
-                          <>
-                            <button
-                              type="button"
-                              onClick={() => void handleUpdateNote()}
-                              disabled={
-                                busyAction !== null || !editingNoteDraft.trim()
-                              }
-                              className="rounded p-1 text-[var(--success)] hover:bg-[var(--paper-inset)] disabled:opacity-40"
-                              aria-label={t('records.saveNoteEdit')}
-                            >
-                              <Check className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setEditingNoteId(null);
-                                setEditingNoteDraft('');
-                              }}
-                              disabled={busyAction !== null}
-                              className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)]"
-                              aria-label={t('records.cancelNoteEdit')}
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </button>
-                          </>
-                        ) : (
-                          <>
-                            {item.type === 'note' && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setEditingNoteId(item.noteId);
-                                  setEditingNoteDraft(item.text);
-                                }}
-                                disabled={busyAction !== null}
-                                className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] disabled:opacity-40"
-                                aria-label={t('records.editNote')}
-                              >
-                                <Pencil className="h-3.5 w-3.5" />
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() =>
-                                void handleDeleteTimelineItem(item.type, itemId)
-                              }
-                              disabled={busyAction !== null}
-                              className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--danger)] disabled:opacity-40"
-                              aria-label={
-                                item.type === 'note'
-                                  ? t('records.deleteNote')
-                                  : t('records.deleteMark')
-                              }
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+              timeline.items.length < TIMELINE_VIRTUALIZE_THRESHOLD ? (
+                <div
+                  ref={timelineScrollRef}
+                  className="min-h-0 flex-1 overflow-y-auto"
+                >
+                  {timeline.items.map(renderTimelineItem)}
+                </div>
+              ) : (
+                <Virtuoso
+                  ref={timelineVirtuosoRef}
+                  data={timeline.items}
+                  computeItemKey={(_index, item) =>
+                    item.type === 'note'
+                      ? `note-${item.noteId}`
+                      : `mark-${item.markId}`
+                  }
+                  itemContent={(_index, item) => renderTimelineItem(item)}
+                  increaseViewportBy={240}
+                  rangeChanged={() => focusPendingVirtualItem('timeline')}
+                  className="min-h-0 flex-1"
+                />
+              )
             ) : (
-              <p className="py-8 text-center text-sm text-[var(--ink-muted)]">
+              <p className="min-h-0 flex-1 px-4 py-8 text-center text-sm text-[var(--ink-muted)]">
                 {t('records.noNotes')}
               </p>
             )}
 
-            {!ownsCaptureSlot && diarization && activeSpeakers.length > 0 && (
-              <div className="border-t border-[var(--line-subtle)] py-4">
-                <h2 className="mb-1 text-sm font-semibold">
-                  {t('records.speakerCorrection')}
-                </h2>
-                <p className="mb-3 text-xs text-[var(--ink-muted)]">
-                  {t('records.speakerCorrectionHint')}
-                </p>
-                <div className="space-y-3">
-                  {activeSpeakers.map((speaker) => (
-                    <div key={speaker.speakerId} className="space-y-1.5">
-                      <div className="flex items-center gap-2">
-                        <span className="w-20 shrink-0 truncate text-xs font-medium text-[var(--ink-secondary)]">
-                          {t('records.speakerUnknown', {
-                            name: speakerLetter(speaker.speakerId),
-                          })}
-                        </span>
-                        <input
-                          value={speakerNameDrafts[speaker.speakerId] ?? ''}
-                          onChange={(event) =>
-                            setSpeakerNameDrafts((current) => ({
-                              ...current,
-                              [speaker.speakerId]: event.target.value,
-                            }))
-                          }
-                          onBlur={() =>
-                            void handleRenameSpeaker(speaker.speakerId)
-                          }
-                          onKeyDown={(event) => {
-                            if (event.key === 'Enter') {
-                              event.currentTarget.blur();
-                            }
-                          }}
-                          placeholder={t('records.speakerNamePlaceholder')}
-                          disabled={busyAction !== null}
-                          className="min-w-0 flex-1 rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-2 py-1.5 text-xs text-[var(--ink)] outline-none focus:ring-1 focus:ring-[var(--accent-warm)] disabled:opacity-50"
-                          aria-label={t('records.renameSpeaker', {
-                            speaker: speakerLabel(speaker.speakerId),
-                          })}
-                        />
-                      </div>
-                      {activeSpeakers.length > 1 && (
-                        <div className="flex items-center gap-2 pl-[88px]">
-                          <CustomSelect
-                            value={speakerMergeTargets[speaker.speakerId] ?? ''}
-                            options={speakerOptions.filter(
-                              (candidate) =>
-                                candidate.value !== String(speaker.speakerId),
+            {!ownsCaptureSlot &&
+              ((diarization && activeSpeakers.length > 0) || record?.audio) && (
+                <div className="max-h-[45%] shrink-0 overflow-y-auto px-4">
+                  {diarization && activeSpeakers.length > 0 && (
+                    <div className="border-t border-[var(--line-subtle)] py-4">
+                      <h2 className="mb-1 text-sm font-semibold">
+                        {t('records.speakerCorrection')}
+                      </h2>
+                      <p className="mb-3 text-xs text-[var(--ink-muted)]">
+                        {t('records.speakerCorrectionHint')}
+                      </p>
+                      <div className="space-y-3">
+                        {activeSpeakers.map((speaker) => (
+                          <div key={speaker.speakerId} className="space-y-1.5">
+                            <div className="flex items-center gap-2">
+                              <span className="w-20 shrink-0 truncate text-xs font-medium text-[var(--ink-secondary)]">
+                                {t('records.speakerUnknown', {
+                                  name: speakerLetter(speaker.speakerId),
+                                })}
+                              </span>
+                              <input
+                                value={
+                                  speakerNameDrafts[speaker.speakerId] ?? ''
+                                }
+                                onChange={(event) =>
+                                  setSpeakerNameDrafts((current) => ({
+                                    ...current,
+                                    [speaker.speakerId]: event.target.value,
+                                  }))
+                                }
+                                onBlur={() =>
+                                  void handleRenameSpeaker(speaker.speakerId)
+                                }
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter') {
+                                    event.currentTarget.blur();
+                                  }
+                                }}
+                                placeholder={t(
+                                  'records.speakerNamePlaceholder',
+                                )}
+                                disabled={busyAction !== null}
+                                className="min-w-0 flex-1 rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-2 py-1.5 text-xs text-[var(--ink)] outline-none focus:ring-1 focus:ring-[var(--accent-warm)] disabled:opacity-50"
+                                aria-label={t('records.renameSpeaker', {
+                                  speaker: speakerLabel(speaker.speakerId),
+                                })}
+                              />
+                            </div>
+                            {activeSpeakers.length > 1 && (
+                              <div className="flex items-center gap-2 pl-[88px]">
+                                <CustomSelect
+                                  value={
+                                    speakerMergeTargets[speaker.speakerId] ?? ''
+                                  }
+                                  options={speakerOptions.filter(
+                                    (candidate) =>
+                                      candidate.value !==
+                                      String(speaker.speakerId),
+                                  )}
+                                  onChange={(value) =>
+                                    setSpeakerMergeTargets((current) => ({
+                                      ...current,
+                                      [speaker.speakerId]: value,
+                                    }))
+                                  }
+                                  disabled={busyAction !== null}
+                                  compact
+                                  className="min-w-0 flex-1 [&>button]:bg-[var(--paper-inset)]"
+                                  placeholder={t('records.mergeInto')}
+                                  ariaLabel={t('records.mergeSpeakerTarget', {
+                                    speaker: speakerLabel(speaker.speakerId),
+                                  })}
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    void handleMergeSpeaker(speaker.speakerId)
+                                  }
+                                  disabled={
+                                    busyAction !== null ||
+                                    !speakerMergeTargets[speaker.speakerId]
+                                  }
+                                  className="rounded-[var(--radius-sm)] px-2 py-1 text-xs font-medium text-[var(--accent-warm)] hover:bg-[var(--accent-warm-subtle)] disabled:opacity-40"
+                                >
+                                  {t('records.merge')}
+                                </button>
+                              </div>
                             )}
-                            onChange={(value) =>
-                              setSpeakerMergeTargets((current) => ({
-                                ...current,
-                                [speaker.speakerId]: value,
-                              }))
-                            }
-                            disabled={busyAction !== null}
-                            compact
-                            className="min-w-0 flex-1 [&>button]:bg-[var(--paper-inset)]"
-                            placeholder={t('records.mergeInto')}
-                            ariaLabel={t('records.mergeSpeakerTarget', {
-                              speaker: speakerLabel(speaker.speakerId),
-                            })}
-                          />
-                          <button
-                            type="button"
-                            onClick={() =>
-                              void handleMergeSpeaker(speaker.speakerId)
-                            }
-                            disabled={
-                              busyAction !== null ||
-                              !speakerMergeTargets[speaker.speakerId]
-                            }
-                            className="rounded-[var(--radius-sm)] px-2 py-1 text-xs font-medium text-[var(--accent-warm)] hover:bg-[var(--accent-warm-subtle)] disabled:opacity-40"
-                          >
-                            {t('records.merge')}
-                          </button>
-                        </div>
+                          </div>
+                        ))}
+                      </div>
+                      {diarization.conflicts.length > 0 && (
+                        <p
+                          className="mt-3 text-xs text-[var(--warning)]"
+                          role="status"
+                        >
+                          {t('records.speakerOverrideConflicts', {
+                            count: diarization.conflicts.length,
+                          })}
+                        </p>
                       )}
                     </div>
-                  ))}
-                </div>
-                {diarization.conflicts.length > 0 && (
-                  <p
-                    className="mt-3 text-xs text-[var(--warning)]"
-                    role="status"
-                  >
-                    {t('records.speakerOverrideConflicts', {
-                      count: diarization.conflicts.length,
-                    })}
-                  </p>
-                )}
-              </div>
-            )}
+                  )}
 
-            {!ownsCaptureSlot && record?.audio && (
-              <div className="border-t border-[var(--line-subtle)] py-4">
-                <h2 className="mb-3 text-sm font-semibold">
-                  {t('records.recordInfo')}
-                </h2>
-                <dl className="space-y-2 text-xs">
-                  <div className="flex items-start justify-between gap-4">
-                    <dt className="pt-1.5 text-[var(--ink-muted)]">
-                      {t('records.tags')}
-                    </dt>
-                    <dd className="min-w-0 flex-1">
-                      <input
-                        value={tagDraft}
-                        onChange={(event) => {
-                          tagDraftRef.current = event.target.value;
-                          tagDirtyRef.current = true;
-                          setTagDraft(event.target.value);
-                        }}
-                        onBlur={() =>
-                          queueMetadataSave(titleDraft, parseTagDraft(tagDraft))
-                        }
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter') {
-                            event.currentTarget.blur();
-                          }
-                        }}
-                        placeholder={t('records.tagsPlaceholder')}
-                        aria-label={t('records.tags')}
-                        className="w-full rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-2 py-1.5 text-xs text-[var(--ink)] outline-none placeholder:text-[var(--ink-muted)] focus:ring-1 focus:ring-[var(--accent-warm)]"
-                      />
-                    </dd>
-                  </div>
-                  <div className="flex justify-between gap-4">
-                    <dt className="text-[var(--ink-muted)]">
-                      {t('records.duration')}
-                    </dt>
-                    <dd>{formatDuration(record.audio.mediaDurationMs)}</dd>
-                  </div>
-                  <div className="flex justify-between gap-4">
-                    <dt className="text-[var(--ink-muted)]">
-                      {t('records.tracks')}
-                    </dt>
-                    <dd>
-                      {record.audio.tracks
-                        .map((track) => t(`records.${track}`))
-                        .join(' · ')}
-                    </dd>
-                  </div>
-                  <div className="flex justify-between gap-4">
-                    <dt className="text-[var(--ink-muted)]">
-                      {t('records.size')}
-                    </dt>
-                    <dd>{formatBytes(record.audio.sizeBytes)}</dd>
-                  </div>
-                  {transcript?.provenance.modelPackRevision && (
-                    <div className="flex justify-between gap-4">
-                      <dt className="text-[var(--ink-muted)]">
-                        {t('records.model')}
-                      </dt>
-                      <dd className="truncate">
-                        {transcript.provenance.modelPackRevision}
-                      </dd>
+                  {record?.audio && (
+                    <div className="border-t border-[var(--line-subtle)] py-4">
+                      <h2 className="mb-3 text-sm font-semibold">
+                        {t('records.recordInfo')}
+                      </h2>
+                      <dl className="space-y-2 text-xs">
+                        <div className="flex items-start justify-between gap-4">
+                          <dt className="pt-1.5 text-[var(--ink-muted)]">
+                            {t('records.tags')}
+                          </dt>
+                          <dd className="min-w-0 flex-1">
+                            <input
+                              value={tagDraft}
+                              onChange={(event) => {
+                                tagDraftRef.current = event.target.value;
+                                tagDirtyRef.current = true;
+                                setTagDraft(event.target.value);
+                              }}
+                              onBlur={() =>
+                                queueMetadataSave(
+                                  titleDraft,
+                                  parseTagDraft(tagDraft),
+                                )
+                              }
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter') {
+                                  event.currentTarget.blur();
+                                }
+                              }}
+                              placeholder={t('records.tagsPlaceholder')}
+                              aria-label={t('records.tags')}
+                              className="w-full rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-2 py-1.5 text-xs text-[var(--ink)] outline-none placeholder:text-[var(--ink-muted)] focus:ring-1 focus:ring-[var(--accent-warm)]"
+                            />
+                          </dd>
+                        </div>
+                        <div className="flex justify-between gap-4">
+                          <dt className="text-[var(--ink-muted)]">
+                            {t('records.duration')}
+                          </dt>
+                          <dd>
+                            {formatDuration(record.audio.mediaDurationMs)}
+                          </dd>
+                        </div>
+                        <div className="flex justify-between gap-4">
+                          <dt className="text-[var(--ink-muted)]">
+                            {t('records.tracks')}
+                          </dt>
+                          <dd>
+                            {record.audio.tracks
+                              .map((track) => t(`records.${track}`))
+                              .join(' · ')}
+                          </dd>
+                        </div>
+                        <div className="flex justify-between gap-4">
+                          <dt className="text-[var(--ink-muted)]">
+                            {t('records.size')}
+                          </dt>
+                          <dd>{formatBytes(record.audio.sizeBytes)}</dd>
+                        </div>
+                        {transcript?.provenance.modelPackRevision && (
+                          <div className="flex justify-between gap-4">
+                            <dt className="text-[var(--ink-muted)]">
+                              {t('records.model')}
+                            </dt>
+                            <dd className="truncate">
+                              {transcript.provenance.modelPackRevision}
+                            </dd>
+                          </div>
+                        )}
+                      </dl>
                     </div>
                   )}
-                </dl>
-              </div>
-            )}
+                </div>
+              )}
           </div>
 
           {ownsCaptureSlot && (
@@ -1903,6 +2490,7 @@ export default function RecordDetail({
                   aria-label={t('records.notePlaceholder')}
                   onChange={(event) => {
                     const next = event.target.value;
+                    noteDraftRef.current = next;
                     if (next.trim() && noteAnchorRef.current === null) {
                       noteAnchorRef.current = currentMediaMs();
                       noteStartedWallRef.current = Date.now();
@@ -1927,6 +2515,7 @@ export default function RecordDetail({
                       event.keyCode !== 229
                     ) {
                       event.preventDefault();
+                      if (busyAction === 'note') return;
                       void submitNote();
                     }
                   }}

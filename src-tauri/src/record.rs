@@ -19,7 +19,9 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::durable_fs::{rename_directory_noreplace, sync_directory};
-use crate::durable_journal::{recover_and_read, DurableRecordJournal};
+use crate::durable_journal::{
+    read_valid_prefix, read_valid_suffix, recover_and_read, DurableRecordJournal,
+};
 use crate::record_analytics::{self, AnalyticsSource, AnalyticsSurface, RecordUseOperation};
 use crate::utils::file_lock::{with_file_lock_blocking, FileLockError, FileLockOptions};
 use crate::{ulog_info, ulog_warn};
@@ -845,6 +847,25 @@ pub struct RecordTranscriptSnapshot {
     pub segments: Vec<RecordTranscriptSegment>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordTranscriptCursor {
+    pub journal_bytes: u64,
+    pub projection_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordTranscriptDelta {
+    pub record_id: String,
+    pub projection_revision: u64,
+    pub state: String,
+    pub upserts: Vec<RecordTranscriptSegment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_snapshot: Option<RecordTranscriptSnapshot>,
+    pub cursor: RecordTranscriptCursor,
+}
+
 impl std::fmt::Debug for RecordTranscriptSnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1406,13 +1427,119 @@ impl RecordStore {
         {
             return Err("live transcript revision journal is invalid".to_string());
         }
-        let entries = recover_and_read::<RecordTranscriptRevisionEvent>(
+        let (entries, _) = read_valid_prefix::<RecordTranscriptRevisionEvent>(
             &path,
             id,
             TRANSCRIPT_REVISION_SCHEMA_VERSION,
             TRANSCRIPT_REVISION_MAX_LINE_BYTES,
         )?;
         project_live_transcript(id, entries).map(Some)
+    }
+
+    pub async fn read_live_transcript_delta(
+        &self,
+        id: &str,
+        cursor: Option<RecordTranscriptCursor>,
+    ) -> Result<Option<RecordTranscriptDelta>, String> {
+        let stored = self
+            .inner
+            .read()
+            .await
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        if stored.record.kind != RecordKind::Audio || stored.record.audio.is_none() {
+            return Err(format!("Record is not audio: {id}"));
+        }
+        let path = stored.path.join("transcript/revisions.jsonl");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("inspect live transcript journal: {error}")),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > TRANSCRIPT_REVISION_MAX_BYTES
+        {
+            return Err("live transcript revision journal is invalid".to_string());
+        }
+
+        if let Some(cursor) = cursor.filter(|cursor| cursor.journal_bytes <= metadata.len()) {
+            if cursor.journal_bytes == metadata.len() {
+                return Ok(None);
+            }
+            if let Ok((entries, journal_bytes)) = read_valid_suffix::<RecordTranscriptRevisionEvent>(
+                &path,
+                id,
+                TRANSCRIPT_REVISION_SCHEMA_VERSION,
+                TRANSCRIPT_REVISION_MAX_LINE_BYTES,
+                cursor.journal_bytes,
+                cursor.projection_revision.saturating_add(1),
+            ) {
+                if entries.is_empty() {
+                    return Ok(None);
+                }
+                let projection_revision = entries
+                    .last()
+                    .map_or(cursor.projection_revision, |entry| entry.seq);
+                let mut state = "live".to_string();
+                let mut upserts = Vec::new();
+                for entry in entries {
+                    match entry.event {
+                        RecordTranscriptRevisionEvent::GenerationStarted { .. }
+                        | RecordTranscriptRevisionEvent::GenerationFailed { .. } => {
+                            state = "recovering".to_string();
+                        }
+                        RecordTranscriptRevisionEvent::SegmentUpsert { segment } => {
+                            state = "live".to_string();
+                            upserts.push(segment);
+                        }
+                        RecordTranscriptRevisionEvent::SessionFailed { .. } => {
+                            state = "failed".to_string();
+                        }
+                        RecordTranscriptRevisionEvent::SessionFinished => {
+                            state = "finalizing".to_string();
+                        }
+                        RecordTranscriptRevisionEvent::SessionStarted { .. } => {
+                            return Err(
+                                "live transcript cursor crossed a session boundary".to_string()
+                            )
+                        }
+                    }
+                }
+                return Ok(Some(RecordTranscriptDelta {
+                    record_id: id.to_string(),
+                    projection_revision,
+                    state,
+                    upserts,
+                    reset_snapshot: None,
+                    cursor: RecordTranscriptCursor {
+                        journal_bytes,
+                        projection_revision,
+                    },
+                }));
+            }
+        }
+
+        let (entries, journal_bytes) = read_valid_prefix::<RecordTranscriptRevisionEvent>(
+            &path,
+            id,
+            TRANSCRIPT_REVISION_SCHEMA_VERSION,
+            TRANSCRIPT_REVISION_MAX_LINE_BYTES,
+        )?;
+        let snapshot = project_live_transcript(id, entries)?;
+        let projection_revision = snapshot.projection_revision;
+        Ok(Some(RecordTranscriptDelta {
+            record_id: id.to_string(),
+            projection_revision,
+            state: snapshot.state.clone(),
+            upserts: Vec::new(),
+            reset_snapshot: Some(snapshot),
+            cursor: RecordTranscriptCursor {
+                journal_bytes,
+                projection_revision,
+            },
+        }))
     }
 
     pub(crate) async fn read_live_segment_finalizations(
@@ -4710,6 +4837,15 @@ pub async fn cmd_record_transcript(
 }
 
 #[tauri::command]
+pub async fn cmd_record_transcript_delta(
+    state: tauri::State<'_, ManagedRecordStore>,
+    id: String,
+    cursor: Option<RecordTranscriptCursor>,
+) -> Result<Option<RecordTranscriptDelta>, String> {
+    state.read_live_transcript_delta(&id, cursor).await
+}
+
+#[tauri::command]
 pub async fn cmd_record_diarization(
     state: tauri::State<'_, ManagedRecordStore>,
     id: String,
@@ -5268,6 +5404,73 @@ mod tests {
         assert_eq!(projection.provenance, provenance);
         assert_eq!(projection.segments, vec![corrected]);
         assert!(!format!("{projection:?}").contains("private corrected canary"));
+    }
+
+    #[tokio::test]
+    async fn live_transcript_delta_reads_only_entries_after_its_cursor() {
+        let temp = tempdir().unwrap();
+        let store = store_at(temp.path());
+        let record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Live delta".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::Queued,
+            })
+            .await
+            .unwrap();
+        let mut journal = store
+            .begin_live_transcript(
+                &record.id,
+                RecordSpeechProvenance {
+                    provider: "local".into(),
+                    model_pack_revision: "local-standard-speech-v2".into(),
+                    onnx_runtime_version: "1.28.0".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let initial = store
+            .read_live_transcript_delta(&record.id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(initial.reset_snapshot.is_some());
+        assert!(initial.upserts.is_empty());
+
+        journal
+            .append_generation_started(
+                1,
+                vec![RecordTranscriptTrackOffset {
+                    track: AudioTrackKind::Microphone,
+                    sample: 0,
+                }],
+            )
+            .unwrap();
+        let appended = journal
+            .append_segment(
+                AudioTrackKind::Microphone,
+                0,
+                16_000,
+                "private delta canary".into(),
+                Some("zh".into()),
+            )
+            .unwrap()
+            .unwrap();
+
+        let delta = store
+            .read_live_transcript_delta(&record.id, Some(initial.cursor))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(delta.reset_snapshot.is_none());
+        assert_eq!(delta.upserts, vec![appended]);
+        assert!(delta.cursor.journal_bytes > initial.cursor.journal_bytes);
+        assert!(store
+            .read_live_transcript_delta(&record.id, Some(delta.cursor))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

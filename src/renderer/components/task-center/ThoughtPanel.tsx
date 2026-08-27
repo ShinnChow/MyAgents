@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NotebookPen, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { Virtuoso } from 'react-virtuoso';
 import {
   thoughtList,
   thoughtMerge,
@@ -30,7 +31,11 @@ import { searchRecords, type RecordSearchHit } from '@/api/searchClient';
 // useThoughtTagCandidates for the rationale.
 import { useThoughtTagCandidates } from '@/hooks/useThoughtTagCandidates';
 import type { Thought } from '@/../shared/types/thought';
-import type { RecordChange, RecordSummary } from '@/../shared/types/record';
+import type {
+  RecordChange,
+  RecordSummary,
+  RecordingSnapshot,
+} from '@/../shared/types/record';
 
 interface Props {
   onDispatchThought?: (t: Thought) => void;
@@ -47,7 +52,12 @@ interface Props {
    * into the input box without a second click (v0.1.69 UX round).
    */
   autoFocusInput?: boolean;
-  onOpenRecord?: (recordId: string, mediaMs?: number) => void;
+  onOpenRecord?: (
+    recordId: string,
+    mediaMs?: number,
+    activeRecording?: boolean,
+  ) => void;
+  activeRecordingSnapshot?: RecordingSnapshot | null;
 }
 
 export function ThoughtPanel({
@@ -56,6 +66,7 @@ export function ThoughtPanel({
   refreshKey,
   autoFocusInput = false,
   onOpenRecord,
+  activeRecordingSnapshot,
 }: Props) {
   const [thoughts, setThoughts] = useState<Thought[]>([]);
   const [audioRecords, setAudioRecords] = useState<RecordSummary[]>([]);
@@ -67,6 +78,10 @@ export function ThoughtPanel({
   > | null>(null);
   const [activeTag, setActiveTag] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const reloadRequestRef = useRef(0);
+  const thoughtScopeRef = useRef<'active' | 'archived' | null>(null);
+  const audioScopeRef = useRef<'active' | 'archived' | null>(null);
   // v0.2.16: archive view filter. Default 'active' — archived thoughts
   // are soft-hidden from the panel until the user flips this toggle.
   const [viewMode, setViewMode] = useState<'active' | 'archived'>('active');
@@ -92,14 +107,31 @@ export function ThoughtPanel({
   const { t } = useTranslation('task');
 
   const reload = useCallback(async () => {
+    const request = reloadRequestRef.current + 1;
+    reloadRequestRef.current = request;
+    // Partial failures may preserve useful rows only within the same scope.
+    // Carrying active rows into the archived view (or vice versa) is a false
+    // product state, so clear only the side whose successful scope differs.
+    if (thoughtScopeRef.current !== viewMode) setThoughts([]);
+    if (audioScopeRef.current !== viewMode) setAudioRecords([]);
     setLoading(true);
-    try {
-      const [list, audio] = await Promise.all([
-        thoughtList({ archived: viewMode }),
-        recordList({ kind: 'audio', archived: viewMode }),
-      ]);
+    const [listResult, audioResult] = await Promise.allSettled([
+      thoughtList({ archived: viewMode }),
+      recordList({ kind: 'audio', archived: viewMode }),
+    ]);
+    if (reloadRequestRef.current !== request) return;
+    const list = listResult.status === 'fulfilled' ? listResult.value : null;
+    const audio = audioResult.status === 'fulfilled' ? audioResult.value : null;
+    if (list) {
+      thoughtScopeRef.current = viewMode;
       setThoughts(list);
+    }
+    if (audio) {
+      audioScopeRef.current = viewMode;
       setAudioRecords(audio);
+    }
+    setLoadError(!list || !audio);
+    if (list && audio) {
       // Drop any phantom ids from the current selection — a thought that
       // was selected before reload but no longer exists (e.g. deleted in
       // another window, or merged elsewhere) shouldn't keep counting
@@ -119,13 +151,20 @@ export function ThoughtPanel({
         }
         return changed ? next : prev;
       });
-    } catch (err) {
-      console.error('[ThoughtPanel] load failed', err);
-      setThoughts([]);
-      setAudioRecords([]);
-    } finally {
-      setLoading(false);
     }
+    if (listResult.status === 'rejected') {
+      console.error(
+        '[ThoughtPanel] text Record load failed',
+        listResult.reason,
+      );
+    }
+    if (audioResult.status === 'rejected') {
+      console.error(
+        '[ThoughtPanel] audio Record load failed',
+        audioResult.reason,
+      );
+    }
+    setLoading(false);
   }, [viewMode]);
 
   useEffect(() => {
@@ -840,7 +879,22 @@ export function ThoughtPanel({
       </div>
 
       {/* List */}
-      <div className="flex-1 overflow-y-auto px-4 py-3">
+      <div className="flex min-h-0 flex-1 flex-col">
+        {loadError && (
+          <div
+            role="alert"
+            className="mx-4 mt-3 flex shrink-0 items-center justify-between gap-3 rounded-[var(--radius-md)] bg-[var(--warning-bg)] px-3 py-2 text-xs text-[var(--ink-secondary)]"
+          >
+            <span>{t('records.listLoadFailed')}</span>
+            <button
+              type="button"
+              onClick={() => void reload()}
+              className="shrink-0 font-semibold text-[var(--accent-warm)] hover:underline"
+            >
+              {t('records.retryLoad')}
+            </button>
+          </div>
+        )}
         {loading ? (
           <div className="py-8 text-center text-sm text-[var(--ink-muted)]">
             {t('common.loading')}
@@ -854,38 +908,49 @@ export function ThoughtPanel({
               : t('records.emptySearch')}
           </div>
         ) : (
-          <div className="flex flex-col gap-3">
-            {visibleItems.map((item) =>
-              item.kind === 'text' ? (
-                <ThoughtCard
-                  key={item.thought.id}
-                  thought={item.thought}
-                  onChanged={(next) => handleCardChanged(item.thought.id, next)}
-                  onDispatch={selectMode ? undefined : onDispatchThought}
-                  onDiscuss={selectMode ? undefined : onDiscussThought}
-                  onTagClick={setActiveTag}
-                  searchQuery={query}
-                  selectMode={selectMode}
-                  selected={selectedIds.has(item.thought.id)}
-                  onToggleSelect={() => toggleSelect(item.thought.id)}
-                  onEnterSelectMode={() => enterSelectMode(item.thought.id)}
-                />
-              ) : (
-                <AudioRecordCard
-                  key={item.record.id}
-                  record={item.record}
-                  onOpen={(id, mediaMs) => onOpenRecord?.(id, mediaMs)}
-                  onArchive={handleAudioArchive}
-                  onDelete={() => setAudioDeleteTarget(item.record)}
-                  selectMode={selectMode}
-                  selected={selectedIds.has(item.record.id)}
-                  onToggleSelect={() => toggleSelect(item.record.id)}
-                  onEnterSelectMode={() => enterSelectMode(item.record.id)}
-                  searchHit={recordSearchHits?.get(item.record.id)}
-                />
-              ),
+          <Virtuoso
+            data={visibleItems}
+            computeItemKey={(_index, item) =>
+              item.kind === 'text' ? item.thought.id : item.record.id
+            }
+            increaseViewportBy={300}
+            className="min-h-0 flex-1 px-4 pt-3"
+            itemContent={(_index, item) => (
+              <div className="pb-3">
+                {item.kind === 'text' ? (
+                  <ThoughtCard
+                    thought={item.thought}
+                    onChanged={(next) =>
+                      handleCardChanged(item.thought.id, next)
+                    }
+                    onDispatch={selectMode ? undefined : onDispatchThought}
+                    onDiscuss={selectMode ? undefined : onDiscussThought}
+                    onTagClick={setActiveTag}
+                    searchQuery={query}
+                    selectMode={selectMode}
+                    selected={selectedIds.has(item.thought.id)}
+                    onToggleSelect={() => toggleSelect(item.thought.id)}
+                    onEnterSelectMode={() => enterSelectMode(item.thought.id)}
+                  />
+                ) : (
+                  <AudioRecordCard
+                    record={item.record}
+                    onOpen={(id, mediaMs, activeRecording) =>
+                      onOpenRecord?.(id, mediaMs, activeRecording)
+                    }
+                    onArchive={handleAudioArchive}
+                    onDelete={() => setAudioDeleteTarget(item.record)}
+                    selectMode={selectMode}
+                    selected={selectedIds.has(item.record.id)}
+                    onToggleSelect={() => toggleSelect(item.record.id)}
+                    onEnterSelectMode={() => enterSelectMode(item.record.id)}
+                    searchHit={recordSearchHits?.get(item.record.id)}
+                    activeRecordingSnapshot={activeRecordingSnapshot}
+                  />
+                )}
+              </div>
             )}
-          </div>
+          />
         )}
       </div>
 

@@ -869,33 +869,32 @@ export default function Launcher({
       system: true,
     };
     setRecordingRequestBusy(true);
+    if (config.recordingSourceSelection) {
+      try {
+        await onStartRecording(initialSelection);
+      } catch (error) {
+        setRecordingSourceDialog({
+          mode: 'start',
+          initialSelection,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        setRecordingRequestBusy(false);
+      }
+      return;
+    }
     let modelPackUsable: boolean | undefined;
     try {
       modelPackUsable = (await speechModelPackStatus()).usable;
     } catch {
       // Resource status is advisory for start; capture remains available.
     }
-    if (!config.recordingSourceSelection || modelPackUsable === false) {
-      setRecordingSourceDialog({
-        mode: 'start',
-        initialSelection,
-        modelPackUsable,
-      });
-      setRecordingRequestBusy(false);
-      return;
-    }
-    try {
-      await onStartRecording(initialSelection);
-    } catch (error) {
-      setRecordingSourceDialog({
-        mode: 'start',
-        initialSelection,
-        modelPackUsable,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      setRecordingRequestBusy(false);
-    }
+    setRecordingSourceDialog({
+      mode: 'start',
+      initialSelection,
+      modelPackUsable,
+    });
+    setRecordingRequestBusy(false);
   }, [config.recordingSourceSelection, onStartRecording]);
 
   const handleRecordingSourceConfirm = useCallback(

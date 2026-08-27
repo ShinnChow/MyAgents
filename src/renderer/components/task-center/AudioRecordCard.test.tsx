@@ -20,6 +20,9 @@ vi.mock('@/analytics/hash', () => ({
   hashPrivateIdentity: mocks.hashPrivateIdentity,
 }));
 vi.mock('@/analytics/tracker', () => ({ track: mocks.track }));
+vi.mock('@/components/Toast', () => ({
+  useToast: () => ({ success: vi.fn(), error: vi.fn() }),
+}));
 
 const RECORD: RecordSummary = {
   id: 'record-1',
@@ -96,30 +99,18 @@ describe('AudioRecordCard', () => {
     );
 
     await user.click(screen.getByRole('button', { name: /Weekly meeting/ }));
-    expect(onOpen).toHaveBeenCalledWith(RECORD.id, 42_000);
+    expect(onOpen).toHaveBeenCalledWith(RECORD.id, 42_000, false);
     expect(screen.getByText('Alice: roadmap decision')).toBeInTheDocument();
   });
 
-  it('projects the authoritative active snapshot into a continuously updated duration', async () => {
-    mocks.recordingSnapshot.mockResolvedValue({
-      recordId: RECORD.id,
-      revision: 3,
-      generation: 1,
-      captureStatus: 'recording',
-      startedAtWallTime: Date.now() - 5_000,
-      mediaDurationMs: 5_000,
-      pausedWallMs: 0,
-      sources: [],
-      sourceActivity: [],
-      warnings: [],
-    });
+  it('renders the authoritative duration projected by the app owner', async () => {
     render(
       <AudioRecordCard
         record={{
           ...RECORD,
           audio: {
             ...RECORD.audio!,
-            mediaDurationMs: 0,
+            mediaDurationMs: 5_000,
             captureStatus: 'recording',
           },
         }}
@@ -130,6 +121,7 @@ describe('AudioRecordCard', () => {
     );
 
     await waitFor(() => expect(screen.getByText('00:05')).toBeInTheDocument());
+    expect(mocks.recordingSnapshot).not.toHaveBeenCalled();
   });
 
   it('tracks one privacy-safe event per stopped-to-playing session', async () => {

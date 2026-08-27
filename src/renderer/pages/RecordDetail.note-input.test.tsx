@@ -4,6 +4,7 @@ import {
   render,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -17,10 +18,12 @@ const mocks = vi.hoisted(() => ({
   recordAddNote: vi.fn(),
   recordGet: vi.fn(),
   recordTranscript: vi.fn(),
+  recordTranscriptDelta: vi.fn(),
   recordDiarization: vi.fn(),
   recordTimeline: vi.fn(),
   recordingSnapshot: vi.fn(),
   recordingSetSourceEnabled: vi.fn(),
+  recordStartTranscription: vi.fn(),
   speechModelPackStatus: vi.fn(),
 }));
 
@@ -30,10 +33,12 @@ vi.mock('@/api/recording', async (importOriginal) => {
     ...actual,
     recordAddNote: mocks.recordAddNote,
     recordTranscript: mocks.recordTranscript,
+    recordTranscriptDelta: mocks.recordTranscriptDelta,
     recordDiarization: mocks.recordDiarization,
     recordTimeline: mocks.recordTimeline,
     recordingSnapshot: mocks.recordingSnapshot,
     recordingSetSourceEnabled: mocks.recordingSetSourceEnabled,
+    recordStartTranscription: mocks.recordStartTranscription,
     speechModelPackStatus: mocks.speechModelPackStatus,
   };
 });
@@ -61,16 +66,28 @@ vi.mock('react-virtuoso', () => ({
     data,
     itemContent,
   }: {
-    data: Array<{ segmentId: string }>;
+    data: Array<Record<string, unknown>>;
     itemContent: (
       index: number,
-      item: { segmentId: string },
+      item: Record<string, unknown>,
     ) => React.ReactNode;
-  }) => (
-    <div data-testid="transcript-virtuoso" data-count={data.length}>
-      {data.slice(0, 2).map((item, index) => itemContent(index, item))}
-    </div>
-  ),
+  }) => {
+    const isTranscript = 'segmentId' in (data[0] ?? {});
+    return (
+      <div
+        data-testid={isTranscript ? 'transcript-virtuoso' : 'timeline-virtuoso'}
+        data-count={data.length}
+      >
+        {data.slice(0, 2).map((item, index) => (
+          <div
+            key={String(item.segmentId ?? item.noteId ?? item.markId ?? index)}
+          >
+            {itemContent(index, item)}
+          </div>
+        ))}
+      </div>
+    );
+  },
 }));
 
 const SNAPSHOT: RecordingSnapshot = {
@@ -116,8 +133,10 @@ const RECORD: RecordDetailData = {
 describe('RecordDetail note input', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    HTMLElement.prototype.scrollTo = vi.fn();
     mocks.recordGet.mockResolvedValue(RECORD);
     mocks.recordTranscript.mockResolvedValue(null);
+    mocks.recordTranscriptDelta.mockResolvedValue(null);
     mocks.recordDiarization.mockResolvedValue(null);
     mocks.recordTimeline.mockResolvedValue({
       recordId: RECORD.id,
@@ -138,6 +157,7 @@ describe('RecordDetail note input', () => {
       }),
     );
     mocks.speechModelPackStatus.mockResolvedValue({ usable: true });
+    mocks.recordStartTranscription.mockResolvedValue(undefined);
     mocks.recordAddNote.mockResolvedValue({
       recordId: RECORD.id,
       revision: 1,
@@ -174,6 +194,96 @@ describe('RecordDetail note input', () => {
     fireEvent.keyDown(input, { key: 'Enter' });
     await waitFor(() => expect(mocks.recordAddNote).toHaveBeenCalledOnce());
     expect(mocks.recordAddNote.mock.calls[0][0].text).toBe('讨论结论');
+  });
+
+  it('deduplicates repeated Enter and preserves text typed while the save is pending', async () => {
+    let resolveSave!: (value: {
+      recordId: string;
+      revision: number;
+      items: [];
+    }) => void;
+    mocks.recordAddNote.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    const input = await screen.findByPlaceholderText(/记下此刻|Note the/);
+    fireEvent.change(input, { target: { value: '第一条' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(mocks.recordAddNote).toHaveBeenCalledOnce();
+
+    fireEvent.change(input, { target: { value: '保存期间的新草稿' } });
+    await act(async () => {
+      resolveSave({ recordId: RECORD.id, revision: 1, items: [] });
+    });
+    expect(input).toHaveValue('保存期间的新草稿');
+  });
+
+  it('keeps active recording controls available when an optional projection fails', async () => {
+    mocks.recordTranscript.mockRejectedValueOnce(
+      new Error('projection unavailable'),
+    );
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    expect(
+      await screen.findByRole('button', { name: /停止并保存|Stop and save/i }),
+    ).toBeEnabled();
+    expect(
+      await screen.findByText(/projection unavailable/),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /重试|Retry/i })).toBeEnabled();
+  });
+
+  it('does not let an older snapshot request overwrite a newer lifecycle projection', async () => {
+    let resolveSnapshot!: (value: RecordingSnapshot) => void;
+    mocks.recordingSnapshot.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSnapshot = resolve;
+      }),
+    );
+    const newest = {
+      ...SNAPSHOT,
+      revision: 8,
+      generation: 3,
+      mediaDurationMs: 18_000,
+    };
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive
+        initialRecordingSnapshot={newest}
+      />,
+    );
+
+    expect(
+      await screen.findByTestId('recording-media-duration'),
+    ).toHaveTextContent('00:18');
+    await act(async () => {
+      resolveSnapshot({
+        ...SNAPSHOT,
+        revision: 2,
+        generation: 1,
+        mediaDurationMs: 2_000,
+      });
+    });
+    expect(screen.getByTestId('recording-media-duration')).toHaveTextContent(
+      '00:18',
+    );
   });
 
   it('routes long transcripts through the existing virtual list', async () => {
@@ -238,6 +348,50 @@ describe('RecordDetail note input', () => {
       expect(await submitPendingNote?.()).toBe(true);
     });
     expect(mocks.recordAddNote.mock.calls[0][0].text).toBe('退出前保存');
+  });
+
+  it('drains a newer draft before the app lifecycle closes the recording', async () => {
+    let resolveFirst!: (value: {
+      recordId: string;
+      revision: number;
+      items: [];
+    }) => void;
+    let flushPendingNote: (() => Promise<boolean>) | undefined;
+    mocks.recordAddNote.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveFirst = resolve;
+      }),
+    );
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+        registerPendingNoteSubmitter={(_recordId, submit) => {
+          flushPendingNote = submit;
+          return () => undefined;
+        }}
+      />,
+    );
+
+    const input = await screen.findByPlaceholderText(/记下此刻|Note the/);
+    fireEvent.change(input, { target: { value: '第一条' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+    fireEvent.change(input, { target: { value: '关闭前的新草稿' } });
+
+    let flushResult: boolean | undefined;
+    await act(async () => {
+      const flushing = flushPendingNote?.().then((value) => {
+        flushResult = value;
+      });
+      resolveFirst({ recordId: RECORD.id, revision: 1, items: [] });
+      await flushing;
+    });
+
+    expect(flushResult).toBe(true);
+    expect(mocks.recordAddNote).toHaveBeenCalledTimes(2);
+    expect(mocks.recordAddNote.mock.calls[1][0].text).toBe('关闭前的新草稿');
+    expect(input).toHaveValue('');
   });
 
   it('renders the authoritative capture activity without a flashing percentage label', async () => {
@@ -361,6 +515,78 @@ describe('RecordDetail note input', () => {
     ).toHaveAttribute('role', 'status');
   });
 
+  it('keeps completed transcription failures recoverable after partial text exists', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready',
+        transcriptionStatus: 'failed',
+      },
+    });
+    mocks.recordingSnapshot.mockResolvedValue(null);
+    mocks.recordTranscript.mockResolvedValue({
+      schemaVersion: 1,
+      recordId: RECORD.id,
+      projectionRevision: 1,
+      state: 'failed',
+      sampleRate: 16_000,
+      provenance: {
+        provider: 'sherpa-onnx',
+        modelPackRevision: 'test',
+        onnxRuntimeVersion: 'test',
+      },
+      segments: [
+        {
+          segmentId: 'partial',
+          track: 'microphone',
+          startSample: 0,
+          endSample: 8_000,
+          text: '保留下来的部分',
+          revision: 1,
+        },
+      ],
+    });
+
+    render(<RecordDetail recordId={RECORD.id} isActive />);
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: /重新转录|Retry transcription/i,
+      }),
+    );
+    await waitFor(() =>
+      expect(mocks.recordStartTranscription).toHaveBeenCalledWith(RECORD.id),
+    );
+    expect(screen.getByText('保留下来的部分')).toBeInTheDocument();
+  });
+
+  it('virtualizes a large note timeline', async () => {
+    mocks.recordTimeline.mockResolvedValue({
+      recordId: RECORD.id,
+      revision: 100,
+      items: Array.from({ length: 100 }, (_, index) => ({
+        type: 'mark' as const,
+        markId: `mark-${index}`,
+        mediaMs: index * 1_000,
+        wallTime: SNAPSHOT.startedAtWallTime + index * 1_000,
+      })),
+    });
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    expect(await screen.findByTestId('timeline-virtuoso')).toHaveAttribute(
+      'data-count',
+      '100',
+    );
+  });
+
   it('keeps the completed playback timeline inside one dedicated progress control', async () => {
     mocks.recordGet.mockResolvedValue({
       ...RECORD,
@@ -378,7 +604,54 @@ describe('RecordDetail note input', () => {
     expect(
       await screen.findByTestId('recording-playback-progress'),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText(/音量|Volume/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/音量|Volume/)).toHaveAttribute(
+      'type',
+      'range',
+    );
+  });
+
+  it('moves keyboard focus from a playback marker to its transcript target', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready',
+        transcriptionStatus: 'ready',
+        mediaDurationMs: 31_000,
+      },
+    });
+    mocks.recordingSnapshot.mockResolvedValue(null);
+    mocks.recordTranscript.mockResolvedValue({
+      schemaVersion: 1,
+      recordId: RECORD.id,
+      projectionRevision: 1,
+      state: 'recording_final',
+      sampleRate: 16_000,
+      provenance: {
+        provider: 'sherpa-onnx',
+        modelPackRevision: 'test',
+        onnxRuntimeVersion: 'test',
+      },
+      segments: [
+        {
+          segmentId: 'focus-target',
+          track: 'microphone',
+          startSample: 16_000,
+          endSample: 24_000,
+          text: '需要定位的内容',
+          revision: 1,
+        },
+      ],
+    });
+
+    render(<RecordDetail recordId={RECORD.id} isActive />);
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: /转写.*00:01|Transcript.*00:01/i,
+      }),
+    );
+    expect(screen.getByText('需要定位的内容').closest('article')).toHaveFocus();
   });
 
   it('defaults dual physical tracks to real mixed playback with single-track choices', async () => {
@@ -531,7 +804,9 @@ describe('RecordDetail note input', () => {
     );
 
     const titleStatus = await screen.findByTestId('record-title-status');
-    expect(titleStatus).toContainElement(screen.getByRole('status'));
+    expect(titleStatus).toContainElement(
+      within(titleStatus).getByRole('status'),
+    );
 
     const composer = screen.getByTestId('recording-note-composer');
     expect(composer).toContainElement(

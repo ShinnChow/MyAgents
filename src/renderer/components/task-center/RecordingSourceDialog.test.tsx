@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -155,5 +155,35 @@ describe('RecordingSourceDialog', () => {
 
     expect(screen.queryByText(/当前录音不会切换/)).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '保存设置' })).toBeEnabled();
+  });
+
+  it('traps focus, closes once on Escape, and restores the opener', async () => {
+    const opener = document.createElement('button');
+    document.body.appendChild(opener);
+    opener.focus();
+    const onCancel = vi.fn();
+    const { unmount } = render(
+      <RecordingSourceDialog
+        mode="start"
+        initialSelection={{ microphone: true, system: true }}
+        onConfirm={vi.fn()}
+        onCancel={onCancel}
+        onOpenSpeechSettings={vi.fn()}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole('checkbox', { name: /麦克风/ })).toHaveFocus(),
+    );
+    const last = screen.getByRole('button', { name: '开始录音' });
+    last.focus();
+    fireEvent.keyDown(last, { key: 'Tab' });
+    expect(screen.getByRole('checkbox', { name: /麦克风/ })).toHaveFocus();
+
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
+    expect(onCancel).toHaveBeenCalledOnce();
+    unmount();
+    expect(opener).toHaveFocus();
+    opener.remove();
   });
 });

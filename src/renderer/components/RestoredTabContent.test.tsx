@@ -6,6 +6,7 @@ import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { PendingAppRoute } from '@/../shared/appRoute';
+import type { RecordingSnapshot } from '@/../shared/types/record';
 import type { Tab } from '@/types/tab';
 import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
@@ -22,6 +23,7 @@ vi.mock('@/context/TabProvider', () => ({
 // Stub the heavy page subtrees so importing App stays cheap and side-effect free.
 const chatRenderSpy = vi.hoisted(() => vi.fn());
 const taskCenterRenderSpy = vi.hoisted(() => vi.fn());
+const taskCenterSnapshotSpy = vi.hoisted(() => vi.fn());
 vi.mock('@/pages/Chat', () => ({
   default: ({
     windowPresentation,
@@ -52,8 +54,15 @@ vi.mock('@/pages/Settings', () => ({
   },
 }));
 vi.mock('@/pages/TaskCenter', () => ({
-  default: ({ pendingRoute }: { pendingRoute?: PendingAppRoute | null }) => {
+  default: ({
+    pendingRoute,
+    activeRecordingSnapshot,
+  }: {
+    pendingRoute?: PendingAppRoute | null;
+    activeRecordingSnapshot?: RecordingSnapshot | null;
+  }) => {
     taskCenterRenderSpy(pendingRoute ?? null);
+    taskCenterSnapshotSpy(activeRecordingSnapshot ?? null);
     return <div data-testid="taskcenter" />;
   },
 }));
@@ -327,6 +336,56 @@ describe('restored live chat tab', () => {
     await waitFor(() =>
       expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
         expect.objectContaining({ generation: 2 }),
+      ),
+    );
+  });
+
+  it('projects active recording ticks into the memoized Task Center slot', async () => {
+    taskCenterSnapshotSpy.mockClear();
+    const taskCenterTab = restoredTab({
+      id: 'task-center-recording',
+      agentDir: null,
+      sessionId: null,
+      view: 'taskcenter',
+      title: 'Task Center',
+    });
+    const snapshot: RecordingSnapshot = {
+      recordId: 'record-1',
+      revision: 1,
+      generation: 1,
+      captureStatus: 'recording',
+      startedAtWallTime: 1_700_000_000_000,
+      mediaDurationMs: 1_000,
+      pausedWallMs: 0,
+      sources: [],
+      sourceActivity: [],
+      warnings: [],
+    };
+    const view = render(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        activeRecordingSnapshot={snapshot}
+      />,
+    );
+
+    view.rerender(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        activeRecordingSnapshot={{
+          ...snapshot,
+          revision: 2,
+          mediaDurationMs: 2_000,
+        }}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(taskCenterSnapshotSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ revision: 2, mediaDurationMs: 2_000 }),
       ),
     );
   });

@@ -7,7 +7,7 @@
  * clicks on the close button.
  */
 
-import { memo, type CSSProperties, useEffect, useState } from 'react';
+import { memo, type CSSProperties } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { X } from 'lucide-react';
@@ -57,23 +57,10 @@ export default memo(function SortableTabItem({
   };
 
   const fixedViewTitle = getFixedTabChromeTitle(tab.view, t);
-  const [now, setNow] = useState(() => Date.now());
   const isRecording =
     tab.view === 'record' && tab.recordingStatus === 'recording';
   const isPaused = tab.view === 'record' && tab.recordingStatus === 'paused';
-  useEffect(() => {
-    if (!isRecording) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 500);
-    return () => window.clearInterval(timer);
-  }, [isRecording]);
-  const recordingDuration = isRecording
-    ? Math.max(
-        tab.recordingMediaDurationMs ?? 0,
-        now -
-          (tab.recordingStartedAtWallTime ?? now) -
-          (tab.recordingPausedWallMs ?? 0),
-      )
-    : (tab.recordingMediaDurationMs ?? 0);
+  const recordingDuration = tab.recordingMediaDurationMs ?? 0;
   const recordingSeconds = Math.max(0, Math.floor(recordingDuration / 1_000));
   const recordingClock = `${Math.floor(recordingSeconds / 60)
     .toString()

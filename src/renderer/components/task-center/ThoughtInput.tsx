@@ -238,6 +238,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
       theme.verticalPaddingPx + theme.pxPerLine * effectiveMaxLines;
     const [value, setValue] = useState('');
     const [busy, setBusy] = useState(false);
+    const interactionBusy = busy || recordingBusy;
     const [error, setError] = useState<string | null>(null);
 
     // Tag autocomplete state.
@@ -433,7 +434,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
 
     const handleSubmit = useCallback(async () => {
       const content = value.trim();
-      if (!content || busy) return;
+      if (!content || interactionBusy) return;
       setBusy(true);
       setError(null);
       try {
@@ -449,7 +450,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
       } finally {
         setBusy(false);
       }
-    }, [value, busy, onCreated, variant]);
+    }, [interactionBusy, onCreated, value, variant]);
 
     const handleKeyDown = useCallback(
       (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -488,7 +489,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
       [tagMenu, filteredTags, tagIndex, insertTag, handleSubmit],
     );
 
-    const canSend = value.trim().length > 0 && !busy;
+    const canSend = value.trim().length > 0 && !interactionBusy;
 
     return (
       <div className="w-full">
@@ -565,7 +566,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
               // minimum, 8-row max, internal scroll past that). We don't
               // set `rows={N}` here because it would re-inject a min-height
               // attribute that fights the JS sizer on first paint.
-              disabled={busy}
+              disabled={interactionBusy}
               // NB: no HTML `autoFocus` attribute. The `autoFocus` prop
               // drives a `useEffect` above that calls `.focus()` via
               // `requestAnimationFrame` — that effect fires on every
@@ -664,7 +665,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
               <button
                 type="button"
                 onClick={handleHashButton}
-                disabled={busy}
+                disabled={interactionBusy}
                 title={t('thoughts.insertTag')}
                 className={`rounded-lg text-[var(--ink-muted)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--accent-warm)] disabled:cursor-not-allowed disabled:opacity-50 ${theme.toolbarButtonPaddingClass}`}
               >
@@ -676,7 +677,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
                 <button
                   type="button"
                   onClick={() => void onStartRecording()}
-                  disabled={recordingBusy}
+                  disabled={interactionBusy}
                   className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-sm font-medium text-[var(--ink-secondary)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--accent-warm)] disabled:cursor-wait disabled:opacity-50"
                 >
                   <Mic className="h-4 w-4" />
@@ -695,7 +696,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
                 <button
                   type="button"
                   onClick={() => void handleSubmit()}
-                  disabled={!canSend}
+                  disabled={!canSend || recordingBusy}
                   className={`rounded-lg bg-[var(--button-primary-bg)] text-[var(--button-primary-text)] transition-colors hover:bg-[var(--button-primary-bg-hover)] disabled:bg-[var(--ink-muted)]/15 disabled:text-[var(--ink-muted)]/60 ${theme.toolbarButtonPaddingClass}`}
                 >
                   <PenLine className="h-4 w-4" />
