@@ -1,7 +1,7 @@
 ---
 type: technical-rfc
 status: ready-for-implementation
-version: 0.2
+version: 0.3
 updated: 2026-08-27
 implementation_repository: "MyAgents"
 product_prd: ../../../MyAgents-dsh/specs/prd/batch-3-myagents-integration.md
@@ -11,10 +11,10 @@ audit_baseline:
   original_commit: c39d7387a6122f9ebed5f4ec94583aebd1da93f6
   revalidated_commit: d6ba358f5430923c1a58a4f7cb244b9d1ff3b068
 runtime_handoff:
-  source_commit: a0d125ce5b717b648e9dd73a17feef80f7273756
-  manifest_sha256: 9ddf2857a2fd2df9150fda49823630f9e66fe8f8bb4e828a15af803dd16a6fa5
-  runtime_manifest_sha256: 338234561a8a5fc19e84163142dde0d30908f622ec322e7e838b830bd211563b
-  compatibility_sha256: bc7e4a5c0782414158335e1e37606e63f1e52f9144fe962e04bf9cb5139a1548
+  source_commit: b2f0d6a7891e693ebcc6cf1c0e7a136d18b113b6
+  manifest_sha256: 1b10a270c643136974076afcb5842b989658f36064d1f1875781f7591b967b3e
+  runtime_manifest_sha256: b2ad2643b6fd2670f9959c69dde62052d6eace87c7e1c60bfdbc29b4c064e46d
+  compatibility_sha256: 5bf5f6db2e2aa742b111fbb122e9ec8b435a53a41b26344f3733b4218b0f6888
 ---
 
 # Batch 3 Technical RFC — MyAgents integration of MyAgents-dsh
@@ -113,14 +113,16 @@ Batch 3 generalizes the compatibility inputs to these flows. It does not redesig
 
 The final repository-external handoff validates successfully without a sibling source checkout and freezes:
 
-- handoff manifest `9ddf2857a2fd2df9150fda49823630f9e66fe8f8bb4e828a15af803dd16a6fa5`;
-- Runtime manifest `338234561a8a5fc19e84163142dde0d30908f622ec322e7e838b830bd211563b`, built from MyAgents-dsh commit `a0d125ce5b717b648e9dd73a17feef80f7273756`;
-- compatibility manifest `bc7e4a5c0782414158335e1e37606e63f1e52f9144fe962e04bf9cb5139a1548`;
+- handoff manifest `1b10a270c643136974076afcb5842b989658f36064d1f1875781f7591b967b3e`;
+- Runtime manifest `b2ad2643b6fd2670f9959c69dde62052d6eace87c7e1c60bfdbc29b4c064e46d`, built from MyAgents-dsh commit `b2f0d6a7891e693ebcc6cf1c0e7a136d18b113b6`;
+- compatibility manifest `5bf5f6db2e2aa742b111fbb122e9ec8b435a53a41b26344f3733b4218b0f6888`;
 - protocol `2.0.0-draft.2`, schema `5e3d3e4c2e64f850d8cd0d12065fc01e9e6ce76fb626e2f0b021f2603956e447`, and generated Host client `faec71c666f4f597944ce8b68aeb6b99ec6c968b9063b0ff2a468078a2db9737`;
-- DSH artifact `ea68706a6b109e6a91134317e55a6693d6cd568d9f3458dedfb829380e6442e5` at upstream commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`;
-- macOS arm64 `verified` evidence `ec4feb06ef89c226f3733bda32b0547ab320aa7e34a32bc5f1dce5ae08872371`; Linux x64 and Windows x64 remain `implementation-complete_pending-native-validation`.
+- DSH artifact `b7431f897c7d9e2022068dbbcdfadd54e862b9b32c173226ae78d1deb89366a7` at upstream commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`;
+- macOS arm64 `verified` evidence `2fa8f05ec2077f54f6b628e7be933ddd69a894d8964b33b104059eb83d7f7719`; Linux x64 and Windows x64 remain `implementation-complete_pending-native-validation`.
 
-This review found one concrete integration blocker omitted by version 0.1: the accepted Runtime refuses to start unless `process.versions.node === 24.13.1`, while MyAgents currently stages Node `24.14.0`. The initial Batch 3 candidate therefore aligns MyAgents' single bundled Node to exact `24.13.1` and runs the complete MyAgents build/test/resource suite on that version. It does not add a second Node distribution. The implementation must update and cross-check every current version authority, including `scripts/download_nodejs.sh`, `setup_windows.ps1`, and the fallback in `build_windows.ps1`, plus resource/version assertions and architecture examples that are treated as executable support inputs. Using `24.14.0`, a user-installed Node, or a semver assumption against this artifact must fail readiness before process spawn. A later Node upgrade requires a newly accepted Runtime artifact and native evidence rather than a Host-side bypass.
+The Node integration blocker found by version 0.1 is now resolved at the artifact source: the accepted Runtime requires exact Node `24.14.0`, which matches MyAgents' bundled Runtime Node. MyAgents must still cross-check every Node version authority, including `scripts/download_nodejs.sh`, `setup_windows.ps1`, and the fallback in `build_windows.ps1`, plus resource/version assertions and executable architecture examples. A user-installed Node or a semver assumption must fail readiness before process spawn. A later Node upgrade requires a newly accepted Runtime artifact and native evidence rather than a Host-side bypass.
+
+npm has a different boundary. The installed DSH Runtime never invokes npm; its recorded npm `11.8.0` is build provenance, not a Host compatibility requirement. MyAgents currently declares development package manager `npm@11.13.0`, ships npm `11.15.0` beside its bundled Node, and resolves `npm/latest` in resource setup. H0 must remove the floating resource download and record an explicit product-owned bundled-npm version. The development npm and bundled npm may remain distinct authorities when their roles are explicit, exact, and independently verified; neither is copied from or constrained by the DSH handoff.
 
 The revalidation also sharpens two existing rules:
 
@@ -322,7 +324,7 @@ For a DSH-bound Product Session:
 
 - Rust creates/owns the existing Session Sidecar and its process-tree control handle;
 - Rust injects verified DSH artifact paths and a session-scoped Runtime home;
-- the Sidecar and DSH child use MyAgents' one bundled Node, which must exactly match the Runtime lock (`24.13.1` for this candidate);
+- the Sidecar and DSH child use MyAgents' one bundled Node, which must exactly match the Runtime lock (`24.14.0` for this candidate);
 - the Node Sidecar creates one `RuntimeProcessHost`;
 - `RuntimeProcessHost` starts one DSH runtime-server with bundled Node;
 - communication is bidirectional JSON-RPC over stdin/stdout;
@@ -379,13 +381,13 @@ MyAgents consumes only a pinned DSH handoff containing:
 For the initial candidate, the committed lock records at least:
 
 ```text
-handoffManifestSha256        9ddf2857a2fd2df9150fda49823630f9e66fe8f8bb4e828a15af803dd16a6fa5
-runtimeManifestSha256        338234561a8a5fc19e84163142dde0d30908f622ec322e7e838b830bd211563b
-compatibilitySha256          bc7e4a5c0782414158335e1e37606e63f1e52f9144fe962e04bf9cb5139a1548
+handoffManifestSha256        1b10a270c643136974076afcb5842b989658f36064d1f1875781f7591b967b3e
+runtimeManifestSha256        b2ad2643b6fd2670f9959c69dde62052d6eace87c7e1c60bfdbc29b4c064e46d
+compatibilitySha256          5bf5f6db2e2aa742b111fbb122e9ec8b435a53a41b26344f3733b4218b0f6888
 protocolSchemaSha256         5e3d3e4c2e64f850d8cd0d12065fc01e9e6ce76fb626e2f0b021f2603956e447
 generatedClientSha256        faec71c666f4f597944ce8b68aeb6b99ec6c968b9063b0ff2a468078a2db9737
-dshArtifactManifestSha256    ea68706a6b109e6a91134317e55a6693d6cd568d9f3458dedfb829380e6442e5
-requiredNodeVersion          24.13.1
+dshArtifactManifestSha256    b7431f897c7d9e2022068dbbcdfadd54e862b9b32c173226ae78d1deb89366a7
+requiredNodeVersion          24.14.0
 ```
 
 An ingestion script accepts one explicit external `--handoff <absolute-directory>` input, first executes that directory's public `verify.mjs` entrypoint with the expected handoff digest, validates the compatibility/platform facts, copies the complete Runtime directory byte-for-byte into build resources, and copies the generated client/contracts through a generated-diff gate. MyAgents code may wrap the generated client but may not hand-edit it or import verifier/package-private `src/*` paths. Installed application startup verifies the committed lock again before marking DSH ready.
@@ -697,7 +699,7 @@ Likely shared refactors:
 - extend `UnifiedEvent` only for proven projection gaps;
 - preserve current Chat/Launcher/Agent Settings transition components;
 - update build-resource staging and Tauri resource manifests;
-- align and verify the single bundled Node against the exact Runtime requirement before DSH process work begins.
+- verify the single bundled Node against the exact Runtime requirement and pin MyAgents' bundled npm distribution independently before DSH process work begins.
 
 ## 20. Verification and release gates
 
@@ -710,7 +712,7 @@ Likely shared refactors:
 - Settings/Launcher versus active Chat transition behavior;
 - frozen Session behavior with selector hidden and with distribution exclusion;
 - DSH handshake/artifact/schema/capability mismatch;
-- exact handoff ingestion, generated-diff, complete-inventory and bundled-Node mismatch rejection;
+- exact handoff ingestion, generated-diff, complete-inventory, bundled-Node mismatch rejection, and deterministic bundled-npm resource validation;
 - native DeepSeek plus every explicitly allowlisted pi-ai Provider/model cell, including rejection of catalog-only and OAuth/cloud cells;
 - generated RPC client, reverse ports and cancellation;
 - event ordering, reconnect replay and cross-generation dedupe;
@@ -753,7 +755,7 @@ Also run MyAgents packaging/resource verification, Rust tests, DSH/MyAgents cros
 
 ## 21. Implementation sequence
 
-1. Preserve the current dirty worktree, align every single-bundled-Node version authority to `24.13.1`, and land explicit-path exact handoff ingestion/resource verification.
+1. Preserve the current dirty worktree, verify every single-bundled-Node version authority at `24.14.0`, pin the separately owned bundled-npm resource, and land explicit-path exact handoff ingestion/resource verification.
 2. Land identity, distribution policy, resolver and legal/illegal legacy fixtures.
 3. Generalize Provider execution constraints and preserve existing transition behavior.
 4. Land the exact Provider/model cell compiler plus generated protocol client.
@@ -772,7 +774,7 @@ Each step updates an implementation ledger in this document or a linked dev plan
 | ID | Action | Status |
 | --- | --- | --- |
 | MA-B3-RFC | Current-code and exact-handoff technical review | `complete` |
-| MA-B3-H0 | Node alignment, handoff ingest, lock and resource verifier | `not_started` |
+| MA-B3-H0 | Node/npm resource authority, handoff ingest, lock and resource verifier | `not_started` |
 | MA-B3-H1 | Runtime identity, policy, resolver and persistence migration | `not_started` |
 | MA-B3-H2 | Provider constraints and exact DSH profile compiler | `not_started` |
 | MA-B3-H3 | RuntimeProcessHost, generated client and seven reverse ports | `not_started` |
@@ -809,6 +811,7 @@ The MyAgents side is complete only when:
 - Provider subscriptions follow the confirmed required-runtime/new-Session behavior;
 - exact DSH artifact/protocol/compatibility facts are verified before admission;
 - the application uses the Runtime's accepted exact Node version and contains no second bundled Node or unverified version bypass;
+- MyAgents' bundled npm resource is independently pinned and verified; it is never inferred from DSH build provenance or a floating registry tag;
 - lifecycle, queue/stop, interactions, configuration, projection and mutations pass fault-injected tests;
 - J1–J18 pass against pinned MyAgents and DSH commits;
 - release/platform claims match native evidence;
