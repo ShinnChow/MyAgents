@@ -1200,10 +1200,7 @@ export default function RecordDetail({
   );
 
   const speakerIdFor = useCallback(
-    (segment: RecordTranscriptSegment): number | null => {
-      if (segment.track === 'microphone' && tracks.includes('system')) {
-        return null;
-      }
+    (segment: RecordTranscriptSegment): number => {
       const middle =
         segment.startSample +
         Math.floor((segment.endSample - segment.startSample) / 2);
@@ -1226,13 +1223,12 @@ export default function RecordDetail({
       }
       return speakerId;
     },
-    [diarization, tracks],
+    [diarization],
   );
 
   const speakerFor = useCallback(
     (segment: RecordTranscriptSegment): string => {
       const speakerId = speakerIdFor(segment);
-      if (speakerId === null) return t('records.me');
       const customName = diarization?.speakers.find(
         (speaker) => speaker.speakerId === speakerId,
       )?.customName;
@@ -1410,7 +1406,7 @@ export default function RecordDetail({
             data-testid="transcript-speaker-line"
             className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-1"
           >
-            {currentSpeakerId !== null && activeSpeakers.length > 0 ? (
+            {activeSpeakers.length > 0 ? (
               <CustomSelect
                 value={String(currentSpeakerId)}
                 options={speakerOptions}

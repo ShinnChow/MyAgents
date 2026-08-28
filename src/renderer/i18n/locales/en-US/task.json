@@ -163,7 +163,6 @@
     "noteTimelineMarker": "Note at {{time}}",
     "markTimelineMarker": "Highlight at {{time}}",
     "speakerUnknown": "Speaker {{name}}",
-    "me": "Me",
     "speakerCorrection": "Speaker corrections",
     "speakerCorrectionHint": "Rename or merge speakers, or reassign an individual sentence on the left.",
     "speakerNamePlaceholder": "Enter speaker name",

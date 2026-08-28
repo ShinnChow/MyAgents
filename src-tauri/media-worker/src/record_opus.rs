@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read};
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const OPUS_CLOCK_RATE: u64 = 48_000;
 const OUTPUT_SAMPLE_RATE: u64 = crate::protocol::SAMPLE_RATE as u64;
@@ -46,6 +46,12 @@ pub struct RecordOpusSummary {
     pub output_samples_16k: u64,
     pub channels: u8,
     pub packets: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordOpusMixSummary {
+    pub output_samples_16k: u64,
+    pub track_output_samples_16k: Vec<u64>,
 }
 
 pub struct DecodedPcmChunk {
@@ -266,6 +272,164 @@ impl RecordOpusDecoder {
 impl Drop for RecordOpusDecoder {
     fn drop(&mut self) {
         self.scratch.zeroize();
+    }
+}
+
+struct BufferedRecordOpusDecoder {
+    decoder: RecordOpusDecoder,
+    pending: Zeroizing<Vec<f32>>,
+    decoded_samples: u64,
+    emitted_samples: u64,
+    finished: bool,
+}
+
+impl BufferedRecordOpusDecoder {
+    fn open(path: &Path) -> Result<Self, RecordOpusError> {
+        Ok(Self {
+            decoder: RecordOpusDecoder::open(path)?,
+            pending: Zeroizing::new(Vec::with_capacity(RECORD_OPUS_FRAME_SAMPLES_16K * 2)),
+            decoded_samples: 0,
+            emitted_samples: 0,
+            finished: false,
+        })
+    }
+
+    fn fill(&mut self) -> Result<(), RecordOpusError> {
+        while self.pending.len() < RECORD_OPUS_FRAME_SAMPLES_16K && !self.finished {
+            match self.decoder.read_chunk()? {
+                Some(chunk) => {
+                    if chunk.start_sample() != self.decoded_samples {
+                        return Err(RecordOpusError::CorruptContainer);
+                    }
+                    self.decoded_samples = self
+                        .decoded_samples
+                        .checked_add(chunk.samples().len() as u64)
+                        .ok_or(RecordOpusError::DurationExceeded)?;
+                    self.pending.extend_from_slice(chunk.samples());
+                }
+                None => {
+                    let summary = self
+                        .decoder
+                        .summary()
+                        .ok_or(RecordOpusError::CorruptContainer)?;
+                    if summary.output_samples_16k != self.decoded_samples {
+                        return Err(RecordOpusError::CorruptContainer);
+                    }
+                    self.finished = true;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, timeline-preserving mixer for the one or two physical tracks in a
+/// Record. It exists only to feed one Record-wide diarization pass; playback
+/// and permanent artifacts remain physically separated.
+pub struct RecordOpusMixer {
+    tracks: Vec<BufferedRecordOpusDecoder>,
+    output_samples_16k: u64,
+}
+
+impl RecordOpusMixer {
+    pub fn open(paths: &[&Path]) -> Result<Self, RecordOpusError> {
+        if !(1..=2).contains(&paths.len()) {
+            return Err(RecordOpusError::UnsupportedStream);
+        }
+        let tracks = paths
+            .iter()
+            .map(|path| BufferedRecordOpusDecoder::open(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            tracks,
+            output_samples_16k: 0,
+        })
+    }
+
+    pub fn read_chunk(&mut self) -> Result<Option<DecodedPcmChunk>, RecordOpusError> {
+        for track in &mut self.tracks {
+            track.fill()?;
+        }
+        let sample_count = self
+            .tracks
+            .iter()
+            .map(|track| track.pending.len().min(RECORD_OPUS_FRAME_SAMPLES_16K))
+            .max()
+            .unwrap_or(0);
+        if sample_count == 0 {
+            return Ok(None);
+        }
+
+        let mut mixed = Zeroizing::new([0.0_f32; RECORD_OPUS_FRAME_SAMPLES_16K]);
+        let mut contributors = [0_u8; RECORD_OPUS_FRAME_SAMPLES_16K];
+        for track in &mut self.tracks {
+            let take = sample_count.min(track.pending.len());
+            for (index, sample) in track.pending[..take].iter().copied().enumerate() {
+                mixed[index] += sample;
+                contributors[index] += 1;
+            }
+            track.pending[..take].zeroize();
+            track.pending.drain(..take);
+            track.emitted_samples = track
+                .emitted_samples
+                .checked_add(take as u64)
+                .ok_or(RecordOpusError::DurationExceeded)?;
+        }
+        if contributors[..sample_count].contains(&0) {
+            return Err(RecordOpusError::CorruptContainer);
+        }
+        for (sample, contributor_count) in mixed[..sample_count]
+            .iter_mut()
+            .zip(contributors[..sample_count].iter().copied())
+        {
+            *sample /= f32::from(contributor_count);
+        }
+        let mut samples = mixed[..sample_count].to_vec();
+
+        let start_sample = self.output_samples_16k;
+        self.output_samples_16k = self
+            .output_samples_16k
+            .checked_add(sample_count as u64)
+            .ok_or(RecordOpusError::DurationExceeded)?;
+        if self.output_samples_16k > MAX_RECORD_DURATION_SECONDS * OUTPUT_SAMPLE_RATE {
+            samples.zeroize();
+            return Err(RecordOpusError::DurationExceeded);
+        }
+        Ok(Some(DecodedPcmChunk {
+            start_sample,
+            samples,
+        }))
+    }
+
+    pub fn stream_positions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.tracks.iter().map(|track| track.emitted_samples)
+    }
+
+    pub fn summary(&self) -> Option<RecordOpusMixSummary> {
+        if self
+            .tracks
+            .iter()
+            .any(|track| !track.finished || !track.pending.is_empty())
+        {
+            return None;
+        }
+        let track_output_samples_16k = self
+            .tracks
+            .iter()
+            .map(|track| {
+                let summary = track.decoder.summary()?;
+                (summary.output_samples_16k == track.decoded_samples
+                    && track.decoded_samples == track.emitted_samples)
+                    .then_some(track.emitted_samples)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if track_output_samples_16k.iter().copied().max()? != self.output_samples_16k {
+            return None;
+        }
+        Some(RecordOpusMixSummary {
+            output_samples_16k: self.output_samples_16k,
+            track_output_samples_16k,
+        })
     }
 }
 
@@ -696,6 +860,66 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn mixes_two_record_tracks_on_one_bounded_media_timeline() {
+        fn decode(path: &Path) -> Vec<f32> {
+            let mut decoder = RecordOpusDecoder::open(path).unwrap();
+            let mut samples = Vec::new();
+            while let Some(chunk) = decoder.read_chunk().unwrap() {
+                samples.extend_from_slice(chunk.samples());
+            }
+            assert!(decoder.summary().is_some());
+            samples
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let microphone = root.path().join("microphone.opus");
+        let system = root.path().join("system.opus");
+        write_fixture(&microphone, 1, 4);
+        write_fixture(&system, 2, 3);
+        let microphone_samples = decode(&microphone);
+        let system_samples = decode(&system);
+
+        let mut single_track = RecordOpusMixer::open(&[&microphone]).unwrap();
+        let mut single_track_samples = Vec::new();
+        while let Some(chunk) = single_track.read_chunk().unwrap() {
+            single_track_samples.extend_from_slice(chunk.samples());
+        }
+        assert_eq!(single_track_samples, microphone_samples);
+
+        let mut mixer = RecordOpusMixer::open(&[&microphone, &system]).unwrap();
+        let mut mixed = Vec::new();
+        let mut next_sample = 0_u64;
+        while let Some(chunk) = mixer.read_chunk().unwrap() {
+            assert_eq!(chunk.start_sample(), next_sample);
+            assert!(chunk.samples().len() <= RECORD_OPUS_FRAME_SAMPLES_16K);
+            mixed.extend_from_slice(chunk.samples());
+            next_sample += chunk.samples().len() as u64;
+        }
+
+        let expected_len = microphone_samples.len().max(system_samples.len());
+        assert_eq!(mixed.len(), expected_len);
+        for (index, actual) in mixed.iter().enumerate() {
+            let expected = match (microphone_samples.get(index), system_samples.get(index)) {
+                (Some(microphone), Some(system)) => (microphone + system) * 0.5,
+                (Some(microphone), None) => *microphone,
+                (None, Some(system)) => *system,
+                (None, None) => unreachable!(),
+            };
+            assert!((*actual - expected).abs() < 1e-6);
+        }
+        assert_eq!(
+            mixer.summary(),
+            Some(RecordOpusMixSummary {
+                output_samples_16k: expected_len as u64,
+                track_output_samples_16k: vec![
+                    microphone_samples.len() as u64,
+                    system_samples.len() as u64,
+                ],
+            })
+        );
     }
 
     #[test]

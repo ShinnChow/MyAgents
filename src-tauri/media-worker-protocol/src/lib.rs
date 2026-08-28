@@ -182,13 +182,13 @@ impl StartRequest {
             (
                 WorkloadKind::RecordBackfillAsr,
                 WorkloadInput::RecordArtifacts { inputs }
-            ) if valid_record_artifacts(inputs, false)
+            ) if valid_record_artifacts(inputs)
         ) || matches!(
             (&self.workload_kind, &self.input),
             (
                 WorkloadKind::RecordDiarization,
                 WorkloadInput::RecordArtifacts { inputs }
-            ) if valid_record_artifacts(inputs, true)
+            ) if valid_record_artifacts(inputs)
         ) || matches!(
             (&self.workload_kind, &self.input),
             (
@@ -208,12 +208,8 @@ fn valid_live_streams(streams: &[PcmStreamStart]) -> bool {
         && (streams.len() == 1 || streams[0].track != streams[1].track)
 }
 
-fn valid_record_artifacts(inputs: &[RecordArtifactInput], require_one: bool) -> bool {
-    let valid_count = if require_one {
-        inputs.len() == 1
-    } else {
-        (1..=2).contains(&inputs.len())
-    };
+fn valid_record_artifacts(inputs: &[RecordArtifactInput]) -> bool {
+    let valid_count = (1..=2).contains(&inputs.len());
     valid_count
         && inputs
             .iter()
@@ -1029,8 +1025,8 @@ mod tests {
             });
         }
         assert!(
-            !start.has_valid_shape(),
-            "diarization owns one selected source"
+            start.has_valid_shape(),
+            "diarization accepts both physical Record tracks"
         );
 
         let finalize = WorkerCommand::Finalize {

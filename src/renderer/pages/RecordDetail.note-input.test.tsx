@@ -790,6 +790,13 @@ describe('RecordDetail note input', () => {
   });
 
   it('keeps the speaker badge and transcript text on the same first line', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        tracks: ['microphone', 'system'],
+      },
+    });
     mocks.recordTranscript.mockResolvedValue({
       schemaVersion: 1,
       recordId: RECORD.id,
@@ -822,8 +829,9 @@ describe('RecordDetail note input', () => {
     );
 
     const line = await screen.findByTestId('transcript-speaker-line');
-    expect(line).toHaveTextContent(/(?:我|Speaker A).*今天怎么样。/i);
-    expect(line.textContent).not.toMatch(/\[(?:我|Speaker A)\]/i);
+    expect(line).toHaveTextContent(/Speaker A.*今天怎么样。/i);
+    expect(line).not.toHaveTextContent('我');
+    expect(line.textContent).not.toMatch(/\[Speaker A\]/i);
     expect(line).toHaveClass('flex');
   });
 

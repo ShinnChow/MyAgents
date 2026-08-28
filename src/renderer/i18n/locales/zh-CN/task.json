@@ -163,7 +163,6 @@
     "noteTimelineMarker": "笔记位置 {{time}}",
     "markTimelineMarker": "重点位置 {{time}}",
     "speakerUnknown": "Speaker {{name}}",
-    "me": "我",
     "speakerCorrection": "说话人纠错",
     "speakerCorrectionHint": "可改名、合并说话人，或在左侧把单句改派给其他说话人。",
     "speakerNamePlaceholder": "输入说话人名称",

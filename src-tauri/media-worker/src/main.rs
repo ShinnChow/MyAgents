@@ -12,7 +12,7 @@ use myagents_media_worker::protocol::{
     WorkerStage, WorkloadIdentity, WorkloadInput, WorkloadKind, read_manager_frame,
     write_control_frame,
 };
-use myagents_media_worker::record_opus::{RecordOpusDecoder, RecordOpusError};
+use myagents_media_worker::record_opus::{RecordOpusDecoder, RecordOpusError, RecordOpusMixer};
 use std::io::{self, BufReader, BufWriter, StdinLock, StdoutLock, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -96,7 +96,7 @@ fn run_started(
             run_record_backfill(&start.identity, inputs, &adapter, &models, writer)
         }
         (WorkloadKind::RecordDiarization, WorkloadInput::RecordArtifacts { inputs }) => {
-            run_record_diarization(&start.identity, &inputs[0], &adapter, &models, writer)
+            run_record_diarization(&start.identity, inputs, &adapter, &models, writer)
         }
         (WorkloadKind::AttachmentAsr, WorkloadInput::Attachment { input_path }) => {
             run_attachment_asr(&start.identity, input_path, &adapter, &models, writer)
@@ -165,7 +165,7 @@ fn run_model_pack_probe(
 
 fn run_record_diarization(
     identity: &WorkloadIdentity,
-    input: &RecordArtifactInput,
+    inputs: &[RecordArtifactInput],
     adapter: &LoadedNativeAdapter,
     models: &myagents_media_worker::model_pack_source::VerifiedModelPack,
     writer: &mut BufWriter<StdoutLock<'_>>,
@@ -175,11 +175,14 @@ fn run_record_diarization(
     let mut diarizer = adapter
         .create_diarizer(models)
         .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
-    let mut checkpoints = vec![PcmStreamCheckpoint {
-        track: input.track,
-        last_ack_sequence: None,
-        analysis_sample: 0,
-    }];
+    let mut checkpoints = inputs
+        .iter()
+        .map(|input| PcmStreamCheckpoint {
+            track: input.track,
+            last_ack_sequence: None,
+            analysis_sample: 0,
+        })
+        .collect::<Vec<_>>();
     write_response(
         writer,
         WorkerResponse::Ready {
@@ -202,8 +205,11 @@ fn run_record_diarization(
         usize::try_from(config.window_samples).map_err(|_| "SPEECH_RESOURCE_LIMIT")?;
     let step_samples = usize::try_from(config.window_samples - config.overlap_samples)
         .map_err(|_| "SPEECH_RESOURCE_LIMIT")?;
-    let mut decoder =
-        RecordOpusDecoder::open(Path::new(&input.input_path)).map_err(map_record_decode_error)?;
+    let paths = inputs
+        .iter()
+        .map(|input| Path::new(&input.input_path))
+        .collect::<Vec<_>>();
+    let mut decoder = RecordOpusMixer::open(&paths).map_err(map_record_decode_error)?;
     let mut pcm = Zeroizing::new(Vec::with_capacity(window_samples));
     let mut observations = SensitiveObservations::default();
     let mut window_start = 0_u64;
@@ -268,7 +274,11 @@ fn run_record_diarization(
                     .checked_add(step_samples as u64)
                     .ok_or("SPEECH_RESOURCE_LIMIT")?;
                 window_index = window_index.checked_add(1).ok_or("SPEECH_RESOURCE_LIMIT")?;
-                checkpoints[0].analysis_sample = window_start;
+                for (checkpoint, stream_position) in
+                    checkpoints.iter_mut().zip(decoder.stream_positions())
+                {
+                    checkpoint.analysis_sample = stream_position.min(window_start);
+                }
                 write_response(
                     writer,
                     WorkerResponse::Heartbeat {
@@ -287,6 +297,7 @@ fn run_record_diarization(
     }
     let summary = decoder.summary().ok_or("SPEECH_CORRUPT_MEDIA")?;
     if summary.output_samples_16k != total_samples
+        || summary.track_output_samples_16k.len() != checkpoints.len()
         || pcm.len() as u64 != total_samples.saturating_sub(window_start)
     {
         return Err("SPEECH_CORRUPT_MEDIA");
@@ -334,7 +345,10 @@ fn run_record_diarization(
         observations.0.push(observation);
     }
     pcm.zeroize();
-    checkpoints[0].analysis_sample = total_samples;
+    for (checkpoint, stream_samples) in checkpoints.iter_mut().zip(summary.track_output_samples_16k)
+    {
+        checkpoint.analysis_sample = stream_samples;
+    }
     if poll_batch_control(identity, &controls, &checkpoints, writer)? {
         return Ok(());
     }

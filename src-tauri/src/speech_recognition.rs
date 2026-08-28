@@ -2842,13 +2842,10 @@ impl SpeechRecognitionManager {
                     .collect::<Vec<_>>()
             }
             SpeechJobKind::RecordDiarization => {
-                if audio.tracks.contains(&AudioTrackKind::System) {
-                    vec![AudioTrackKind::System]
-                } else if audio.tracks.contains(&AudioTrackKind::Microphone) {
-                    vec![AudioTrackKind::Microphone]
-                } else {
-                    Vec::new()
-                }
+                [AudioTrackKind::Microphone, AudioTrackKind::System]
+                    .into_iter()
+                    .filter(|track| audio.tracks.contains(track))
+                    .collect::<Vec<_>>()
             }
             SpeechJobKind::AgentAttachmentAsr => return Err("SPEECH_WORKLOAD_NOT_READY"),
         };
@@ -5267,6 +5264,70 @@ mod tests {
             assert_eq!(job.worker_generation, None);
             assert_eq!(job.stage, SpeechJobStage::Validating);
         }
+    }
+
+    #[test]
+    fn diarization_uses_every_available_physical_record_track() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(&root);
+        let record = tauri::async_runtime::block_on(manager.record_store.create_audio(
+            AudioRecordCreateInput {
+                title: "Meeting".into(),
+                tracks: vec![AudioTrackKind::Microphone, AudioTrackKind::System],
+                transcription_status: TranscriptionStatus::Ready,
+            },
+        ))
+        .unwrap();
+        let record_path =
+            tauri::async_runtime::block_on(manager.record_store.audio_workspace_path(&record.id))
+                .unwrap();
+        fs::write(record_path.join("audio/microphone.opus"), b"microphone").unwrap();
+        fs::write(record_path.join("audio/system.opus"), b"system").unwrap();
+        let finalized =
+            tauri::async_runtime::block_on(manager.record_store.finalize_audio_capture(
+                &record.id,
+                CaptureStatus::Ready,
+                1_000,
+                vec![
+                    AudioTrackArtifactInput {
+                        track: AudioTrackKind::Microphone,
+                        relative_path: "audio/microphone.opus".into(),
+                    },
+                    AudioTrackArtifactInput {
+                        track: AudioTrackKind::System,
+                        relative_path: "audio/system.opus".into(),
+                    },
+                ],
+            ))
+            .unwrap();
+
+        let mut job = fixture_job(
+            "speech_diarization_tracks",
+            SpeechJobKind::RecordDiarization,
+            SpeechJobOrigin::Record {
+                record_id: record.id.clone(),
+            },
+            SpeechJobState::Running,
+            Utc::now(),
+        );
+        job.source.size_bytes = finalized.audio.unwrap().size_bytes;
+        let generation = job.worker_generation.unwrap();
+        {
+            let mut state = manager.state.lock().unwrap();
+            state.active_job = Some((job.job_id.clone(), generation));
+            state.jobs.insert(job.job_id.clone(), job.clone());
+        }
+
+        let WorkloadInput::RecordArtifacts { inputs } = manager
+            .resolve_record_worker_input(&job, generation)
+            .unwrap()
+        else {
+            panic!("record diarization must use Record artifacts");
+        };
+        assert_eq!(
+            inputs.iter().map(|input| input.track).collect::<Vec<_>>(),
+            vec![TrackKind::Microphone, TrackKind::System]
+        );
     }
 
     #[test]
