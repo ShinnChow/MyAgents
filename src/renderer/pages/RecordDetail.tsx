@@ -961,12 +961,25 @@ export default function RecordDetail({
     if (canMixPhysicalTracks) return ['microphone', 'system'];
     return tracks[0] ? [tracks[0]] : [];
   }, [canMixPhysicalTracks, selectedTrack, tracks]);
-  const audioSrc = selectedPhysicalTracks[0]
-    ? recordMediaUrl(recordId, selectedPhysicalTracks[0])
-    : undefined;
-  const secondaryAudioSrc = selectedPhysicalTracks[1]
-    ? recordMediaUrl(recordId, selectedPhysicalTracks[1])
-    : undefined;
+  // `audio.tracks` describes admitted capture sources before permanent media
+  // exists. Keep browser media ownership behind the native capture lifecycle
+  // so a finalized URL is first attached only after its artifact is published.
+  const recordCaptureOwnsArtifacts = [
+    'preparing',
+    'recording',
+    'paused',
+    'stopping',
+    'finalizing',
+  ].includes(record?.audio?.captureStatus ?? '');
+  const playbackMediaReady = !ownsCaptureSlot && !recordCaptureOwnsArtifacts;
+  const audioSrc =
+    playbackMediaReady && selectedPhysicalTracks[0]
+      ? recordMediaUrl(recordId, selectedPhysicalTracks[0])
+      : undefined;
+  const secondaryAudioSrc =
+    playbackMediaReady && selectedPhysicalTracks[1]
+      ? recordMediaUrl(recordId, selectedPhysicalTracks[1])
+      : undefined;
   useEffect(() => {
     playbackSessionTrackedRef.current = false;
     playbackErrorShownRef.current = false;
@@ -1411,7 +1424,7 @@ export default function RecordDetail({
               />
             ) : (
               <span className="inline-flex shrink-0 rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-1.5 py-0.5 text-xs font-medium text-[var(--ink-secondary)]">
-                [{speakerFor(segment)}]
+                {speakerFor(segment)}
               </span>
             )}
             <button
@@ -1908,7 +1921,7 @@ export default function RecordDetail({
               </div>
             </>
           ) : (
-            <div className="flex min-w-0 flex-1 items-center gap-4 max-lg:col-span-2 max-lg:flex-wrap">
+            <div className="grid min-w-0 flex-1 grid-cols-[36px_minmax(140px,1fr)_116px] items-center gap-4 max-lg:col-span-2">
               <button
                 type="button"
                 disabled={!audioSrc}
@@ -1926,155 +1939,181 @@ export default function RecordDetail({
                   <Play className="ml-0.5 h-4 w-4" />
                 )}
               </button>
-              <span className="w-[92px] shrink-0 font-mono text-xs tabular-nums opacity-70">
-                {formatDuration(playbackMs)} /{' '}
-                {formatDuration(playbackDurationMs)}
-              </span>
               <div
-                className="relative h-5 min-w-[120px] flex-1"
-                data-testid="recording-playback-progress"
+                className="flex min-w-0 flex-col gap-1"
+                data-testid="recording-playback-timeline"
               >
-                <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 overflow-hidden rounded-full bg-[var(--paper)]/20">
+                <div
+                  className="relative h-5 min-w-[120px]"
+                  data-testid="recording-playback-progress"
+                >
+                  <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 overflow-hidden rounded-full bg-[var(--paper)]/20">
+                    <span
+                      className="block h-full rounded-full bg-[var(--accent-warm)]"
+                      style={{ width: `${playbackPercent}%` }}
+                    />
+                  </div>
                   <span
-                    className="block h-full rounded-full bg-[var(--accent-warm)]"
-                    style={{ width: `${playbackPercent}%` }}
+                    aria-hidden="true"
+                    className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--paper)] shadow-sm"
+                    style={{ left: `${playbackPercent}%` }}
+                  />
+                  {playbackMarkers.map((marker) => {
+                    const markerPercent = Math.min(
+                      100,
+                      Math.max(
+                        0,
+                        (marker.mediaMs / Math.max(1, playbackDurationMs)) *
+                          100,
+                      ),
+                    );
+                    return (
+                      <button
+                        key={marker.key}
+                        type="button"
+                        onClick={() =>
+                          highlightAndFocus(marker.key, marker.mediaMs)
+                        }
+                        className={`absolute top-1/2 z-20 h-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--paper)] ${
+                          marker.kind === 'mark'
+                            ? 'w-1.5 bg-[var(--warning)]'
+                            : marker.kind === 'note'
+                              ? 'w-1 bg-[var(--accent-warm)]'
+                              : 'w-px bg-[var(--paper)]/55'
+                        }`}
+                        style={{ left: `${markerPercent}%` }}
+                        aria-label={t(`records.${marker.kind}TimelineMarker`, {
+                          time: formatDuration(marker.mediaMs),
+                        })}
+                      />
+                    );
+                  })}
+                  <input
+                    type="range"
+                    min={0}
+                    max={Math.max(1, playbackDurationMs)}
+                    value={Math.min(playbackMs, playbackDurationMs)}
+                    onChange={(event) => seekTo(Number(event.target.value))}
+                    className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
+                    aria-label={t('records.duration')}
                   />
                 </div>
-                <span
-                  aria-hidden="true"
-                  className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--paper)] shadow-sm"
-                  style={{ left: `${playbackPercent}%` }}
-                />
-                {playbackMarkers.map((marker) => {
-                  const markerPercent = Math.min(
-                    100,
-                    Math.max(
-                      0,
-                      (marker.mediaMs / Math.max(1, playbackDurationMs)) * 100,
-                    ),
-                  );
-                  return (
-                    <button
-                      key={marker.key}
-                      type="button"
-                      onClick={() =>
-                        highlightAndFocus(marker.key, marker.mediaMs)
-                      }
-                      className={`absolute top-1/2 z-20 h-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--paper)] ${
-                        marker.kind === 'mark'
-                          ? 'w-1.5 bg-[var(--warning)]'
-                          : marker.kind === 'note'
-                            ? 'w-1 bg-[var(--accent-warm)]'
-                            : 'w-px bg-[var(--paper)]/55'
-                      }`}
-                      style={{ left: `${markerPercent}%` }}
-                      aria-label={t(`records.${marker.kind}TimelineMarker`, {
-                        time: formatDuration(marker.mediaMs),
-                      })}
+                <span className="font-mono text-xs tabular-nums text-[var(--paper)]/70">
+                  {formatDuration(playbackMs)} /{' '}
+                  {formatDuration(playbackDurationMs)}
+                </span>
+              </div>
+              <div
+                className="flex min-w-0 flex-col gap-1.5"
+                data-testid="recording-playback-tools"
+              >
+                {playbackTracks.length > 1 && (
+                  <CustomSelect
+                    value={selectedTrack}
+                    options={playbackTrackOptions}
+                    onChange={(value) =>
+                      switchPlaybackTrack(value as typeof playbackTrack)
+                    }
+                    compact
+                    className="w-full [&>button]:border-[var(--paper)]/20 [&>button]:bg-[var(--paper)] [&>button]:text-[var(--ink)] [&>button>span]:text-[var(--ink)] [&>button>svg]:text-[var(--ink-muted)]"
+                    popoverMinWidth={120}
+                    ariaLabel={t('records.tracks')}
+                  />
+                )}
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setPlaybackVolume((current) => (current > 0 ? 0 : 1))
+                    }
+                    className="shrink-0 text-[var(--paper)]/75 transition-colors hover:text-[var(--paper)]"
+                    aria-label={
+                      playbackVolume > 0
+                        ? t('records.mutePlayback')
+                        : t('records.unmutePlayback')
+                    }
+                  >
+                    {playbackVolume > 0 ? (
+                      <Volume2 className="h-4 w-4" />
+                    ) : (
+                      <VolumeX className="h-4 w-4" />
+                    )}
+                  </button>
+                  <div className="relative h-5 min-w-0 flex-1">
+                    <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 overflow-hidden rounded-full bg-[var(--paper)]/20">
+                      <span
+                        className="block h-full rounded-full bg-[var(--paper)]/75"
+                        style={{ width: `${playbackVolume * 100}%` }}
+                      />
+                    </div>
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--paper)]"
+                      style={{ left: `${playbackVolume * 100}%` }}
                     />
-                  );
-                })}
-                <input
-                  type="range"
-                  min={0}
-                  max={Math.max(1, playbackDurationMs)}
-                  value={Math.min(playbackMs, playbackDurationMs)}
-                  onChange={(event) => seekTo(Number(event.target.value))}
-                  className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0"
-                  aria-label={t('records.duration')}
-                />
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={playbackVolume}
+                      onChange={(event) =>
+                        setPlaybackVolume(Number(event.target.value))
+                      }
+                      className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                      aria-label={t('records.volume')}
+                    />
+                  </div>
+                </div>
               </div>
-              <div className="flex shrink-0 items-center gap-1.5">
-                <button
-                  type="button"
-                  onClick={() =>
-                    setPlaybackVolume((current) => (current > 0 ? 0 : 1))
-                  }
-                  className="text-[var(--paper)]/70 hover:text-[var(--paper)]"
-                  aria-label={
-                    playbackVolume > 0
-                      ? t('records.mutePlayback')
-                      : t('records.unmutePlayback')
-                  }
-                >
-                  {playbackVolume > 0 ? (
-                    <Volume2 className="h-4 w-4" />
-                  ) : (
-                    <VolumeX className="h-4 w-4" />
-                  )}
-                </button>
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.05}
-                  value={playbackVolume}
-                  onChange={(event) =>
-                    setPlaybackVolume(Number(event.target.value))
-                  }
-                  className="h-4 w-12 accent-[var(--accent-warm)]"
-                  aria-label={t('records.volume')}
-                />
-              </div>
-              {playbackTracks.length > 1 && (
-                <CustomSelect
-                  value={selectedTrack}
-                  options={playbackTrackOptions}
-                  onChange={(value) =>
-                    switchPlaybackTrack(value as typeof playbackTrack)
-                  }
-                  compact
-                  className="w-24 shrink-0 [&>button]:border-0 [&>button]:bg-[var(--paper)]/12 [&>button]:text-white"
-                  popoverMinWidth={120}
-                  ariaLabel={t('records.tracks')}
-                />
-              )}
             </div>
           )}
-          <audio
-            ref={audioRef}
-            src={audioSrc}
-            data-testid="recording-primary-audio"
-            preload="metadata"
-            onLoadedMetadata={(event) => {
-              const pending = pendingSeekRef.current;
-              if (pending === null) return;
-              event.currentTarget.currentTime = pending / 1_000;
-              setPlaybackMs(pending);
-              pendingSeekRef.current = null;
-            }}
-            onPlay={() => {
-              setPlaying(true);
-              trackPlaybackSession();
-            }}
-            onPause={() => setPlaying(false)}
-            onError={() => {
-              audioRef.current?.pause();
-              secondaryAudioRef.current?.pause();
-              setPlaying(false);
-              setPlaybackError(true);
-              if (!playbackErrorShownRef.current) {
-                playbackErrorShownRef.current = true;
-                toast.error(t('records.playbackFailed'));
-              }
-            }}
-            onEnded={() => {
-              secondaryAudioRef.current?.pause();
-              setPlaying(false);
-              playbackSessionTrackedRef.current = false;
-            }}
-            onTimeUpdate={(event) => {
-              const currentTime = event.currentTarget.currentTime;
-              const secondaryAudio = secondaryAudioRef.current;
-              if (
-                secondaryAudio &&
-                Math.abs(secondaryAudio.currentTime - currentTime) > 0.12
-              ) {
-                secondaryAudio.currentTime = currentTime;
-              }
-              setPlaybackMs(currentTime * 1_000);
-            }}
-          />
+          {audioSrc && (
+            <audio
+              ref={audioRef}
+              src={audioSrc}
+              data-testid="recording-primary-audio"
+              preload="metadata"
+              onLoadedMetadata={(event) => {
+                const pending = pendingSeekRef.current;
+                if (pending === null) return;
+                event.currentTarget.currentTime = pending / 1_000;
+                setPlaybackMs(pending);
+                pendingSeekRef.current = null;
+              }}
+              onPlay={() => {
+                setPlaying(true);
+                trackPlaybackSession();
+              }}
+              onPause={() => setPlaying(false)}
+              onError={() => {
+                audioRef.current?.pause();
+                secondaryAudioRef.current?.pause();
+                setPlaying(false);
+                setPlaybackError(true);
+                if (!playbackErrorShownRef.current) {
+                  playbackErrorShownRef.current = true;
+                  toast.error(t('records.playbackFailed'));
+                }
+              }}
+              onEnded={() => {
+                secondaryAudioRef.current?.pause();
+                setPlaying(false);
+                playbackSessionTrackedRef.current = false;
+              }}
+              onTimeUpdate={(event) => {
+                const currentTime = event.currentTarget.currentTime;
+                const secondaryAudio = secondaryAudioRef.current;
+                if (
+                  secondaryAudio &&
+                  Math.abs(secondaryAudio.currentTime - currentTime) > 0.12
+                ) {
+                  secondaryAudio.currentTime = currentTime;
+                }
+                setPlaybackMs(currentTime * 1_000);
+              }}
+            />
+          )}
           {secondaryAudioSrc && (
             <audio
               ref={secondaryAudioRef}

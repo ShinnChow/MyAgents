@@ -595,6 +595,7 @@ describe('RecordDetail note input', () => {
         captureStatus: 'ready',
         transcriptionStatus: 'ready',
         mediaDurationMs: 31_000,
+        tracks: ['microphone', 'system'],
       },
     });
     mocks.recordingSnapshot.mockResolvedValue(null);
@@ -608,6 +609,37 @@ describe('RecordDetail note input', () => {
       'type',
       'range',
     );
+    const playbackTimeline = screen.getByTestId('recording-playback-timeline');
+    expect(playbackTimeline).toHaveClass('flex-col');
+    expect(playbackTimeline).toHaveTextContent('00:00 / 00:31');
+    const playbackTools = screen.getByTestId('recording-playback-tools');
+    expect(playbackTools).toHaveClass('flex-col');
+    expect(playbackTools).toContainElement(
+      screen.getByRole('button', { name: /音轨|Tracks/i }),
+    );
+    expect(playbackTools).toContainElement(
+      screen.getByLabelText(/音量|Volume/),
+    );
+  });
+
+  it('does not attach playback media while capture still owns the audio artifacts', async () => {
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    expect(
+      await screen.findByRole('button', { name: /停止并保存|Stop and save/i }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByTestId('recording-primary-audio'),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByTestId('recording-secondary-audio'),
+    ).not.toBeInTheDocument();
   });
 
   it('moves keyboard focus from a playback marker to its transcript target', async () => {
@@ -790,7 +822,8 @@ describe('RecordDetail note input', () => {
     );
 
     const line = await screen.findByTestId('transcript-speaker-line');
-    expect(line).toHaveTextContent(/\[.*\].*今天怎么样。/i);
+    expect(line).toHaveTextContent(/(?:我|Speaker A).*今天怎么样。/i);
+    expect(line.textContent).not.toMatch(/\[(?:我|Speaker A)\]/i);
     expect(line).toHaveClass('flex');
   });
 

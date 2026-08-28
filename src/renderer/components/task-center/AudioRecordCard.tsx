@@ -241,7 +241,7 @@ export function AudioRecordCard({
           </div>
         )}
       </div>
-      {track && (
+      {!active && track && (
         <audio
           ref={audioRef}
           src={recordMediaUrl(record.id, track)}
@@ -281,7 +281,7 @@ export function AudioRecordCard({
           onError={reportPlaybackError}
         />
       )}
-      {secondaryTrack && (
+      {!active && secondaryTrack && (
         <audio
           ref={secondaryAudioRef}
           src={recordMediaUrl(record.id, secondaryTrack)}

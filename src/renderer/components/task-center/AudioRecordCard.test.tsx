@@ -104,7 +104,7 @@ describe('AudioRecordCard', () => {
   });
 
   it('renders the authoritative duration projected by the app owner', async () => {
-    render(
+    const { container } = render(
       <AudioRecordCard
         record={{
           ...RECORD,
@@ -121,6 +121,7 @@ describe('AudioRecordCard', () => {
     );
 
     await waitFor(() => expect(screen.getByText('00:05')).toBeInTheDocument());
+    expect(container.querySelector('audio')).toBeNull();
     expect(mocks.recordingSnapshot).not.toHaveBeenCalled();
   });
 
