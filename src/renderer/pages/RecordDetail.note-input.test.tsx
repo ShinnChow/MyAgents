@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => ({
   recordingSetSourceEnabled: vi.fn(),
   recordStartTranscription: vi.fn(),
   speechModelPackStatus: vi.fn(),
+  copyPlainText: vi.fn(),
   eventListeners: new Map<
     string,
     (event: { payload: Record<string, unknown> }) => void
@@ -57,7 +58,11 @@ vi.mock('@/components/Toast', () => ({
 }));
 
 vi.mock('@/hooks/useConfig', () => ({
-  useConfig: () => ({ config: {}, updateConfig: vi.fn() }),
+  useConfig: () => ({ config: {}, projects: [], updateConfig: vi.fn() }),
+}));
+
+vi.mock('@/utils/clipboard', () => ({
+  copyPlainText: mocks.copyPlainText,
 }));
 
 vi.mock('@/analytics', () => ({
@@ -186,6 +191,7 @@ describe('RecordDetail note input', () => {
     );
     mocks.speechModelPackStatus.mockResolvedValue({ usable: true });
     mocks.recordStartTranscription.mockResolvedValue(undefined);
+    mocks.copyPlainText.mockResolvedValue(undefined);
     mocks.recordAddNote.mockResolvedValue({
       recordId: RECORD.id,
       revision: 1,
@@ -955,6 +961,115 @@ describe('RecordDetail note input', () => {
       screen.getByRole('button', { name: /添加笔记|Add note/i }),
     );
     expect(composer).not.toHaveClass('border');
+  });
+
+  it('keeps the title in the left column and starts the notes panel at the top', async () => {
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    const titleStatus = await screen.findByTestId('record-title-status');
+    expect(titleStatus.closest('header')).toHaveClass(
+      'col-start-1',
+      'row-start-1',
+    );
+    expect(screen.getByTestId('record-notes-panel')).toHaveClass(
+      'col-start-2',
+      'row-start-1',
+      'row-span-3',
+    );
+    expect(screen.getByLabelText(/记录标题|Record title/)).toHaveClass(
+      'hover:bg-[var(--paper-inset)]',
+      'focus:bg-[var(--paper-inset)]',
+    );
+  });
+
+  it('shows one focused detail menu with AI discussion and Markdown export', async () => {
+    mocks.recordGet.mockResolvedValue({
+      ...RECORD,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready',
+        transcriptionStatus: 'ready',
+        sizeBytes: 1_024,
+      },
+    });
+    mocks.recordingSnapshot.mockResolvedValue(null);
+
+    render(<RecordDetail recordId={RECORD.id} isActive={false} />);
+
+    fireEvent.click(
+      await screen.findByTitle(/更多记录操作|More record actions/),
+    );
+    expect(
+      screen.getByRole('button', { name: /AI 讨论|Discuss with AI/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', {
+        name: /导出转写文本与笔记|Export transcript and notes/,
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/录音来源设置|Recording source/)).toBeNull();
+    expect(screen.queryByText(/导出纯文本纪要|Export plain text/)).toBeNull();
+  });
+
+  it('copies one transcript segment and restores the copy label after three seconds', async () => {
+    mocks.recordTranscript.mockResolvedValue({
+      schemaVersion: 1,
+      recordId: RECORD.id,
+      projectionRevision: 1,
+      state: 'live',
+      sampleRate: 16_000,
+      provenance: {
+        provider: 'sherpa-onnx',
+        modelPackRevision: 'test',
+        onnxRuntimeVersion: 'test',
+      },
+      segments: [
+        {
+          segmentId: 'copy-segment',
+          track: 'microphone',
+          startSample: 0,
+          endSample: 16_000,
+          text: '复制这一条转写。',
+          revision: 1,
+        },
+      ],
+    });
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    const copyButton = await screen.findByRole('button', {
+      name: /^(复制|Copy)$/,
+    });
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.click(copyButton);
+        await Promise.resolve();
+      });
+      expect(mocks.copyPlainText).toHaveBeenCalledWith('复制这一条转写。');
+      expect(screen.getByRole('button', { name: /已复制|Copied/ })).toBe(
+        copyButton,
+      );
+
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(screen.getByRole('button', { name: /^(复制|Copy)$/ })).toBe(
+        copyButton,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('renders the manager media clock without projecting wall time', async () => {

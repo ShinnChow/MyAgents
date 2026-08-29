@@ -64,11 +64,6 @@ export function ThoughtBulkBar({
         <span className="px-3 text-xs tabular-nums text-[var(--ink-muted)]">
           {t('thoughts.selectedCount', { count })}
         </span>
-        {mergeDisabledReason && (
-          <span className="max-w-48 truncate px-1 text-xs text-[var(--ink-muted)]">
-            {mergeDisabledReason}
-          </span>
-        )}
         <div className="h-5 w-px bg-[var(--line)]" />
         <button
           type="button"
@@ -80,7 +75,7 @@ export function ThoughtBulkBar({
               ? t('thoughts.mergeNeedsTwo')
               : t('thoughts.mergeTooltip'))
           }
-          className="flex items-center gap-1.5 rounded-full px-3 py-1 text-sm text-[var(--ink-secondary)] transition-colors hover:bg-[var(--accent-warm-subtle)] hover:text-[var(--accent-warm)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--ink-secondary)]"
+          className="flex items-center gap-1.5 rounded-full px-3 py-1 text-sm text-[var(--ink-secondary)] transition-colors hover:bg-[var(--accent-warm-subtle)] hover:text-[var(--accent-warm)] disabled:cursor-not-allowed disabled:text-[var(--ink-muted)] disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--ink-muted)]"
         >
           <Layers className="h-3.5 w-3.5" strokeWidth={1.75} />
           {t('thoughts.merge')}

@@ -6,18 +6,12 @@ import {
   MessageSquare,
   Mic,
   MoreHorizontal,
-  Pause,
-  Play,
   Trash2,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import { recordMediaUrl } from '@/api/recording';
-import { hashPrivateIdentity } from '@/analytics/hash';
-import { track as trackAnalytics } from '@/analytics/tracker';
 import type { RecordSummary, RecordingSnapshot } from '@/../shared/types/record';
 import type { RecordSearchHit } from '@/api/searchClient';
-import { useToast } from '@/components/Toast';
 import { Popover } from '@/components/ui/Popover';
 import { relativeTime } from '@/utils/taskCenterUtils';
 import { isSupportedLocale } from '@/../shared/i18n';
@@ -66,16 +60,10 @@ export function AudioRecordCard({
   activeRecordingSnapshot,
 }: Props) {
   const { t, i18n } = useTranslation('task');
-  const toast = useToast();
-  const [playing, setPlaying] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [showWorkspacePicker, setShowWorkspacePicker] = useState(false);
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const secondaryAudioRef = useRef<HTMLAudioElement>(null);
   const menuAnchorRef = useRef<HTMLButtonElement>(null);
   const discussAnchorRef = useRef<HTMLButtonElement>(null);
-  const playbackErrorShownRef = useRef(false);
-  const playbackSessionTrackedRef = useRef(false);
   const locale = isSupportedLocale(i18n.language) ? i18n.language : 'zh-CN';
   const audio = record.audio;
   const activeSnapshot = activeRecordingSnapshot?.recordId === record.id ? activeRecordingSnapshot : null;
@@ -85,37 +73,6 @@ export function AudioRecordCard({
     : false;
   const displayedDurationMs = activeSnapshot?.mediaDurationMs ?? audio?.mediaDurationMs ?? 0;
   if (!audio) return null;
-  const physicalTracks = audio.tracks.includes('mixed')
-    ? (['mixed'] as const)
-    : audio.tracks.includes('microphone') && audio.tracks.includes('system')
-      ? (['microphone', 'system'] as const)
-      : audio.tracks[0]
-        ? ([audio.tracks[0]] as const)
-        : [];
-  const track = physicalTracks[0];
-  const secondaryTrack = physicalTracks[1];
-  const reportPlaybackError = () => {
-    audioRef.current?.pause();
-    secondaryAudioRef.current?.pause();
-    setPlaying(false);
-    if (playbackErrorShownRef.current) return;
-    playbackErrorShownRef.current = true;
-    toast.error(t('records.playbackFailed'));
-  };
-  const togglePlayback = () => {
-    const element = audioRef.current;
-    if (!element) return;
-    if (element.paused) {
-      const secondary = secondaryAudioRef.current;
-      if (secondary) secondary.currentTime = element.currentTime;
-      const plays = [element.play()];
-      if (secondary) plays.push(secondary.play());
-      void Promise.all(plays).catch(reportPlaybackError);
-    } else {
-      element.pause();
-      secondaryAudioRef.current?.pause();
-    }
-  };
   const status =
     effectiveCaptureStatus === 'recording'
       ? t('records.recording')
@@ -217,37 +174,6 @@ export function AudioRecordCard({
               placement="bottom-end"
               className="min-w-[140px] py-1"
             >
-              {onDiscuss && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowMenu(false);
-                    setShowWorkspacePicker(true);
-                    requestAnimationFrame(() => discussAnchorRef.current?.focus());
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-[var(--ink-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]"
-                >
-                  <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  {t('thoughts.aiDiscuss')}
-                </button>
-              )}
-              {!active && track && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowMenu(false);
-                    togglePlayback();
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-[var(--ink-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]"
-                >
-                  {playing ? (
-                    <Pause className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  ) : (
-                    <Play className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  )}
-                  {playing ? t('records.pausePlayback') : t('records.play')}
-                </button>
-              )}
               {onEnterSelectMode && (
                 <button
                   type="button"
@@ -307,49 +233,6 @@ export function AudioRecordCard({
           anchorRef={discussAnchorRef}
           tags={record.tags}
           onSelect={(workspaceId) => onDiscuss(record, workspaceId)}
-        />
-      )}
-      {!active && track && (
-        <audio
-          ref={audioRef}
-          src={recordMediaUrl(record.id, track)}
-          preload="none"
-          onPause={() => setPlaying(false)}
-          onPlay={() => {
-            setPlaying(true);
-            if (playbackSessionTrackedRef.current) return;
-            playbackSessionTrackedRef.current = true;
-            void hashPrivateIdentity('record', record.id).then((recordHash) => {
-              trackAnalytics('record_use', {
-                event_schema_version: 1,
-                record_hash: recordHash ?? undefined,
-                record_kind: 'audio',
-                operation: 'play',
-                source: 'desktop',
-                surface: 'task_center',
-              });
-            });
-          }}
-          onEnded={() => {
-            secondaryAudioRef.current?.pause();
-            setPlaying(false);
-            playbackSessionTrackedRef.current = false;
-          }}
-          onTimeUpdate={(event) => {
-            const secondary = secondaryAudioRef.current;
-            if (secondary && Math.abs(secondary.currentTime - event.currentTarget.currentTime) > 0.12) {
-              secondary.currentTime = event.currentTarget.currentTime;
-            }
-          }}
-          onError={reportPlaybackError}
-        />
-      )}
-      {!active && secondaryTrack && (
-        <audio
-          ref={secondaryAudioRef}
-          src={recordMediaUrl(record.id, secondaryTrack)}
-          preload="none"
-          onError={reportPlaybackError}
         />
       )}
     </article>

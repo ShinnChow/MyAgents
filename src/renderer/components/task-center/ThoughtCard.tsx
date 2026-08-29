@@ -339,20 +339,6 @@ export function ThoughtCard({
               placement="bottom-end"
               className="min-w-[120px] py-1"
             >
-              {onDiscuss && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowMenu(false);
-                    setShowWorkspacePicker(true);
-                    requestAnimationFrame(() => discussAnchorRef.current?.focus());
-                  }}
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-[var(--ink-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]"
-                >
-                  <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />
-                  {t('thoughts.aiDiscuss')}
-                </button>
-              )}
               <button
                 type="button"
                 onClick={() => {

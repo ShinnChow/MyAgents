@@ -5,6 +5,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Thought } from '@/../shared/types/thought';
 import { ThoughtCard } from './ThoughtCard';
 
+vi.mock('@/hooks/useConfig', () => ({
+  useConfig: () => ({ projects: [] }),
+}));
+
 const THOUGHT: Thought = {
   id: 'thought-1',
   content: '单击进入编辑',
@@ -35,5 +39,20 @@ describe('ThoughtCard', () => {
 
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument();
+  });
+
+  it('keeps AI discussion out of the More menu', async () => {
+    const user = userEvent.setup();
+    render(
+      <ThoughtCard
+        thought={THOUGHT}
+        onChanged={vi.fn()}
+        onDiscuss={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'AI 讨论' })).toBeInTheDocument();
+    await user.click(screen.getByTitle('更多操作'));
+    expect(screen.getAllByRole('button', { name: 'AI 讨论' })).toHaveLength(1);
   });
 });

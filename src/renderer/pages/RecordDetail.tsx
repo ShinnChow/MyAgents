@@ -3,9 +3,10 @@ import {
   Archive,
   ArchiveRestore,
   Check,
+  Copy,
   Download,
   FileText,
-  Mic,
+  MessageSquare,
   Pause,
   Pencil,
   Play,
@@ -46,6 +47,7 @@ import {
 import { recordDelete, recordGet, recordSetArchived } from '@/api/taskCenter';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import RecordingSourceDialog from '@/components/task-center/RecordingSourceDialog';
+import { RecordWorkspacePicker } from '@/components/task-center/RecordWorkspacePicker';
 import { useToast } from '@/components/Toast';
 import DropdownMenu, {
   type DropdownMenuSection,
@@ -68,6 +70,7 @@ import { isTauriEnvironment } from '@/utils/browserMock';
 import { listenWithCleanup } from '@/utils/tauriListen';
 import { useConfig } from '@/hooks/useConfig';
 import { hashPrivateIdentity, track } from '@/analytics';
+import { copyPlainText } from '@/utils/clipboard';
 import {
   applyRecordTranscriptDelta,
   reconcileRecordTranscriptSnapshot,
@@ -213,6 +216,8 @@ export default function RecordDetail({
   >({});
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [showSourceSettings, setShowSourceSettings] = useState(false);
+  const [showWorkspacePicker, setShowWorkspacePicker] = useState(false);
+  const [copiedSegmentId, setCopiedSegmentId] = useState<string | null>(null);
   const [playbackTrack, setPlaybackTrack] = useState<
     'microphone' | 'system' | 'mixed'
   >('mixed');
@@ -250,9 +255,11 @@ export default function RecordDetail({
   const transcriptScrollRef = useRef<HTMLDivElement>(null);
   const transcriptItemRefs = useRef(new Map<string, HTMLElement>());
   const transcriptVirtuosoRef = useRef<VirtuosoHandle>(null);
+  const recordActionsAnchorRef = useRef<HTMLSpanElement>(null);
   const pendingTranscriptFocusRef = useRef<string | null>(null);
   const pendingTimelineVirtualFocusRef = useRef<string | null>(null);
   const highlightTimerRef = useRef<number | undefined>(undefined);
+  const copyResetTimerRef = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     snapshotRef.current = snapshot;
@@ -262,6 +269,9 @@ export default function RecordDetail({
     () => () => {
       if (highlightTimerRef.current !== undefined) {
         window.clearTimeout(highlightTimerRef.current);
+      }
+      if (copyResetTimerRef.current !== undefined) {
+        window.clearTimeout(copyResetTimerRef.current);
       }
     },
     [],
@@ -919,6 +929,22 @@ export default function RecordDetail({
     }
   }, [record, t, toast]);
 
+  const handleDiscuss = useCallback(
+    (workspaceId: string) => {
+      track('task_align_discuss', {});
+      window.dispatchEvent(
+        new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
+          detail: {
+            sourceRecordId: recordId,
+            sourceRecordKind: 'audio',
+            workspaceId,
+          },
+        }),
+      );
+    },
+    [recordId],
+  );
+
   const handleDelete = useCallback(async () => {
     if (!record) return;
     setBusyAction('delete');
@@ -1398,6 +1424,25 @@ export default function RecordDetail({
     [diarization, recordId, refresh, t, toast],
   );
 
+  const handleCopyTranscriptSegment = useCallback(
+    async (segment: RecordTranscriptSegment) => {
+      try {
+        await copyPlainText(segment.text);
+        setCopiedSegmentId(segment.segmentId);
+        if (copyResetTimerRef.current !== undefined) {
+          window.clearTimeout(copyResetTimerRef.current);
+        }
+        copyResetTimerRef.current = window.setTimeout(() => {
+          setCopiedSegmentId(null);
+          copyResetTimerRef.current = undefined;
+        }, 3_000);
+      } catch {
+        toast.error(t('records.copyFailed'));
+      }
+    },
+    [t, toast],
+  );
+
   const renderTranscriptSegment = useCallback(
     (segment: RecordTranscriptSegment) => {
       if (!transcript) return null;
@@ -1412,8 +1457,27 @@ export default function RecordDetail({
             if (element) transcriptItemRefs.current.set(itemKey, element);
             else transcriptItemRefs.current.delete(itemKey);
           }}
-          className={`mb-1.5 grid grid-cols-[52px_minmax(0,1fr)] items-start gap-2 rounded-[var(--radius-md)] px-2 py-2 transition-colors hover:bg-[var(--hover-bg)] ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
+          className={`group relative mb-1.5 grid grid-cols-[52px_minmax(0,1fr)] items-start gap-2 rounded-[var(--radius-md)] px-2 py-2 pr-16 transition-colors hover:bg-[var(--hover-bg)] ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
         >
+          <button
+            type="button"
+            onClick={() => void handleCopyTranscriptSegment(segment)}
+            className={`absolute right-2 top-2 inline-flex items-center gap-1 rounded-full bg-[var(--paper-elevated)] px-2 py-1 text-xs font-medium text-[var(--ink-secondary)] shadow-xs transition-[opacity,color,background-color] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent-warm)] ${copiedSegmentId === segment.segmentId ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'}`}
+            aria-label={
+              copiedSegmentId === segment.segmentId
+                ? t('records.copied')
+                : t('records.copy')
+            }
+          >
+            {copiedSegmentId === segment.segmentId ? (
+              <Check className="h-3 w-3" />
+            ) : (
+              <Copy className="h-3 w-3" />
+            )}
+            {copiedSegmentId === segment.segmentId
+              ? t('records.copied')
+              : t('records.copy')}
+          </button>
           <button
             type="button"
             onClick={() => highlightAndFocus(itemKey, mediaMs)}
@@ -1456,6 +1520,8 @@ export default function RecordDetail({
     [
       activeSpeakers,
       busyAction,
+      copiedSegmentId,
+      handleCopyTranscriptSegment,
       handleReassignSegment,
       highlightAndFocus,
       highlightedItem,
@@ -1639,6 +1705,10 @@ export default function RecordDetail({
     !transcript &&
     !ownsCaptureSlot &&
     (transcriptionStatus === 'not_started' || modelPack?.usable === true);
+  const canDiscuss =
+    !ownsCaptureSlot &&
+    ['ready', 'interrupted'].includes(captureStatus ?? '') &&
+    (record?.audio?.sizeBytes ?? 0) > 0;
   const playbackMarkers = useMemo(() => {
     if (playbackDurationMs <= 0) return [];
     const userMarkers = timeline.items.map((item) => ({
@@ -1663,9 +1733,10 @@ export default function RecordDetail({
       {
         items: [
           {
-            icon: <Mic className="h-3.5 w-3.5" />,
-            label: t('records.recordingSourceSettings'),
-            onClick: () => setShowSourceSettings(true),
+            icon: <MessageSquare className="h-3.5 w-3.5" />,
+            label: t('thoughts.aiDiscuss'),
+            onClick: () => setShowWorkspacePicker(true),
+            disabled: !canDiscuss,
           },
         ],
       },
@@ -1683,14 +1754,8 @@ export default function RecordDetail({
         items: [
           {
             icon: <FileText className="h-3.5 w-3.5" />,
-            label: t('records.exportMarkdown'),
+            label: t('records.exportTranscriptAndNotes'),
             onClick: () => void handleExportText('markdown'),
-            disabled: ownsCaptureSlot,
-          },
-          {
-            icon: <FileText className="h-3.5 w-3.5" />,
-            label: t('records.exportText'),
-            onClick: () => void handleExportText('text'),
             disabled: ownsCaptureSlot,
           },
         ],
@@ -1726,6 +1791,7 @@ export default function RecordDetail({
       },
     ],
     [
+      canDiscuss,
       handleArchive,
       handleExportAudio,
       handleExportText,
@@ -1753,51 +1819,44 @@ export default function RecordDetail({
 
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden bg-[var(--paper)] text-[var(--ink)]">
-      <header className="flex h-[52px] shrink-0 items-center gap-3 px-5">
-        <div
-          data-testid="record-title-status"
-          className="flex min-w-0 flex-1 items-center gap-2"
-        >
-          <input
-            value={titleDraft}
-            onChange={(event) => {
-              titleDraftRef.current = event.target.value;
-              titleDirtyRef.current = true;
-              setTitleDraft(event.target.value);
-            }}
-            onBlur={() =>
-              queueMetadataSave(titleDraft, parseTagDraft(tagDraft))
-            }
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') event.currentTarget.blur();
-            }}
-            aria-label={t('records.titleLabel')}
-            className="min-w-20 max-w-[calc(100%_-_88px)] truncate bg-transparent text-base font-semibold text-[var(--ink)] outline-none"
-            style={{
-              width: `${Math.min(48, Math.max(8, Array.from(titleDraft).length + 1))}ch`,
-            }}
-          />
-          <span
-            className="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-[var(--ink-muted)]"
-            role="status"
-            aria-live="polite"
-            data-status={captureStatus ?? transcriptionStatus}
+      <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(320px,2fr)] grid-rows-[52px_84px_minmax(0,1fr)] gap-x-5 px-5 pb-5 max-lg:grid-cols-1 max-lg:grid-rows-[52px_auto_minmax(300px,55vh)_minmax(320px,65vh)] max-lg:gap-y-4 max-lg:overflow-y-auto">
+        <header className="col-start-1 row-start-1 flex min-w-0 items-center gap-3">
+          <div
+            data-testid="record-title-status"
+            className="flex min-w-0 flex-1 items-center gap-2"
           >
-            <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
-            {statusLabel}
-          </span>
-        </div>
-        <DropdownMenu
-          sections={recordActionSections}
-          size="md"
-          minWidth={190}
-          disabled={busyAction !== null}
-          title={t('records.moreActions')}
-        />
-      </header>
+            <input
+              value={titleDraft}
+              onChange={(event) => {
+                titleDraftRef.current = event.target.value;
+                titleDirtyRef.current = true;
+                setTitleDraft(event.target.value);
+              }}
+              onBlur={() =>
+                queueMetadataSave(titleDraft, parseTagDraft(tagDraft))
+              }
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') event.currentTarget.blur();
+              }}
+              aria-label={t('records.titleLabel')}
+              className="min-w-20 max-w-[calc(100%_-_88px)] truncate rounded-[var(--radius-sm)] bg-transparent px-1.5 py-1 text-base font-semibold text-[var(--ink)] outline-none transition-colors hover:bg-[var(--paper-inset)] focus:bg-[var(--paper-inset)]"
+              style={{
+                width: `${Math.min(48, Math.max(8, Array.from(titleDraft).length + 1))}ch`,
+              }}
+            />
+            <span
+              className="inline-flex shrink-0 items-center gap-1.5 text-xs font-medium text-[var(--ink-muted)]"
+              role="status"
+              aria-live="polite"
+              data-status={captureStatus ?? transcriptionStatus}
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass}`} />
+              {statusLabel}
+            </span>
+          </div>
+        </header>
 
-      <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,3fr)_minmax(320px,2fr)] grid-rows-[84px_minmax(0,1fr)] gap-x-5 px-5 pb-5 max-lg:grid-cols-1 max-lg:grid-rows-[auto_minmax(300px,55vh)_minmax(320px,65vh)] max-lg:gap-y-4 max-lg:overflow-y-auto">
-        <section className="col-start-1 row-start-1 flex h-[84px] items-center gap-5 overflow-hidden rounded-[var(--radius-lg)] bg-[var(--ink)] px-5 text-[var(--paper)] shadow-sm max-lg:grid max-lg:h-auto max-lg:min-h-[132px] max-lg:grid-cols-[92px_minmax(0,1fr)] max-lg:grid-rows-[auto_auto] max-lg:gap-x-4 max-lg:gap-y-2 max-lg:overflow-visible max-lg:py-3">
+        <section className="col-start-1 row-start-2 flex h-[84px] items-center gap-5 overflow-hidden rounded-[var(--radius-lg)] bg-[var(--ink)] px-5 text-[var(--paper)] shadow-sm max-lg:grid max-lg:h-auto max-lg:min-h-[132px] max-lg:grid-cols-[92px_minmax(0,1fr)] max-lg:grid-rows-[auto_auto] max-lg:gap-x-4 max-lg:gap-y-2 max-lg:overflow-visible max-lg:py-3">
           {ownsCaptureSlot ? (
             <>
               <div className="min-w-[92px] max-lg:col-start-1 max-lg:row-start-1">
@@ -2143,37 +2202,55 @@ export default function RecordDetail({
           )}
         </section>
 
-        <section className="col-start-1 row-start-2 flex min-h-0 flex-col py-4 pr-2 max-lg:row-start-2">
-          <div className="mb-3 flex items-center justify-between">
+        <section className="col-start-1 row-start-3 flex min-h-0 flex-col py-4 pr-2 max-lg:row-start-3">
+          <div className="mb-3 flex min-h-6 items-center justify-between gap-3">
             <h2 className="text-sm font-semibold text-[var(--ink)]">
               {t('records.transcript')}
             </h2>
-            <span
-              className="text-xs text-[var(--ink-muted)]"
-              role="status"
-              aria-live="polite"
-            >
-              {liveTranscriptionFailed
-                ? t('records.transcriptLiveFailed')
-                : transcriptionStatus === 'lagging' ||
-                    transcript?.state === 'lagging'
-                  ? t('records.transcriptLagging')
-                  : transcriptionStatus === 'recovering' ||
-                      transcript?.state === 'recovering'
-                    ? t('records.transcriptRecovering')
-                    : ownsCaptureSlot
-                      ? t('records.transcriptLive')
-                      : transcriptionStatus &&
-                          [
-                            'queued',
-                            'live',
-                            'lagging',
-                            'recovering',
-                            'finalizing',
-                          ].includes(transcriptionStatus)
-                        ? t('records.transcriptPending')
-                        : null}
-            </span>
+            <div className="flex min-w-0 items-center gap-2">
+              <span
+                className="truncate text-xs text-[var(--ink-muted)]"
+                role="status"
+                aria-live="polite"
+              >
+                {liveTranscriptionFailed
+                  ? t('records.transcriptLiveFailed')
+                  : transcriptionStatus === 'lagging' ||
+                      transcript?.state === 'lagging'
+                    ? t('records.transcriptLagging')
+                    : transcriptionStatus === 'recovering' ||
+                        transcript?.state === 'recovering'
+                      ? t('records.transcriptRecovering')
+                      : ownsCaptureSlot
+                        ? t('records.transcriptLive')
+                        : transcriptionStatus &&
+                            [
+                              'queued',
+                              'live',
+                              'lagging',
+                              'recovering',
+                              'finalizing',
+                            ].includes(transcriptionStatus)
+                          ? t('records.transcriptPending')
+                          : null}
+              </span>
+              <span ref={recordActionsAnchorRef} className="flex shrink-0">
+                <DropdownMenu
+                  sections={recordActionSections}
+                  size="sm"
+                  minWidth={220}
+                  disabled={busyAction !== null}
+                  title={t('records.moreActions')}
+                />
+              </span>
+              <RecordWorkspacePicker
+                open={showWorkspacePicker}
+                onClose={() => setShowWorkspacePicker(false)}
+                anchorRef={recordActionsAnchorRef}
+                tags={record?.tags ?? []}
+                onSelect={handleDiscuss}
+              />
+            </div>
           </div>
           {(loadError || projectionError) && (
             <div
@@ -2304,7 +2381,10 @@ export default function RecordDetail({
           )}
         </section>
 
-        <aside className="col-start-2 row-span-2 row-start-1 flex min-h-0 flex-col rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] shadow-xs max-lg:col-start-1 max-lg:row-span-1 max-lg:row-start-3">
+        <aside
+          data-testid="record-notes-panel"
+          className="col-start-2 row-span-3 row-start-1 flex min-h-0 flex-col rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] shadow-xs max-lg:col-start-1 max-lg:row-span-1 max-lg:row-start-4"
+        >
           <div className="flex min-h-0 flex-1 flex-col pt-4">
             <h2 className="mb-3 px-4 text-sm font-semibold">
               {t('records.notes')}

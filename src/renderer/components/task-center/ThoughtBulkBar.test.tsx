@@ -18,10 +18,15 @@ describe('ThoughtBulkBar', () => {
       />,
     );
 
+    const merge = screen.getByRole('button', { name: '合并' });
     expect(
-      screen.getByText('语音记录不能合并；可继续归档或删除'),
-    ).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '合并' })).toBeDisabled();
+      screen.queryByText('语音记录不能合并；可继续归档或删除'),
+    ).not.toBeInTheDocument();
+    expect(merge).toBeDisabled();
+    expect(merge).toHaveAttribute(
+      'title',
+      '语音记录不能合并；可继续归档或删除',
+    );
     expect(screen.getByRole('button', { name: '归档' })).toBeEnabled();
     expect(screen.getByRole('button', { name: '删除' })).toBeEnabled();
   });
