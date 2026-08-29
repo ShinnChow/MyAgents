@@ -4,8 +4,11 @@ use crate::{process_cmd, ulog_warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Platform {
+    #[cfg(any(target_os = "macos", test))]
     Macos,
+    #[cfg(any(target_os = "windows", test))]
     Windows,
+    #[cfg(any(not(any(target_os = "macos", target_os = "windows")), test))]
     Unsupported,
 }
 
@@ -32,15 +35,18 @@ fn current_platform() -> Platform {
 
 fn privacy_settings_target(source: &str, platform: Platform) -> Option<PrivacySettingsTarget> {
     match (platform, source) {
+        #[cfg(any(target_os = "macos", test))]
         (Platform::Macos, "microphone") => Some(PrivacySettingsTarget {
             program: "/usr/bin/open",
             argument: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
         }),
+        #[cfg(any(target_os = "macos", test))]
         (Platform::Macos, "system") => Some(PrivacySettingsTarget {
             program: "/usr/bin/open",
             argument:
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
         }),
+        #[cfg(any(target_os = "windows", test))]
         (Platform::Windows, "microphone") => Some(PrivacySettingsTarget {
             program: "explorer.exe",
             argument: "ms-settings:privacy-microphone",
