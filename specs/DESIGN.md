@@ -1444,6 +1444,8 @@ Launcher 输入区提供 Chat / Record 两种明确模式。Record mode 的文�
 
 text/audio Record 卡片使用同一信息层级和尺寸语言。audio 卡片第一行左侧复用 text Record 的相对时间 / 自然日期格式，时间语义仍取录音开始时间；右侧始终显示更多菜单，并在 hover/focus 时于更多菜单左侧出现“AI 讨论”快捷动作。第二行显示与标题字号匹配的小型录音图标、单行标题和小型状态 tag。播放、归档、删除与其它低频动作收进更多菜单；点击“AI 讨论”后先选择 Agent 工作区，再直接打开新的讨论 Session。卡片内容和动作必须收敛在 Record 列表栏内，虚拟列表留白由 item 自身承担，不得以 hover 按钮或滚动根节点 padding 扩大宽度、溢出左右边界。
 
+Record 卡片的整个非控件区域承担主动作：audio 单击打开独立详情 Tab，text 单击进入原地编辑；两者都支持聚焦后用 Enter/Space 触发。AI 讨论、派发、更多菜单、标签、展开/收起及编辑态按钮保持独立事件边界，不得同时触发卡片主动作。整卡交互使用可键盘激活的容器，不使用包裹内部按钮的整卡 `<button>`。
+
 audio Record detail 是单实例顶部 Tab，布局按“主时间线 + 录音/播放控制 + 转录内容”组织：
 
 - 录音中 Header 固定显示计时、来源 activity、Pause/Resume 与 Stop。activity 只表达真实 capture sample 是否活跃，不做频谱、波形编辑器或装饰性随机动画。
@@ -1461,6 +1463,7 @@ audio Record detail 是单实例顶部 Tab，布局按“主时间线 + 录音/�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.68 | 2026-08-29 | **Record 整卡主动作**：audio 整卡打开详情，text 整卡单击进入编辑；卡内悬浮与内容按钮保持独立，并补齐键盘操作 |
 | 2.8.67 | 2026-08-29 | **Record 列表对齐与宽度约束**：audio 卡片复用 text Record 时间格式和 hover 动作位置；缩小录音图标；虚拟列表 item 自持水平留白并补齐宽度约束 |
 | 2.8.66 | 2026-08-29 | **Record AI 讨论与音频卡片收口**：text/audio 共用工作区选择与新讨论 Session；audio 只引用 Record 根目录唯一当前态 `content.md`；音频卡片对齐想法卡片的时间、标题、状态、更多菜单与 hover AI 讨论层级 |
 | 2.8.65 | 2026-08-25 | **统一 Record 与桌面录音规范**：Launcher 增加 Record mode；任务中心统一 text/audio；定义单实例 Record detail、录音状态、手动转录、说话人纠错、资源卡与最小托盘入口 |

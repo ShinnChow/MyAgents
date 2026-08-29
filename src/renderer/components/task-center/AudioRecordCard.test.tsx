@@ -156,6 +156,31 @@ describe('AudioRecordCard', () => {
     expect(screen.queryByText('Alice: roadmap decision')).not.toBeInTheDocument();
   });
 
+  it('opens from the whole card while keeping floating controls independent', async () => {
+    const user = userEvent.setup();
+    const onOpen = vi.fn();
+    render(
+      <AudioRecordCard
+        record={RECORD}
+        onOpen={onOpen}
+        onArchive={vi.fn()}
+        onDelete={vi.fn()}
+        onDiscuss={vi.fn()}
+      />,
+    );
+
+    const card = screen.getByRole('button', { name: 'Weekly meeting' });
+    await user.click(screen.getByText('01:05'));
+    expect(onOpen).toHaveBeenCalledWith(RECORD.id, undefined, false);
+
+    await user.click(screen.getByTitle('更多操作'));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+
+    card.focus();
+    await user.keyboard('{Enter}');
+    expect(onOpen).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps playback in More instead of adding a third action row', async () => {
     const user = userEvent.setup();
     render(<AudioRecordCard record={RECORD} onOpen={vi.fn()} onArchive={vi.fn()} onDelete={vi.fn()} />);

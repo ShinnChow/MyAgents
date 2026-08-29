@@ -44,6 +44,14 @@ function formatDuration(value: number): string {
     .padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
 }
 
+function isCardControl(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    target.closest('button, a, input, textarea, select, [role="menuitem"]') !==
+      null
+  );
+}
+
 export function AudioRecordCard({
   record,
   onOpen,
@@ -121,6 +129,26 @@ export function AudioRecordCard({
             ? t('records.failed')
             : t('records.complete');
   const dateLabel = relativeTime(record.createdAt, locale);
+  const openRecord = () =>
+    onOpen(record.id, searchHit?.mediaMs ?? undefined, active);
+  const handleCardClick = (event: React.MouseEvent<HTMLElement>) => {
+    if (selectMode) {
+      if (!active) onToggleSelect?.();
+      return;
+    }
+    if (isCardControl(event.target)) return;
+    openRecord();
+  };
+  const handleCardKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.target !== event.currentTarget) return;
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    if (selectMode) {
+      if (!active) onToggleSelect?.();
+      return;
+    }
+    openRecord();
+  };
   const summary = (
     <>
       <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--accent-warm-subtle)] text-[var(--accent-warm)]">
@@ -144,22 +172,15 @@ export function AudioRecordCard({
 
   return (
     <article
-      role={selectMode ? 'checkbox' : undefined}
+      role={selectMode ? 'checkbox' : 'button'}
+      aria-label={selectMode ? undefined : record.title || t('records.untitled')}
       aria-checked={selectMode ? selected : undefined}
       aria-disabled={selectMode && active ? true : undefined}
-      tabIndex={selectMode && !active ? 0 : undefined}
-      onClick={selectMode && !active ? onToggleSelect : undefined}
-      onKeyDown={
-        selectMode && !active
-          ? (event) => {
-              if (event.key !== 'Enter' && event.key !== ' ') return;
-              event.preventDefault();
-              onToggleSelect?.();
-            }
-          : undefined
-      }
-      className={`group relative w-full min-w-0 max-w-full overflow-hidden rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 transition-shadow hover:shadow-sm ${
-        selectMode && !active ? 'cursor-pointer' : ''
+      tabIndex={selectMode && active ? undefined : 0}
+      onClick={handleCardClick}
+      onKeyDown={handleCardKeyDown}
+      className={`group relative w-full min-w-0 max-w-full overflow-hidden rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 outline-none transition-shadow hover:shadow-sm focus-visible:ring-1 focus-visible:ring-[var(--accent-warm)] ${
+        !selectMode || !active ? 'cursor-pointer' : ''
       } ${selected ? 'bg-[var(--accent-warm-subtle)] ring-1 ring-[var(--accent-warm)]' : ''}`}
     >
       <div className="mb-2 flex h-5 min-w-0 items-center gap-2">
@@ -274,13 +295,9 @@ export function AudioRecordCard({
       {selectMode ? (
         <div className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left">{summary}</div>
       ) : (
-        <button
-          type="button"
-          onClick={() => onOpen(record.id, searchHit?.mediaMs ?? undefined, active)}
-          className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left"
-        >
+        <div className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left">
           {summary}
-        </button>
+        </div>
       )}
 
       {onDiscuss && (

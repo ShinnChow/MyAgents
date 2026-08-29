@@ -61,6 +61,14 @@ interface Props {
 const VIEW_CLAMP_LINES = 5;
 const EDIT_MAX_HEIGHT_PX = 200; // ~8.8 行 @ text-sm 14px × leading-relaxed 1.625 ≈ 22.75px/行
 
+function isCardControl(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    target.closest('button, a, input, textarea, select, [role="menuitem"]') !==
+      null
+  );
+}
+
 export function ThoughtCard({
   thought,
   onChanged,
@@ -187,20 +195,20 @@ export function ThoughtCard({
 
   const convertedCount = thought.convertedTaskIds?.length ?? 0;
 
-  // Multi-select skin — the entire card becomes a click target that toggles
-  // selection. We render via `<div role="button">` rather than a real
-  // `<button>` because the card already nests a textarea (in edit mode) and
-  // a popover trigger; nesting interactive elements inside a `<button>` is
-  // invalid HTML and causes accessibility-tree noise.
+  // The card owns the primary action in both reading modes: edit in the
+  // normal view, selection toggle in multi-select. Nested controls keep their
+  // own action and never bubble into the card action.
   const handleCardClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!selectMode) return;
-    // Tag pills inside the body call `e.stopPropagation()` so they don't
-    // toggle selection when filtering by tag — but in selectMode we want
-    // the whole card to be a select target; the renderer above already
-    // suppresses `onTagClick` in selectMode, so this branch only sees
-    // bare clicks. Defensive guard for future divergence:
-    if ((e.target as HTMLElement).closest('[data-thought-card-no-toggle]')) return;
-    onToggleSelect?.();
+    if (editing || isCardControl(e.target)) return;
+    if (selectMode) onToggleSelect?.();
+    else enterEdit();
+  };
+  const handleCardKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget || editing) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    if (selectMode) onToggleSelect?.();
+    else enterEdit();
   };
 
   return (
@@ -213,9 +221,18 @@ export function ThoughtCard({
     //                  action bar) — 12px, the larger step that visually
     //                  separates "read" from "act".
     <div
+      role={selectMode ? 'checkbox' : editing ? undefined : 'button'}
+      aria-checked={selectMode ? selected : undefined}
+      aria-label={
+        !selectMode && !editing
+          ? `${t('common.edit')}: ${thought.content.slice(0, 80)}`
+          : undefined
+      }
+      tabIndex={editing ? undefined : 0}
       onClick={handleCardClick}
-      className={`group relative rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 transition-shadow hover:shadow-sm ${
-        selectMode ? 'cursor-pointer' : ''
+      onKeyDown={handleCardKeyDown}
+      className={`group relative rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 outline-none transition-shadow hover:shadow-sm focus-visible:ring-1 focus-visible:ring-[var(--accent-warm)] ${
+        !editing ? 'cursor-pointer' : ''
       } ${selected ? 'ring-1 ring-[var(--accent-warm)] bg-[var(--accent-warm-subtle)]' : ''}`}
     >
       {/* Top meta row — time + derived-task count on the left, action
@@ -421,7 +438,6 @@ export function ThoughtCard({
                   overflow: 'hidden',
                 }
           }
-          onDoubleClick={selectMode ? undefined : enterEdit}
         >
           {renderWithTagHighlights(thought.content, selectMode ? undefined : onTagClick, searchQuery)}
         </div>
