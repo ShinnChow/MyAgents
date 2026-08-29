@@ -1457,18 +1457,23 @@ export default function RecordDetail({
             if (element) transcriptItemRefs.current.set(itemKey, element);
             else transcriptItemRefs.current.delete(itemKey);
           }}
-          className={`group relative mb-1.5 grid grid-cols-[52px_minmax(0,1fr)] items-start gap-2 rounded-[var(--radius-md)] px-2 py-2 pr-16 transition-colors hover:bg-[var(--hover-bg)] ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
+          className={`group relative mb-1.5 grid grid-cols-[52px_minmax(0,1fr)] items-start gap-2 rounded-[var(--radius-md)] px-2 py-2 transition-colors hover:bg-[var(--hover-bg)] ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
         >
           <button
             type="button"
             onClick={() => void handleCopyTranscriptSegment(segment)}
-            className={`absolute right-2 top-2 inline-flex items-center gap-1 rounded-full bg-[var(--paper-elevated)] px-2 py-1 text-xs font-medium text-[var(--ink-secondary)] shadow-xs transition-[opacity,color,background-color] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent-warm)] ${copiedSegmentId === segment.segmentId ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'}`}
+            className="isolate absolute right-2 top-2 z-10 inline-flex items-center gap-1 rounded-full bg-[var(--paper-elevated)] px-2 py-1 text-xs font-medium text-[var(--ink-secondary)] opacity-0 shadow-xs transition-[opacity,color,background-color] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent-warm)]"
             aria-label={
               copiedSegmentId === segment.segmentId
                 ? t('records.copied')
                 : t('records.copy')
             }
           >
+            <span
+              aria-hidden="true"
+              data-testid="transcript-copy-mask"
+              className="pointer-events-none absolute -bottom-2 -left-12 -right-2 -top-2 -z-10 bg-gradient-to-r from-[var(--paper-elevated-a0)] to-[var(--paper-elevated)]"
+            />
             {copiedSegmentId === segment.segmentId ? (
               <Check className="h-3 w-3" />
             ) : (

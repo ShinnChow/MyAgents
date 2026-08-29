@@ -1052,6 +1052,19 @@ describe('RecordDetail note input', () => {
     const copyButton = await screen.findByRole('button', {
       name: /^(复制|Copy)$/,
     });
+    const transcriptItem = copyButton.closest('article');
+    expect(transcriptItem).not.toHaveClass('pr-16');
+    expect(copyButton).toHaveClass(
+      'absolute',
+      'opacity-0',
+      'group-hover:opacity-100',
+      'focus-visible:opacity-100',
+    );
+    expect(screen.getByTestId('transcript-copy-mask')).toHaveClass(
+      'bg-gradient-to-r',
+      'from-[var(--paper-elevated-a0)]',
+      'to-[var(--paper-elevated)]',
+    );
     vi.useFakeTimers();
     try {
       await act(async () => {
@@ -1062,6 +1075,8 @@ describe('RecordDetail note input', () => {
       expect(screen.getByRole('button', { name: /已复制|Copied/ })).toBe(
         copyButton,
       );
+      expect(copyButton).toHaveClass('opacity-0');
+      expect(copyButton).not.toHaveClass('opacity-100');
 
       act(() => vi.advanceTimersByTime(3_000));
       expect(screen.getByRole('button', { name: /^(复制|Copy)$/ })).toBe(
