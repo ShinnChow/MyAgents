@@ -19,6 +19,8 @@ import type { RecordSummary, RecordingSnapshot } from '@/../shared/types/record'
 import type { RecordSearchHit } from '@/api/searchClient';
 import { useToast } from '@/components/Toast';
 import { Popover } from '@/components/ui/Popover';
+import { relativeTime } from '@/utils/taskCenterUtils';
+import { isSupportedLocale } from '@/../shared/i18n';
 import { RecordWorkspacePicker } from './RecordWorkspacePicker';
 
 interface Props {
@@ -66,6 +68,7 @@ export function AudioRecordCard({
   const discussAnchorRef = useRef<HTMLButtonElement>(null);
   const playbackErrorShownRef = useRef(false);
   const playbackSessionTrackedRef = useRef(false);
+  const locale = isSupportedLocale(i18n.language) ? i18n.language : 'zh-CN';
   const audio = record.audio;
   const activeSnapshot = activeRecordingSnapshot?.recordId === record.id ? activeRecordingSnapshot : null;
   const effectiveCaptureStatus = activeSnapshot?.captureStatus ?? audio?.captureStatus;
@@ -117,17 +120,11 @@ export function AudioRecordCard({
               audio.diarizationStatus === 'failed'
             ? t('records.failed')
             : t('records.complete');
-  const dateLabel = new Intl.DateTimeFormat(i18n.resolvedLanguage, {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(record.createdAt);
+  const dateLabel = relativeTime(record.createdAt, locale);
   const summary = (
     <>
-      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--accent-warm-subtle)] text-[var(--accent-warm)]">
-        <Mic className="h-4 w-4" />
+      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--accent-warm-subtle)] text-[var(--accent-warm)]">
+        <Mic className="h-3.5 w-3.5" strokeWidth={1.5} />
       </span>
       <span className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--ink)]">
         {record.title || t('records.untitled')}
@@ -161,16 +158,12 @@ export function AudioRecordCard({
             }
           : undefined
       }
-      className={`group relative min-w-0 rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 transition-shadow hover:shadow-sm ${
+      className={`group relative w-full min-w-0 max-w-full overflow-hidden rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 transition-shadow hover:shadow-sm ${
         selectMode && !active ? 'cursor-pointer' : ''
       } ${selected ? 'bg-[var(--accent-warm-subtle)] ring-1 ring-[var(--accent-warm)]' : ''}`}
     >
-      <div className="mb-2 flex h-5 items-center justify-between gap-2">
-        <span
-          className={`min-w-0 truncate text-xs text-[var(--ink-muted)]/60 transition-opacity ${
-            !active && onDiscuss ? 'group-hover:opacity-0 group-focus-within:opacity-0' : ''
-          }`}
-        >
+      <div className="mb-2 flex h-5 min-w-0 items-center gap-2">
+        <span className="min-w-0 flex-1 truncate text-xs text-[var(--ink-muted)]/60">
           {dateLabel}
         </span>
         {!selectMode && (
@@ -180,7 +173,7 @@ export function AudioRecordCard({
                 ref={discussAnchorRef}
                 type="button"
                 onClick={() => setShowWorkspacePicker((value) => !value)}
-                className="absolute left-4 top-4 flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-0.5 text-sm text-[var(--ink-muted)] opacity-0 transition-opacity hover:bg-[var(--paper-inset)] hover:text-[var(--accent-cool)] group-hover:opacity-100 group-focus-within:opacity-100"
+                className="flex items-center gap-1 rounded-[var(--radius-md)] px-2 py-0.5 text-sm text-[var(--ink-muted)] opacity-0 transition-opacity hover:bg-[var(--paper-inset)] hover:text-[var(--accent-cool)] group-hover:opacity-100 group-focus-within:opacity-100"
               >
                 <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />
                 {t('thoughts.aiDiscuss')}
@@ -279,12 +272,12 @@ export function AudioRecordCard({
       </div>
 
       {selectMode ? (
-        <div className="flex w-full min-w-0 items-center gap-3 text-left">{summary}</div>
+        <div className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left">{summary}</div>
       ) : (
         <button
           type="button"
           onClick={() => onOpen(record.id, searchHit?.mediaMs ?? undefined, active)}
-          className="flex w-full min-w-0 items-center gap-3 text-left"
+          className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left"
         >
           {summary}
         </button>

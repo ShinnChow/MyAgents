@@ -107,6 +107,31 @@ describe('AudioRecordCard', () => {
     expect(onDiscuss).toHaveBeenCalledWith(RECORD, 'workspace-1');
   });
 
+  it('matches text Record date, hover action, icon, and width hierarchy', () => {
+    const dateNow = vi
+      .spyOn(Date, 'now')
+      .mockReturnValue(RECORD.createdAt + 8 * 60 * 60 * 1_000);
+    const { container } = render(
+      <AudioRecordCard
+        record={RECORD}
+        onOpen={vi.fn()}
+        onArchive={vi.fn()}
+        onDelete={vi.fn()}
+        onDiscuss={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/8.*小时前/)).toBeInTheDocument();
+    const discussButton = screen.getAllByRole('button', { name: 'AI 讨论' })[0];
+    expect(discussButton).not.toHaveClass('absolute');
+    const card = container.querySelector('article');
+    expect(card).toHaveClass('w-full', 'max-w-full', 'overflow-hidden');
+    const mic = container.querySelector('.lucide-mic');
+    expect(mic).toHaveClass('h-3.5', 'w-3.5');
+
+    dateNow.mockRestore();
+  });
+
   it('opens a search hit at its indexed media time', async () => {
     const user = userEvent.setup();
     const onOpen = vi.fn();

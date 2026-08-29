@@ -1442,7 +1442,7 @@ Task Center 的列表与卡片只保留执行类型 tag，生命周期状态由�
 
 Launcher 输入区提供 Chat / Record 两种明确模式。Record mode 的文字提交创建 text Record，录音动作创建 audio Record 并立即打开详情；模式切换不改变全局侧栏或顶部 Tab 结构。任务中心以一个 Record 区统一展示 text/audio，不再把音频拆成第二个历史页；卡片用类型、标题、时间、录音/转录状态表达差异，批量删除前明确展示所选数量与不可恢复后果。
 
-text/audio Record 卡片使用同一信息层级和尺寸语言。audio 卡片第一行左侧显示“日期 + 小时分”，右侧始终显示更多菜单；第二行显示录音图标、单行标题和小型状态 tag。播放、归档、删除与其它低频动作收进更多菜单，hover/focus 时左侧出现“AI 讨论”快捷动作；点击后先选择 Agent 工作区，再直接打开新的讨论 Session。卡片内容和动作必须收敛在 Record 列表栏内，不得以 hover 按钮扩大静止态宽度或溢出右边界。
+text/audio Record 卡片使用同一信息层级和尺寸语言。audio 卡片第一行左侧复用 text Record 的相对时间 / 自然日期格式，时间语义仍取录音开始时间；右侧始终显示更多菜单，并在 hover/focus 时于更多菜单左侧出现“AI 讨论”快捷动作。第二行显示与标题字号匹配的小型录音图标、单行标题和小型状态 tag。播放、归档、删除与其它低频动作收进更多菜单；点击“AI 讨论”后先选择 Agent 工作区，再直接打开新的讨论 Session。卡片内容和动作必须收敛在 Record 列表栏内，虚拟列表留白由 item 自身承担，不得以 hover 按钮或滚动根节点 padding 扩大宽度、溢出左右边界。
 
 audio Record detail 是单实例顶部 Tab，布局按“主时间线 + 录音/播放控制 + 转录内容”组织：
 
@@ -1461,6 +1461,7 @@ audio Record detail 是单实例顶部 Tab，布局按“主时间线 + 录音/�
 
 | 版本 | 日期 | 变更 |
 |------|------|------|
+| 2.8.67 | 2026-08-29 | **Record 列表对齐与宽度约束**：audio 卡片复用 text Record 时间格式和 hover 动作位置；缩小录音图标；虚拟列表 item 自持水平留白并补齐宽度约束 |
 | 2.8.66 | 2026-08-29 | **Record AI 讨论与音频卡片收口**：text/audio 共用工作区选择与新讨论 Session；audio 只引用 Record 根目录唯一当前态 `content.md`；音频卡片对齐想法卡片的时间、标题、状态、更多菜单与 hover AI 讨论层级 |
 | 2.8.65 | 2026-08-25 | **统一 Record 与桌面录音规范**：Launcher 增加 Record mode；任务中心统一 text/audio；定义单实例 Record detail、录音状态、手动转录、说话人纠错、资源卡与最小托盘入口 |
 | 2.8.64 | 2026-08-23 | **App Shell 弹层材质与位置对齐**：小助理 popover 改从当前侧栏右侧 8px 出现；rail 工作区 flyout、消息中心与小助理统一使用 elevated 背景、阴影和圆角外壳 |

@@ -155,9 +155,9 @@ export default function TaskCenter({
 
       {/* Two-column body — each panel renders its own section header
           (icon + label + collapsible 🔍 search toggle). */}
-      <div className="flex flex-1 overflow-hidden">
+      <div className="flex min-w-0 flex-1 overflow-hidden">
         {/* Left: Thought stream */}
-        <div className="flex w-[480px] shrink-0 flex-col overflow-hidden">
+        <div className="flex w-[480px] min-w-0 max-w-full shrink-0 flex-col overflow-hidden">
           <ThoughtPanel
             onDispatchThought={handleDispatch}
             onDiscussThought={handleDiscuss}

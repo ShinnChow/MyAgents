@@ -11,9 +11,13 @@ function source(relativePath: string): string {
 describe('Task Center layout contract', () => {
   it('keeps the thought panel fixed while allowing the task panel to shrink', () => {
     const taskCenter = source('src/renderer/pages/TaskCenter.tsx');
+    const thoughtPanel = source('src/renderer/components/task-center/ThoughtPanel.tsx');
 
-    expect(taskCenter).toContain('w-[480px] shrink-0');
     expect(taskCenter).toContain('flex min-w-0 flex-1 flex-col overflow-hidden');
+    expect(taskCenter).toContain('w-[480px] min-w-0 max-w-full shrink-0');
+    expect(thoughtPanel).toContain(
+      'box-border w-full min-w-0 max-w-full px-4 pb-3',
+    );
   });
 
   it('compacts the task toolbar without allowing its title to break', () => {

@@ -650,7 +650,7 @@ export function ThoughtPanel({
   }, [audioDeleteTarget, t, toast]);
 
   return (
-    <div className="relative flex h-full flex-col">
+    <div className="relative flex h-full w-full min-w-0 max-w-full flex-col overflow-hidden">
       {/* Section header — label on the left, persistent search pill on
           the right. The search pill replaces the prior "icon toggle →
           full-width input" pattern with an always-visible affordance
@@ -885,7 +885,7 @@ export function ThoughtPanel({
       </div>
 
       {/* List */}
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col overflow-hidden">
         {loadError && (
           <div
             role="alert"
@@ -920,9 +920,9 @@ export function ThoughtPanel({
               item.kind === 'text' ? item.thought.id : item.record.id
             }
             increaseViewportBy={300}
-            className="min-h-0 flex-1 px-4 pt-3"
+            className="box-border min-h-0 w-full max-w-full flex-1 overflow-x-hidden pt-3"
             itemContent={(_index, item) => (
-              <div className="pb-3">
+              <div className="box-border w-full min-w-0 max-w-full px-4 pb-3">
                 {item.kind === 'text' ? (
                   <ThoughtCard
                     thought={item.thought}
