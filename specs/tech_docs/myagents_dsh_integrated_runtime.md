@@ -1,20 +1,21 @@
 ---
 type: technical-rfc
 status: ready-for-implementation
-version: 0.3
-updated: 2026-08-27
+version: 0.4
+updated: 2026-08-29
 implementation_repository: "MyAgents"
-product_prd: ../../../MyAgents-dsh/specs/prd/batch-3-myagents-integration.md
-runtime_rfc: ../../../MyAgents-dsh/specs/rfc/batch-3-myagents-integration-runtime.md
+product_prd: ../../../MyAgents-dsh/specs/prd/prd_0.3_myagents_integration.md
+runtime_rfc: ../../../MyAgents-dsh/specs/prd/tech_rfc_0.3_myagents_dsh_integration.md
 audit_baseline:
   version: 0.4.12
   original_commit: c39d7387a6122f9ebed5f4ec94583aebd1da93f6
   revalidated_commit: d6ba358f5430923c1a58a4f7cb244b9d1ff3b068
 runtime_handoff:
-  source_commit: b2f0d6a7891e693ebcc6cf1c0e7a136d18b113b6
-  manifest_sha256: 1b10a270c643136974076afcb5842b989658f36064d1f1875781f7591b967b3e
-  runtime_manifest_sha256: b2ad2643b6fd2670f9959c69dde62052d6eace87c7e1c60bfdbc29b4c064e46d
-  compatibility_sha256: 5bf5f6db2e2aa742b111fbb122e9ec8b435a53a41b26344f3733b4218b0f6888
+  status: current-draft-3-ready-for-ingestion
+  source_commit: 2a303f0923f2cca290b2961fb913e27ff5c8404d
+  manifest_sha256: acb54443e178ae697f6a9a062264f4b02b035d990c3d98277132b6b2c446f653
+  runtime_manifest_sha256: a99c7d8060e36647a004edce4ee5b27221d9867c75b3a751ca3112ae4c812099
+  compatibility_sha256: dd97a0a91bc749576bea3b9ab64e5bf52f95d841968194ef18c3f89428de82f3
 ---
 
 # Batch 3 Technical RFC — MyAgents integration of MyAgents-dsh
@@ -111,14 +112,16 @@ Batch 3 generalizes the compatibility inputs to these flows. It does not redesig
 
 ### 2.4 Exact-handoff revalidation and required amendments
 
-The final repository-external handoff validates successfully without a sibling source checkout and freezes:
+The current repository-external handoff validates successfully without a sibling source checkout and freezes:
 
-- handoff manifest `1b10a270c643136974076afcb5842b989658f36064d1f1875781f7591b967b3e`;
-- Runtime manifest `b2ad2643b6fd2670f9959c69dde62052d6eace87c7e1c60bfdbc29b4c064e46d`, built from MyAgents-dsh commit `b2f0d6a7891e693ebcc6cf1c0e7a136d18b113b6`;
-- compatibility manifest `5bf5f6db2e2aa742b111fbb122e9ec8b435a53a41b26344f3733b4218b0f6888`;
-- protocol `2.0.0-draft.2`, schema `5e3d3e4c2e64f850d8cd0d12065fc01e9e6ce76fb626e2f0b021f2603956e447`, and generated Host client `faec71c666f4f597944ce8b68aeb6b99ec6c968b9063b0ff2a468078a2db9737`;
-- DSH artifact `b7431f897c7d9e2022068dbbcdfadd54e862b9b32c173226ae78d1deb89366a7` at upstream commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`;
-- macOS arm64 `verified` evidence `2fa8f05ec2077f54f6b628e7be933ddd69a894d8964b33b104059eb83d7f7719`; Linux x64 and Windows x64 remain `implementation-complete_pending-native-validation`.
+- handoff manifest `acb54443e178ae697f6a9a062264f4b02b035d990c3d98277132b6b2c446f653`;
+- Runtime manifest `a99c7d8060e36647a004edce4ee5b27221d9867c75b3a751ca3112ae4c812099`, built from MyAgents-dsh commit `2a303f0923f2cca290b2961fb913e27ff5c8404d`;
+- compatibility manifest `dd97a0a91bc749576bea3b9ab64e5bf52f95d841968194ef18c3f89428de82f3`;
+- protocol `2.0.0-draft.3`, schema `810bed6deb66d40982c5455e36d703364128da501fcd516fc7b4b2f1eddb5bd3`, and generated Host client `f445472f09acbee4d01a9ae1ae8278b88c50b37c9fe63fd38e5cea0cd9fac07b`;
+- DSH artifact `9c5ed754341bae0f82bbb118188c5c45a97f640133cc3e91d22b9a2bee1b3f7c` at upstream commit `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`;
+- macOS arm64, Linux x64 and Windows x64 all labeled `implementation-complete_pending-native-validation` for these bytes.
+
+Draft.3 contains 40 Host requests, seven reverse requests and four notifications, including `plan/apply`, `permission/rules/list`, `permission/rules/add`, and `permission/rules/revoke`. H0 must ingest and verify this complete immutable handoff; draft.2 inputs remain historical and are a hard compatibility failure. No pending-native-validation platform claim may be surfaced as verified product support.
 
 The Node integration blocker found by version 0.1 is now resolved at the artifact source: the accepted Runtime requires exact Node `24.14.0`, which matches MyAgents' bundled Runtime Node. MyAgents must still cross-check every Node version authority, including `scripts/download_nodejs.sh`, `setup_windows.ps1`, and the fallback in `build_windows.ps1`, plus resource/version assertions and executable architecture examples. A user-installed Node or a semver assumption must fail readiness before process spawn. A later Node upgrade requires a newly accepted Runtime artifact and native evidence rather than a Host-side bypass.
 
@@ -378,19 +381,21 @@ MyAgents consumes only a pinned DSH handoff containing:
 - supported-platform claims and evidence;
 - license and notice inventory.
 
-For the initial candidate, the committed lock records at least:
+The following block is the exact draft.3 seed for the first implementation lock:
 
 ```text
-handoffManifestSha256        1b10a270c643136974076afcb5842b989658f36064d1f1875781f7591b967b3e
-runtimeManifestSha256        b2ad2643b6fd2670f9959c69dde62052d6eace87c7e1c60bfdbc29b4c064e46d
-compatibilitySha256          5bf5f6db2e2aa742b111fbb122e9ec8b435a53a41b26344f3733b4218b0f6888
-protocolSchemaSha256         5e3d3e4c2e64f850d8cd0d12065fc01e9e6ce76fb626e2f0b021f2603956e447
-generatedClientSha256        faec71c666f4f597944ce8b68aeb6b99ec6c968b9063b0ff2a468078a2db9737
-dshArtifactManifestSha256    b7431f897c7d9e2022068dbbcdfadd54e862b9b32c173226ae78d1deb89366a7
+handoffManifestSha256        acb54443e178ae697f6a9a062264f4b02b035d990c3d98277132b6b2c446f653
+runtimeManifestSha256        a99c7d8060e36647a004edce4ee5b27221d9867c75b3a751ca3112ae4c812099
+compatibilitySha256          dd97a0a91bc749576bea3b9ab64e5bf52f95d841968194ef18c3f89428de82f3
+protocolSchemaSha256         810bed6deb66d40982c5455e36d703364128da501fcd516fc7b4b2f1eddb5bd3
+generatedClientSha256        f445472f09acbee4d01a9ae1ae8278b88c50b37c9fe63fd38e5cea0cd9fac07b
+dshArtifactManifestSha256    9c5ed754341bae0f82bbb118188c5c45a97f640133cc3e91d22b9a2bee1b3f7c
 requiredNodeVersion          24.14.0
 ```
 
 An ingestion script accepts one explicit external `--handoff <absolute-directory>` input, first executes that directory's public `verify.mjs` entrypoint with the expected handoff digest, validates the compatibility/platform facts, copies the complete Runtime directory byte-for-byte into build resources, and copies the generated client/contracts through a generated-diff gate. MyAgents code may wrap the generated client but may not hand-edit it or import verifier/package-private `src/*` paths. Installed application startup verifies the committed lock again before marking DSH ready.
+
+The first implementation lock must be populated from these exact handoff values after running the package's public `verify.mjs`. Its generated client contains 40 Host methods and all four permission/Plan control-plane methods; a draft.2 client is a hard compatibility failure.
 
 For local Batch 3 development, that input may be a content-addressed artifact cache produced by the pinned MyAgents-dsh build. Release CI must obtain the same immutable bytes from its approved distribution asset/channel before resource staging; application startup does not fetch a floating Runtime from the network. The exact asset transport may vary by distribution policy without changing Host architecture, but every channel terminates in the same digest verifier before admission.
 
@@ -468,6 +473,22 @@ The current managed-Codex Host dispatcher is useful implementation evidence, but
 For non-DeepSeek model routes, MyAgents also supplies the approved Host-backed executor for the canonical `WebSearch`/`WebFetch` definitions when the DSH compatibility manifest requires it. DSH performs catalog registration, schema validation, visibility, permission, Hook, origin and terminal handling; MyAgents executes the governed web capability through `host/tool/execute`. A Session is not advertised with the complete 20-tool profile unless this backend is ready and has passed the joint contract campaign.
 
 Reverse calls are bounded, cancellable and generation-fenced. Host disconnect or timeout returns one protocol-defined failure and cannot leave a turn appearing idle.
+
+### 9.1 Permission and Plan ownership
+
+MyAgents keeps its product vocabulary and translates it at the DSH adapter boundary:
+
+| MyAgents product choice | DSH base permission mode | DSH Plan state |
+| --- | --- | --- |
+| `auto` | `acceptEdits` | normal |
+| `plan` | `acceptEdits` | enter/retain with `plan/apply` |
+| `fullAgency` | `bypassPermissions` | normal |
+
+Plan is not encoded as a DSH permission string. At Session birth, `plan` compiles the deterministic `acceptEdits` base and enters Plan before the first turn. When the user changes to or from `plan`, the SessionEngine adapter applies the corresponding base configuration plus `plan/apply` with current revision facts, waits for Runtime acknowledgement, and only then updates effective UI state. Stale revisions and mismatched Plan artifacts fail closed; desired/effective drift remains visible and retryable.
+
+Inline permission requests continue through `host/interaction/request`. One-shot allow/deny settles only that request. `always_allow` creates an exact durable Runtime rule. The adapter also exposes the generated `permission/rules/list`, `permission/rules/add`, and `permission/rules/revoke` operations so settings, diagnostics, or later policy UI can inspect and revoke authoritative Runtime state without scraping transcript events. Batch 3 need not add `default` or `dontAsk` to the ordinary desktop selector, but it must preserve them as valid protocol values and must not coerce them silently.
+
+Visibility and permission remain independent: hiding a tool is configuration; allowing it is execution policy. `fullAgency` removes interactive permission prompts but is not an OS sandbox and does not contain arbitrary Bash subprocess effects. Its UI copy must say this explicitly. Hard policy, origin/workspace/revision constraints and Hooks remain enforceable even in `fullAgency`.
 
 ## 10. Events, transcript and conversation UI
 
@@ -580,7 +601,7 @@ Each item uses the readiness result from the resolver/artifact verifier: ready, 
 
 ### 14.3 Conversation
 
-DSH uses existing MessageList, composer, queue, stop, inline tool/permission/question/plan cards, attachment pipeline, history actions and status panel. Every visible control must call a real SessionEngine capability.
+DSH uses existing MessageList, composer, queue, stop, inline tool/permission/question/plan cards, attachment pipeline, history actions and status panel. Every visible control must call a real SessionEngine capability. Permission/AskUser cards settle through the reverse request exactly once; switching the product to Plan uses `plan/apply`, not a decorative local state; any exact always-allow rule shown by product UI is read from Runtime and is revocable through the generated rule API.
 
 ## 15. IM, Agent Channel and automation
 
@@ -627,8 +648,8 @@ The MyAgents build stages the exact DSH Runtime directory; it does not bundle it
 
 Supported claims:
 
-- the supplied Runtime is natively verified on macOS arm64, but MyAgents may mark the product path ready only after its own packaged smoke against that exact nested manifest;
-- Windows x64 and Linux x64 remain `implementation-complete_pending-native-validation` until their native campaigns pass;
+- macOS arm64, Windows x64 and Linux x64 are all `implementation-complete_pending-native-validation` in the supplied draft.3 handoff;
+- MyAgents may mark a platform path verified only after an updated exact handoff carries passing native Runtime evidence and MyAgents' own packaged smoke passes against that nested manifest;
 - the UI must not turn “implementation complete” into “verified”.
 
 Updates are atomic and side-by-side by artifact identity. Existing Sessions may require their compatible artifact to remain available. Garbage collection cannot remove an artifact referenced by a retained executable Session.
@@ -718,7 +739,8 @@ Likely shared refactors:
 - event ordering, reconnect replay and cross-generation dedupe;
 - queue/follow-up/steer/stop races;
 - configuration desired/effective transitions;
-- interaction settlement and timeout;
+- all four DSH base permission modes, accepted `auto/plan/fullAgency` mappings, Plan enter/exit/retry/stale revision, exact rule add/list/revoke/restart, interaction settlement and timeout;
+- `fullAgency` still obeys hard policy, origin/workspace/revision constraints and Host Hook deny;
 - transcript terminal/persistence failure reconciliation;
 - fork/rewind/delete crash points;
 - IM rotation and Heartbeat fallback;
@@ -734,7 +756,7 @@ Against the exact staged DSH artifact:
 - J1–J18 from the accepted PRD;
 - Desktop, IM, Task/Cron, Goal, Inbox and injected entry points;
 - ordinary Provider routes for every advertised API-family cell;
-- permission, AskUser and plan approval inline;
+- permission and AskUser inline, Host Plan transitions, exact always-allow rule creation/revocation, and no inert permission controls;
 - tools, MCP, Skills, Host tools, Hooks, attachment/image;
 - restart/resume, operation uncertainty and mutation recovery;
 - packaged macOS arm64 smoke and native Windows/Linux campaigns before verified claims;
@@ -758,10 +780,10 @@ Also run MyAgents packaging/resource verification, Rust tests, DSH/MyAgents cros
 1. Preserve the current dirty worktree, verify every single-bundled-Node version authority at `24.14.0`, pin the separately owned bundled-npm resource, and land explicit-path exact handoff ingestion/resource verification.
 2. Land identity, distribution policy, resolver and legal/illegal legacy fixtures.
 3. Generalize Provider execution constraints and preserve existing transition behavior.
-4. Land the exact Provider/model cell compiler plus generated protocol client.
+4. Land the exact Provider/model cell compiler plus the current draft.3 generated protocol client.
 5. Build `RuntimeProcessHost`, reverse ports, sanitized child environment and handshake.
 6. Build the DSH SessionEngine adapter, serialized event inbox, projection and transcript reconciliation.
-7. Connect queue/steer/follow-up/stop, configuration, interactions, extensions and Host canonical web.
+7. Connect queue/steer/follow-up/stop, configuration, interactions, Host Plan, exact permission-rule management, extensions and Host canonical web.
 8. Connect mutation and recovery protocols.
 9. Migrate every non-Desktop entry point through the same resolver/adapter.
 10. Expose grouped selector/readiness and existing new-Tab behavior.
@@ -774,11 +796,12 @@ Each step updates an implementation ledger in this document or a linked dev plan
 | ID | Action | Status |
 | --- | --- | --- |
 | MA-B3-RFC | Current-code and exact-handoff technical review | `complete` |
-| MA-B3-H0 | Node/npm resource authority, handoff ingest, lock and resource verifier | `not_started` |
+| MA-B3-H0 | Node/npm resource authority, current draft.3 handoff ingest, lock and resource verifier | `not_started` |
 | MA-B3-H1 | Runtime identity, policy, resolver and persistence migration | `not_started` |
 | MA-B3-H2 | Provider constraints and exact DSH profile compiler | `not_started` |
-| MA-B3-H3 | RuntimeProcessHost, generated client and seven reverse ports | `not_started` |
+| MA-B3-H3 | RuntimeProcessHost, 40-method draft.3 generated client and seven reverse ports | `not_started` |
 | MA-B3-H4 | SessionEngine adapter, projection, queue/config/interaction/mutation/recovery | `not_started` |
+| MA-B3-H4P | `auto/plan/fullAgency` translation, Host Plan and exact permission-rule adapter | `not_started` |
 | MA-B3-H5 | Desktop/IM/Task/Goal/Inbox UI and entrypoint integration | `not_started` |
 | MA-B3-H6 | Packaged cross-repository J1–J18 acceptance | `not_started` |
 
@@ -798,6 +821,7 @@ Each step updates an implementation ledger in this document or a linked dev plan
 | P0-10 mutations/history | Sections 13, 16 |
 | P0-11 security/provenance | Sections 7, 8.3, 17–18 |
 | P0-12 observability | Section 18 |
+| P0-13 permission/Plan control plane | Sections 9.1, 12, 14.3 and 20 |
 | P1-01 future Pi | Sections 3.1, 5.1; no Batch 3 UI |
 
 ## 23. Definition of done
@@ -813,14 +837,16 @@ The MyAgents side is complete only when:
 - the application uses the Runtime's accepted exact Node version and contains no second bundled Node or unverified version bypass;
 - MyAgents' bundled npm resource is independently pinned and verified; it is never inferred from DSH build provenance or a floating registry tag;
 - lifecycle, queue/stop, interactions, configuration, projection and mutations pass fault-injected tests;
+- `auto/plan/fullAgency` are mapped to real Runtime behavior; Plan and exact rules use generated draft.3 methods; the UI makes no OS-sandbox claim;
 - J1–J18 pass against pinned MyAgents and DSH commits;
 - release/platform claims match native evidence;
 - DSH remains controlled rollout and Claude Agent SDK remains the general default for this development release.
 
 ## 24. References
 
-- `../../../MyAgents-dsh/specs/prd/batch-3-myagents-integration.md`
-- `../../../MyAgents-dsh/specs/rfc/batch-3-myagents-integration-runtime.md`
+- `../../../MyAgents-dsh/specs/prd/prd_0.3_myagents_integration.md`
+- `../../../MyAgents-dsh/specs/prd/tech_rfc_0.3_myagents_dsh_integration.md`
+- `../../../MyAgents-dsh/specs/tech_docs/permissions-and-interactions.md`
 - `../ARCHITECTURE.md`
 - `./multi_agent_runtime.md`
 - `../prd/prd_0.1_pi_native_agent_runtime_myagents_integration.md`
