@@ -11,7 +11,10 @@ import { CUSTOM_EVENTS } from '@/../shared/constants';
 import type { Thought } from '@/../shared/types/thought';
 import type { TaskCreateRequest } from '@/../shared/taskDiscussion';
 import type { PendingAppRoute } from '@/../shared/appRoute';
-import type { RecordingSnapshot } from '@/../shared/types/record';
+import type {
+  RecordSummary,
+  RecordingSnapshot,
+} from '@/../shared/types/record';
 
 interface Props {
   isActive?: boolean;
@@ -76,14 +79,30 @@ export default function TaskCenter({
     window.dispatchEvent(
       new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
         detail: {
-          thoughtId: t.id,
+          sourceRecordId: t.id,
+          sourceRecordKind: 'text',
           content: t.content,
-          tags: t.tags,
           workspaceId,
         },
       }),
     );
   }, []);
+
+  const handleDiscussAudio = useCallback(
+    (record: RecordSummary, workspaceId: string) => {
+      track('task_align_discuss', {});
+      window.dispatchEvent(
+        new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
+          detail: {
+            sourceRecordId: record.id,
+            sourceRecordKind: 'audio',
+            workspaceId,
+          },
+        }),
+      );
+    },
+    [],
+  );
 
   const handleCreateTask = useCallback(() => {
     const request: TaskCreateRequest = {
@@ -142,6 +161,7 @@ export default function TaskCenter({
           <ThoughtPanel
             onDispatchThought={handleDispatch}
             onDiscussThought={handleDiscuss}
+            onDiscussAudioRecord={handleDiscussAudio}
             refreshKey={isActive ? '1' : '0'}
             // Suppress thought-input autofocus when the user arrived via
             // the Launcher 「我的任务」 search icon — in that flow the

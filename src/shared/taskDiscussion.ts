@@ -22,7 +22,6 @@ export interface TaskDiscussionRequest {
   workspaceId: string;
   workspacePath: string;
   sourceRecordId?: string;
-  sourceRecordTags?: string[];
 }
 
 export interface PreparedTaskDiscussion {

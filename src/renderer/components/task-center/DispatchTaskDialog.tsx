@@ -409,7 +409,6 @@ export function DispatchTaskDialog({
         workspaceId: workspace.id,
         workspacePath: workspace.path,
         sourceRecordId: thought?.id,
-        sourceRecordTags: thought?.tags,
       });
       if (!opened) setBusy(false);
     } catch (error) {

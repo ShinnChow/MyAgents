@@ -23,6 +23,7 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 - 没有 transcript 的历史音频在转录区域显示“开始转录”。只有用户点击后才调用 `cmd_speech_record_transcribe`；安装模型、打开详情或启动 App 都不会自动扫描历史 Record。
 - 本期人工纠错只覆盖 speaker rename、merge 与 exact segment reassign。原始 transcript revision 保留，override 单独持久化并在 projection/export/search 时合成；不提供任意字词改写。
 - 所有录音模式只投影当前 Record 内的匿名 `Speaker A/B/C`；物理麦克风不代表“我”。单轨直接 diarize，双物理轨由同一 Media Worker 按共同媒体时间线有界混合后做一次 Record-wide clustering。speaker embedding 只在 exact Worker generation 内短暂存在并在结束时主动清理，不持久化声纹，也不跨 Record 复用身份。
+- audio Record 结束保存后，`RecordStore` 在 Record 根目录生成唯一的 `content.md` 当前态文稿，包含元数据、当前 speaker projection、转写、现场笔记与重点 Mark。它是可重建的派生 artifact：最终转写、diarization、speaker override、metadata 或 timeline 变化后原子覆盖刷新；录音中不生成，损坏或缺失时由 AI 讨论接纳入口按当前 Record revision 重建。Renderer、Session 与 TaskStore 都不维护第二份副本。
 - 托盘只消费 `RecordingManager` projection：录音中 icon 增加状态圆点，菜单出现“正在录音...”，点击打开 exact Record Tab。托盘不拥有录音状态或导航 history。
 - SearchEngine 复用现有 Tantivy + jieba 建立 Record index；`RecordStore` change broadcast 驱动 upsert/delete，搜索按 `record_id` 合并 title/content/tag/transcript/speaker 命中，每个 Record 最多返回一项。
 - analytics 复用 renderer `track()` 与现有 Tauri bridge，只记录 typed milestone、枚举、duration bucket 与不可逆 Record hash；不记录音频、transcript、speaker name、路径或自由文本，也不新建 endpoint/outbox/retry/store。

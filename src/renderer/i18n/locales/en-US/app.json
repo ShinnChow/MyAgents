@@ -91,6 +91,7 @@
     "noModelProviderForDiscussion": "No available model provider configured. Cannot start AI discussion.",
     "taskDiscussionContentRequired": "Describe the task goal and requirements",
     "taskDiscussionStartFailed": "Unable to start the task discussion",
+    "recordDiscussionDocumentFailed": "The recording document could not be prepared. Try again shortly.",
     "discussionTabTitle": "Task discussion",
     "diagnosticsTabTitle": "Issue diagnosis",
     "exitAppTitle": "Exit app",

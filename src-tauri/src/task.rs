@@ -1188,8 +1188,6 @@ pub struct TaskDiscussionMetadata {
     pub workspace_path: String,
     #[serde(default, rename = "sourceRecordId", alias = "sourceThoughtId")]
     pub source_record_id: Option<String>,
-    #[serde(default, rename = "sourceRecordTags", alias = "sourceThoughtTags")]
-    pub source_record_tags: Vec<String>,
     pub created_at: i64,
 }
 
@@ -5129,7 +5127,6 @@ pub async fn cmd_task_prepare_discussion(
     workspace_id: String,
     workspace_path: String,
     source_record_id: Option<String>,
-    source_record_tags: Option<Vec<String>>,
 ) -> Result<PreparedTaskDiscussion, String> {
     validate_safe_id(&discussion_id, "discussionId")?;
     let root = crate::app_dirs::myagents_data_dir()
@@ -5153,14 +5150,13 @@ pub async fn cmd_task_prepare_discussion(
         workspace_id,
         workspace_path,
         source_record_id,
-        source_record_tags: source_record_tags.unwrap_or_default(),
         created_at: now_ms(),
     };
     let json = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("serialize Task discussion metadata: {e}"))?;
     write_atomic_text(&dir.join("metadata.json"), &json)?;
     ulog_debug!(
-        "[task] prepared discussion id={} thought={:?}",
+        "[task] prepared discussion id={} record={:?}",
         discussion_id,
         meta.source_record_id,
     );

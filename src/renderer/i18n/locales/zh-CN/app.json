@@ -91,6 +91,7 @@
     "noModelProviderForDiscussion": "未配置可用模型供应商，无法开始 AI 讨论",
     "taskDiscussionContentRequired": "请输入任务目标与需求",
     "taskDiscussionStartFailed": "无法开始任务讨论",
+    "recordDiscussionDocumentFailed": "录音文稿暂时无法准备，请稍后重试",
     "discussionTabTitle": "任务讨论",
     "diagnosticsTabTitle": "问题诊断",
     "exitAppTitle": "退出应用",

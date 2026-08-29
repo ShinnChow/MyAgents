@@ -4576,21 +4576,21 @@ export default function App() {
   // contract is admitted again at the moment the first turn is dispatched.
   const handleStartTaskDiscussion = useCallback(
     async ({
-      thoughtId,
+      sourceRecordId,
+      sourceRecordKind = 'text',
       content,
-      tags = [],
       workspaceId,
     }: {
-      thoughtId?: string;
-      content: string;
-      tags?: string[];
-      /** Explicit workspace pick from the ThoughtCard popover (v0.1.69
-       *  polish). When present we use it directly; when absent (old
-       *  callers or programmatic triggers) we fall back to the smart
-       *  tag→project match so behavior degrades gracefully. */
+      sourceRecordId?: string;
+      sourceRecordKind?: 'text' | 'audio';
+      content?: string;
       workspaceId?: string;
     }): Promise<boolean> => {
-      if (!content?.trim()) {
+      if (sourceRecordKind === 'audio' && !sourceRecordId) {
+        toastRef.current?.error(t('appChrome.recordDiscussionDocumentFailed'));
+        return false;
+      }
+      if (sourceRecordKind !== 'audio' && !content?.trim()) {
         toastRef.current?.error(t('appChrome.taskDiscussionContentRequired'));
         return false;
       }
@@ -4611,14 +4611,10 @@ export default function App() {
           toastRef.current?.error(t('appChrome.noWorkspaceForDiscussion'));
           return false;
         }
-        // Prefer the explicit pick; fall back to smart default for legacy
-        // callers / programmatic use.
-        const lowerTags = (tags ?? []).map((tag) => tag.toLowerCase());
         const workspace =
           (workspaceId
             ? projects.find((p) => p.id === workspaceId)
             : undefined) ??
-          projects.find((p) => lowerTags.includes(p.name.toLowerCase())) ??
           projects[0];
 
         // PRD 0.2.3: 从前端唯一 builtin selection helper 解析出成对的 (provider, model)。
@@ -4653,6 +4649,12 @@ export default function App() {
         if (!isTauriEnvironment()) {
           throw new Error('Task discussion requires the desktop Task store');
         }
+        const sourceRecordDocumentPath =
+          sourceRecordKind === 'audio'
+            ? await tauriInvoke<string>('cmd_record_discussion_document', {
+                id: sourceRecordId,
+              })
+            : undefined;
         const discussionId = `discussion-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         const prepared = await tauriInvoke<PreparedTaskDiscussion>(
           'cmd_task_prepare_discussion',
@@ -4660,17 +4662,19 @@ export default function App() {
             discussionId,
             workspaceId: workspace.id,
             workspacePath: workspace.path,
-            sourceRecordId: thoughtId || undefined,
-            sourceRecordTags: tags ?? [],
+            sourceRecordId: sourceRecordId || undefined,
           },
         );
         const discussionPrompt = buildTaskDiscussionReminder({
-          ...prepared,
+          candidatesDir: prepared.candidatesDir,
           workspaceId: workspace.id,
           workspacePath: workspace.path,
-          sourceRecordId: thoughtId || undefined,
-          sourceRecordTags: tags ?? [],
-          visibleUserMessage: content,
+          sourceRecordId: sourceRecordId || undefined,
+          sourceRecordDocumentPath,
+          visibleUserMessage:
+            sourceRecordKind === 'audio'
+              ? '请完整读取 sourceRecordDocumentPath 指向的录音文稿。文稿包含转写内容、说话人信息、现场笔记和重点标记。请以文件中的当前内容为准，理解记录并与我进一步讨论。'
+              : (content ?? ''),
         });
 
         const alignmentProviderIntent =
@@ -4750,10 +4754,11 @@ export default function App() {
         return true;
       } catch (err) {
         console.error('[App] OPEN_AI_DISCUSSION failed:', err);
+        const message = err instanceof Error ? err.message : String(err);
         toastRef.current?.error(
-          err instanceof Error
-            ? err.message
-            : t('appChrome.taskDiscussionStartFailed'),
+          message.includes('RECORD_DISCUSSION_DOCUMENT_')
+            ? t('appChrome.recordDiscussionDocumentFailed')
+            : message || t('appChrome.taskDiscussionStartFailed'),
         );
         return false;
       }
@@ -4764,9 +4769,9 @@ export default function App() {
   const handleCreateDialogDiscussion = useCallback(
     async (request: TaskDiscussionRequest) => {
       const opened = await handleStartTaskDiscussion({
-        thoughtId: request.sourceRecordId,
+        sourceRecordId: request.sourceRecordId,
+        sourceRecordKind: 'text',
         content: request.content,
-        tags: request.sourceRecordTags,
         workspaceId: request.workspaceId,
       });
       if (opened) setTaskCreateIntent(null);

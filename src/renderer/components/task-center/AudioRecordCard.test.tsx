@@ -13,8 +13,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@/api/recording', () => ({
   recordingSnapshot: mocks.recordingSnapshot,
-  recordMediaUrl: (recordId: string, track: string) =>
-    `record://${recordId}/${track}`,
+  recordMediaUrl: (recordId: string, track: string) => `record://${recordId}/${track}`,
 }));
 vi.mock('@/analytics/hash', () => ({
   hashPrivateIdentity: mocks.hashPrivateIdentity,
@@ -22,6 +21,19 @@ vi.mock('@/analytics/hash', () => ({
 vi.mock('@/analytics/tracker', () => ({ track: mocks.track }));
 vi.mock('@/components/Toast', () => ({
   useToast: () => ({ success: vi.fn(), error: vi.fn() }),
+}));
+vi.mock('@/hooks/useConfig', () => ({
+  useConfig: () => ({
+    projects: [
+      {
+        id: 'workspace-1',
+        name: 'weekly',
+        displayName: 'Weekly workspace',
+        path: '/Users/me/weekly',
+        isHidden: false,
+      },
+    ],
+  }),
 }));
 
 const RECORD: RecordSummary = {
@@ -68,6 +80,7 @@ describe('AudioRecordCard', () => {
     };
     const { rerender } = render(<AudioRecordCard {...props} />);
 
+    await user.click(screen.getByTitle('更多操作'));
     await user.click(screen.getByRole('button', { name: '多选' }));
     expect(onEnterSelectMode).toHaveBeenCalledOnce();
 
@@ -77,6 +90,21 @@ describe('AudioRecordCard', () => {
     await user.click(checkbox);
     expect(onToggleSelect).toHaveBeenCalledOnce();
     expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it('keeps AI discussion in the stable menu and selects a workspace', async () => {
+    const user = userEvent.setup();
+    const onDiscuss = vi.fn();
+    render(
+      <AudioRecordCard record={RECORD} onOpen={vi.fn()} onArchive={vi.fn()} onDelete={vi.fn()} onDiscuss={onDiscuss} />,
+    );
+
+    await user.click(screen.getByTitle('更多操作'));
+    const discussButtons = screen.getAllByRole('button', { name: 'AI 讨论' });
+    await user.click(discussButtons[discussButtons.length - 1]);
+    await user.click(screen.getByRole('button', { name: /Weekly workspace/ }));
+
+    expect(onDiscuss).toHaveBeenCalledWith(RECORD, 'workspace-1');
   });
 
   it('opens a search hit at its indexed media time', async () => {
@@ -100,7 +128,16 @@ describe('AudioRecordCard', () => {
 
     await user.click(screen.getByRole('button', { name: /Weekly meeting/ }));
     expect(onOpen).toHaveBeenCalledWith(RECORD.id, 42_000, false);
-    expect(screen.getByText('Alice: roadmap decision')).toBeInTheDocument();
+    expect(screen.queryByText('Alice: roadmap decision')).not.toBeInTheDocument();
+  });
+
+  it('keeps playback in More instead of adding a third action row', async () => {
+    const user = userEvent.setup();
+    render(<AudioRecordCard record={RECORD} onOpen={vi.fn()} onArchive={vi.fn()} onDelete={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: '播放' })).toBeNull();
+    await user.click(screen.getByTitle('更多操作'));
+    expect(screen.getByRole('button', { name: '播放' })).toBeInTheDocument();
   });
 
   it('renders the authoritative duration projected by the app owner', async () => {
@@ -127,12 +164,7 @@ describe('AudioRecordCard', () => {
 
   it('tracks one privacy-safe event per stopped-to-playing session', async () => {
     const { container } = render(
-      <AudioRecordCard
-        record={RECORD}
-        onOpen={vi.fn()}
-        onArchive={vi.fn()}
-        onDelete={vi.fn()}
-      />,
+      <AudioRecordCard record={RECORD} onOpen={vi.fn()} onArchive={vi.fn()} onDelete={vi.fn()} />,
     );
     const audio = container.querySelector('audio');
     expect(audio).not.toBeNull();

@@ -40,6 +40,10 @@ import type {
 interface Props {
   onDispatchThought?: (t: Thought) => void;
   onDiscussThought?: (t: Thought, workspaceId: string) => void;
+  onDiscussAudioRecord?: (
+    record: RecordSummary,
+    workspaceId: string,
+  ) => void;
   /**
    * When `true`, the panel re-fetches from disk. Parent should bump this on tab
    * activation so a thought created elsewhere (e.g. Launcher 想法 mode) appears
@@ -63,6 +67,7 @@ interface Props {
 export function ThoughtPanel({
   onDispatchThought,
   onDiscussThought,
+  onDiscussAudioRecord,
   refreshKey,
   autoFocusInput = false,
   onOpenRecord,
@@ -941,6 +946,15 @@ export function ThoughtPanel({
                     }
                     onArchive={handleAudioArchive}
                     onDelete={() => setAudioDeleteTarget(item.record)}
+                    onDiscuss={
+                      selectMode ||
+                      !['ready', 'interrupted'].includes(
+                        item.record.audio?.captureStatus ?? '',
+                      ) ||
+                      (item.record.audio?.sizeBytes ?? 0) <= 0
+                        ? undefined
+                        : onDiscussAudioRecord
+                    }
                     selectMode={selectMode}
                     selected={selectedIds.has(item.record.id)}
                     onToggleSelect={() => toggleSelect(item.record.id)}

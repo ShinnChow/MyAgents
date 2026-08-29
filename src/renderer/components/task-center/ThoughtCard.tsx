@@ -10,13 +10,7 @@
 //     `EDIT_MAX_HEIGHT_PX`, beyond which it scrolls internally. This keeps
 //     a single oversized draft from eating the whole panel.
 
-import {
-  useCallback,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
+import { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Archive,
@@ -31,16 +25,10 @@ import {
 } from 'lucide-react';
 import { thoughtDelete, thoughtSetArchived, thoughtUpdate } from '@/api/taskCenter';
 import { Popover } from '@/components/ui/Popover';
-import WorkspaceIcon from '@/components/launcher/WorkspaceIcon';
-import { useConfig } from '@/hooks/useConfig';
-import { getFolderName } from '@/types/tab';
-import { isProjectVisibleToUser, type Project } from '@/config/types';
 import type { Thought } from '@/../shared/types/thought';
+import { RecordWorkspacePicker } from './RecordWorkspacePicker';
 import { splitWithTagHighlights } from '@/utils/parseThoughtTags';
-import {
-  findHighlightRanges,
-  renderTextWithHighlights,
-} from '@/utils/highlightSearchMatches';
+import { findHighlightRanges, renderTextWithHighlights } from '@/utils/highlightSearchMatches';
 import { relativeTime } from '@/utils/taskCenterUtils';
 import { isSupportedLocale } from '@/../shared/i18n';
 
@@ -100,33 +88,6 @@ export function ThoughtCard({
   const editRef = useRef<HTMLTextAreaElement>(null);
   const menuAnchorRef = useRef<HTMLButtonElement>(null);
   const discussAnchorRef = useRef<HTMLButtonElement>(null);
-
-  // Workspace list for the AI-discussion picker. Internal projects
-  // (the ~/.myagents helper workspace) and hidden system presets are hidden —
-  // a thought belongs to user work, not the diagnostic sandbox. Sorted by
-  // most-recently opened so the user's current work bubbles up.
-  const { projects } = useConfig();
-  const pickableWorkspaces = useMemo<Project[]>(() => {
-    return projects
-      .filter(isProjectVisibleToUser)
-      .slice()
-      .sort((a, b) => {
-        const ta = a.lastOpened ? new Date(a.lastOpened).getTime() : 0;
-        const tb = b.lastOpened ? new Date(b.lastOpened).getTime() : 0;
-        return tb - ta;
-      });
-  }, [projects]);
-
-  // Smart default — match a thought tag against a workspace name so the
-  // popover lands with the most likely pick highlighted. Falls back to
-  // the first (most recent) workspace.
-  const suggestedWorkspaceId = useMemo(() => {
-    const lowerTags = thought.tags?.map((t) => t.toLowerCase()) ?? [];
-    const matched = pickableWorkspaces.find((p) =>
-      lowerTags.includes(p.name.toLowerCase()),
-    );
-    return (matched ?? pickableWorkspaces[0])?.id;
-  }, [pickableWorkspaces, thought.tags]);
 
   // Overflow detection — measure only in collapsed state so flipping to
   // expanded doesn't reset the flag (clientHeight would grow to match).
@@ -255,11 +216,7 @@ export function ThoughtCard({
       onClick={handleCardClick}
       className={`group relative rounded-[var(--radius-lg)] bg-[var(--paper-elevated)] p-4 transition-shadow hover:shadow-sm ${
         selectMode ? 'cursor-pointer' : ''
-      } ${
-        selected
-          ? 'ring-1 ring-[var(--accent-warm)] bg-[var(--accent-warm-subtle)]'
-          : ''
-      }`}
+      } ${selected ? 'ring-1 ring-[var(--accent-warm)] bg-[var(--accent-warm-subtle)]' : ''}`}
     >
       {/* Top meta row — time + derived-task count on the left, action
           cluster on the right. Moved from the bottom of the card (prior
@@ -335,48 +292,13 @@ export function ThoughtCard({
                  AI 讨论 button is clicked. Portal'd via Popover so the
                  anchor's `overflow-hidden` card chrome can't clip it. */}
             {onDiscuss && (
-              <Popover
+              <RecordWorkspacePicker
                 open={showWorkspacePicker}
                 onClose={() => setShowWorkspacePicker(false)}
                 anchorRef={discussAnchorRef}
-                placement="bottom-end"
-                className="min-w-[240px] max-w-[320px] py-1"
-              >
-                <div className="px-3 pt-2 pb-1 text-xs font-semibold uppercase tracking-[0.12em] text-[var(--ink-muted)]/70">
-                  {t('thoughts.workspacePicker')}
-                </div>
-                <div className="max-h-[280px] overflow-y-auto py-1">
-                  {pickableWorkspaces.length === 0 ? (
-                    <div className="px-3 py-4 text-xs text-[var(--ink-muted)]">
-                      {t('thoughts.noWorkspace')}
-                    </div>
-                  ) : (
-                    pickableWorkspaces.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        onClick={() => {
-                          setShowWorkspacePicker(false);
-                          onDiscuss(thought, p.id);
-                        }}
-                        className={`flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-[var(--hover-bg)] ${
-                          p.id === suggestedWorkspaceId ? 'bg-[var(--accent-warm-subtle)]' : ''
-                        }`}
-                      >
-                        <WorkspaceIcon icon={p.icon} size={20} />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-sm font-medium text-[var(--ink)]">
-                            {p.displayName || getFolderName(p.path)}
-                          </div>
-                          <div className="truncate text-xs text-[var(--ink-muted)]/70">
-                            {p.path}
-                          </div>
-                        </div>
-                      </button>
-                    ))
-                  )}
-                </div>
-              </Popover>
+                tags={thought.tags}
+                onSelect={(workspaceId) => onDiscuss(thought, workspaceId)}
+              />
             )}
             {/* "更多" — always visible so the user has a permanent
                  handle on secondary actions (编辑 / 删除) without having
@@ -400,6 +322,20 @@ export function ThoughtCard({
               placement="bottom-end"
               className="min-w-[120px] py-1"
             >
+              {onDiscuss && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowMenu(false);
+                    setShowWorkspacePicker(true);
+                    requestAnimationFrame(() => discussAnchorRef.current?.focus());
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-[var(--ink-secondary)] hover:bg-[var(--hover-bg)] hover:text-[var(--ink)]"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" strokeWidth={1.5} />
+                  {t('thoughts.aiDiscuss')}
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -487,11 +423,7 @@ export function ThoughtCard({
           }
           onDoubleClick={selectMode ? undefined : enterEdit}
         >
-          {renderWithTagHighlights(
-            thought.content,
-            selectMode ? undefined : onTagClick,
-            searchQuery,
-          )}
+          {renderWithTagHighlights(thought.content, selectMode ? undefined : onTagClick, searchQuery)}
         </div>
       )}
 
@@ -525,9 +457,7 @@ export function ThoughtCard({
         </button>
       )}
 
-      {error && (
-        <div className="mt-2 text-xs text-[var(--error)]">{error}</div>
-      )}
+      {error && <div className="mt-2 text-xs text-[var(--error)]">{error}</div>}
 
       {/* Inline edit action bar — only in edit mode. Sits at the bottom
           so the edit flow reads top-down: textarea → save/cancel. */}
@@ -558,18 +488,13 @@ export function ThoughtCard({
   );
 }
 
-function renderWithTagHighlights(
-  content: string,
-  onTagClick?: (tag: string) => void,
-  searchQuery?: string,
-) {
+function renderWithTagHighlights(content: string, onTagClick?: (tag: string) => void, searchQuery?: string) {
   // Saved-card tags sit one typography step below the compact thought body,
   // so they read as metadata rather than competing with the prose. Keep the
   // authoring overlay separate: its glyph metrics must match the textarea for
   // cursor/highlight alignment.
   const parts = splitWithTagHighlights(content);
-  const pillCls =
-    'rounded-[var(--radius-sm)] bg-[var(--accent-warm-subtle)] px-1 text-xs text-[var(--accent-warm)]';
+  const pillCls = 'rounded-[var(--radius-sm)] bg-[var(--accent-warm-subtle)] px-1 text-xs text-[var(--accent-warm)]';
   // Search-keyword highlight is intentionally only applied to non-tag
   // segments. Tag pills are already a coloured block; layering a `<mark>`
   // inside them doubles the visual emphasis and looks broken.

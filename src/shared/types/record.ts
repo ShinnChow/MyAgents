@@ -23,12 +23,7 @@ export type TranscriptionStatus =
   | 'ready'
   | 'failed';
 
-export type DiarizationStatus =
-  | 'not_applicable'
-  | 'queued'
-  | 'running'
-  | 'ready'
-  | 'failed';
+export type DiarizationStatus = 'not_applicable' | 'queued' | 'running' | 'ready' | 'failed';
 
 export interface AudioRecordSummary {
   mediaDurationMs: number;
@@ -44,6 +39,7 @@ export interface RecordArtifact {
   path: string;
   sizeBytes: number;
   sha256: string;
+  sourceRevision?: number;
 }
 
 export interface RecordSummary {

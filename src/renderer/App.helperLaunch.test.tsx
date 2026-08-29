@@ -2041,11 +2041,12 @@ describe('App helper launch', () => {
       return undefined;
     });
 
+    const recordBody = '    indented Record body\nkeep trailing spaces  \n';
     render(<App />);
     act(() => {
       window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
         detail: {
-          content: '梳理并创建一个周期任务',
+            content: recordBody,
           workspaceId: mocks.project.id,
           tags: [],
         },
@@ -2064,6 +2065,105 @@ describe('App helper launch', () => {
     expect(mocks.toast.error).not.toHaveBeenCalledWith(
       expect.stringContaining('provider'),
     );
+    const discussionChat = [...mocks.chatProps]
+      .reverse()
+      .find((props) => Boolean(props.initialMessage)) as
+      | { initialMessage?: { text?: string } }
+      | undefined;
+    expect(discussionChat?.initialMessage?.text?.endsWith(recordBody)).toBe(
+      true,
+    );
+  });
+
+  it('ensures the canonical audio document before opening a Record discussion', async () => {
+    mocks.tauriEnvironment = true;
+    mocks.multiAgentRuntime = true;
+    mocks.agent.runtime = 'codex';
+    mocks.resolveBuiltinSelection.mockReturnValue(undefined);
+    tauriCoreMocks.invoke.mockImplementation(async (command) => {
+      if (command === 'cmd_record_discussion_document') {
+        return '/Users/me/.myagents/records/2026-08/record-audio/content.md';
+      }
+      if (command === 'cmd_task_prepare_discussion') {
+        return {
+          discussionId: 'discussion-audio',
+          discussionDir: '/tmp/task-discussions/discussion-audio',
+          candidatesDir: '/tmp/task-discussions/discussion-audio/candidates',
+        };
+      }
+      return undefined;
+    });
+
+    render(<App />);
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
+          detail: {
+            sourceRecordId: 'record-audio',
+            sourceRecordKind: 'audio',
+            workspaceId: mocks.project.id,
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => expect(mocks.ensureSessionSidecar).toHaveBeenCalled());
+    const commands = tauriCoreMocks.invoke.mock.calls.map(
+      ([command]) => command,
+    );
+    expect(commands.indexOf('cmd_record_discussion_document')).toBeLessThan(
+      commands.indexOf('cmd_task_prepare_discussion'),
+    );
+    expect(tauriCoreMocks.invoke).toHaveBeenCalledWith(
+      'cmd_task_prepare_discussion',
+      expect.not.objectContaining({ sourceRecordTags: expect.anything() }),
+    );
+    const discussionChat = [...mocks.chatProps]
+      .reverse()
+      .find((props) => Boolean(props.initialMessage)) as
+      | { initialMessage?: { text?: string; requiredSystemSkill?: unknown } }
+      | undefined;
+    const prompt = discussionChat?.initialMessage?.text ?? '';
+    expect(prompt).toContain(
+      'sourceRecordDocumentPath: /Users/me/.myagents/records/2026-08/record-audio/content.md',
+    );
+    expect(prompt).toContain(
+      '请完整读取 sourceRecordDocumentPath 指向的录音文稿',
+    );
+    expect(prompt).not.toContain('discussionId:');
+    expect(prompt).not.toContain('discussionDir:');
+    expect(prompt).not.toContain('sourceRecordTags:');
+    expect(discussionChat?.initialMessage?.requiredSystemSkill).toBeTruthy();
+  });
+
+  it('does not create discussion state when the canonical audio document is unavailable', async () => {
+    mocks.tauriEnvironment = true;
+    tauriCoreMocks.invoke.mockImplementation(async (command) => {
+      if (command === 'cmd_record_discussion_document') {
+        throw new Error('RECORD_DISCUSSION_DOCUMENT_NOT_READY');
+      }
+      return undefined;
+    });
+
+    render(<App />);
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(CUSTOM_EVENTS.OPEN_AI_DISCUSSION, {
+          detail: {
+            sourceRecordId: 'record-audio',
+            sourceRecordKind: 'audio',
+            workspaceId: mocks.project.id,
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => expect(mocks.toast.error).toHaveBeenCalled());
+    expect(tauriCoreMocks.invoke).not.toHaveBeenCalledWith(
+      'cmd_task_prepare_discussion',
+      expect.anything(),
+    );
+    expect(mocks.ensureSessionSidecar).not.toHaveBeenCalled();
   });
 
   it('commits the helper tab before launching so the active tab is renderable', async () => {

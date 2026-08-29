@@ -29,6 +29,9 @@ use crate::{ulog_info, ulog_warn};
 const RECORD_SCHEMA_VERSION: u32 = 1;
 const RECORD_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 const TEXT_CONTENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const AUDIO_DISCUSSION_DOCUMENT_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const AUDIO_DISCUSSION_DOCUMENT_PATH: &str = "content.md";
+const AUDIO_DISCUSSION_DOCUMENT_KIND: &str = "record/discussion-document+markdown";
 const TEXT_ATTACHMENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const LEGACY_THOUGHT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const TRANSCRIPT_SNAPSHOT_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -120,6 +123,8 @@ pub struct RecordArtifact {
     pub path: String,
     pub size_bytes: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1216,6 +1221,51 @@ impl RecordStore {
         Ok(stored.path.clone())
     }
 
+    pub async fn ensure_audio_discussion_document(&self, id: &str) -> Result<PathBuf, String> {
+        let mut inner = self.inner.write().await;
+        let stored = inner
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        ensure_audio_record(&stored, id)?;
+        if !audio_discussion_document_allowed(&stored.record)
+            || !audio_discussion_audio_present(&stored.path, &stored.record)
+        {
+            return Err("RECORD_DISCUSSION_DOCUMENT_NOT_READY".to_string());
+        }
+
+        // Live transcript revisions do not independently bump the Record
+        // revision, so admission re-renders instead of trusting only the
+        // cached artifact revision between stop and final backfill.
+        let document_record = rebuild_audio_discussion_document(&stored, stored.record.clone())
+            .map_err(|error| {
+                ulog_warn!(
+                    "[record] discussion document rebuild failed recordId={} error={}",
+                    id,
+                    error
+                );
+                format!("RECORD_DISCUSSION_DOCUMENT_FAILED: {error}")
+            })?;
+        if document_record.artifacts != stored.record.artifacts {
+            inner.insert(
+                id.to_string(),
+                StoredRecord {
+                    record: document_record,
+                    ..stored.clone()
+                },
+            );
+        }
+
+        let record_root = fs::canonicalize(&stored.path)
+            .map_err(|error| format!("resolve Record directory: {error}"))?;
+        let document_path = fs::canonicalize(stored.path.join(AUDIO_DISCUSSION_DOCUMENT_PATH))
+            .map_err(|error| format!("resolve Record discussion document: {error}"))?;
+        if document_path.parent() != Some(record_root.as_path()) {
+            return Err("Record discussion document escaped its Record directory".to_string());
+        }
+        Ok(document_path)
+    }
+
     pub(crate) async fn update_audio_capture(
         &self,
         id: &str,
@@ -1302,7 +1352,7 @@ impl RecordStore {
             })
             .ok_or_else(|| "audio artifact size overflow".to_string())?;
 
-        let mut updated = stored.record;
+        let mut updated = stored.record.clone();
         updated
             .artifacts
             .retain(|artifact| artifact.kind != "audio/ogg-opus");
@@ -1323,6 +1373,7 @@ impl RecordStore {
             stored.legacy_thought_digest.clone(),
             false,
         )?;
+        updated = refresh_audio_discussion_document_best_effort(&stored, updated);
         inner.insert(
             id.to_string(),
             StoredRecord {
@@ -1610,7 +1661,7 @@ impl RecordStore {
         if stored.record.kind != RecordKind::Audio {
             return Err(format!("Record is not audio: {id}"));
         }
-        let mut updated = stored.record;
+        let mut updated = stored.record.clone();
         let audio = updated
             .audio
             .as_mut()
@@ -1629,6 +1680,7 @@ impl RecordStore {
             stored.legacy_thought_digest.clone(),
             false,
         )?;
+        updated = refresh_audio_discussion_document_best_effort(&stored, updated);
         inner.insert(
             id.to_string(),
             StoredRecord {
@@ -1703,7 +1755,7 @@ impl RecordStore {
         bytes.zeroize();
         write_result?;
 
-        let mut updated = stored.record;
+        let mut updated = stored.record.clone();
         replace_record_artifact(
             &mut updated.artifacts,
             record_artifact_from_file(
@@ -1729,6 +1781,7 @@ impl RecordStore {
             stored.legacy_thought_digest.clone(),
             false,
         )?;
+        updated = refresh_audio_discussion_document_best_effort(&stored, updated);
         inner.insert(
             id.to_string(),
             StoredRecord {
@@ -1793,7 +1846,7 @@ impl RecordStore {
             .map_err(|_| "diarization result serialization is not UTF-8".to_string())?;
         crate::task::write_atomic_text(&result_path, content)?;
 
-        let mut updated = stored.record;
+        let mut updated = stored.record.clone();
         replace_record_artifact(
             &mut updated.artifacts,
             record_artifact_from_file(
@@ -1816,6 +1869,7 @@ impl RecordStore {
             stored.legacy_thought_digest.clone(),
             false,
         )?;
+        updated = refresh_audio_discussion_document_best_effort(&stored, updated);
         inner.insert(
             id.to_string(),
             StoredRecord {
@@ -2004,9 +2058,10 @@ impl RecordStore {
         if updated_at_wall_time <= 0 {
             return Err("Speaker override wall time is invalid".to_string());
         }
-        let inner = self.inner.write().await;
+        let mut inner = self.inner.write().await;
         let stored = inner
             .get(record_id)
+            .cloned()
             .ok_or_else(|| format!("Record not found: {record_id}"))?;
         let audio = stored
             .record
@@ -2020,16 +2075,30 @@ impl RecordStore {
             .find(|artifact| artifact.kind == "diarization/model-projection+json")
             .ok_or_else(|| "Record diarization is not available".to_string())?;
         let model = read_owned_diarization_result(record_id, &stored.path, audio, artifact)?;
-        let mut overrides = read_speaker_overrides(stored)?;
+        let mut overrides = read_speaker_overrides(&stored)?;
         if overrides.revision != expected_override_revision {
             return Err("RECORD_SPEAKER_OVERRIDE_REVISION_CONFLICT".to_string());
         }
-        mutate(stored, &model, &mut overrides)?;
+        mutate(&stored, &model, &mut overrides)?;
         overrides.revision = overrides.revision.saturating_add(1);
         overrides.updated_at_wall_time = updated_at_wall_time;
-        write_speaker_overrides(stored, &overrides)?;
-        let projection = project_diarization(stored, model, overrides)?;
-        drop(inner);
+        write_speaker_overrides(&stored, &overrides)?;
+        let mut updated = stored.record.clone();
+        updated.updated_at = now_ms();
+        updated.revision = updated.revision.saturating_add(1);
+        persist_existing_record(
+            &stored.path,
+            &updated,
+            stored.legacy_thought_digest.clone(),
+            false,
+        )?;
+        updated = refresh_audio_discussion_document_best_effort(&stored, updated);
+        let updated_stored = StoredRecord {
+            record: updated,
+            ..stored
+        };
+        let projection = project_diarization(&updated_stored, model, overrides)?;
+        inner.insert(record_id.to_string(), updated_stored);
         self.emit_change(record_id, RecordChangeKind::Upsert);
         Ok(projection)
     }
@@ -2105,7 +2174,8 @@ impl RecordStore {
             },
         )?;
         entries.push(entry);
-        let updated = touch_timeline_record(&stored)?;
+        let updated =
+            refresh_audio_discussion_document_best_effort(&stored, touch_timeline_record(&stored)?);
         inner.insert(
             input.record_id.clone(),
             StoredRecord {
@@ -2160,7 +2230,8 @@ impl RecordStore {
             },
         )?;
         entries.push(entry);
-        let updated = touch_timeline_record(&stored)?;
+        let updated =
+            refresh_audio_discussion_document_best_effort(&stored, touch_timeline_record(&stored)?);
         inner.insert(
             input.record_id.clone(),
             StoredRecord {
@@ -2223,7 +2294,8 @@ impl RecordStore {
                 text: input.text,
             },
         )?);
-        let updated = touch_timeline_record(&stored)?;
+        let updated =
+            refresh_audio_discussion_document_best_effort(&stored, touch_timeline_record(&stored)?);
         inner.insert(
             input.record_id.clone(),
             StoredRecord {
@@ -2294,7 +2366,8 @@ impl RecordStore {
             }
         };
         entries.push(journal.append(input.deleted_at_wall_time, 0, event)?);
-        let updated = touch_timeline_record(&stored)?;
+        let updated =
+            refresh_audio_discussion_document_best_effort(&stored, touch_timeline_record(&stored)?);
         inner.insert(
             input.record_id.clone(),
             StoredRecord {
@@ -2514,7 +2587,7 @@ impl RecordStore {
         if stored.record.title == title && stored.record.tags == tags {
             return Ok(stored.record);
         }
-        let mut updated = stored.record;
+        let mut updated = stored.record.clone();
         updated.title = title.to_string();
         updated.tags = tags;
         updated.updated_at = now_ms();
@@ -2525,6 +2598,7 @@ impl RecordStore {
             stored.legacy_thought_digest.clone(),
             false,
         )?;
+        updated = refresh_audio_discussion_document_best_effort(&stored, updated);
         inner.insert(
             input.id.clone(),
             StoredRecord {
@@ -2848,7 +2922,7 @@ fn read_record_directory_inner(
     ensure_plain_directory(path)?;
     let manifest_path = path.join("record.json");
     let raw = read_bounded_regular_file(&manifest_path, RECORD_MANIFEST_MAX_BYTES)?;
-    let manifest: RecordManifest =
+    let mut manifest: RecordManifest =
         serde_json::from_slice(&raw).map_err(|error| format!("parse record.json: {error}"))?;
     if manifest.schema_version != RECORD_SCHEMA_VERSION {
         return Err(format!(
@@ -2864,7 +2938,38 @@ fn read_record_directory_inner(
     if !is_safe_id(&manifest.id) || !name_matches {
         return Err("record id does not match directory".to_string());
     }
-    validate_record_artifacts(path, &manifest.artifacts, allow_staging_name)?;
+    // Audio content.md is a rebuildable projection. A crash can occur after
+    // replacing that file but before replacing record.json (or vice versa),
+    // so a stale projection must never make the primary Record disappear at
+    // startup. Durable source artifacts remain strict; a stale discussion
+    // document is dropped from the in-memory inventory and rebuilt on the
+    // next source mutation or discussion admission.
+    let durable_artifacts = if manifest.kind == RecordKind::Audio {
+        manifest
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.kind != AUDIO_DISCUSSION_DOCUMENT_KIND)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        manifest.artifacts.clone()
+    };
+    validate_record_artifacts(path, &durable_artifacts, allow_staging_name)?;
+    if manifest.kind == RecordKind::Audio {
+        let source_revision = manifest.revision;
+        let mut seen = false;
+        manifest.artifacts.retain(|artifact| {
+            if artifact.kind != AUDIO_DISCUSSION_DOCUMENT_KIND {
+                return true;
+            }
+            if seen {
+                return false;
+            }
+            seen = true;
+            validate_audio_discussion_document_artifact(path, artifact, source_revision, false)
+                .is_ok()
+        });
+    }
     if !manifest.artifacts.is_empty()
         && manifest.images.iter().any(|image| {
             !manifest
@@ -3055,6 +3160,41 @@ fn validate_record_artifacts(
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_audio_discussion_document_artifact(
+    record_dir: &Path,
+    artifact: &RecordArtifact,
+    source_revision: u64,
+    verify_digest: bool,
+) -> Result<(), String> {
+    if artifact.kind != AUDIO_DISCUSSION_DOCUMENT_KIND
+        || artifact.path != AUDIO_DISCUSSION_DOCUMENT_PATH
+        || artifact.source_revision != Some(source_revision)
+        || artifact.size_bytes == 0
+        || artifact.size_bytes > AUDIO_DISCUSSION_DOCUMENT_MAX_BYTES
+        || artifact.sha256.len() != 64
+        || !artifact
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("Record discussion document inventory is stale".to_string());
+    }
+    let path =
+        resolve_plain_record_artifact(record_dir, Path::new(AUDIO_DISCUSSION_DOCUMENT_PATH))?;
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("inspect Record discussion document: {error}"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() != artifact.size_bytes
+    {
+        return Err("Record discussion document is stale".to_string());
+    }
+    if verify_digest && sha256_regular_file_exact(&path, artifact.size_bytes)? != artifact.sha256 {
+        return Err("Record discussion document digest is stale".to_string());
     }
     Ok(())
 }
@@ -3455,15 +3595,34 @@ fn read_current_transcript(
     let Some(audio) = stored.record.audio.as_ref() else {
         return Err(format!("Record is not audio: {}", stored.record.id));
     };
-    let Some(artifact) = stored
+    if let Some(artifact) = stored
         .record
         .artifacts
         .iter()
         .find(|artifact| artifact.kind == "transcript/recording-final+json")
-    else {
-        return Ok(None);
+    {
+        return read_owned_transcript_snapshot(&stored.record.id, &stored.path, audio, artifact)
+            .map(Some);
+    }
+    let path = stored.path.join("transcript/revisions.jsonl");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect live transcript journal: {error}")),
     };
-    read_owned_transcript_snapshot(&stored.record.id, &stored.path, audio, artifact).map(Some)
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > TRANSCRIPT_REVISION_MAX_BYTES
+    {
+        return Err("live transcript revision journal is invalid".to_string());
+    }
+    let (entries, _) = read_valid_prefix::<RecordTranscriptRevisionEvent>(
+        &path,
+        &stored.record.id,
+        TRANSCRIPT_REVISION_SCHEMA_VERSION,
+        TRANSCRIPT_REVISION_MAX_LINE_BYTES,
+    )?;
+    project_live_transcript(&stored.record.id, entries).map(Some)
 }
 
 fn read_diarization_projection_for_stored(
@@ -3512,7 +3671,7 @@ fn build_record_search_documents(
     if stored.record.kind != RecordKind::Audio {
         return Ok(documents);
     }
-    let audio = stored
+    let _audio = stored
         .record
         .audio
         .as_ref()
@@ -3521,12 +3680,7 @@ fn build_record_search_documents(
     let diarization = read_diarization_projection_for_stored(stored)?;
     if let Some(transcript) = transcript.as_ref() {
         for segment in &transcript.segments {
-            let speaker = export_speaker_label(segment, diarization.as_ref(), &audio.tracks, false);
-            let speaker_terms = if speaker == "Me" {
-                "我\nMe".to_string()
-            } else {
-                speaker
-            };
+            let speaker_terms = export_speaker_label(segment, diarization.as_ref());
             documents.push(RecordSearchDocument {
                 record_id: stored.record.id.clone(),
                 kind: RecordKind::Audio,
@@ -3698,6 +3852,7 @@ fn record_artifact_from_file(
         path,
         size_bytes: metadata.len(),
         sha256: sha256_regular_file_exact(source, metadata.len())?,
+        source_revision: None,
     })
 }
 
@@ -4002,6 +4157,93 @@ fn touch_timeline_record(stored: &StoredRecord) -> Result<Record, String> {
     Ok(updated)
 }
 
+fn audio_discussion_document_allowed(record: &Record) -> bool {
+    record.kind == RecordKind::Audio
+        && record.audio.as_ref().is_some_and(|audio| {
+            matches!(
+                audio.capture_status,
+                CaptureStatus::Ready | CaptureStatus::Interrupted
+            )
+        })
+        && record
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "audio/ogg-opus" && artifact.size_bytes > 0)
+}
+
+fn audio_discussion_audio_present(record_path: &Path, record: &Record) -> bool {
+    record.artifacts.iter().any(|artifact| {
+        if artifact.kind != "audio/ogg-opus" || artifact.size_bytes == 0 {
+            return false;
+        }
+        let Ok(path) = resolve_plain_record_artifact(record_path, Path::new(&artifact.path)) else {
+            return false;
+        };
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && metadata.len() == artifact.size_bytes
+        })
+    })
+}
+
+fn rebuild_audio_discussion_document(
+    stored: &StoredRecord,
+    record: Record,
+) -> Result<Record, String> {
+    if !audio_discussion_document_allowed(&record) {
+        return Err("audio Record has not been stopped and saved".to_string());
+    }
+    let render_source = StoredRecord {
+        record: record.clone(),
+        path: stored.path.clone(),
+        legacy_thought_digest: stored.legacy_thought_digest.clone(),
+    };
+    let content =
+        render_record_text_export(&render_source, RecordTextExportFormat::Markdown, "en-US")?;
+    if content.is_empty() || content.len() as u64 > AUDIO_DISCUSSION_DOCUMENT_MAX_BYTES {
+        return Err("Record discussion document exceeds the fixed size limit".to_string());
+    }
+    let relative = PathBuf::from(AUDIO_DISCUSSION_DOCUMENT_PATH);
+    let document_path = stored.path.join(&relative);
+    write_atomic_replace(&document_path, content.as_bytes())?;
+    let mut artifact =
+        record_artifact_from_file(&document_path, &relative, AUDIO_DISCUSSION_DOCUMENT_KIND)?;
+    artifact.source_revision = Some(record.revision);
+
+    let mut updated = record;
+    replace_record_artifact(
+        &mut updated.artifacts,
+        artifact,
+        AUDIO_DISCUSSION_DOCUMENT_KIND,
+    );
+    persist_existing_record(
+        &stored.path,
+        &updated,
+        stored.legacy_thought_digest.clone(),
+        false,
+    )?;
+    Ok(updated)
+}
+
+fn refresh_audio_discussion_document_best_effort(stored: &StoredRecord, record: Record) -> Record {
+    if !audio_discussion_document_allowed(&record) {
+        return record;
+    }
+    match rebuild_audio_discussion_document(stored, record.clone()) {
+        Ok(updated) => updated,
+        Err(error) => {
+            ulog_warn!(
+                "[record] discussion document refresh deferred recordId={} revision={} error={}",
+                record.id,
+                record.revision,
+                error
+            );
+            record
+        }
+    }
+}
+
 fn validate_new_export_destination(raw: &str, extension: &str) -> Result<PathBuf, String> {
     let destination = crate::workspace_files::attachment_export::validate_export_destination(raw)?;
     if destination
@@ -4111,12 +4353,7 @@ fn export_duration(media_ms: u64) -> String {
 fn export_speaker_label(
     segment: &RecordTranscriptSegment,
     diarization: Option<&RecordDiarizationProjection>,
-    tracks: &[AudioTrackKind],
-    zh: bool,
 ) -> String {
-    if segment.track == AudioTrackKind::Microphone && tracks.contains(&AudioTrackKind::System) {
-        return if zh { "我" } else { "Me" }.to_string();
-    }
     let middle = segment
         .start_sample
         .saturating_add(segment.end_sample.saturating_sub(segment.start_sample) / 2);
@@ -4221,18 +4458,73 @@ fn render_record_text_export(
         })
         .collect::<Vec<_>>()
         .join(" · ");
+    let tags = stored
+        .record
+        .tags
+        .iter()
+        .map(|tag| format!("#{tag}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let status = if matches!(audio.capture_status, CaptureStatus::Interrupted) {
+        if zh {
+            "录音中断"
+        } else {
+            "Recording interrupted"
+        }
+    } else if matches!(audio.capture_status, CaptureStatus::Failed)
+        || matches!(audio.transcription_status, TranscriptionStatus::Failed)
+        || matches!(audio.diarization_status, DiarizationStatus::Failed)
+    {
+        if zh {
+            "处理失败"
+        } else {
+            "Processing failed"
+        }
+    } else if matches!(
+        audio.transcription_status,
+        TranscriptionStatus::Queued
+            | TranscriptionStatus::Live
+            | TranscriptionStatus::Lagging
+            | TranscriptionStatus::Recovering
+            | TranscriptionStatus::Finalizing
+    ) || matches!(
+        audio.diarization_status,
+        DiarizationStatus::Queued | DiarizationStatus::Running
+    ) {
+        if zh {
+            "处理中"
+        } else {
+            "Processing"
+        }
+    } else {
+        if zh {
+            "已完成"
+        } else {
+            "Complete"
+        }
+    };
+    let duration = export_duration(audio.media_duration_ms);
     let mut output = String::new();
     match format {
         RecordTextExportFormat::Markdown => {
             writeln!(output, "# {title}\n").map_err(|error| error.to_string())?;
             writeln!(output, "- {}: {created}", if zh { "日期" } else { "Date" })
                 .map_err(|error| error.to_string())?;
+            writeln!(output, "- {}: {status}", if zh { "状态" } else { "Status" })
+                .map_err(|error| error.to_string())?;
             writeln!(
                 output,
-                "- {}: {tracks}\n",
-                if zh { "音轨" } else { "Tracks" }
+                "- {}: {duration}",
+                if zh { "时长" } else { "Duration" }
             )
             .map_err(|error| error.to_string())?;
+            writeln!(output, "- {}: {tracks}", if zh { "音轨" } else { "Tracks" })
+                .map_err(|error| error.to_string())?;
+            if !tags.is_empty() {
+                writeln!(output, "- {}: {tags}", if zh { "标签" } else { "Tags" })
+                    .map_err(|error| error.to_string())?;
+            }
+            writeln!(output).map_err(|error| error.to_string())?;
             writeln!(output, "## {}\n", if zh { "转写" } else { "Transcript" })
                 .map_err(|error| error.to_string())?;
         }
@@ -4240,8 +4532,21 @@ fn render_record_text_export(
             writeln!(output, "{title}").map_err(|error| error.to_string())?;
             writeln!(output, "{}: {created}", if zh { "日期" } else { "Date" })
                 .map_err(|error| error.to_string())?;
-            writeln!(output, "{}: {tracks}\n", if zh { "音轨" } else { "Tracks" })
+            writeln!(output, "{}: {status}", if zh { "状态" } else { "Status" })
                 .map_err(|error| error.to_string())?;
+            writeln!(
+                output,
+                "{}: {duration}",
+                if zh { "时长" } else { "Duration" }
+            )
+            .map_err(|error| error.to_string())?;
+            writeln!(output, "{}: {tracks}", if zh { "音轨" } else { "Tracks" })
+                .map_err(|error| error.to_string())?;
+            if !tags.is_empty() {
+                writeln!(output, "{}: {tags}", if zh { "标签" } else { "Tags" })
+                    .map_err(|error| error.to_string())?;
+            }
+            writeln!(output).map_err(|error| error.to_string())?;
             writeln!(output, "{}", if zh { "转写" } else { "Transcript" })
                 .map_err(|error| error.to_string())?;
         }
@@ -4250,7 +4555,7 @@ fn render_record_text_export(
         for segment in &transcript.segments {
             let media_ms =
                 segment.start_sample.saturating_mul(1_000) / transcript.sample_rate as u64;
-            let speaker = export_speaker_label(segment, diarization.as_ref(), &audio.tracks, zh);
+            let speaker = export_speaker_label(segment, diarization.as_ref());
             match format {
                 RecordTextExportFormat::Markdown => writeln!(
                     output,
@@ -4834,6 +5139,19 @@ pub async fn cmd_record_get(
 }
 
 #[tauri::command]
+pub async fn cmd_record_discussion_document(
+    state: tauri::State<'_, ManagedRecordStore>,
+    id: String,
+) -> Result<String, String> {
+    state
+        .ensure_audio_discussion_document(&id)
+        .await?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "RECORD_DISCUSSION_DOCUMENT_FAILED: path is not valid UTF-8".to_string())
+}
+
+#[tauri::command]
 pub async fn cmd_record_transcript(
     state: tauri::State<'_, ManagedRecordStore>,
     id: String,
@@ -5400,6 +5718,14 @@ mod tests {
             .await
             .unwrap();
 
+        let discussion_document = store
+            .ensure_audio_discussion_document(&record.id)
+            .await
+            .unwrap();
+        assert!(fs::read_to_string(discussion_document)
+            .unwrap()
+            .contains("private corrected canary"));
+
         let projection = store
             .read_live_transcript_revisions(&record.id)
             .await
@@ -5803,6 +6129,14 @@ mod tests {
             .await
             .unwrap();
         let root = store.audio_workspace_path(&record.id).await.unwrap();
+        assert!(!root.join(AUDIO_DISCUSSION_DOCUMENT_PATH).exists());
+        assert_eq!(
+            store
+                .ensure_audio_discussion_document(&record.id)
+                .await
+                .unwrap_err(),
+            "RECORD_DISCUSSION_DOCUMENT_NOT_READY"
+        );
         fs::write(root.join("audio/microphone.opus"), b"record-opus").unwrap();
         store
             .finalize_audio_capture(
@@ -5816,6 +6150,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert!(root.join(AUDIO_DISCUSSION_DOCUMENT_PATH).is_file());
         let provenance = RecordSpeechProvenance {
             provider: "local".into(),
             model_pack_revision: "speech-pack-1".into(),
@@ -5959,25 +6294,51 @@ mod tests {
         let temp = tempdir().unwrap();
         let export_temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let store = store_at(temp.path());
+        let empty_record = store
+            .create_audio(AudioRecordCreateInput {
+                title: "Empty interrupted recording".into(),
+                tracks: vec![AudioTrackKind::Microphone],
+                transcription_status: TranscriptionStatus::NotStarted,
+            })
+            .await
+            .unwrap();
+        store
+            .finalize_audio_capture(&empty_record.id, CaptureStatus::Interrupted, 0, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .ensure_audio_discussion_document(&empty_record.id)
+                .await
+                .unwrap_err(),
+            "RECORD_DISCUSSION_DOCUMENT_NOT_READY"
+        );
         let record = store
             .create_audio(AudioRecordCreateInput {
                 title: "Meeting".into(),
-                tracks: vec![AudioTrackKind::Microphone],
+                tracks: vec![AudioTrackKind::Microphone, AudioTrackKind::System],
                 transcription_status: TranscriptionStatus::Queued,
             })
             .await
             .unwrap();
         let root = store.audio_workspace_path(&record.id).await.unwrap();
         fs::write(root.join("audio/microphone.opus"), b"record-opus").unwrap();
+        fs::write(root.join("audio/system.opus"), b"system-opus").unwrap();
         store
             .finalize_audio_capture(
                 &record.id,
                 CaptureStatus::Ready,
                 5_000,
-                vec![AudioTrackArtifactInput {
-                    track: AudioTrackKind::Microphone,
-                    relative_path: "audio/microphone.opus".into(),
-                }],
+                vec![
+                    AudioTrackArtifactInput {
+                        track: AudioTrackKind::Microphone,
+                        relative_path: "audio/microphone.opus".into(),
+                    },
+                    AudioTrackArtifactInput {
+                        track: AudioTrackKind::System,
+                        relative_path: "audio/system.opus".into(),
+                    },
+                ],
             )
             .await
             .unwrap();
@@ -6044,6 +6405,41 @@ mod tests {
             })
             .await
             .unwrap();
+        let before_metadata = store.get(&record.id).await.unwrap();
+        store
+            .update_audio_metadata(AudioRecordMetadataUpdateInput {
+                id: record.id.clone(),
+                expected_revision: before_metadata.revision,
+                title: "Updated meeting".into(),
+                tags: vec!["project".into(), "weekly".into()],
+            })
+            .await
+            .unwrap();
+
+        let document_path = store
+            .ensure_audio_discussion_document(&record.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            document_path,
+            fs::canonicalize(root.join(AUDIO_DISCUSSION_DOCUMENT_PATH)).unwrap()
+        );
+        let document = fs::read_to_string(&document_path).unwrap();
+        assert!(document.contains("# Updated meeting"));
+        assert!(document.contains("- Tags: #project #weekly"));
+        assert!(document.contains("[00:01] **Alice**: hello"));
+        assert!(!document.contains("**Me**"));
+        assert!(document.contains("[00:02] corrected note"));
+        assert!(document.contains("[00:03] Highlight"));
+        let current = store.get(&record.id).await.unwrap();
+        let document_artifact = current
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == AUDIO_DISCUSSION_DOCUMENT_KIND)
+            .unwrap();
+        assert_eq!(document_artifact.path, AUDIO_DISCUSSION_DOCUMENT_PATH);
+        assert_eq!(document_artifact.source_revision, Some(current.revision));
+        assert_eq!(document_artifact.sha256, sha256_text(&document));
 
         let search_documents = store.search_documents(&record.id).await.unwrap();
         assert!(search_documents.iter().any(|document| {
@@ -6081,7 +6477,7 @@ mod tests {
         let text_destination = export_temp.path().join("meeting.md");
         store
             .export_text(RecordTextExportInput {
-                record_id: record.id,
+                record_id: record.id.clone(),
                 format: RecordTextExportFormat::Markdown,
                 destination_path: text_destination.to_string_lossy().to_string(),
                 locale: "zh-CN".into(),
@@ -6092,6 +6488,31 @@ mod tests {
         assert!(exported.contains("[00:01] **Alice**: hello"));
         assert!(exported.contains("[00:02] corrected note"));
         assert!(exported.contains("[00:03] 标记重点"));
+
+        store
+            .update_audio_processing_status(&record.id, None, Some(DiarizationStatus::Failed))
+            .await
+            .unwrap();
+        let failed_document = fs::read_to_string(
+            store
+                .ensure_audio_discussion_document(&record.id)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(failed_document.contains("- Status: Processing failed"));
+
+        fs::remove_file(&document_path).unwrap();
+        drop(store);
+        let reloaded = store_at(temp.path());
+        assert!(reloaded.get(&record.id).await.is_some());
+        let rebuilt = reloaded
+            .ensure_audio_discussion_document(&record.id)
+            .await
+            .unwrap();
+        assert!(fs::read_to_string(rebuilt)
+            .unwrap()
+            .contains("# Updated meeting"));
     }
 
     #[test]

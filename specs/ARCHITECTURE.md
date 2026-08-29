@@ -453,7 +453,7 @@ ONNX Runtime CPU、PDFium、PP-OCRv6 Small 模型/字典和 Worker 按 target �
 
 #### App-owned 本地语音识别
 
-`RecordStore` 是文字/音频 Record、录音 artifact、timeline、transcript revision、说话人 override 与导出 source 的持久权威，根目录为 `~/.myagents/records/`；旧 `thoughts/` 只作为一次性迁移输入。`RecordingManager` 拥有 App-global 唯一采集槽、设备 identity、pause/resume/stop、Ogg Opus archive、异常恢复和录音期 wake lock。`SpeechRecognitionManager` 是 Record / Agent 语音 job、Worker generation、持久恢复与结果发布的 App-global owner；三者都不属于 Tab、Session 或 Sidecar。
+`RecordStore` 是文字/音频 Record、录音 artifact、timeline、transcript revision、说话人 override、导出 source 与 audio Record 根目录 `content.md` 当前态文稿的持久权威，根目录为 `~/.myagents/records/`；旧 `thoughts/` 只作为一次性迁移输入。`content.md` 是可由当前 Record revision 重建的派生 artifact，只在结束保存后产生，并随最终转写、说话人/元数据/现场笔记/重点 Mark 变化原子覆盖刷新；AI 讨论只消费这一份源文件，不创建平行快照。`RecordingManager` 拥有 App-global 唯一采集槽、设备 identity、pause/resume/stop、Ogg Opus archive、异常恢复和录音期 wake lock。`SpeechRecognitionManager` 是 Record / Agent 语音 job、Worker generation、持久恢复与结果发布的 App-global owner；三者都不属于 Tab、Session 或 Sidecar。
 
 录音控制面是 Renderer/托盘 → Tauri command；数据面在 Rust 内从一个有界 callback fan-out 先进入权威 archive，再可选进入 live analysis。采集使用平台 backend（macOS ScreenCaptureKit + `cpal` microphone、Windows WASAPI loopback + `cpal`、Linux PipeWire + `cpal`），重采样、容器与 codec 分别复用 `rubato`、`ogg` 和 bundled libopus；不得再实现第二套 DSP、媒体容器、设备 watcher 或通用队列。`myagents-media-worker` 是一次一 generation 的受管进程，私有 framed stdin/stdout 不监听端口、不下载资源、不写 Record；Manager 校验 exact `(jobId, generation)` 后才拥有发布权。
 
@@ -791,7 +791,7 @@ installer.ts         — analyseTree → staging → 文件锁内复核/rename �
 - Task/Session identity protection 由 per-Session lifecycle guard 串行化：任何 durable mutation（含 legacy migration）只要让 Task 进入受保护状态或新增受保护 Session binding，都与 Session 删除遵循 `lifecycle → TaskStore` 锁序；scheduler active execution 覆盖 Session id 已 claim、Sidecar `Task` owner 尚未附着的窗口，birth guard 只保留到权威 Session metadata 出现（不持满整轮），shared-session joiner 不得提前 adopt。metadata creator 由该 reservation 决定，不绑定 Sidecar `isNew`；被删除的 fixed Session 换新 UUID，不复活旧 identity
 - 同一 Task 的 status、timer、execution claim 与 stop side effect 由 keyed Task-control lifecycle 串行化；stop 使用现有 `queueId` 精确停止当前 Turn。持久 `Running/Stopped` 只表达 scheduler intent，具体 Turn 以非持久 `running/stopping/stop_failed` 投影；stop 未确认时禁止 rerun。Attached Space Task 的终态不能 generic rerun，必须由新的 claim/reopen 创建新 Attached Task
 - Runtime terminal 先由 TaskStore 在一笔原子提交中结算 counter/time/`lastExecution`/连续失败/可选终态，再写 `cron_runs` 审计、通知和释放 Session owner；外围 cleanup 没有 Task 状态写权限。recurring 可重试失败第 5 次才 Blocked，成功清零；永久失败、一次性任务失败或 termination 未确认立即 Blocked，manual run-now 不改 durable status
-- AI 讨论路径：智能创建或 Record「AI 讨论」→ 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`
+- AI 讨论路径：智能创建或 Record「AI 讨论」→ 选择工作区 → 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`。text Record 的可见首轮 query 使用完整当前正文；audio Record 的可见 query 指向 RecordStore admission 后的唯一 `content.md`，隐藏 reminder 只保留读取与 workspace scope 所需字段
 - Record 列表统一展示 text/audio；文字 Record 可继续派发 Task，audio Record 打开单实例详情完成播放、笔记/Mark、手动补转录、说话人改名/合并/片段重分配与导出。Record 与 Task 生命周期保持独立，不把 transcription job 或录音状态塞进 Task row
 - Agent comment 的本地有界 locator index 由 TaskStore 从 `comments.jsonl` 异步重建并增量维护；App 级通知投影与 Cloud source 合并排序、source-aware 已读和 typed route，但不复制评论正文 authority
 - 状态变更广播 Tauri event `task:status-changed`（非 SSE），所有打开的任务中心 Tab 实时同步
