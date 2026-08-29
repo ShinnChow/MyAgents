@@ -241,6 +241,7 @@ export default function RecordDetail({
   const transcriptCursorRef = useRef<RecordTranscriptCursor | undefined>(
     undefined,
   );
+  const transcriptDeltaQueueRef = useRef<Promise<void> | null>(null);
   const noteSubmitInFlightRef = useRef<Promise<boolean> | null>(null);
   const noteDraftRef = useRef('');
   const timelineScrollRef = useRef<HTMLDivElement>(null);
@@ -412,6 +413,36 @@ export default function RecordDetail({
     void requestSnapshot().catch(() => undefined);
   }, [refresh, requestSnapshot]);
 
+  const pullTranscriptDelta = useCallback(() => {
+    const epoch = transcriptPollEpochRef.current;
+    const previous = transcriptDeltaQueueRef.current ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (transcriptPollEpochRef.current !== epoch) return;
+        try {
+          const delta = await recordTranscriptDelta(
+            recordId,
+            transcriptCursorRef.current,
+          );
+          if (transcriptPollEpochRef.current !== epoch || !delta) return;
+          transcriptCursorRef.current = delta.cursor;
+          setTranscript((current) =>
+            applyRecordTranscriptDelta(current, delta),
+          );
+        } catch {
+          // The 1.5 s recovery poll retries missed or failed notifications.
+        }
+      });
+    transcriptDeltaQueueRef.current = next;
+    void next.finally(() => {
+      if (transcriptDeltaQueueRef.current === next) {
+        transcriptDeltaQueueRef.current = null;
+      }
+    });
+    return next;
+  }, [recordId]);
+
   useEffect(() => {
     const next = initialRecordingSnapshot;
     if (!next || next.recordId !== recordId) return;
@@ -449,6 +480,10 @@ export default function RecordDetail({
       'record:changed',
       ({ payload }) => {
         if (payload.id !== recordId) return;
+        if (payload.kind === 'transcript') {
+          void pullTranscriptDelta();
+          return;
+        }
         // Notes and marks emit record:changed too. While capture is active,
         // refresh metadata/timeline without resetting the incremental
         // transcript cursor back to a full-journal read.
@@ -457,7 +492,7 @@ export default function RecordDetail({
       controller.signal,
     );
     return () => controller.abort();
-  }, [applySnapshot, recordId, refresh]);
+  }, [applySnapshot, pullTranscriptDelta, recordId, refresh]);
 
   const isPaused = snapshot?.captureStatus === 'paused';
   const ownsCaptureSlot =
@@ -471,24 +506,8 @@ export default function RecordDetail({
     let cancelled = false;
     let timer: number | undefined;
     const poll = async () => {
-      const epoch = transcriptPollEpochRef.current;
-      try {
-        const delta = await recordTranscriptDelta(
-          recordId,
-          transcriptCursorRef.current,
-        );
-        if (cancelled || transcriptPollEpochRef.current !== epoch) return;
-        if (delta) {
-          transcriptCursorRef.current = delta.cursor;
-          setTranscript((current) =>
-            applyRecordTranscriptDelta(current, delta),
-          );
-        }
-      } catch {
-        // A later record:changed refresh remains the recovery path.
-      } finally {
-        if (!cancelled) timer = window.setTimeout(poll, 1_500);
-      }
+      await pullTranscriptDelta();
+      if (!cancelled) timer = window.setTimeout(poll, 1_500);
     };
     void poll();
     return () => {
@@ -496,7 +515,7 @@ export default function RecordDetail({
       transcriptPollEpochRef.current += 1;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [isActive, ownsCaptureSlot, recordId]);
+  }, [isActive, ownsCaptureSlot, pullTranscriptDelta]);
 
   const mediaDurationMs =
     snapshot?.mediaDurationMs ?? record?.audio?.mediaDurationMs ?? 0;
@@ -1393,12 +1412,12 @@ export default function RecordDetail({
             if (element) transcriptItemRefs.current.set(itemKey, element);
             else transcriptItemRefs.current.delete(itemKey);
           }}
-          className={`mb-1.5 grid grid-cols-[64px_minmax(0,1fr)] gap-2 rounded-[var(--radius-md)] px-2 py-2 transition-colors hover:bg-[var(--hover-bg)] ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
+          className={`mb-1.5 grid grid-cols-[52px_minmax(0,1fr)] items-start gap-2 rounded-[var(--radius-md)] px-2 py-2 transition-colors hover:bg-[var(--hover-bg)] ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
         >
           <button
             type="button"
             onClick={() => highlightAndFocus(itemKey, mediaMs)}
-            className="text-left text-xs tabular-nums text-[var(--ink-muted)] hover:text-[var(--accent-warm)]"
+            className="self-start pt-1 text-left text-xs tabular-nums text-[var(--ink-muted)] hover:text-[var(--accent-warm)]"
           >
             {formatDuration(mediaMs)}
           </button>
@@ -1627,13 +1646,6 @@ export default function RecordDetail({
       mediaMs: item.type === 'note' ? item.anchorMediaMs : item.mediaMs,
       kind: item.type,
     }));
-    const transcriptMarkers = (transcript?.segments ?? []).map((segment) => ({
-      key: `transcript-${segment.segmentId}`,
-      mediaMs:
-        (segment.startSample * 1_000) /
-        Math.max(1, transcript?.sampleRate ?? 1),
-      kind: 'transcript' as const,
-    }));
     const sample = <T,>(items: T[], limit: number): T[] => {
       if (items.length <= limit) return items;
       return Array.from(
@@ -1644,14 +1656,8 @@ export default function RecordDetail({
           ],
       );
     };
-    return [
-      ...sample(userMarkers, 80),
-      ...sample(
-        transcriptMarkers,
-        Math.max(0, 160 - Math.min(80, userMarkers.length)),
-      ),
-    ];
-  }, [playbackDurationMs, timeline.items, transcript]);
+    return sample(userMarkers, 80);
+  }, [playbackDurationMs, timeline.items]);
   const recordActionSections = useMemo<DropdownMenuSection[]>(
     () => [
       {
@@ -1973,9 +1979,7 @@ export default function RecordDetail({
                         className={`absolute top-1/2 z-20 h-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--paper)] ${
                           marker.kind === 'mark'
                             ? 'w-1.5 bg-[var(--warning)]'
-                            : marker.kind === 'note'
-                              ? 'w-1 bg-[var(--accent-warm)]'
-                              : 'w-px bg-[var(--paper)]/55'
+                            : 'w-1 bg-[var(--accent-warm)]'
                         }`}
                         style={{ left: `${markerPercent}%` }}
                         aria-label={t(`records.${marker.kind}TimelineMarker`, {
@@ -1994,7 +1998,7 @@ export default function RecordDetail({
                     aria-label={t('records.duration')}
                   />
                 </div>
-                <span className="font-mono text-xs tabular-nums text-[var(--paper)]/70">
+                <span className="text-center font-mono text-xs tabular-nums text-[var(--paper)]/70">
                   {formatDuration(playbackMs)} /{' '}
                   {formatDuration(playbackDurationMs)}
                 </span>

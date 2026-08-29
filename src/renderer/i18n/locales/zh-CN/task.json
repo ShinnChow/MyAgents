@@ -159,7 +159,6 @@
     "loadingRecord": "正在读取",
     "mutePlayback": "静音",
     "unmutePlayback": "恢复音量",
-    "transcriptTimelineMarker": "转写位置 {{time}}",
     "noteTimelineMarker": "笔记位置 {{time}}",
     "markTimelineMarker": "重点位置 {{time}}",
     "speakerUnknown": "Speaker {{name}}",

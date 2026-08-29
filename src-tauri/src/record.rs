@@ -1057,6 +1057,7 @@ struct StoredRecord {
 pub enum RecordChangeKind {
     Upsert,
     Delete,
+    Transcript,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1130,6 +1131,10 @@ impl RecordStore {
             id: id.to_string(),
             kind,
         });
+    }
+
+    pub(crate) fn notify_live_transcript_changed(&self, id: &str) {
+        self.emit_change(id, RecordChangeKind::Transcript);
     }
 
     pub async fn create_text(&self, input: TextRecordCreateInput) -> Result<Record, String> {

@@ -120,7 +120,7 @@ export interface RecordingChange {
 export interface RecordChange {
   sequence: number;
   id: string;
-  kind: 'upsert' | 'delete';
+  kind: 'upsert' | 'delete' | 'transcript';
 }
 
 export interface RecordSpeechProvenance {

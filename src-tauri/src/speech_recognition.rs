@@ -1591,10 +1591,14 @@ impl SpeechRecognitionManager {
                     Some((cursor.track, cursor.next_sequence, end_sample)),
                     None,
                 );
-                if let Err((code, retryable)) = response {
-                    return settle_live_spawn_failure(
-                        self, record_id, generation, &child, &code, retryable,
-                    );
+                match response {
+                    Ok(true) => self.record_store.notify_live_transcript_changed(record_id),
+                    Ok(false) => {}
+                    Err((code, retryable)) => {
+                        return settle_live_spawn_failure(
+                            self, record_id, generation, &child, &code, retryable,
+                        )
+                    }
                 }
                 cursor.position = end_sample;
                 cursor.last_sequence = Some(cursor.next_sequence);
@@ -1632,7 +1636,7 @@ impl SpeechRecognitionManager {
                             true,
                         );
                     }
-                    if let Err((code, retryable)) = read_live_frame_settlement(
+                    match read_live_frame_settlement(
                         &responses,
                         &identity,
                         journal,
@@ -1640,9 +1644,13 @@ impl SpeechRecognitionManager {
                         None,
                         None,
                     ) {
-                        return settle_live_spawn_failure(
-                            self, record_id, generation, &child, &code, retryable,
-                        );
+                        Ok(true) => self.record_store.notify_live_transcript_changed(record_id),
+                        Ok(false) => {}
+                        Err((code, retryable)) => {
+                            return settle_live_spawn_failure(
+                                self, record_id, generation, &child, &code, retryable,
+                            )
+                        }
                     }
                     control.complete_flush(flush);
                     continue;
@@ -1704,7 +1712,7 @@ impl SpeechRecognitionManager {
                             true,
                         );
                     }
-                    if let Err((code, retryable)) = read_live_frame_settlement(
+                    match read_live_frame_settlement(
                         &responses,
                         &identity,
                         journal,
@@ -1712,9 +1720,13 @@ impl SpeechRecognitionManager {
                         None,
                         Some(expected_source_samples),
                     ) {
-                        return settle_live_spawn_failure(
-                            self, record_id, generation, &child, &code, retryable,
-                        );
+                        Ok(true) => self.record_store.notify_live_transcript_changed(record_id),
+                        Ok(false) => {}
+                        Err((code, retryable)) => {
+                            return settle_live_spawn_failure(
+                                self, record_id, generation, &child, &code, retryable,
+                            )
+                        }
                     }
                     if let Ok(mut child) = child.lock() {
                         let _ = child.wait();
@@ -3642,8 +3654,9 @@ fn read_live_frame_settlement(
     next_worker_revision: &mut u64,
     expected_ack: Option<(TrackKind, u64, u64)>,
     expected_completed_samples: Option<u64>,
-) -> Result<(), (String, bool)> {
+) -> Result<bool, (String, bool)> {
     let mut acked = expected_ack.is_none();
+    let mut transcript_changed = false;
     loop {
         let response = receive_live_response(responses)?;
         if response.identity() != identity {
@@ -3694,11 +3707,15 @@ fn read_live_frame_settlement(
                         return Err((code.to_string(), false));
                     }
                 };
-                if journal
-                    .append_segment(track, start_sample, end_sample, text, language)
-                    .is_err()
-                {
-                    return Err(("SPEECH_JOB_STORE_WRITE_FAILED".to_string(), false));
+                match journal.append_segment(track, start_sample, end_sample, text, language) {
+                    Ok(Some(mut segment)) => {
+                        segment.zeroize_sensitive();
+                        transcript_changed = true;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        return Err(("SPEECH_JOB_STORE_WRITE_FAILED".to_string(), false));
+                    }
                 }
             }
             WorkerResponse::Heartbeat { checkpoint, .. }
@@ -3713,13 +3730,13 @@ fn read_live_frame_settlement(
                         return Err(("SPEECH_WORKER_PROTOCOL_ERROR".to_string(), true));
                     }
                 }
-                return Ok(());
+                return Ok(transcript_changed);
             }
             WorkerResponse::Heartbeat { .. } if expected_completed_samples.is_some() && acked => {}
             WorkerResponse::Completed { metrics, .. }
                 if expected_completed_samples == Some(metrics.source_samples) && acked =>
             {
-                return Ok(())
+                return Ok(transcript_changed)
             }
             WorkerResponse::Failed { code, .. } => {
                 let retryable = worker_code_retryable(&code);
@@ -6039,6 +6056,7 @@ mod tests {
             .begin_live_transcript(&record.id, resources.provenance.clone())
             .await
             .unwrap();
+        let mut record_changes = manager.record_store.subscribe_changes();
         journal
             .append_generation_started(generation, journal.replay_offsets())
             .unwrap();
@@ -6055,6 +6073,13 @@ mod tests {
         );
         journal.finish().unwrap();
         analysis.finish().unwrap();
+
+        let transcript_change = record_changes.try_recv().unwrap();
+        assert_eq!(transcript_change.id, record.id);
+        assert_eq!(
+            transcript_change.kind,
+            crate::record::RecordChangeKind::Transcript
+        );
 
         let projection = manager
             .record_store

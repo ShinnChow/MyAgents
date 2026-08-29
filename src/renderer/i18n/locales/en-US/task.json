@@ -159,7 +159,6 @@
     "loadingRecord": "Loading",
     "mutePlayback": "Mute",
     "unmutePlayback": "Unmute",
-    "transcriptTimelineMarker": "Transcript at {{time}}",
     "noteTimelineMarker": "Note at {{time}}",
     "markTimelineMarker": "Highlight at {{time}}",
     "speakerUnknown": "Speaker {{name}}",

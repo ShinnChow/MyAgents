@@ -122,6 +122,7 @@ impl SearchEngine {
                                 crate::record::RecordChangeKind::Delete => {
                                     record_index.delete(&change.id)
                                 }
+                                crate::record::RecordChangeKind::Transcript => Ok(()),
                             };
                             if let Err(error) = result {
                                 ulog_error!(

@@ -220,7 +220,8 @@ export function ThoughtPanel({
     const ac = new AbortController();
     void listenWithCleanup<RecordChange>(
       'record:changed',
-      () => {
+      ({ payload }) => {
+        if (payload.kind === 'transcript') return;
         void reload();
       },
       ac.signal,

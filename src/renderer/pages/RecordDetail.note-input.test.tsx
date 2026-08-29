@@ -25,6 +25,10 @@ const mocks = vi.hoisted(() => ({
   recordingSetSourceEnabled: vi.fn(),
   recordStartTranscription: vi.fn(),
   speechModelPackStatus: vi.fn(),
+  eventListeners: new Map<
+    string,
+    (event: { payload: Record<string, unknown> }) => void
+  >(),
 }));
 
 vi.mock('@/api/recording', async (importOriginal) => {
@@ -59,6 +63,28 @@ vi.mock('@/hooks/useConfig', () => ({
 vi.mock('@/analytics', () => ({
   hashPrivateIdentity: vi.fn(async () => 'record-hash'),
   track: vi.fn(),
+}));
+
+vi.mock('@/utils/tauriListen', () => ({
+  listenWithCleanup: vi.fn(
+    async (
+      event: string,
+      handler: (event: { payload: Record<string, unknown> }) => void,
+      signal: AbortSignal,
+    ) => {
+      mocks.eventListeners.set(event, handler);
+      signal.addEventListener(
+        'abort',
+        () => {
+          if (mocks.eventListeners.get(event) === handler) {
+            mocks.eventListeners.delete(event);
+          }
+        },
+        { once: true },
+      );
+      return { unlisten: vi.fn(), isRegistered: () => true };
+    },
+  ),
 }));
 
 vi.mock('react-virtuoso', () => ({
@@ -133,6 +159,8 @@ const RECORD: RecordDetailData = {
 describe('RecordDetail note input', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.eventListeners.clear();
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
     HTMLElement.prototype.scrollTo = vi.fn();
     mocks.recordGet.mockResolvedValue(RECORD);
     mocks.recordTranscript.mockResolvedValue(null);
@@ -611,7 +639,8 @@ describe('RecordDetail note input', () => {
     );
     const playbackTimeline = screen.getByTestId('recording-playback-timeline');
     expect(playbackTimeline).toHaveClass('flex-col');
-    expect(playbackTimeline).toHaveTextContent('00:00 / 00:31');
+    const playbackTime = within(playbackTimeline).getByText('00:00 / 00:31');
+    expect(playbackTime).toHaveClass('text-center');
     const playbackTools = screen.getByTestId('recording-playback-tools');
     expect(playbackTools).toHaveClass('flex-col');
     expect(playbackTools).toContainElement(
@@ -642,7 +671,7 @@ describe('RecordDetail note input', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('moves keyboard focus from a playback marker to its transcript target', async () => {
+  it('keeps transcript seeking on its text without drawing playback markers', async () => {
     mocks.recordGet.mockResolvedValue({
       ...RECORD,
       audio: {
@@ -678,12 +707,17 @@ describe('RecordDetail note input', () => {
 
     render(<RecordDetail recordId={RECORD.id} isActive />);
 
-    fireEvent.click(
-      await screen.findByRole('button', {
+    const transcriptText = await screen.findByRole('button', {
+      name: '需要定位的内容',
+    });
+    expect(
+      screen.queryByRole('button', {
         name: /转写.*00:01|Transcript.*00:01/i,
       }),
-    );
-    expect(screen.getByText('需要定位的内容').closest('article')).toHaveFocus();
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(transcriptText);
+    expect(transcriptText.closest('article')).toHaveFocus();
   });
 
   it('defaults dual physical tracks to real mixed playback with single-track choices', async () => {
@@ -833,6 +867,70 @@ describe('RecordDetail note input', () => {
     expect(line).not.toHaveTextContent('我');
     expect(line.textContent).not.toMatch(/\[Speaker A\]/i);
     expect(line).toHaveClass('flex');
+    const article = line.closest('article');
+    expect(article).toHaveClass(
+      'grid-cols-[52px_minmax(0,1fr)]',
+      'items-start',
+    );
+    expect(within(article!).getByText('00:00')).toHaveClass(
+      'self-start',
+      'pt-1',
+    );
+  });
+
+  it('pulls a live transcript delta immediately after its change event', async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    mocks.recordTranscript.mockResolvedValue({
+      schemaVersion: 1,
+      recordId: RECORD.id,
+      projectionRevision: 1,
+      state: 'live',
+      sampleRate: 16_000,
+      provenance: {
+        provider: 'sherpa-onnx',
+        modelPackRevision: 'test',
+        onnxRuntimeVersion: 'test',
+      },
+      segments: [],
+    });
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(mocks.eventListeners.has('record:changed')).toBe(true);
+    });
+    mocks.recordTranscriptDelta.mockResolvedValueOnce({
+      recordId: RECORD.id,
+      projectionRevision: 2,
+      state: 'live',
+      upserts: [
+        {
+          segmentId: 'event-segment',
+          track: 'microphone',
+          startSample: 16_000,
+          endSample: 24_000,
+          text: '通知后立即显示',
+          revision: 1,
+        },
+      ],
+      cursor: { journalBytes: 256, projectionRevision: 2 },
+    });
+
+    mocks.eventListeners.get('record:changed')?.({
+      payload: {
+        sequence: 1,
+        id: RECORD.id,
+        kind: 'transcript',
+      },
+    });
+
+    expect(await screen.findByText('通知后立即显示')).toBeInTheDocument();
   });
 
   it('keeps the status beside the title and note shortcuts inside one borderless composer', async () => {
