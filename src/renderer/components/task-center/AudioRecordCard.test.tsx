@@ -183,6 +183,8 @@ describe('AudioRecordCard', () => {
     );
 
     await waitFor(() => expect(screen.getByText('00:05')).toBeInTheDocument());
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument();
+    expect(screen.queryByText('处理中')).not.toBeInTheDocument();
     expect(container.querySelector('audio')).toBeNull();
   });
 });

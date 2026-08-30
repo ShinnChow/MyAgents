@@ -587,11 +587,6 @@ export default function RecordDetail({
     const now = Date.now();
     const anchorMediaMs = noteAnchorRef.current ?? currentMediaMs();
     const startedAtWallTime = noteStartedWallRef.current ?? now;
-    const previousIds = new Set(
-      timeline.items.map((item) =>
-        item.type === 'note' ? item.noteId : item.markId,
-      ),
-    );
     setBusyAction('note');
     const operation = recordAddNote({
       recordId,
@@ -609,13 +604,6 @@ export default function RecordDetail({
           noteAnchorRef.current = null;
           noteStartedWallRef.current = null;
         }
-        const created = next.items.find(
-          (item) => item.type === 'note' && !previousIds.has(item.noteId),
-        );
-        if (created?.type === 'note') {
-          setPendingTimelineFocus(`note-${created.noteId}`);
-        }
-        toast.success(t('records.noteSaved'));
         return true;
       })
       .catch((error) => {
@@ -634,7 +622,7 @@ export default function RecordDetail({
       });
     noteSubmitInFlightRef.current = operation;
     return operation;
-  }, [currentMediaMs, recordId, t, timeline.items, toast]);
+  }, [currentMediaMs, recordId, t, toast]);
 
   const flushPendingNote = useCallback(async (): Promise<boolean> => {
     // Closing/stopping may begin while note A is in flight and the user has
@@ -1545,14 +1533,15 @@ export default function RecordDetail({
       const isEditing = item.type === 'note' && editingNoteId === item.noteId;
       const itemKey = `${item.type}-${itemId}`;
       return (
-        <div className="px-4 pb-3">
+        <div key={itemKey} className="px-4 pb-3">
           <div
             ref={(element) => {
               if (element) timelineItemRefs.current.set(itemKey, element);
               else timelineItemRefs.current.delete(itemKey);
             }}
             tabIndex={-1}
-            className={`group grid w-full grid-cols-[48px_minmax(0,1fr)_auto] items-start gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-left text-sm leading-relaxed transition-colors ${item.type === 'mark' ? 'text-[var(--accent-warm)]' : 'text-[var(--ink)]'} ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
+            data-testid={`recording-timeline-${itemKey}`}
+            className={`group relative grid w-full grid-cols-[48px_minmax(0,1fr)] items-start gap-2 rounded-[var(--radius-sm)] px-1 py-1 text-left text-sm leading-relaxed transition-colors ${item.type === 'mark' ? 'text-[var(--accent-warm)]' : 'text-[var(--ink)]'} ${highlightedItem === itemKey ? 'bg-[var(--accent-warm-subtle)]' : ''}`}
           >
             <button
               type="button"
@@ -1565,25 +1554,15 @@ export default function RecordDetail({
               {formatDuration(mediaMs)}
             </button>
             {isEditing ? (
-              <textarea
-                autoFocus
-                value={editingNoteDraft}
-                onChange={(event) => setEditingNoteDraft(event.target.value)}
-                className="min-h-20 w-full resize-y rounded-[var(--radius-sm)] bg-[var(--paper-inset)] px-2 py-1.5 text-sm text-[var(--ink)] outline-none focus:ring-1 focus:ring-[var(--accent-warm)]"
-                aria-label={t('records.editNote')}
-              />
-            ) : (
-              <button
-                type="button"
-                onClick={() => highlightAndFocus(itemKey, mediaMs)}
-                className="whitespace-pre-wrap break-words text-left"
-              >
-                {item.type === 'note' ? item.text : t('records.mark')}
-              </button>
-            )}
-            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100">
-              {isEditing ? (
-                <>
+              <div className="rounded-[var(--radius-sm)] border border-[var(--line)] bg-transparent px-2 pb-1.5 pt-2 focus-within:border-[var(--accent-warm)]">
+                <textarea
+                  autoFocus
+                  value={editingNoteDraft}
+                  onChange={(event) => setEditingNoteDraft(event.target.value)}
+                  className="min-h-20 w-full resize-y bg-transparent text-sm text-[var(--ink)] outline-none"
+                  aria-label={t('records.editNote')}
+                />
+                <div className="mt-2 flex items-center justify-end gap-1">
                   <button
                     type="button"
                     onClick={() => void handleUpdateNote()}
@@ -1605,41 +1584,54 @@ export default function RecordDetail({
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
-                </>
-              ) : (
-                <>
-                  {item.type === 'note' && (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingNoteId(item.noteId);
-                        setEditingNoteDraft(item.text);
-                      }}
-                      disabled={busyAction !== null}
-                      className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--ink)] disabled:opacity-40"
-                      aria-label={t('records.editNote')}
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void handleDeleteTimelineItem(item.type, itemId)
-                    }
-                    disabled={busyAction !== null}
-                    className="rounded p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] hover:text-[var(--danger)] disabled:opacity-40"
-                    aria-label={
-                      item.type === 'note'
-                        ? t('records.deleteNote')
-                        : t('records.deleteMark')
-                    }
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </>
-              )}
-            </div>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => highlightAndFocus(itemKey, mediaMs)}
+                className="whitespace-pre-wrap break-words text-left"
+              >
+                {item.type === 'note' ? item.text : t('records.mark')}
+              </button>
+            )}
+            {!isEditing && (
+              <div className="pointer-events-none absolute right-0 top-0 flex items-center bg-gradient-to-r from-[var(--paper-elevated-a0)] via-[var(--paper-elevated)] to-[var(--paper-elevated)] pb-1 pl-7 opacity-0 transition-opacity group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100">
+                <DropdownMenu
+                  size="sm"
+                  disabled={busyAction !== null}
+                  minWidth={112}
+                  sections={[
+                    {
+                      items: [
+                        ...(item.type === 'note'
+                          ? [
+                              {
+                                icon: <Pencil className="h-3.5 w-3.5" />,
+                                label: t('records.editNote'),
+                                onClick: () => {
+                                  setEditingNoteId(item.noteId);
+                                  setEditingNoteDraft(item.text);
+                                },
+                              },
+                            ]
+                          : []),
+                        {
+                          icon: <Trash2 className="h-3.5 w-3.5" />,
+                          label:
+                            item.type === 'note'
+                              ? t('records.deleteNote')
+                              : t('records.deleteMark'),
+                          onClick: () =>
+                            void handleDeleteTimelineItem(item.type, itemId),
+                          danger: true,
+                        },
+                      ],
+                    },
+                  ]}
+                />
+              </div>
+            )}
           </div>
         </div>
       );
@@ -1714,25 +1706,6 @@ export default function RecordDetail({
     !ownsCaptureSlot &&
     ['ready', 'interrupted'].includes(captureStatus ?? '') &&
     (record?.audio?.sizeBytes ?? 0) > 0;
-  const playbackMarkers = useMemo(() => {
-    if (playbackDurationMs <= 0) return [];
-    const userMarkers = timeline.items.map((item) => ({
-      key: item.type === 'note' ? `note-${item.noteId}` : `mark-${item.markId}`,
-      mediaMs: item.type === 'note' ? item.anchorMediaMs : item.mediaMs,
-      kind: item.type,
-    }));
-    const sample = <T,>(items: T[], limit: number): T[] => {
-      if (items.length <= limit) return items;
-      return Array.from(
-        { length: limit },
-        (_value, index) =>
-          items[
-            Math.floor((index * (items.length - 1)) / Math.max(1, limit - 1))
-          ],
-      );
-    };
-    return sample(userMarkers, 80);
-  }, [playbackDurationMs, timeline.items]);
   const recordActionSections = useMemo<DropdownMenuSection[]>(
     () => [
       {
@@ -2024,34 +1997,6 @@ export default function RecordDetail({
                     className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[var(--paper)] shadow-sm"
                     style={{ left: `${playbackPercent}%` }}
                   />
-                  {playbackMarkers.map((marker) => {
-                    const markerPercent = Math.min(
-                      100,
-                      Math.max(
-                        0,
-                        (marker.mediaMs / Math.max(1, playbackDurationMs)) *
-                          100,
-                      ),
-                    );
-                    return (
-                      <button
-                        key={marker.key}
-                        type="button"
-                        onClick={() =>
-                          highlightAndFocus(marker.key, marker.mediaMs)
-                        }
-                        className={`absolute top-1/2 z-20 h-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--paper)] ${
-                          marker.kind === 'mark'
-                            ? 'w-1.5 bg-[var(--warning)]'
-                            : 'w-1 bg-[var(--accent-warm)]'
-                        }`}
-                        style={{ left: `${markerPercent}%` }}
-                        aria-label={t(`records.${marker.kind}TimelineMarker`, {
-                          time: formatDuration(marker.mediaMs),
-                        })}
-                      />
-                    );
-                  })}
                   <input
                     type="range"
                     min={0}
@@ -2607,7 +2552,7 @@ export default function RecordDetail({
             <div className="shrink-0 p-3 pt-2">
               <div
                 data-testid="recording-note-composer"
-                className="rounded-[var(--radius-lg)] bg-[var(--paper-inset)] px-3 pb-2 pt-3 focus-within:ring-1 focus-within:ring-[var(--accent-warm)]"
+                className="rounded-[var(--radius-lg)] border border-[var(--line)] bg-transparent px-3 pb-2 pt-3 focus-within:border-[var(--accent-warm)]"
               >
                 <textarea
                   value={noteDraft}

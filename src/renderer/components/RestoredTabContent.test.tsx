@@ -6,7 +6,10 @@ import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { PendingAppRoute } from '@/../shared/appRoute';
-import type { RecordingSnapshot } from '@/../shared/types/record';
+import type {
+  RecordingSnapshot,
+  RecordingSourceSelection,
+} from '@/../shared/types/record';
 import type { Tab } from '@/types/tab';
 import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
@@ -57,13 +60,27 @@ vi.mock('@/pages/TaskCenter', () => ({
   default: ({
     pendingRoute,
     activeRecordingSnapshot,
+    onStartRecording,
   }: {
     pendingRoute?: PendingAppRoute | null;
     activeRecordingSnapshot?: RecordingSnapshot | null;
+    onStartRecording?: (
+      selection: RecordingSourceSelection,
+    ) => Promise<void>;
   }) => {
     taskCenterRenderSpy(pendingRoute ?? null);
     taskCenterSnapshotSpy(activeRecordingSnapshot ?? null);
-    return <div data-testid="taskcenter" />;
+    return (
+      <div data-testid="taskcenter">
+        <button
+          type="button"
+          data-testid="taskcenter-start-recording"
+          onClick={() =>
+            void onStartRecording?.({ microphone: true, system: false })
+          }
+        />
+      </div>
+    );
   },
 }));
 vi.mock('@/components/ChatBootOverlay', () => ({
@@ -387,6 +404,30 @@ describe('restored live chat tab', () => {
       expect(taskCenterSnapshotSpy).toHaveBeenLastCalledWith(
         expect.objectContaining({ revision: 2, mediaDurationMs: 2_000 }),
       ),
+    );
+  });
+
+  it('routes Task Center recording admission through the owning tab id', () => {
+    noopProps.onStartRecording.mockClear();
+    const taskCenterTab = restoredTab({
+      id: 'task-center-record-start',
+      agentDir: null,
+      sessionId: null,
+      view: 'taskcenter',
+      title: 'Task Center',
+    });
+    render(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('taskcenter-start-recording'));
+    expect(noopProps.onStartRecording).toHaveBeenCalledWith(
+      taskCenterTab.id,
+      { microphone: true, system: false },
     );
   });
 });

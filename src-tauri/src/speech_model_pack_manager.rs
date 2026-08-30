@@ -7,8 +7,8 @@ use crate::local_inference::{
     ComputeWorkloadIdentity, ComputeWorkloadKind, LocalComputeCoordinator, LocalComputeLease,
 };
 use crate::speech_model_pack::{
-    install_plan, verify_installed_pack, ModelPackAsset, ModelPackAssetFormat,
-    ModelPackInstallPlan, ModelPackLegalSource, MODEL_PACK_SOURCE_LOCK,
+    inspect_installed_pack, install_plan, verify_installed_pack, ModelPackAsset,
+    ModelPackAssetFormat, ModelPackInstallPlan, ModelPackLegalSource, MODEL_PACK_SOURCE_LOCK,
 };
 use futures_util::StreamExt;
 use myagents_media_worker_protocol::{
@@ -137,28 +137,29 @@ impl SpeechModelPackManager {
         ensure_private_directory(&models_root.join("private"))?;
         cleanup_abandoned_operation_dirs(&models_root.join("private"))?;
 
-        let (active, active_pointer, last_error_code) = match read_active_pointer(&models_root) {
-            Ok(Some(pointer)) if pointer.pack_revision != plan.pack_revision => {
-                match verify_previous_revision_pointer(&models_root, &pointer, &plan.pack_id) {
-                    Ok(()) => (None, Some(pointer), None),
-                    Err(code) => (None, Some(pointer), Some(code.to_string())),
+        let (active, active_pointer, last_error_code, verify_after_startup) =
+            match read_active_pointer(&models_root) {
+                Ok(Some(pointer)) if pointer.pack_revision != plan.pack_revision => {
+                    match verify_previous_revision_pointer(&models_root, &pointer, &plan.pack_id) {
+                        Ok(()) => (None, Some(pointer), None, false),
+                        Err(code) => (None, Some(pointer), Some(code.to_string()), false),
+                    }
                 }
-            }
-            Ok(Some(pointer)) => {
-                match verify_pointer_and_pack(&models_root, &pointer, &plan.pack_revision) {
-                    Ok((active, pointer)) => (Some(active), Some(pointer), None),
-                    Err(code) => (None, Some(pointer), Some(code.to_string())),
+                Ok(Some(pointer)) => {
+                    match inspect_pointer_and_pack(&models_root, &pointer, &plan.pack_revision) {
+                        Ok((active, pointer)) => (Some(active), Some(pointer), None, true),
+                        Err(code) => (None, Some(pointer), Some(code.to_string()), false),
+                    }
                 }
-            }
-            Ok(None) => (None, None, None),
-            Err(code) => (None, None, Some(code.to_string())),
-        };
+                Ok(None) => (None, None, None, false),
+                Err(code) => (None, None, Some(code.to_string()), false),
+            };
         let downloaded_bytes = if active.is_some() {
             total_download_bytes(&plan)
         } else {
             0
         };
-        Ok(Arc::new(Self {
+        let manager = Arc::new(Self {
             models_root,
             worker_path,
             native_manifest_path,
@@ -167,14 +168,22 @@ impl SpeechModelPackManager {
             plan,
             cancelled: AtomicBool::new(false),
             state: Mutex::new(ModelPackState {
-                operation: Operation::Idle,
+                operation: if verify_after_startup {
+                    Operation::Checking
+                } else {
+                    Operation::Idle
+                },
                 active,
                 active_pointer,
                 downloaded_bytes,
                 last_error_code,
                 running_probe: None,
             }),
-        }))
+        });
+        if verify_after_startup {
+            manager.start_background_verification();
+        }
+        Ok(manager)
     }
 
     pub fn status(&self) -> SpeechModelPackStatus {
@@ -252,18 +261,39 @@ impl SpeechModelPackManager {
         if active.revision != revision || pointer.pack_revision != revision {
             return Err("SPEECH_MODEL_PACK_REVISION_UNAVAILABLE");
         }
-        verify_pointer_and_pack(&self.models_root, &pointer, &self.plan.pack_revision)
-            .map(|(pack, _)| pack)
+        // Startup has already restored a signed, metadata-checked activation.
+        // The media Worker independently performs the full SHA-256 inventory
+        // check immediately before loading any model, so repeating it here
+        // would only move the same cost onto the user's action path.
+        Ok(active)
     }
 
     pub async fn install(self: &Arc<Self>) -> Result<SpeechModelPackStatus, String> {
+        if self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?
+            .operation
+            != Operation::Idle
+        {
+            return Err("SPEECH_RESOURCE_BUSY".into());
+        }
         let cached_revision = self
             .state
             .lock()
             .ok()
             .and_then(|state| state.active.as_ref().map(|pack| pack.revision.clone()));
         if let Some(revision) = cached_revision {
-            if self.resolve_revision(&revision).is_ok() {
+            let pointer = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| state.active_pointer.clone());
+            if pointer.as_ref().is_some_and(|pointer| {
+                pointer.pack_revision == revision
+                    && verify_pointer_and_pack(&self.models_root, pointer, &self.plan.pack_revision)
+                        .is_ok()
+            }) {
                 return Ok(self.status());
             }
             if let Ok(mut state) = self.state.lock() {
@@ -317,6 +347,61 @@ impl SpeechModelPackManager {
                 Err(code.to_string())
             }
         }
+    }
+
+    fn start_background_verification(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            // Keep model IO off the first-paint and Global Sidecar startup path.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let pointer = manager
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.active_pointer.clone());
+                let result =
+                    pointer
+                        .as_ref()
+                        .ok_or("SPEECH_RESOURCE_CORRUPT")
+                        .and_then(|pointer| {
+                            verify_pointer_and_pack(
+                                &manager.models_root,
+                                pointer,
+                                &manager.plan.pack_revision,
+                            )
+                        });
+
+                let Ok(mut state) = manager.state.lock() else {
+                    return;
+                };
+                if state.operation != Operation::Checking || state.active_pointer != pointer {
+                    return;
+                }
+                state.operation = Operation::Idle;
+                match result {
+                    Ok((active, _)) => {
+                        state.active = Some(active);
+                        state.downloaded_bytes = total_download_bytes(&manager.plan);
+                        state.last_error_code = None;
+                        crate::ulog_info!(
+                            "[speech-resource] background model verification completed revision={}",
+                            manager.plan.pack_revision
+                        );
+                    }
+                    Err(code) => {
+                        state.active = None;
+                        state.downloaded_bytes = 0;
+                        state.last_error_code = Some(code.to_string());
+                        crate::ulog_warn!(
+                            "[speech-resource] background model verification failed code={}",
+                            code
+                        );
+                    }
+                }
+            })
+            .await;
+        });
     }
 
     pub fn remove(&self, in_use: bool) -> Result<SpeechModelPackStatus, String> {
@@ -1128,21 +1213,7 @@ fn verify_pointer_and_pack(
     pointer: &ActivePointer,
     expected_revision: &str,
 ) -> Result<(ActivatedModelPack, ActivePointer), &'static str> {
-    if pointer.schema_version != ACTIVE_POINTER_SCHEMA_VERSION
-        || pointer.pack_revision != expected_revision
-        || !valid_pack_directory_name(&pointer.directory_name)
-        || pointer.manifest_sha256
-            != format!("{:x}", Sha256::digest(MODEL_PACK_SOURCE_LOCK.as_bytes()))
-        || chrono::DateTime::parse_from_rfc3339(&pointer.activated_at).is_err()
-    {
-        return Err("SPEECH_RESOURCE_CORRUPT");
-    }
-    crate::resource_signature::verify_minisign_bytes(
-        MODEL_PACK_SOURCE_LOCK.as_bytes(),
-        &pointer.manifest_signature,
-        "speech model manifest",
-    )
-    .map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    validate_active_pointer(pointer, expected_revision)?;
     let pack_root = models_root.join("packs").join(&pointer.directory_name);
     ensure_plain_directory(&pack_root)?;
     let manifest_path = pack_root.join("manifest.json");
@@ -1157,6 +1228,50 @@ fn verify_pointer_and_pack(
         },
         pointer.clone(),
     ))
+}
+
+fn inspect_pointer_and_pack(
+    models_root: &Path,
+    pointer: &ActivePointer,
+    expected_revision: &str,
+) -> Result<(ActivatedModelPack, ActivePointer), &'static str> {
+    validate_active_pointer(pointer, expected_revision)?;
+    let pack_root = models_root.join("packs").join(&pointer.directory_name);
+    ensure_plain_directory(&pack_root)?;
+    let manifest_path = pack_root.join("manifest.json");
+    let inspected =
+        inspect_installed_pack(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    if inspected.pack_revision != pointer.pack_revision {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+    Ok((
+        ActivatedModelPack {
+            revision: inspected.pack_revision,
+            manifest_path,
+        },
+        pointer.clone(),
+    ))
+}
+
+fn validate_active_pointer(
+    pointer: &ActivePointer,
+    expected_revision: &str,
+) -> Result<(), &'static str> {
+    if pointer.schema_version != ACTIVE_POINTER_SCHEMA_VERSION
+        || pointer.pack_revision != expected_revision
+        || !valid_pack_directory_name(&pointer.directory_name)
+        || pointer.manifest_sha256
+            != format!("{:x}", Sha256::digest(MODEL_PACK_SOURCE_LOCK.as_bytes()))
+        || chrono::DateTime::parse_from_rfc3339(&pointer.activated_at).is_err()
+    {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+    crate::resource_signature::verify_minisign_bytes(
+        MODEL_PACK_SOURCE_LOCK.as_bytes(),
+        &pointer.manifest_signature,
+        "speech model manifest",
+    )
+    .map_err(|_| "SPEECH_RESOURCE_CORRUPT")
 }
 
 fn write_active_pointer(

@@ -19,6 +19,7 @@
   },
   "thoughts": {
     "title": "记录",
+    "centerTitle": "想法",
     "searchPlaceholder": "搜索记录…",
     "openFolder": "打开记录存储的文件夹",
     "tagFilter": "按标签筛选",
@@ -30,6 +31,7 @@
     "emptyActive": "还没有记录，写下第一条吧",
     "emptySearch": "没有匹配的记录",
     "inputPlaceholder": "写下此刻的记录… 用 #标签 归类",
+    "centerInputPlaceholder": "记录此刻的想法…用 #标签 归类",
     "tagMenuMatch": "匹配 #{{query}}",
     "tagMenuChoose": "选择标签",
     "insertTag": "插入 # 标签",

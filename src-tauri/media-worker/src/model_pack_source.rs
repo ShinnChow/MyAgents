@@ -447,6 +447,23 @@ pub fn install_plan() -> Result<ModelPackInstallPlan, SourceLockError> {
 pub fn verify_installed_pack(
     manifest_path: &Path,
 ) -> Result<VerifiedModelPack, InstalledPackError> {
+    inspect_installed_pack_inner(manifest_path, true)
+}
+
+/// Restores an App-activated pack from its immutable manifest and exact file
+/// metadata without reading hundreds of MiB of model bytes. This is only a
+/// discovery check: callers must never load a model from this result unless an
+/// isolated Worker performs `verify_installed_pack` at its execution boundary.
+pub fn inspect_installed_pack(
+    manifest_path: &Path,
+) -> Result<VerifiedModelPack, InstalledPackError> {
+    inspect_installed_pack_inner(manifest_path, false)
+}
+
+fn inspect_installed_pack_inner(
+    manifest_path: &Path,
+    verify_digests: bool,
+) -> Result<VerifiedModelPack, InstalledPackError> {
     if !manifest_path.is_absolute() {
         return Err(InstalledPackError::UnsafePath);
     }
@@ -471,7 +488,7 @@ pub fn verify_installed_pack(
         .ok_or(InstalledPackError::UnsafePath)?;
     ensure_plain_directory(root)?;
     let expected = expected_installed_files(&lock)?;
-    let verified = verify_file_inventory(root, &expected)?;
+    let verified = inspect_file_inventory(root, &expected, verify_digests)?;
     let path = |relative: &str| {
         verified
             .get(relative)
@@ -527,9 +544,18 @@ fn expected_installed_files(
     Ok(expected)
 }
 
+#[cfg(test)]
 fn verify_file_inventory(
     root: &Path,
     expected: &[ExpectedInstalledFile],
+) -> Result<HashMap<String, PathBuf>, InstalledPackError> {
+    inspect_file_inventory(root, expected, true)
+}
+
+fn inspect_file_inventory(
+    root: &Path,
+    expected: &[ExpectedInstalledFile],
+    verify_digests: bool,
 ) -> Result<HashMap<String, PathBuf>, InstalledPackError> {
     let mut verified = HashMap::with_capacity(expected.len());
     for file in expected {
@@ -539,7 +565,7 @@ fn verify_file_inventory(
             || metadata.file_type().is_symlink()
             || has_execute_bits(&metadata)
             || metadata.len() != file.size
-            || sha256_file(&path)? != file.sha256
+            || (verify_digests && sha256_file(&path)? != file.sha256)
         {
             return Err(InstalledPackError::FileMismatch);
         }
@@ -763,6 +789,24 @@ mod tests {
         fs::write(root.path().join("models/model.onnx"), b"model-drift").unwrap();
         assert_eq!(
             verify_file_inventory(root.path(), &expected),
+            Err(InstalledPackError::FileMismatch)
+        );
+    }
+
+    #[test]
+    fn discovery_inventory_does_not_hash_model_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("models")).unwrap();
+        fs::write(root.path().join("models/model.onnx"), b"model-drift").unwrap();
+        let expected = vec![ExpectedInstalledFile {
+            path: "models/model.onnx".into(),
+            sha256: format!("{:x}", Sha256::digest(b"other-digest")),
+            size: 11,
+        }];
+
+        assert!(inspect_file_inventory(root.path(), &expected, false).is_ok());
+        assert_eq!(
+            inspect_file_inventory(root.path(), &expected, true),
             Err(InstalledPackError::FileMismatch)
         );
     }

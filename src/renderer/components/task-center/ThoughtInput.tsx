@@ -678,7 +678,9 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
                   type="button"
                   onClick={() => void onStartRecording()}
                   disabled={interactionBusy}
-                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-sm font-medium text-[var(--ink-secondary)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--accent-warm)] disabled:cursor-wait disabled:opacity-50"
+                  className={`inline-flex items-center gap-1.5 rounded-lg text-sm font-medium text-[var(--ink-secondary)] transition-colors hover:bg-[var(--paper-inset)] hover:text-[var(--accent-warm)] disabled:cursor-wait disabled:opacity-50 ${
+                    variant === 'launcher' ? 'h-8 px-2.5' : 'h-7 px-2'
+                  }`}
                 >
                   <Mic className="h-4 w-4" />
                   <span>

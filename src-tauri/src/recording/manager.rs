@@ -1308,15 +1308,31 @@ impl RecordingManager {
     }
 
     async fn validate_command_revision(&self, input: &RecordingCommandInput) -> Result<(), String> {
+        let control_revision = {
+            let state = self.state.lock().await;
+            let Some(slot) = state.slot.as_ref() else {
+                return Err("RECORDING_NOT_ACTIVE".to_string());
+            };
+            let snapshot = slot.snapshot();
+            if snapshot.record_id != input.record_id {
+                return Err("RECORDING_RECORD_MISMATCH".to_string());
+            }
+            snapshot.revision
+        };
         let record = self
             .record_store
             .get(&input.record_id)
             .await
             .ok_or_else(|| "RECORDING_RECORD_NOT_FOUND".to_string())?;
-        if record.revision != input.expected_revision {
+        // RecordStore owns one monotonic revision for every persisted change,
+        // including live notes and metadata. RecordingManager owns the capture
+        // control fence. Revisions advanced only by RecordStore content writes
+        // are therefore valid, while anything older than the last control
+        // transition (or newer than durable state) is stale/invalid.
+        if input.expected_revision < control_revision || input.expected_revision > record.revision {
             return Err(format!(
-                "RECORDING_REVISION_CONFLICT expected={} actual={}",
-                input.expected_revision, record.revision
+                "RECORDING_REVISION_CONFLICT expected={} control={} record={}",
+                input.expected_revision, control_revision, record.revision
             ));
         }
         Ok(())
@@ -2587,7 +2603,7 @@ pub async fn cmd_recording_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::RecordStore;
+    use crate::record::{RecordNoteCreateInput, RecordStore};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::thread::JoinHandle;
     use tempfile::tempdir;
@@ -2864,6 +2880,65 @@ mod tests {
             .artifacts
             .iter()
             .all(|artifact| artifact.kind == "audio/ogg-opus" && artifact.size_bytes > 0));
+    }
+
+    #[tokio::test]
+    async fn timeline_notes_do_not_invalidate_pause_or_stop_controls() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(RecordStore::new(root.path().join("records"), None));
+        let manager = RecordingManager::with_backend(store.clone(), Arc::new(FakeBackend), false);
+        let started = manager
+            .start(RecordingStartInput {
+                operation_id: "start-with-notes".to_string(),
+                selection: CaptureSelection::default(),
+            })
+            .await
+            .unwrap();
+
+        let first_timeline = store
+            .add_note(RecordNoteCreateInput {
+                record_id: started.snapshot.record_id.clone(),
+                operation_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                anchor_media_ms: 1_000,
+                started_at_wall_time: 1_700_000_000_000,
+                submitted_at_wall_time: 1_700_000_001_000,
+                text: "first live note".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(first_timeline.revision > started.snapshot.revision);
+
+        let paused = manager
+            .pause(RecordingCommandInput {
+                record_id: started.snapshot.record_id.clone(),
+                expected_revision: started.snapshot.revision,
+                operation_id: "pause-after-note".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let second_timeline = store
+            .add_note(RecordNoteCreateInput {
+                record_id: paused.record_id.clone(),
+                operation_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                anchor_media_ms: 2_000,
+                started_at_wall_time: 1_700_000_002_000,
+                submitted_at_wall_time: 1_700_000_003_000,
+                text: "second live note".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(second_timeline.revision > paused.revision);
+
+        let stopped = manager
+            .stop(RecordingCommandInput {
+                record_id: paused.record_id,
+                expected_revision: paused.revision,
+                operation_id: "stop-after-note".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(stopped.capture_status, CaptureStatus::Ready);
     }
 
     #[tokio::test]

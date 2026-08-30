@@ -5,7 +5,7 @@
 ## Owner 与进程边界
 
 - `RecordStore` 是 `~/.myagents/records/` 下 text/audio Record、artifact、timeline、transcript revision、diarization projection、speaker override 与 export source 的持久权威。旧 `thoughts/` 只作为幂等迁移输入；迁移完成后产品不再双写。
-- `RecordingManager` 拥有 App-global 唯一采集槽、设备流、Ogg Opus 归档、pause/stop/recovery 和录音期 wake lock。Renderer 与托盘只消费其 snapshot。
+- `RecordingManager` 拥有 App-global 唯一采集槽、设备流、Ogg Opus 归档、pause/stop/recovery 和录音期 wake lock。Renderer 与托盘只消费其 snapshot。录音控制命令的 revision fence 以 Manager 最近一次控制变更为下界、RecordStore 当前持久 revision 为上界；录音期笔记、Mark 或元数据写入可以推进全局 Record revision，但不能使同一 generation 的 pause/stop 失效。
 - `SpeechRecognitionManager` 拥有 durable speech job、FIFO、Worker generation、重试/取消/退出收敛，以及向 `RecordStore` 发布 transcript / diarization projection 的授权。
 - `SpeechModelPackManager` 是 `SpeechRecognitionManager` 内的模型权重子 owner：只管理显式安装、校验、active revision 和移除，不拥有 job terminal 或 Record 内容。
 - `LocalInferenceRuntimeRegistry` 只解析 App bundle 中经过 manifest 校验的共享 `onnx-cpu` identity；`LocalComputeCoordinator` 只授予重型推理 lease。
@@ -23,7 +23,7 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 - 没有 transcript 的历史音频在转录区域显示“开始转录”。只有用户点击后才调用 `cmd_speech_record_transcribe`；安装模型、打开详情或启动 App 都不会自动扫描历史 Record。
 - 本期人工纠错只覆盖 speaker rename、merge 与 exact segment reassign。原始 transcript revision 保留，override 单独持久化并在 projection/export/search 时合成；不提供任意字词改写。
 - 所有录音模式只投影当前 Record 内的匿名 `Speaker A/B/C`；物理麦克风不代表“我”。单轨直接 diarize，双物理轨由同一 Media Worker 按共同媒体时间线有界混合后做一次 Record-wide clustering。speaker embedding 只在 exact Worker generation 内短暂存在并在结束时主动清理，不持久化声纹，也不跨 Record 复用身份。
-- audio Record 结束保存后，`RecordStore` 在 Record 根目录生成唯一的 `content.md` 当前态文稿，包含元数据、当前 speaker projection、转写、现场笔记与重点 Mark。它是可重建的派生 artifact：最终转写、diarization、speaker override、metadata 或 timeline 变化后原子覆盖刷新；录音中不生成，损坏或缺失时由 AI 讨论接纳入口按当前 Record revision 重建。Renderer、Session 与 TaskStore 都不维护第二份副本。
+- audio Record 结束保存后，`RecordStore` 在 Record 根目录生成唯一的 `content.md` 当前态文稿，包含元数据、当前 speaker projection、转写、现场笔记与重点 Mark。它是可重建的派生 artifact：最终转写、diarization、speaker override、metadata 或 timeline 变化后原子覆盖刷新；录音中不生成，损坏或缺失时由 AI 讨论接纳入口按当前 Record revision 重建。Renderer、Session 与 TaskStore 都不维护第二份副本。AI 讨论仍以该文稿为主；`RecordStore` 同时返回经 artifact inventory 验证的实际音轨绝对路径，仅供 Agent 需要时核对原始声音。
 - 托盘只消费 `RecordingManager` projection：录音中 icon 增加状态圆点，菜单出现“正在录音...”，点击打开 exact Record Tab。托盘不拥有录音状态或导航 history。
 - SearchEngine 复用现有 Tantivy + jieba 建立 Record index；`RecordStore` change broadcast 驱动 upsert/delete，搜索按 `record_id` 合并 title/content/tag/transcript/speaker 命中，每个 Record 最多返回一项。
 - analytics 复用 renderer `track()` 与现有 Tauri bridge，只记录 typed milestone、枚举、duration bucket 与不可逆 Record hash；不记录音频、transcript、speaker name、路径或自由文本，也不新建 endpoint/outbox/retry/store。
@@ -135,7 +135,7 @@ https://download.myagents.io/models/speech/assets/sha256/<sha256>/<filename>
 3. 从固定第一方地址取得 manifest/signature，验证 byte identity 与 updater Minisign trust root。
 4. 顺序下载锁定 asset 到 0700 private 目录中的 0600 `create_new` 文件；每个响应只允许 HTTPS `download.myagents.io` 固定 host，逐 chunk 执行 exact size、SHA-256 与总下载硬上限。
 5. Rust 内置的 pure-Rust bzip2 decoder + tar reader 只选择 source lock 白名单文件。archive 中任意 traversal、重复路径、symlink 或 special entry 都让整个 staging 失败；运行时不调用系统 tar、Python 或用户 PATH。
-6. manifest 最后写入；Manager 在安装、激活与 queued pipeline 的执行边界要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。同步 live admission 只接受由该完整激活流程产生的内存 snapshot，避免在开始录音的交互热路径重复读取整个 pack；Worker 每次实际执行仍独立重开并校验 exact manifest、模型与 legal 文件后才加载模型。
+6. manifest 最后写入；Manager 在安装与激活边界要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。后续 App 启动只同步恢复签名 pointer、exact manifest 与文件元数据，完整 pack 校验延迟到首屏和 Global Sidecar 启动之后的 blocking pool；该后台检查期间已激活 pack 仍可被语音功能使用，失败后才撤销内存 active 并投影 repair 状态。queued pipeline 与同步 live admission 都只读取该内存 snapshot，避免在用户操作热路径重复读取整个 pack；Worker 每次实际执行仍独立重开并校验 exact manifest、模型与 legal 文件后才加载模型。
 7. 取得 `SpeechModelValidation` compute lease，让当前随包 Worker 依次真实创建并释放 ASR、VAD 和 diarizer engine。高优先级 workload 到达时 kill exact probe tree、释放 lease 后重试。
 8. staging 以 no-replace directory rename 发布到唯一 pack 目录，最后 atomic replace `active.json`。rename 前明确失败会删除新 pack并保持旧 pointer；rename 已可见但 parent-directory sync 失败时绝不删除 pointer 已引用的 pack，状态保留新 active 并报告 `SPEECH_RESOURCE_ACTIVATION_DURABILITY_UNCONFIRMED`。
 

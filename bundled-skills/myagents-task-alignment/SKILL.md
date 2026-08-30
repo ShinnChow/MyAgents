@@ -20,12 +20,13 @@ metadata:
 
 首轮消息的隐藏 `<TASK_DISCUSSION>` 中会给出：
 
-- `discussionId`
-- `discussionDir`
 - `candidatesDir`
 - `workspaceId`
 - `workspacePath`
-- 可选的 `sourceRecordId` 与标签
+- 可选的 `sourceRecordId`
+- 音频 Record 还会提供 `sourceRecordDocumentPath` 与 `sourceRecordAudioPaths`
+
+`discussionId` 和 `discussionDir` 由应用在准备持久候选目录时内部使用，不进入 Agent 上下文。写候选稿时直接使用 `candidatesDir`，不要自行从路径反推或要求用户提供这两个内部字段。音频讨论以 `sourceRecordDocumentPath` 指向的当前态文稿为准；只有需要核对原始声音时才读取 `sourceRecordAudioPaths`，不要把音频复制进候选目录。
 
 这些值来自应用，不要要求用户重填，也不要自行猜测或改写。若隐藏上下文缺失或路径无效，说明当前讨论无法安全创建 Task；仍可继续普通讨论，但不要调用 Task 创建命令。
 

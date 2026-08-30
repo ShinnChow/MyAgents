@@ -756,6 +756,9 @@ export const MemoizedTabContent = memo(
               pendingRoute={taskPendingRoute ?? null}
               onRouteConsumed={onTaskRouteConsumed}
               activeRecordingSnapshot={activeRecordingSnapshot}
+              onStartRecording={(selection) =>
+                onStartRecording(tab.id, selection)
+              }
               onOpenRecord={(recordId, mediaMs, activeRecording) =>
                 onOpenRecord(recordId, mediaMs, 'task_center', activeRecording)
               }
@@ -3967,6 +3970,7 @@ export default function App() {
         title?: string;
         activeRecording?: boolean;
         mediaMs?: number;
+        openInNewTab?: boolean;
       } = {},
     ): Promise<boolean> => {
       const currentTabs = tabsRef.current;
@@ -4014,12 +4018,13 @@ export default function App() {
             (tab) => tab.view === 'launcher' || tab.view === 'taskcenter',
           )
         : undefined;
-      const reusable =
-        sourceTab ??
-        (options.activeRecording &&
-        (activeTab?.view === 'launcher' || activeTab?.view === 'taskcenter')
-          ? activeTab
-          : functionalTab);
+      const reusable = options.openInNewTab
+        ? undefined
+        : sourceTab ??
+          (options.activeRecording &&
+          (activeTab?.view === 'launcher' || activeTab?.view === 'taskcenter')
+            ? activeTab
+            : functionalTab);
       const title = options.title ?? t('tabs.record');
       const recordTab: Tab = {
         id:
@@ -4075,6 +4080,9 @@ export default function App() {
 
   const handleStartRecording = useCallback(
     async (tabId: string, selection: RecordingSourceSelection) => {
+      const openInNewTab = tabsRef.current.some(
+        (tab) => tab.id === tabId && tab.view === 'taskcenter',
+      );
       recordingAdmissionTabsRef.current.add(tabId);
       setLoadingTabs((current) => ({ ...current, [tabId]: true }));
       try {
@@ -4083,6 +4091,7 @@ export default function App() {
           sourceTabId: tabId,
           snapshot: result.snapshot,
           activeRecording: true,
+          openInNewTab,
         });
       } finally {
         recordingAdmissionTabsRef.current.delete(tabId);
@@ -4649,11 +4658,15 @@ export default function App() {
         if (!isTauriEnvironment()) {
           throw new Error('Task discussion requires the desktop Task store');
         }
-        const sourceRecordDocumentPath =
+        const sourceRecordDiscussionContext =
           sourceRecordKind === 'audio'
-            ? await tauriInvoke<string>('cmd_record_discussion_document', {
-                id: sourceRecordId,
-              })
+            ? await tauriInvoke<{
+                documentPath: string;
+                audioSources: Array<{
+                  track: 'microphone' | 'system' | 'mixed';
+                  path: string;
+                }>;
+              }>('cmd_record_discussion_context', { id: sourceRecordId })
             : undefined;
         const discussionId = `discussion-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         const prepared = await tauriInvoke<PreparedTaskDiscussion>(
@@ -4670,10 +4683,11 @@ export default function App() {
           workspaceId: workspace.id,
           workspacePath: workspace.path,
           sourceRecordId: sourceRecordId || undefined,
-          sourceRecordDocumentPath,
+          sourceRecordAudioPaths: sourceRecordDiscussionContext?.audioSources,
+          sourceRecordDocumentPath: sourceRecordDiscussionContext?.documentPath,
           visibleUserMessage:
             sourceRecordKind === 'audio'
-              ? '请完整读取 sourceRecordDocumentPath 指向的录音文稿。文稿包含转写内容、说话人信息、现场笔记和重点标记。请以文件中的当前内容为准，理解记录并与我进一步讨论。'
+              ? '请完整读取 sourceRecordDocumentPath 指向的录音文稿。文稿包含转写内容、说话人信息、现场笔记和重点标记。请以文件中的当前内容为准，理解记录并与我进一步讨论；如需核对原始声音，可读取 sourceRecordAudioPaths 中列出的音频文件。'
               : (content ?? ''),
         });
 

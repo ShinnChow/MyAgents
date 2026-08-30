@@ -24,6 +24,16 @@ describe('systemReminder', () => {
       workspaceId: 'workspace-1',
       workspacePath: '/Users/me/project<&',
       sourceRecordId: 'record-1',
+      sourceRecordAudioPaths: [
+        {
+          track: 'microphone',
+          path: '/Users/me/.myagents/records/a<&/audio/microphone.opus',
+        },
+        {
+          track: 'system',
+          path: '/Users/me/.myagents/records/a<&/audio/system.opus',
+        },
+      ],
       sourceRecordDocumentPath: '/Users/me/.myagents/records/a<&/content.md',
       visibleUserMessage: '每周整理一次发布记录',
     });
@@ -31,7 +41,19 @@ describe('systemReminder', () => {
     const parsed = parseLeadingSystemReminder(raw);
     expect(parsed.kind).toBe(TASK_DISCUSSION_TAG);
     expect(parsed.body).toContain('workspacePath: /Users/me/project&lt;&amp;');
+    expect(parsed.body).toContain(
+      '- microphone: /Users/me/.myagents/records/a&lt;&amp;/audio/microphone.opus',
+    );
+    expect(parsed.body).toContain(
+      '- system: /Users/me/.myagents/records/a&lt;&amp;/audio/system.opus',
+    );
     expect(parsed.body).toContain('sourceRecordDocumentPath: /Users/me/.myagents/records/a&lt;&amp;/content.md');
+    expect(parsed.body.indexOf('sourceRecordId:')).toBeLessThan(
+      parsed.body.indexOf('sourceRecordAudioPaths:'),
+    );
+    expect(parsed.body.indexOf('sourceRecordAudioPaths:')).toBeLessThan(
+      parsed.body.indexOf('sourceRecordDocumentPath:'),
+    );
     expect(parsed.body).not.toContain('discussionId:');
     expect(parsed.body).not.toContain('discussionDir:');
     expect(parsed.body).not.toContain('sourceRecordTags:');

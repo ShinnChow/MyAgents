@@ -19,6 +19,7 @@
   },
   "thoughts": {
     "title": "Records",
+    "centerTitle": "Ideas",
     "searchPlaceholder": "Search records...",
     "openFolder": "Open records folder",
     "tagFilter": "Filter by tag",
@@ -30,6 +31,7 @@
     "emptyActive": "No records yet. Capture the first one.",
     "emptySearch": "No matching records",
     "inputPlaceholder": "Capture a record... Use #tags to organize",
+    "centerInputPlaceholder": "Capture this thought... Use #tags to organize",
     "tagMenuMatch": "Matching #{{query}}",
     "tagMenuChoose": "Choose a tag",
     "insertTag": "Insert # tag",

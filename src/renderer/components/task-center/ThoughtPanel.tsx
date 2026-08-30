@@ -62,6 +62,8 @@ interface Props {
     activeRecording?: boolean,
   ) => void;
   activeRecordingSnapshot?: RecordingSnapshot | null;
+  onStartRecording?: () => void | Promise<void>;
+  recordingBusy?: boolean;
 }
 
 export function ThoughtPanel({
@@ -72,6 +74,8 @@ export function ThoughtPanel({
   autoFocusInput = false,
   onOpenRecord,
   activeRecordingSnapshot,
+  onStartRecording,
+  recordingBusy = false,
 }: Props) {
   const [thoughts, setThoughts] = useState<Thought[]>([]);
   const [audioRecords, setAudioRecords] = useState<RecordSummary[]>([]);
@@ -695,7 +699,7 @@ export function ThoughtPanel({
                   strokeWidth={1.5}
                 />
                 <span className="whitespace-nowrap text-base font-semibold text-[var(--ink)]">
-                  {t('records.title')}
+                  {t('thoughts.centerTitle')}
                 </span>
               </div>
               <div className="ml-auto flex min-w-0 flex-1 justify-end">
@@ -792,8 +796,11 @@ export function ThoughtPanel({
             }
           }}
           existingTags={tagCandidates}
+          placeholder={t('thoughts.centerInputPlaceholder')}
           autoFocus={autoFocusInput}
           minLines={3}
+          onStartRecording={onStartRecording}
+          recordingBusy={recordingBusy}
         />
       </div>
 
@@ -824,7 +831,7 @@ export function ThoughtPanel({
           </div>
         ) : (
           <span className="text-sm font-semibold tracking-[0.04em] text-[var(--ink-muted)]">
-            {t('records.title')}{' '}
+            {t('thoughts.centerTitle')}{' '}
             <span className="text-[var(--ink-muted)]/60">
               ({thoughts.length + audioRecords.length})
             </span>

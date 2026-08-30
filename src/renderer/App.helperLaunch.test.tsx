@@ -2081,8 +2081,21 @@ describe('App helper launch', () => {
     mocks.agent.runtime = 'codex';
     mocks.resolveBuiltinSelection.mockReturnValue(undefined);
     tauriCoreMocks.invoke.mockImplementation(async (command) => {
-      if (command === 'cmd_record_discussion_document') {
-        return '/Users/me/.myagents/records/2026-08/record-audio/content.md';
+      if (command === 'cmd_record_discussion_context') {
+        return {
+          documentPath:
+            '/Users/me/.myagents/records/2026-08/record-audio/content.md',
+          audioSources: [
+            {
+              track: 'microphone',
+              path: '/Users/me/.myagents/records/2026-08/record-audio/audio/microphone.opus',
+            },
+            {
+              track: 'system',
+              path: '/Users/me/.myagents/records/2026-08/record-audio/audio/system.opus',
+            },
+          ],
+        };
       }
       if (command === 'cmd_task_prepare_discussion') {
         return {
@@ -2111,7 +2124,7 @@ describe('App helper launch', () => {
     const commands = tauriCoreMocks.invoke.mock.calls.map(
       ([command]) => command,
     );
-    expect(commands.indexOf('cmd_record_discussion_document')).toBeLessThan(
+    expect(commands.indexOf('cmd_record_discussion_context')).toBeLessThan(
       commands.indexOf('cmd_task_prepare_discussion'),
     );
     expect(tauriCoreMocks.invoke).toHaveBeenCalledWith(
@@ -2128,6 +2141,12 @@ describe('App helper launch', () => {
       'sourceRecordDocumentPath: /Users/me/.myagents/records/2026-08/record-audio/content.md',
     );
     expect(prompt).toContain(
+      '- microphone: /Users/me/.myagents/records/2026-08/record-audio/audio/microphone.opus',
+    );
+    expect(prompt).toContain(
+      '- system: /Users/me/.myagents/records/2026-08/record-audio/audio/system.opus',
+    );
+    expect(prompt).toContain(
       '请完整读取 sourceRecordDocumentPath 指向的录音文稿',
     );
     expect(prompt).not.toContain('discussionId:');
@@ -2139,7 +2158,7 @@ describe('App helper launch', () => {
   it('does not create discussion state when the canonical audio document is unavailable', async () => {
     mocks.tauriEnvironment = true;
     tauriCoreMocks.invoke.mockImplementation(async (command) => {
-      if (command === 'cmd_record_discussion_document') {
+      if (command === 'cmd_record_discussion_context') {
         throw new Error('RECORD_DISCUSSION_DOCUMENT_NOT_READY');
       }
       return undefined;

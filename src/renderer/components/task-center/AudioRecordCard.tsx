@@ -73,18 +73,6 @@ export function AudioRecordCard({
     : false;
   const displayedDurationMs = activeSnapshot?.mediaDurationMs ?? audio?.mediaDurationMs ?? 0;
   if (!audio) return null;
-  const status =
-    effectiveCaptureStatus === 'recording'
-      ? t('records.recording')
-      : effectiveCaptureStatus === 'paused'
-        ? t('records.paused')
-        : ['queued', 'live', 'lagging', 'recovering', 'finalizing'].includes(audio.transcriptionStatus)
-          ? t('records.processing')
-          : effectiveCaptureStatus === 'failed' ||
-              audio.transcriptionStatus === 'failed' ||
-              audio.diarizationStatus === 'failed'
-            ? t('records.failed')
-            : t('records.complete');
   const dateLabel = relativeTime(record.createdAt, locale);
   const openRecord = () =>
     onOpen(record.id, searchHit?.mediaMs ?? undefined, active);
@@ -116,13 +104,6 @@ export function AudioRecordCard({
       </span>
       <span className="shrink-0 tabular-nums text-xs text-[var(--ink-muted)]">
         {formatDuration(displayedDurationMs)}
-      </span>
-      <span
-        className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${
-          active ? 'bg-[var(--error-subtle)] text-[var(--error)]' : 'bg-[var(--success-bg)] text-[var(--success)]'
-        }`}
-      >
-        {status}
       </span>
     </>
   );

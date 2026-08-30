@@ -15,6 +15,7 @@ import type {
 import RecordDetail, { safeRecordExportBaseName } from './RecordDetail';
 
 const mocks = vi.hoisted(() => ({
+  recordAddMark: vi.fn(),
   recordAddNote: vi.fn(),
   recordGet: vi.fn(),
   recordTranscript: vi.fn(),
@@ -26,6 +27,8 @@ const mocks = vi.hoisted(() => ({
   recordStartTranscription: vi.fn(),
   speechModelPackStatus: vi.fn(),
   copyPlainText: vi.fn(),
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
   eventListeners: new Map<
     string,
     (event: { payload: Record<string, unknown> }) => void
@@ -36,6 +39,7 @@ vi.mock('@/api/recording', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/recording')>();
   return {
     ...actual,
+    recordAddMark: mocks.recordAddMark,
     recordAddNote: mocks.recordAddNote,
     recordTranscript: mocks.recordTranscript,
     recordTranscriptDelta: mocks.recordTranscriptDelta,
@@ -54,7 +58,10 @@ vi.mock('@/api/taskCenter', async (importOriginal) => {
 });
 
 vi.mock('@/components/Toast', () => ({
-  useToast: () => ({ success: vi.fn(), error: vi.fn() }),
+  useToast: () => ({
+    success: mocks.toastSuccess,
+    error: mocks.toastError,
+  }),
 }));
 
 vi.mock('@/hooks/useConfig', () => ({
@@ -197,6 +204,11 @@ describe('RecordDetail note input', () => {
       revision: 1,
       items: [],
     });
+    mocks.recordAddMark.mockResolvedValue({
+      recordId: RECORD.id,
+      revision: 1,
+      items: [],
+    });
   });
 
   it('does not submit IME composition or Shift+Enter, then submits plain Enter', async () => {
@@ -228,6 +240,38 @@ describe('RecordDetail note input', () => {
     fireEvent.keyDown(input, { key: 'Enter' });
     await waitFor(() => expect(mocks.recordAddNote).toHaveBeenCalledOnce());
     expect(mocks.recordAddNote.mock.calls[0][0].text).toBe('讨论结论');
+    expect(mocks.toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it('uses the inline timeline as mark feedback without a success toast', async () => {
+    mocks.recordAddMark.mockResolvedValueOnce({
+      recordId: RECORD.id,
+      revision: 1,
+      items: [
+        {
+          type: 'mark',
+          markId: 'mark-inline-feedback',
+          mediaMs: 3_000,
+          wallTime: SNAPSHOT.startedAtWallTime + 3_000,
+        },
+      ],
+    });
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: /标记重点|Mark highlight/i,
+      }),
+    );
+
+    await waitFor(() => expect(mocks.recordAddMark).toHaveBeenCalledOnce());
+    expect(mocks.toastSuccess).not.toHaveBeenCalled();
   });
 
   it('deduplicates repeated Enter and preserves text typed while the save is pending', async () => {
@@ -260,6 +304,39 @@ describe('RecordDetail note input', () => {
       resolveSave({ recordId: RECORD.id, revision: 1, items: [] });
     });
     expect(input).toHaveValue('保存期间的新草稿');
+  });
+
+  it('keeps the note composer focused after Enter saves a note', async () => {
+    mocks.recordAddNote.mockResolvedValueOnce({
+      recordId: RECORD.id,
+      revision: 3,
+      items: [
+        {
+          type: 'note',
+          seq: 1,
+          noteId: 'saved-note',
+          anchorMediaMs: 10_000,
+          startedAtWallTime: SNAPSHOT.startedAtWallTime,
+          submittedAtWallTime: SNAPSHOT.startedAtWallTime + 1_000,
+          text: '连续记录',
+        },
+      ],
+    });
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    const input = await screen.findByPlaceholderText(/记下此刻|Note the/);
+    input.focus();
+    fireEvent.change(input, { target: { value: '连续记录' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    await waitFor(() => expect(input).toHaveValue(''));
+    await waitFor(() => expect(input).toHaveFocus());
   });
 
   it('keeps active recording controls available when an optional projection fails', async () => {
@@ -621,6 +698,68 @@ describe('RecordDetail note input', () => {
     );
   });
 
+  it('overlays timeline actions in one menu and keeps edit controls below the input', async () => {
+    mocks.recordTimeline.mockResolvedValue({
+      recordId: RECORD.id,
+      revision: 1,
+      items: [
+        {
+          type: 'note',
+          seq: 1,
+          noteId: 'editable-note',
+          anchorMediaMs: 7_000,
+          startedAtWallTime: SNAPSHOT.startedAtWallTime,
+          submittedAtWallTime: SNAPSHOT.startedAtWallTime + 7_000,
+          text: '需要编辑的现场笔记',
+        },
+      ],
+    });
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive={false}
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    const row = await screen.findByTestId(
+      'recording-timeline-note-editable-note',
+    );
+    expect(row).toHaveClass('grid-cols-[48px_minmax(0,1fr)]');
+    const menuTrigger = within(row).getByTitle(/更多操作|More actions/i);
+    const actionOverlay = menuTrigger.closest('.absolute');
+    expect(actionOverlay).toHaveClass(
+      'right-0',
+      'bg-gradient-to-r',
+      'opacity-0',
+    );
+
+    fireEvent.click(menuTrigger);
+    expect(
+      await screen.findByRole('button', { name: /删除笔记|Delete note/i }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole('button', { name: /编辑笔记|Edit note/i }),
+    );
+
+    const editor = await screen.findByRole('textbox', {
+      name: /编辑笔记|Edit note/i,
+    });
+    const editorSurface = editor.parentElement;
+    expect(editorSurface).toHaveClass('border', 'bg-transparent');
+    expect(editorSurface).toContainElement(
+      screen.getByRole('button', {
+        name: /保存笔记修改|Save note changes/i,
+      }),
+    );
+    expect(editorSurface).toContainElement(
+      screen.getByRole('button', {
+        name: /取消笔记修改|Cancel note changes/i,
+      }),
+    );
+  });
+
   it('keeps the completed playback timeline inside one dedicated progress control', async () => {
     mocks.recordGet.mockResolvedValue({
       ...RECORD,
@@ -688,6 +827,27 @@ describe('RecordDetail note input', () => {
       },
     });
     mocks.recordingSnapshot.mockResolvedValue(null);
+    mocks.recordTimeline.mockResolvedValue({
+      recordId: RECORD.id,
+      revision: 2,
+      items: [
+        {
+          type: 'note',
+          seq: 1,
+          noteId: 'timeline-note',
+          anchorMediaMs: 2_000,
+          startedAtWallTime: SNAPSHOT.startedAtWallTime,
+          submittedAtWallTime: SNAPSHOT.startedAtWallTime + 2_000,
+          text: '时间轴笔记',
+        },
+        {
+          type: 'mark',
+          markId: 'timeline-mark',
+          mediaMs: 3_000,
+          wallTime: SNAPSHOT.startedAtWallTime + 3_000,
+        },
+      ],
+    });
     mocks.recordTranscript.mockResolvedValue({
       schemaVersion: 1,
       recordId: RECORD.id,
@@ -719,6 +879,11 @@ describe('RecordDetail note input', () => {
     expect(
       screen.queryByRole('button', {
         name: /转写.*00:01|Transcript.*00:01/i,
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', {
+        name: /笔记位置|Note at|重点位置|Highlight at/i,
       }),
     ).not.toBeInTheDocument();
 
@@ -939,7 +1104,7 @@ describe('RecordDetail note input', () => {
     expect(await screen.findByText('通知后立即显示')).toBeInTheDocument();
   });
 
-  it('keeps the status beside the title and note shortcuts inside one borderless composer', async () => {
+  it('keeps the status beside the title and note shortcuts inside one outline-only composer', async () => {
     render(
       <RecordDetail
         recordId={RECORD.id}
@@ -960,7 +1125,8 @@ describe('RecordDetail note input', () => {
     expect(composer).toContainElement(
       screen.getByRole('button', { name: /添加笔记|Add note/i }),
     );
-    expect(composer).not.toHaveClass('border');
+    expect(composer).toHaveClass('border', 'bg-transparent');
+    expect(composer).not.toHaveClass('bg-[var(--paper-inset)]');
   });
 
   it('keeps the title in the left column and starts the notes panel at the top', async () => {

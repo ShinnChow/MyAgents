@@ -1017,6 +1017,20 @@ pub struct RecordAudioExportInput {
     pub destination_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordDiscussionAudioSource {
+    pub track: AudioTrackKind,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordDiscussionContext {
+    pub document_path: String,
+    pub audio_sources: Vec<RecordDiscussionAudioSource>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordTextExportFormat {
@@ -1264,6 +1278,44 @@ impl RecordStore {
             return Err("Record discussion document escaped its Record directory".to_string());
         }
         Ok(document_path)
+    }
+
+    pub async fn ensure_audio_discussion_context(
+        &self,
+        id: &str,
+    ) -> Result<RecordDiscussionContext, String> {
+        let document_path = self.ensure_audio_discussion_document(id).await?;
+        let record = self
+            .get(id)
+            .await
+            .ok_or_else(|| format!("Record not found: {id}"))?;
+        let tracks = record
+            .audio
+            .as_ref()
+            .ok_or_else(|| format!("Record is not audio: {id}"))?
+            .tracks
+            .clone();
+        let mut audio_sources = Vec::with_capacity(tracks.len());
+        for track in tracks {
+            if let Ok(media) = self.resolve_record_media(id, track).await {
+                let path = media
+                    .path
+                    .into_os_string()
+                    .into_string()
+                    .map_err(|_| "RECORD_DISCUSSION_AUDIO_PATH_INVALID".to_string())?;
+                audio_sources.push(RecordDiscussionAudioSource { track, path });
+            }
+        }
+        if audio_sources.is_empty() {
+            return Err("RECORD_DISCUSSION_DOCUMENT_NOT_READY".to_string());
+        }
+        let document_path = document_path.into_os_string().into_string().map_err(|_| {
+            "RECORD_DISCUSSION_DOCUMENT_FAILED: path is not valid UTF-8".to_string()
+        })?;
+        Ok(RecordDiscussionContext {
+            document_path,
+            audio_sources,
+        })
     }
 
     pub(crate) async fn update_audio_capture(
@@ -5139,16 +5191,11 @@ pub async fn cmd_record_get(
 }
 
 #[tauri::command]
-pub async fn cmd_record_discussion_document(
+pub async fn cmd_record_discussion_context(
     state: tauri::State<'_, ManagedRecordStore>,
     id: String,
-) -> Result<String, String> {
-    state
-        .ensure_audio_discussion_document(&id)
-        .await?
-        .into_os_string()
-        .into_string()
-        .map_err(|_| "RECORD_DISCUSSION_DOCUMENT_FAILED: path is not valid UTF-8".to_string())
+) -> Result<RecordDiscussionContext, String> {
+    state.ensure_audio_discussion_context(&id).await
 }
 
 #[tauri::command]
@@ -6151,6 +6198,27 @@ mod tests {
             .await
             .unwrap();
         assert!(root.join(AUDIO_DISCUSSION_DOCUMENT_PATH).is_file());
+        let discussion_context = store
+            .ensure_audio_discussion_context(&record.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            discussion_context.document_path,
+            fs::canonicalize(root.join(AUDIO_DISCUSSION_DOCUMENT_PATH))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+        assert_eq!(
+            discussion_context.audio_sources,
+            vec![RecordDiscussionAudioSource {
+                track: AudioTrackKind::Microphone,
+                path: fs::canonicalize(root.join("audio/microphone.opus"))
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            }]
+        );
         let provenance = RecordSpeechProvenance {
             provider: "local".into(),
             model_pack_revision: "speech-pack-1".into(),

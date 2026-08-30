@@ -54,6 +54,10 @@ export interface TaskDiscussionReminderInput {
   workspaceId: string;
   workspacePath: string;
   sourceRecordId?: string;
+  sourceRecordAudioPaths?: Array<{
+    track: 'microphone' | 'system' | 'mixed';
+    path: string;
+  }>;
   sourceRecordDocumentPath?: string;
   visibleUserMessage: string;
 }
@@ -243,6 +247,14 @@ export function buildTaskDiscussionReminder(input: TaskDiscussionReminderInput):
   ];
   if (input.sourceRecordId?.trim()) {
     lines.push(`sourceRecordId: ${escapeSystemReminderText(input.sourceRecordId.trim())}`);
+  }
+  if (input.sourceRecordAudioPaths?.length) {
+    lines.push('sourceRecordAudioPaths:');
+    for (const source of input.sourceRecordAudioPaths) {
+      lines.push(
+        `- ${source.track}: ${escapeSystemReminderText(source.path.trim())}`,
+      );
+    }
   }
   if (input.sourceRecordDocumentPath?.trim()) {
     lines.push(`sourceRecordDocumentPath: ${escapeSystemReminderText(input.sourceRecordDocumentPath.trim())}`);

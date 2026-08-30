@@ -1,19 +1,23 @@
 // TaskCenter — single-instance tab combining Thought stream (left) and Task list (right).
 // PRD §5 / §6.
 
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ThoughtPanel } from '@/components/task-center/ThoughtPanel';
 import { TaskListPanel } from '@/components/task-center/TaskListPanel';
+import RecordingSourceDialog from '@/components/task-center/RecordingSourceDialog';
 import { taskCenterAvailable } from '@/api/taskCenter';
+import { speechModelPackStatus } from '@/api/recording';
 import { track } from '@/analytics';
 import { CUSTOM_EVENTS } from '@/../shared/constants';
+import { useConfig } from '@/hooks/useConfig';
 import type { Thought } from '@/../shared/types/thought';
 import type { TaskCreateRequest } from '@/../shared/taskDiscussion';
 import type { PendingAppRoute } from '@/../shared/appRoute';
 import type {
   RecordSummary,
   RecordingSnapshot,
+  RecordingSourceSelection,
 } from '@/../shared/types/record';
 
 interface Props {
@@ -34,6 +38,7 @@ interface Props {
     activeRecording?: boolean,
   ) => void;
   activeRecordingSnapshot?: RecordingSnapshot | null;
+  onStartRecording?: (selection: RecordingSourceSelection) => Promise<void>;
 }
 
 export default function TaskCenter({
@@ -44,8 +49,79 @@ export default function TaskCenter({
   onRouteConsumed,
   onOpenRecord,
   activeRecordingSnapshot,
+  onStartRecording,
 }: Props) {
   const { t } = useTranslation('task');
+  const { config, updateConfig } = useConfig();
+  const [recordingRequestBusy, setRecordingRequestBusy] = useState(false);
+  const [recordingSourceDialog, setRecordingSourceDialog] = useState<{
+    initialSelection: RecordingSourceSelection;
+    modelPackUsable?: boolean;
+    error?: string;
+  } | null>(null);
+
+  const handleOpenSpeechSettings = useCallback(() => {
+    setRecordingSourceDialog(null);
+    window.dispatchEvent(
+      new CustomEvent(CUSTOM_EVENTS.OPEN_SETTINGS, {
+        detail: {
+          section: 'mcp',
+          officialToolId: 'speech-recognition',
+        },
+      }),
+    );
+  }, []);
+
+  const handleRequestRecording = useCallback(async () => {
+    if (!onStartRecording) return;
+    const initialSelection = config.recordingSourceSelection ?? {
+      microphone: true,
+      system: true,
+    };
+    setRecordingRequestBusy(true);
+    if (config.recordingSourceSelection) {
+      try {
+        await onStartRecording(initialSelection);
+      } catch (error) {
+        setRecordingSourceDialog({
+          initialSelection,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        setRecordingRequestBusy(false);
+      }
+      return;
+    }
+    let modelPackUsable: boolean | undefined;
+    try {
+      modelPackUsable = (await speechModelPackStatus()).usable;
+    } catch {
+      // Resource status is advisory for start; capture remains available.
+    }
+    setRecordingSourceDialog({ initialSelection, modelPackUsable });
+    setRecordingRequestBusy(false);
+  }, [config.recordingSourceSelection, onStartRecording]);
+
+  const handleRecordingSourceConfirm = useCallback(
+    async (selection: RecordingSourceSelection) => {
+      if (!onStartRecording || !recordingSourceDialog) return;
+      setRecordingRequestBusy(true);
+      try {
+        await updateConfig({ recordingSourceSelection: selection });
+        await onStartRecording(selection);
+        setRecordingSourceDialog(null);
+      } catch (error) {
+        setRecordingSourceDialog({
+          ...recordingSourceDialog,
+          initialSelection: selection,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        setRecordingRequestBusy(false);
+      }
+    },
+    [onStartRecording, recordingSourceDialog, updateConfig],
+  );
 
   // Child panels react to `isActive` transitions on their own (via refreshKey
   // derived from it below). We do NOT setState in an effect here — the lint
@@ -137,6 +213,18 @@ export default function TaskCenter({
 
   return (
     <div className="flex h-full flex-col bg-[var(--paper)]">
+      {recordingSourceDialog && (
+        <RecordingSourceDialog
+          mode="start"
+          initialSelection={recordingSourceDialog.initialSelection}
+          modelPackUsable={recordingSourceDialog.modelPackUsable}
+          error={recordingSourceDialog.error}
+          busy={recordingRequestBusy}
+          onConfirm={handleRecordingSourceConfirm}
+          onCancel={() => setRecordingSourceDialog(null)}
+          onOpenSpeechSettings={handleOpenSpeechSettings}
+        />
+      )}
       {/* Page title — v0.1.69 polish:
             • breadcrumb "沉淀想法 › 派发任务 › 让 AI 执行" removed
               (it was scene-setting copy, redundant once the user is in
@@ -173,6 +261,10 @@ export default function TaskCenter({
             autoFocusInput={!!isActive && !pendingIntent?.autofocusSearch}
             onOpenRecord={onOpenRecord}
             activeRecordingSnapshot={activeRecordingSnapshot}
+            onStartRecording={
+              onStartRecording ? handleRequestRecording : undefined
+            }
+            recordingBusy={recordingRequestBusy}
           />
         </div>
 

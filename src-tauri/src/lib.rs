@@ -701,7 +701,7 @@ pub fn run() {
             record::cmd_record_create,
             record::cmd_record_list,
             record::cmd_record_get,
-            record::cmd_record_discussion_document,
+            record::cmd_record_discussion_context,
             record::cmd_record_transcript,
             record::cmd_record_transcript_delta,
             record::cmd_record_diarization,
