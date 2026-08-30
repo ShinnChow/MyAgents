@@ -3454,13 +3454,16 @@ fn validate_transcript_segments(
     let mut characters = 0_usize;
     let mut previous_key: Option<(u64, u64, &str)> = None;
     for segment in segments {
+        let track_is_valid = audio.tracks.contains(&segment.track)
+            || (segment.track == AudioTrackKind::Mixed
+                && audio.tracks.contains(&AudioTrackKind::Microphone)
+                && audio.tracks.contains(&AudioTrackKind::System));
         if !is_safe_id(&segment.segment_id)
             || !ids.insert(segment.segment_id.as_str())
             || segment.revision == 0
             || segment.start_sample >= segment.end_sample
             || segment.end_sample > max_sample
-            || !audio.tracks.contains(&segment.track)
-            || segment.track == AudioTrackKind::Mixed
+            || !track_is_valid
             || segment.text.trim().is_empty()
             || segment.text.chars().any(|character| character == '\0')
         {
@@ -6420,7 +6423,7 @@ mod tests {
                 &record.id,
                 vec![RecordTranscriptSegment {
                     segment_id: "segment-1".into(),
-                    track: AudioTrackKind::Microphone,
+                    track: AudioTrackKind::Mixed,
                     start_sample: 16_000,
                     end_sample: 32_000,
                     text: "hello".into(),

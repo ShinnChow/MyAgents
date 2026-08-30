@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   recordDiarization: vi.fn(),
   recordTimeline: vi.fn(),
   recordingSnapshot: vi.fn(),
+  recordingStop: vi.fn(),
   recordingSetSourceEnabled: vi.fn(),
   recordStartTranscription: vi.fn(),
   speechModelPackStatus: vi.fn(),
@@ -46,6 +47,7 @@ vi.mock('@/api/recording', async (importOriginal) => {
     recordDiarization: mocks.recordDiarization,
     recordTimeline: mocks.recordTimeline,
     recordingSnapshot: mocks.recordingSnapshot,
+    recordingStop: mocks.recordingStop,
     recordingSetSourceEnabled: mocks.recordingSetSourceEnabled,
     recordStartTranscription: mocks.recordStartTranscription,
     speechModelPackStatus: mocks.speechModelPackStatus,
@@ -184,6 +186,12 @@ describe('RecordDetail note input', () => {
       items: [],
     });
     mocks.recordingSnapshot.mockResolvedValue(SNAPSHOT);
+    mocks.recordingStop.mockResolvedValue({
+      ...SNAPSHOT,
+      revision: SNAPSHOT.revision + 1,
+      captureStatus: 'ready',
+      sourceActivity: [],
+    });
     mocks.recordingSetSourceEnabled.mockImplementation(
       async (
         _snapshot: RecordingSnapshot,
@@ -1102,6 +1110,118 @@ describe('RecordDetail note input', () => {
     });
 
     expect(await screen.findByText('通知后立即显示')).toBeInTheDocument();
+  });
+
+  it('reconciles the final transcript after stop releases the capture owner', async () => {
+    (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+    const liveTranscript = {
+      schemaVersion: 1,
+      recordId: RECORD.id,
+      projectionRevision: 2,
+      state: 'finalizing',
+      sampleRate: 16_000,
+      provenance: {
+        provider: 'local',
+        modelPackRevision: 'test',
+        onnxRuntimeVersion: 'test',
+      },
+      segments: [
+        {
+          segmentId: 'live-segment',
+          track: 'microphone' as const,
+          startSample: 0,
+          endSample: 8_000,
+          text: '实时草稿',
+          revision: 1,
+        },
+      ],
+    };
+    const settlingRecord = {
+      ...RECORD,
+      revision: RECORD.revision + 1,
+      audio: {
+        ...RECORD.audio!,
+        captureStatus: 'ready' as const,
+        transcriptionStatus: 'queued' as const,
+      },
+    };
+    const finalRecord = {
+      ...settlingRecord,
+      revision: settlingRecord.revision + 1,
+      audio: {
+        ...settlingRecord.audio,
+        transcriptionStatus: 'ready' as const,
+      },
+    };
+    const finalTranscript = {
+      ...liveTranscript,
+      projectionRevision: 1,
+      state: 'recording_final',
+      segments: [
+        {
+          segmentId: 'final-segment',
+          track: 'mixed' as const,
+          startSample: 0,
+          endSample: 16_000,
+          text: '最终转写',
+          revision: 1,
+        },
+      ],
+    };
+    mocks.recordTranscript.mockResolvedValue(liveTranscript);
+    mocks.recordingStop.mockImplementationOnce(async () => {
+      mocks.recordGet.mockResolvedValue(settlingRecord);
+      return {
+        ...SNAPSHOT,
+        revision: settlingRecord.revision,
+        captureStatus: 'ready',
+        sourceActivity: [],
+      };
+    });
+
+    render(
+      <RecordDetail
+        recordId={RECORD.id}
+        isActive
+        initialRecordingSnapshot={SNAPSHOT}
+      />,
+    );
+
+    expect(await screen.findByText('实时草稿')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(mocks.eventListeners.has('record:changed')).toBe(true);
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: /停止并保存|Stop and save/i }),
+    );
+    await waitFor(() => expect(mocks.recordTranscript).toHaveBeenCalledTimes(2));
+
+    mocks.eventListeners.get('recording:changed')?.({
+      payload: {
+        sequence: 1,
+        recordId: RECORD.id,
+        revision: settlingRecord.revision,
+        captureStatus: 'finalizing',
+        snapshot: {
+          ...SNAPSHOT,
+          revision: settlingRecord.revision,
+          captureStatus: 'finalizing',
+        },
+      },
+    });
+
+    mocks.recordGet.mockResolvedValue(finalRecord);
+    mocks.recordTranscript.mockResolvedValue(finalTranscript);
+    mocks.eventListeners.get('record:changed')?.({
+      payload: {
+        sequence: 2,
+        id: RECORD.id,
+        kind: 'upsert',
+      },
+    });
+
+    expect(await screen.findByText('最终转写')).toBeInTheDocument();
+    expect(screen.queryByText('实时草稿')).not.toBeInTheDocument();
   });
 
   it('keeps the status beside the title and note shortcuts inside one outline-only composer', async () => {

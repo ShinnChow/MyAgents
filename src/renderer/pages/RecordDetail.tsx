@@ -165,6 +165,15 @@ function sameStrings(left: string[], right: string[]): boolean {
   );
 }
 
+function ownsRecordingSlot(snapshot: RecordingSnapshot | null): boolean {
+  return (
+    !!snapshot &&
+    ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(
+      snapshot.captureStatus,
+    )
+  );
+}
+
 export default function RecordDetail({
   recordId,
   isActive,
@@ -181,7 +190,8 @@ export default function RecordDetail({
   const { config, updateConfig } = useConfig();
   const [record, setRecord] = useState<RecordDetailData | null>(null);
   const [snapshot, setSnapshot] = useState<RecordingSnapshot | null>(
-    initialRecordingSnapshot?.recordId === recordId
+    initialRecordingSnapshot?.recordId === recordId &&
+      ownsRecordingSlot(initialRecordingSnapshot)
       ? initialRecordingSnapshot
       : null,
   );
@@ -241,6 +251,18 @@ export default function RecordDetail({
   const playbackErrorShownRef = useRef(false);
   const refreshGenerationRef = useRef(0);
   const snapshotEpochRef = useRef(0);
+  const releasedRecordingRef = useRef<{
+    recordId: string;
+    generation: number;
+  } | null>(
+    initialRecordingSnapshot?.recordId === recordId &&
+      !ownsRecordingSlot(initialRecordingSnapshot)
+      ? {
+          recordId,
+          generation: initialRecordingSnapshot.generation,
+        }
+      : null,
+  );
   const recordingChangeSequenceRef = useRef(0);
   const transcriptPollEpochRef = useRef(0);
   const transcriptCursorRef = useRef<RecordTranscriptCursor | undefined>(
@@ -279,7 +301,31 @@ export default function RecordDetail({
 
   const applySnapshot = useCallback(
     (next: RecordingSnapshot | null) => {
-      const owned = next?.recordId === recordId ? next : null;
+      const releasedGeneration =
+        releasedRecordingRef.current?.recordId === recordId
+          ? releasedRecordingRef.current.generation
+          : null;
+      if (
+        next?.recordId === recordId &&
+        !ownsRecordingSlot(next) &&
+        (releasedGeneration === null || next.generation > releasedGeneration)
+      ) {
+        releasedRecordingRef.current = {
+          recordId,
+          generation: next.generation,
+        };
+      }
+      const currentReleasedGeneration =
+        releasedRecordingRef.current?.recordId === recordId
+          ? releasedRecordingRef.current.generation
+          : null;
+      const owned =
+        next?.recordId === recordId &&
+        ownsRecordingSlot(next) &&
+        (currentReleasedGeneration === null ||
+          next.generation > currentReleasedGeneration)
+          ? next
+          : null;
       const current = snapshotRef.current;
       if (
         current &&
@@ -505,11 +551,7 @@ export default function RecordDetail({
   }, [applySnapshot, pullTranscriptDelta, recordId, refresh]);
 
   const isPaused = snapshot?.captureStatus === 'paused';
-  const ownsCaptureSlot =
-    !!snapshot &&
-    ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(
-      snapshot.captureStatus,
-    );
+  const ownsCaptureSlot = ownsRecordingSlot(snapshot);
 
   useEffect(() => {
     if (!isActive || !ownsCaptureSlot) return;
