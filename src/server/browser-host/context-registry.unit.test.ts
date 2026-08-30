@@ -222,6 +222,97 @@ describe('BrowserContextRegistry', () => {
     expect(context.close).toHaveBeenCalledOnce();
   });
 
+  it('retires the exact Context when both identity checkpoint attempts fail', async () => {
+    const context = fakeContext();
+    const checkpointIdentity = vi.fn().mockRejectedValue(new Error('identity store unavailable'));
+    const onContextClosed = vi.fn();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { registry, browser } = harness([context], { checkpointIdentity, onContextClosed });
+
+    await registry.getContext(binding('a'));
+    await expect(registry.closeSessionContext('a')).resolves.toBeUndefined();
+
+    expect(checkpointIdentity).toHaveBeenCalledTimes(2);
+    expect(context.close).toHaveBeenCalledOnce();
+    expect(onContextClosed).toHaveBeenCalledOnce();
+    expect(browser.close).toHaveBeenCalledOnce();
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining(
+      'checkpoint=failed phase=destructive-close',
+    ));
+  });
+
+  it('reports Context close as the terminal failure when checkpoint and close both fail', async () => {
+    const context = fakeContext();
+    vi.mocked(context.close).mockRejectedValue(new Error('native close failed'));
+    const checkpointIdentity = vi.fn().mockRejectedValue(new Error('identity store unavailable'));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { registry, browser } = harness([context], { checkpointIdentity });
+
+    await registry.getContext(binding('a'));
+    await expect(registry.closeSessionContext('a')).rejects.toMatchObject({
+      name: 'BROWSER_CONTEXT_CLOSE_FAILED',
+    });
+
+    expect(checkpointIdentity).toHaveBeenCalledTimes(2);
+    expect(context.close).toHaveBeenCalledOnce();
+    expect(browser.close).not.toHaveBeenCalled();
+    await expect(registry.getContext(binding('a'))).resolves.toBeDefined();
+    expect(warning.mock.calls.flat().join(' ')).toContain(
+      'checkpoint=failed phase=destructive-close',
+    );
+    expect(warning.mock.calls.flat().join(' ')).toContain('context=close-failed');
+  });
+
+  it('does not recreate a release timer after checkpoint-only failure', async () => {
+    vi.useFakeTimers();
+    try {
+      const context = fakeContext();
+      const checkpointIdentity = vi.fn().mockRejectedValue(new Error('identity store unavailable'));
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { registry } = harness([context], { checkpointIdentity });
+
+      registry.retainConnection('a');
+      await registry.getContext(binding('a'));
+      registry.releaseConnection('a');
+      await vi.advanceTimersByTimeAsync(45_000);
+
+      expect(checkpointIdentity).toHaveBeenCalledTimes(2);
+      expect(context.close).toHaveBeenCalledOnce();
+      warning.mockRestore();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('deduplicates concurrent close while checkpoint failure degrades to diagnostics', async () => {
+    const context = fakeContext();
+    const checkpointIdentity = vi.fn().mockRejectedValue(new Error('identity store unavailable'));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { registry } = harness([context], { checkpointIdentity });
+
+    await registry.getContext(binding('a'));
+    await Promise.all([
+      registry.closeSessionContext('a'),
+      registry.closeSessionContext('a'),
+    ]);
+
+    expect(checkpointIdentity).toHaveBeenCalledTimes(2);
+    expect(context.close).toHaveBeenCalledOnce();
+    warning.mockRestore();
+  });
+
+  it('lets shutdown finish when identity persistence fails but Context close succeeds', async () => {
+    const context = fakeContext();
+    const checkpointIdentity = vi.fn().mockRejectedValue(new Error('identity store unavailable'));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { registry } = harness([context], { checkpointIdentity });
+
+    await registry.getContext(binding('a'));
+    await expect(registry.shutdown()).resolves.toBeUndefined();
+    expect(context.close).toHaveBeenCalledOnce();
+    warning.mockRestore();
+  });
+
   it('does not replay a CAS-rejected local identity value at the next unchanged checkpoint', async () => {
     const staleState = {
       cookies: [{ name: 'session', value: 'stale', domain: 'example.com', path: '/' }],

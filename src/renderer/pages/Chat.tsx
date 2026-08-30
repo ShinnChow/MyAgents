@@ -784,6 +784,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   // ── Embedded browser state ──
   const [browserUrl, setBrowserUrl] = useState<string | null>(null);
   const [browserAlive, setBrowserAlive] = useState(false);
+  const [browserReloadSignal, setBrowserReloadSignal] = useState(0);
   // When browser is previewing a local file, store its metadata for editor toggle
   const [browserSourceFile, setBrowserSourceFile] = useState<{ name: string; content: string; size: number; path: string } | null>(null);
   // Live URL surfaced from BrowserPanel (Rust `browser:url-changed`). Drives
@@ -1040,11 +1041,9 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     setSplitActiveView('browser');
     // Give auto-save a moment to flush, then reload the webview
     setTimeout(() => {
-      import('@tauri-apps/api/core').then(({ invoke: inv }) => {
-        inv('cmd_browser_reload', { tabId }).catch(() => {});
-      });
+      setBrowserReloadSignal(value => value + 1);
     }, 300);
-  }, [browserUrl, tabId]);
+  }, [browserUrl]);
 
   // Stable context value for the Chat-owned browser. Presentation (split vs.
   // fullscreen) is decided here, not by individual link renderers.
@@ -5909,6 +5908,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                     isDraggingSplit={isDraggingSplit}
                     isSplitTransitioning={isSplitWidthTransitioning}
                     browserAlive={browserAlive}
+                    reloadSignal={browserReloadSignal}
                     sourceFile={browserSourceFile}
                     workspace={agentDir}
                     onBrowserCreated={handleBrowserCreated}

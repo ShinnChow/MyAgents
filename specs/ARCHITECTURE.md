@@ -251,7 +251,7 @@ Global control request
 用于 Rust 与 Renderer 之间的控制请求、命令和事件：
 - Session / Global 普通 HTTP 控制请求（相对路径 + 逻辑 owner，由 Rust 解析当前 generation）
 - 内嵌终端事件（`terminal:data:{id}`）
-- 内嵌浏览器事件（`browser:url-changed:{tabId}`）
+- 内嵌浏览器事件（`browser:url-changed:{tabId}:{lifecycleToken}` / `browser:loading:{tabId}:{lifecycleToken}`）
 - 任务状态变更（`task:status-changed`）
 - 工作区文件变更（`workspace:files-changed:{eventKey}`，`eventKey` 由 `watch_start` 返回）
 - 工作区文件操作（`cmd_workspace_*`，所有 `src-tauri/src/workspace_files/` 命令）
@@ -296,7 +296,7 @@ Rust 为 Global 与 Session 两类 Sidecar 都在 spawn 前分配 process-global
 受管工具只把 JS 控制代码与 App 一起发布：`@playwright/mcp`、`playwright`、`playwright-core` 保持上游 package-local CommonJS / data-file 布局进入 `Resources/node_modules`，不折叠进 ESM `server-dist.js`。Chromium、Chromium Headless Shell 与 FFmpeg 不进入 App bundle、installer 或 updater。`src/shared/managed-browser-runtime.json` 是随 App 签名发布的 required runtime set 与各平台官方 artifact 计划：它锁定 Playwright 官方来源解析出的最终 Chrome for Testing / Playwright CDN URL、archive size、SHA-256、归档根和 executable path。Rust App owner 从未安装时只在用户点击“安装资源”后直连该锁定官方 artifact，完成摘要校验、安全解压与原子安装；读取状态不访问网络。首次成功形成 install authorization，后续 App revision 变化自动维护且最多重试两次；没有用户卸载入口。Browser Host 只能消费 Rust 投影的精确 executable path，不回退系统 Chrome、用户 Playwright cache、`npx playwright install` 或 App resources。
 
 - 一个 App Browser generation 共享一个 Chromium Browser process；每个 Product Session 一个隔离 `BrowserContext` 和原生窗口，同一 Context 的 Pages 是 Tabs。不存在 persistent/user-data-dir/Profile lease 模式。
-- Context 从 Rust-owned Browser Identity revision 初始化，Host 仅通过 `addCookies()` / `cookies()` 恢复和保存 Cookie，并在成功工具调用后防抖保存、在 close/teardown/shutdown 前强制保存；禁止对 headed Context 使用 Playwright `storageState()`，因为它会用用户可见的临时页面遍历历史 Web Storage origin。并发 checkpoint 通过 revision + key-level CAS 合并；旧版本留下的 localStorage / IndexedDB origin 只作兼容读取并在后续 checkpoint 清理，不再恢复。
+- Context 从 Rust-owned Browser Identity revision 初始化，Host 仅通过 `addCookies()` / `cookies()` 恢复和保存 Cookie，并在成功工具调用后防抖保存、在 close/teardown/shutdown 前强制保存；禁止对 headed Context 使用 Playwright `storageState()`，因为它会用用户可见的临时页面遍历历史 Web Storage origin。并发 checkpoint 通过 revision + key-level CAS 合并；旧版本留下的 localStorage / IndexedDB origin 只作兼容读取并在后续 checkpoint 清理，不再恢复。Browser Identity 只拥有持久化结果，不拥有 Context 生杀权：destructive close 前的 checkpoint 保持有界重试和结构化诊断，但 checkpoint-only failure 不得阻止 exact Context 退休；只有真实 Context close failure 才保留 entry 并触发既有精确 release retry。
 - Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
 - `config.mcpEnabledServers` 只表达全局可用性，因此两个固定内置 ID 可以同时启用。真正形成执行工具集的 Session、Agent 默认、Launcher 与 Task override 选择入口才互斥：选择一个会移除另一个，取消选择不改变对方；最终 Session 工具集仍取全局可用集与该执行选择集的交集。自定义 MCP 不参与该规则。
 
@@ -718,6 +718,7 @@ Chat / Tab 自己持有的 URL 预览器（Tauri Multi-Webview）。AI Markdown 
 - **链接动作 owner**：Markdown、`ExternalLink`、WebSearch / WebFetch 与文件工具不各自解释点击。HTTP(S) 统一走 `useOpenWebLink()`：Chat 普通点击进入当前 Tab 的 `BrowserPanel`，Cmd/Ctrl 点击或 Chat 外 surface 才交给系统浏览器；反引号 HTTP(S) 仅做标准 URL 格式校验，不探测网络可达性。文件链接、inline path 与工具 path 统一走 `FileActionContext`：显式 Markdown file link 保留作者声明的链接样式并在动作时复核；系统推断的 inline/tool path 只有 Rust existence + safety check 为 `exists:true` 时才获得下划线和左右键动作。只有当前挂载的 inferred target 才订阅校验，按 target 去重并以最多 200 条分批；工作区 watcher 使 workspace cache 失效，workspace 外 local target 使用 30 秒临时验证租约。workspace identity / generation fence 与单 target request sequence 共同拒绝跨工作区、跨代次和乱序迟到结果，左右键动作均再次复核。目标在动作前失效时撤销资格并明确反馈，不能静默交给 OS。
 - **Overlay 协调**：原生 Webview 浮于 React DOM 之上，Overlay 出现时通过 `closeLayer.hasOverlayLayer()` 自动 hide
 - **呈现与关闭 owner**：全屏条件只由“Browser 是当前 active split view”派生，不能由残留 `browserUrl` 单独决定；分屏、全屏、工具栏和 Tab × 共用同一个资源清理与剩余 view handoff callback
+- **代际 owner**：`tabId` 只表示 Chat Tab 产品 scope；每次 `BrowserPanel` effect lifetime 生成 required lifecycle token。Rust `BrowserManager` 必须在 native `add_child()` 前登记该 generation 的 birth intent，create / navigate / history / reload / resize / show / hide / close 与 URL/loading event 全部携带同一 token；迟到 birth、command、callback 或旧 close 只能作用于其 exact generation，不能覆盖或销毁复用同一 `tabId` 的新 WebView。普通 App/update shutdown 继续复用全局 lifecycle spawn gate，等待已准入 birth settlement 后统一 drain，不建立第二套退出状态机。
 - **Cookie 持久化**：同 App 所有 Webview 共享，默认持久化磁盘
 - **关闭即销毁**，不后台保活
 
@@ -1014,8 +1015,8 @@ Space 与其它 renderer CSS surface 一样直接继承 `<html>` 上当前 Theme
 | Agent attachment 转录 | 当前 Session Sidecar → Admin API → Management API → `SpeechRecognitionManager`；scope 由进程身份注入，不新增 Sidecar owner |
 | 终端打开 | `cmd_terminal_create(workspace, rows, cols, port, id)` |
 | 终端关闭 / Tab 关闭 | `cmd_terminal_close(terminalId)` |
-| 浏览器打开 | `cmd_browser_create(tabId, url, x, y, width, height)` |
-| 浏览器关闭 / Tab 关闭 | `cmd_browser_close(tabId)` |
+| 浏览器打开 | `cmd_browser_create(tabId, lifecycleToken, url, bounds)`；Rust 在 native birth 前登记 exact generation |
+| 浏览器关闭 / Tab 关闭 | `cmd_browser_close(tabId, lifecycleToken)`；迟到 close 只退休匹配 generation |
 | 任务立即执行 / 重新派发 | `TaskApplication::run*` / `cron run-now` → 直接触发 Task execution use case；不创建 CronTask |
 | Task 软删除 | `TaskApplication::delete_ordinary` → `TaskStore` 写 `→ deleted` 伪状态 + 联动清理来源 Record |
 | 应用退出 / 普通重启 | Rust `RunEvent::ExitRequested` 统一关闭资源创建入口，等待在途创建完成登记或释放，再通过现有进程树句柄停止 Sidecar / Plugin Bridge 并清理 IM、终端和浏览器；普通重启通过 `request_restart()` 进入同一路径 |
