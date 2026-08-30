@@ -9,8 +9,8 @@ import {
 
 interface UseTabSwipeGestureOptions {
   contentRef: RefObject<HTMLDivElement | null>;
-  tabsRef: RefObject<Tab[]>;
-  activeTabIdRef: RefObject<string | null>;
+  getTabs: () => readonly Tab[];
+  getActiveTabId: () => string;
   onSwitchTab: (tabId: string) => void;
 }
 
@@ -182,8 +182,8 @@ function isSmallPostCommitTail(deltaX: number, deltaY: number, expectedDeltaSign
 
 export function useTabSwipeGesture({
   contentRef,
-  tabsRef,
-  activeTabIdRef,
+  getTabs,
+  getActiveTabId,
   onSwitchTab,
 }: UseTabSwipeGestureOptions) {
   const stateRef = useRef<SwipeState>({
@@ -227,7 +227,7 @@ export function useTabSwipeGesture({
     // ─── Helpers ───────────────────────────────────────────────
 
     function getActiveIndex(): number {
-      return tabsRef.current.findIndex(t => t.id === activeTabIdRef.current);
+      return getTabs().findIndex(t => t.id === getActiveTabId());
     }
 
     function getTabEl(index: number): HTMLElement | null {
@@ -426,7 +426,7 @@ export function useTabSwipeGesture({
 
       if (commit && adjEl) {
         const curTarget = swipeDir * cw;
-        const newTabId = tabsRef.current[state.adjacentIndex]?.id;
+        const newTabId = getTabs()[state.adjacentIndex]?.id;
         const oldEl = curEl;
 
         // 1) Update tab bar IMMEDIATELY.
@@ -599,7 +599,7 @@ export function useTabSwipeGesture({
       state.cooldownUntil = 0;
       state.traceCooldownAbsorbCount = 0;
 
-      const tabs = tabsRef.current;
+      const tabs = getTabs();
       if (tabs.length <= 1) {
         if (state.phase !== 'idle') {
           cleanupDOM();
@@ -1002,6 +1002,6 @@ export function useTabSwipeGesture({
       cleanupDOM();
       resetState();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps -- refs are stable
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- command getters are stable
   }, []);
 }

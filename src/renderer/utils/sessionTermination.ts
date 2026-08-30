@@ -10,7 +10,7 @@
  * unit-testable without component scaffolding.
  */
 import { isPendingSessionId } from '../../shared/constants';
-import type { Tab } from '@/types/tab';
+import type { ChatTab, LauncherTab, Tab } from '@/types/tab';
 
 /**
  * Reset Tab fields when the bound session is permanently gone.
@@ -25,21 +25,12 @@ import type { Tab } from '@/types/tab';
  * stick on a launcher tab and the user would see a misleading "still
  * working" / "unread" badge on a blank canvas. (Codex review suggestion.)
  */
-export function resetTabToLauncher(tab: Tab): Tab {
-    return {
-        ...tab,
-        agentDir: null,
-        sessionId: null,
-        view: 'launcher',
-        title: 'New Tab',
-        // Back to a launcher tab → benign 'push' default (its next chat flip sets the
-        // real disposition). MUST be explicit: `...tab` would otherwise carry a stale
-        // 'pending'/'adopt' onto a launcher tab.
-        sidecarConfigDisposition: 'push',
-        initialMessage: undefined,
-        isGenerating: false,
-        hasUnread: false,
-    };
+export function resetTabToLauncher(tab: ChatTab): LauncherTab {
+  return {
+    id: tab.id,
+    view: 'launcher',
+    title: 'New Tab',
+  };
 }
 
 /**
@@ -52,19 +43,16 @@ export function resetTabToLauncher(tab: Tab): Tab {
  * `setTabs(prev => …)` no-op-friendly (a referentially-equal next state
  * means React skips the re-render).
  */
-export function applyTerminalSessionToTabs(
-    tabs: readonly Tab[],
-    sessionId: string,
-): Tab[] | readonly Tab[] {
-    let changed = false;
-    const next = tabs.map((t) => {
-        if (t.sessionId === sessionId) {
-            changed = true;
-            return resetTabToLauncher(t);
-        }
-        return t;
-    });
-    return changed ? next : tabs;
+export function applyTerminalSessionToTabs(tabs: readonly Tab[], sessionId: string): Tab[] | readonly Tab[] {
+  let changed = false;
+  const next = tabs.map((t) => {
+    if (t.view === 'chat' && t.sessionId === sessionId) {
+      changed = true;
+      return resetTabToLauncher(t);
+    }
+    return t;
+  });
+  return changed ? next : tabs;
 }
 
 /**
@@ -77,21 +65,21 @@ export function applyTerminalSessionToTabs(
  * launcher view by a reconcile event firing during its setup window.
  */
 export function reconcileTabsToLiveSessions(
-    tabs: readonly Tab[],
-    liveSessionIds: readonly string[],
+  tabs: readonly Tab[],
+  liveSessionIds: readonly string[],
 ): Tab[] | readonly Tab[] {
-    const live = new Set(liveSessionIds);
-    let changed = false;
-    const next = tabs.map((t) => {
-        if (!t.sessionId) return t;
-        // Use the shared `isPendingSessionId` helper rather than a local
-        // `startsWith('pending-')` — the prefix lives in `../../shared/constants`
-        // and could drift; using the shared predicate keeps it the single
-        // source of truth. (Codex review #AI-1.)
-        if (isPendingSessionId(t.sessionId)) return t;
-        if (live.has(t.sessionId)) return t;
-        changed = true;
-        return resetTabToLauncher(t);
-    });
-    return changed ? next : tabs;
+  const live = new Set(liveSessionIds);
+  let changed = false;
+  const next = tabs.map((t) => {
+    if (t.view !== 'chat' || !t.sessionId) return t;
+    // Use the shared `isPendingSessionId` helper rather than a local
+    // `startsWith('pending-')` — the prefix lives in `../../shared/constants`
+    // and could drift; using the shared predicate keeps it the single
+    // source of truth. (Codex review #AI-1.)
+    if (isPendingSessionId(t.sessionId)) return t;
+    if (live.has(t.sessionId)) return t;
+    changed = true;
+    return resetTabToLauncher(t);
+  });
+  return changed ? next : tabs;
 }

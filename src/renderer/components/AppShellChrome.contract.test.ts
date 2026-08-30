@@ -11,9 +11,12 @@ function source(relativePath: string): string {
 describe('App Shell chrome contract', () => {
   it('saves an active Record note before tab close, app exit, or update restart', () => {
     const app = source('src/renderer/App.tsx');
-    const recordClose = app.slice(
-      app.indexOf('{recordCloseConfirmState && ('),
-      app.indexOf('{/* One exit confirmation'),
+    const recordLifecycle = source(
+      'src/renderer/features/record/useRecordTabLifecycle.tsx',
+    );
+    const recordClose = recordLifecycle.slice(
+      recordLifecycle.indexOf('const confirm = useCallback'),
+      recordLifecycle.indexOf('const adapter = useMemo'),
     );
     const exitConfirm = app.slice(
       app.indexOf('{exitConfirmState && ('),
@@ -24,8 +27,8 @@ describe('App Shell chrome contract', () => {
       app.indexOf('// System tray event handling'),
     );
 
-    expect(recordClose.indexOf('flushPendingRecordNote')).toBeLessThan(
-      recordClose.indexOf('recordingStop'),
+    expect(recordClose.indexOf('flushPendingNote')).toBeLessThan(
+      recordClose.indexOf('stopRecording'),
     );
     expect(exitConfirm.indexOf('flushPendingRecordNote')).toBeLessThan(
       exitConfirm.indexOf('pending.resolve(true)'),
@@ -51,9 +54,12 @@ describe('App Shell chrome contract', () => {
   it('keeps the Chat owner subtree mounted while its existing boot surface covers startup', () => {
     const chat = source('src/renderer/pages/Chat.tsx');
     const app = source('src/renderer/App.tsx');
+    const chatTabModule = source('src/renderer/features/chat/tabModule.tsx');
     const tabProvider = source('src/renderer/context/TabProvider.tsx');
 
-    expect(app).toContain('<Suspense fallback={<ChatBootOverlay />}>');
+    expect(chatTabModule).toContain(
+      '<Suspense fallback={<ChatBootOverlay />}>',
+    );
     expect(app).not.toContain(') : isLoading ? (\n        <ChatBootOverlay />');
     expect(chat).toContain('show={showStartupOverlay || isSessionLoading}');
     expect(chat).toContain('error={sessionRestoreError}');
@@ -212,16 +218,18 @@ describe('App Shell chrome contract', () => {
     );
     expect(titlebar).toContain('bg-[var(--global-sidebar-bg)]');
     expect(titlebar).not.toContain('border-b border-[var(--line)]');
-    expect(tabbar).toContain("background: 'var(--global-sidebar-bg)'");
     expect(tabbar).toMatch(
-      /maskImage:\s*'linear-gradient\(to right, #000 0%, rgba\(0, 0, 0, 0\) 100%\)'/,
+      /background:\s*["']var\(--global-sidebar-bg\)["']/,
+    );
+    expect(tabbar).toMatch(
+      /maskImage:\s*["']linear-gradient\(to right, #000 0%, rgba\(0, 0, 0, 0\) 100%\)["']/,
     );
     expect(tabbar).not.toContain('var(--paper-a0)');
     expect(sidebar).toContain(
       'data-global-sidebar-motion={sidebarMotion ?? undefined}',
     );
-    expect(sidebar).toContain(
-      "data-global-sidebar-titlebar-follow={isWindows ? 'full' : 'toggle-slot'}",
+    expect(sidebar).toMatch(
+      /data-global-sidebar-titlebar-follow=\{isWindows \? ["']full["'] : ["']toggle-slot["']\}/,
     );
     expect(sidebar).not.toContain('transition-[width]');
     expect(app).toContain('data-tab-content-workspace');
@@ -313,17 +321,17 @@ describe('App Shell chrome contract', () => {
     );
     const storeProjection = source('src/renderer/hooks/useTaskCenterData.ts');
 
-    expect(sidebar).toContain(
-      'const loadHistorySearchOverlayContent = () => import',
+    expect(sidebar).toMatch(
+      /const loadHistorySearchOverlayContent = \(\) =>\s*import/,
     );
-    expect(sidebar).toContain(
-      'onIntent={() => { void loadHistorySearchOverlayContent(); }}',
+    expect(sidebar).toMatch(
+      /onIntent=\{\(\) => \{\s*void loadHistorySearchOverlayContent\(\);\s*\}\}/,
     );
     expect(sidebar).toContain(
       '<HistorySearchOverlayFrame onClose={handleSearchClose}>',
     );
-    expect(sidebar).toContain(
-      '<Suspense fallback={<HistorySearchOverlayFallback onClose={handleSearchClose} />}>',
+    expect(sidebar).toMatch(
+      /<Suspense\s+fallback=\{\s*<HistorySearchOverlayFallback onClose=\{handleSearchClose\} \/>\s*\}\s*>/,
     );
     expect(sidebar).not.toContain(
       '<Suspense fallback={null}>\n          <HistorySearchOverlayContent',

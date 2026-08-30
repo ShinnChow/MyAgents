@@ -57,7 +57,7 @@ async function clearDurable(path: string): Promise<void> {
  *  before the process exits. Clears the snapshot when nothing is restorable
  *  (e.g. only a launcher tab is open) so the next boot won't resurrect tabs the
  *  user had closed. */
-export async function persistOpenTabsDurable(tabs: Tab[], activeTabId: string | null): Promise<void> {
+export async function persistOpenTabsDurable(tabs: readonly Tab[], activeTabId: string | null): Promise<void> {
     if (isBrowserDevMode()) return;
     try {
         const path = await durablePath();

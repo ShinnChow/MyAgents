@@ -13,16 +13,14 @@ import { CSS } from '@dnd-kit/utilities';
 import { X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import {
-  TAB_ITEM_MAX_WIDTH_PX,
-  TAB_ITEM_MIN_WIDTH_PX,
-} from '@/components/tabBarLayout';
+import { TAB_ITEM_MAX_WIDTH_PX, TAB_ITEM_MIN_WIDTH_PX } from '@/components/tabBarLayout';
 import TabActivityIndicator from '@/components/TabActivityIndicator';
-import { type Tab, getFolderName } from '@/types/tab';
-import { getFixedTabChromeTitle } from '@/utils/tabChromeTitle';
+import type { Tab } from '@/types/tab';
+import type { TabChromeModel } from '@/tab-workspace/contracts';
 
 interface SortableTabItemProps {
   tab: Tab;
+  chrome: TabChromeModel;
   isActive: boolean;
   /** Stable callback — receives tabId so parent doesn't need inline closures */
   onSelectTab: (tabId: string) => void;
@@ -30,21 +28,9 @@ interface SortableTabItemProps {
   onCloseTab: (tabId: string) => void;
 }
 
-export default memo(function SortableTabItem({
-  tab,
-  isActive,
-  onSelectTab,
-  onCloseTab,
-}: SortableTabItemProps) {
+export default memo(function SortableTabItem({ tab, chrome, isActive, onSelectTab, onCloseTab }: SortableTabItemProps) {
   const { t } = useTranslation('app');
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: tab.id });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: tab.id });
 
   const style: CSSProperties = {
     transform: CSS.Translate.toString(transform),
@@ -56,35 +42,16 @@ export default memo(function SortableTabItem({
     flex: `1 1 ${TAB_ITEM_MAX_WIDTH_PX}px`,
   };
 
-  const fixedViewTitle = getFixedTabChromeTitle(tab.view, t);
-  const isRecording =
-    tab.view === 'record' && tab.recordingStatus === 'recording';
-  const isPaused = tab.view === 'record' && tab.recordingStatus === 'paused';
-  const recordingDuration = tab.recordingMediaDurationMs ?? 0;
-  const recordingSeconds = Math.max(0, Math.floor(recordingDuration / 1_000));
-  const recordingClock = `${Math.floor(recordingSeconds / 60)
-    .toString()
-    .padStart(2, '0')}:${(recordingSeconds % 60).toString().padStart(2, '0')}`;
-
-  // Prefer the session title once it exists; before that, the workspace name
-  // gives an untitled chat tab a useful identity. Fixed product tabs remain
-  // localized chrome.
-  const hasSessionTitle =
-    tab.title && tab.title !== 'New Tab' && tab.title !== 'New Chat';
-  const workspaceTitle = tab.agentDir ? getFolderName(tab.agentDir) : undefined;
-  const displayTitle =
-    isRecording || isPaused
-      ? t('tabs.recordingTime', { time: recordingClock })
-      : (fixedViewTitle ??
-        (hasSessionTitle ? tab.title : (workspaceTitle ?? tab.title)));
-  const hasChatContext =
-    tab.view === 'chat' && workspaceTitle && hasSessionTitle;
-  const tooltipTitle = hasChatContext
-    ? `${workspaceTitle} — ${displayTitle}`
-    : displayTitle;
-  const accessibleTitle = hasChatContext
-    ? `${workspaceTitle}, ${displayTitle}`
-    : displayTitle;
+  const isRecording = chrome.recordingState === 'recording';
+  const isPaused = chrome.recordingState === 'paused';
+  const tooltipTitle =
+    chrome.subtitle && (chrome.contextualSubtitle || chrome.subtitle !== chrome.title)
+      ? `${chrome.subtitle} — ${chrome.title}`
+      : chrome.title;
+  const accessibleTitle =
+    chrome.subtitle && (chrome.contextualSubtitle || chrome.subtitle !== chrome.title)
+      ? `${chrome.subtitle}, ${chrome.title}`
+      : chrome.title;
 
   return (
     <div
@@ -117,15 +84,13 @@ export default memo(function SortableTabItem({
         aria-label={accessibleTitle}
         {...listeners}
       >
-        {(isRecording || isPaused) && (
-          <span className="mr-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--error)]" />
-        )}
-        <span className="min-w-0 truncate">{displayTitle}</span>
+        {(isRecording || isPaused) && <span className="mr-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--error)]" />}
+        <span className="min-w-0 truncate">{chrome.title}</span>
       </span>
 
       <TabActivityIndicator
-        isGenerating={tab.isGenerating}
-        hasUnread={!isActive && tab.hasUnread}
+        isGenerating={chrome.isGenerating}
+        hasUnread={!isActive && chrome.hasUnread}
         className="ml-1"
       />
 

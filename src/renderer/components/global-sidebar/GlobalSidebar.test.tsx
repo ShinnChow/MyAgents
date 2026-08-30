@@ -136,11 +136,8 @@ import GlobalSidebar, { isPointerWithinBounds } from './GlobalSidebar';
 
 const launcherTab: Tab = {
   id: 'launcher-tab',
-  agentDir: null,
-  sessionId: null,
   view: 'launcher',
   title: 'Launcher',
-  sidecarConfigDisposition: 'push',
 };
 
 type SidebarProps = ComponentProps<typeof GlobalSidebar>;

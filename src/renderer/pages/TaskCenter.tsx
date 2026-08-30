@@ -29,7 +29,12 @@ interface Props {
    *  search input without the user touching the UI a second time. `nonce`
    *  forces the consumer's effect to re-fire when the same intent is sent
    *  back-to-back (e.g. user clicking the Launcher search icon twice). */
-  pendingIntent?: { autofocusSearch?: boolean; nonce: number } | null;
+  pendingIntent?: {
+    autofocusSearch?: boolean;
+    nonce: number;
+    consumed?: boolean;
+  } | null;
+  onSearchIntentConsumed?: (generation: number) => void;
   pendingRoute?: PendingAppRoute | null;
   onRouteConsumed?: (generation: number) => void;
   onOpenRecord?: (
@@ -44,6 +49,7 @@ interface Props {
 export default function TaskCenter({
   isActive,
   pendingIntent,
+  onSearchIntentConsumed,
   currentSessionId,
   pendingRoute,
   onRouteConsumed,
@@ -279,6 +285,7 @@ export default function TaskCenter({
           <TaskListPanel
             refreshKey={isActive ? '1' : '0'}
             pendingIntent={pendingIntent ?? null}
+            onSearchIntentConsumed={onSearchIntentConsumed}
             pendingRoute={pendingRoute ?? null}
             onRouteConsumed={onRouteConsumed}
             onCreateTask={handleCreateTask}

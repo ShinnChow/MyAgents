@@ -1587,7 +1587,9 @@ function WorkspaceTree({
   const tabBySession = useMemo(() => {
     const map = new Map<string, Tab>();
     for (const tab of tabs) {
-      if (tab.sessionId) map.set(tab.sessionId, tab);
+      if (tab.view === 'chat' && tab.sessionId) {
+        map.set(tab.sessionId, tab);
+      }
     }
     return map;
   }, [tabs]);
@@ -2051,8 +2053,8 @@ function SessionRow({
         className="flex h-full w-full min-w-0 items-center gap-2 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--accent)]"
       >
         <TabActivityIndicator
-          isGenerating={tab?.isGenerating}
-          hasUnread={tab?.hasUnread}
+          isGenerating={tab?.view === 'chat' ? tab.isGenerating : undefined}
+          hasUnread={tab?.view === 'chat' ? tab.hasUnread : undefined}
         />
         <OverflowNameTooltip
           label={displayTitle}

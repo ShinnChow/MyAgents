@@ -6,17 +6,26 @@ import {
   sessionRuntimeIdentityFromMetadataForOpen,
 } from './sessionOpenPlan';
 
+const chatTab = (id: string, sessionId: string) => ({
+  id,
+  view: 'chat' as const,
+  title: 'Chat',
+  agentDir: '/workspace',
+  sessionId,
+  sidecarConfigDisposition: 'push' as const,
+});
+
 describe('planSessionOpen', () => {
   test('jumps to the tab that already owns the target session', () => {
     expect(planSessionOpen({
-      tabs: [{ id: 'tab-a', sessionId: 'session-a' }],
+      tabs: [chatTab('tab-a', 'session-a')],
       targetSessionId: 'session-a',
     })).toEqual({ type: 'jump-to-tab', tabId: 'tab-a' });
   });
 
   test('opens a new tab for an unopened persisted session', () => {
     expect(planSessionOpen({
-      tabs: [{ id: 'tab-a', sessionId: 'session-a' }],
+      tabs: [chatTab('tab-a', 'session-a')],
       targetSessionId: 'session-b',
     })).toEqual({ type: 'open-new-tab' });
   });
