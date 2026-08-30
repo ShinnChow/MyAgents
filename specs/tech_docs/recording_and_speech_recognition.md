@@ -14,6 +14,8 @@
 
 Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/stdout framed protocol；live PCM 是有界 binary frame，控制与结果是有界 JSON frame。Worker 路径、模型路径和 transcript 不进入 Debug / unified log。
 
+随 App 发布的 speech native bundle 由唯一入口 `scripts/prepare-native-inference.mjs` 构建。顶层 owner 在同一仓库锁内取得 exact target document prepared bundle 的 immutable ONNX Runtime descriptor，再交给 speech builder；speech 不读取当前 `document-processing/v1` 投影，也不复制 ORT。Sherpa 上游 archive 只展开 CMake 构建实际需要的根文件、`cmake/` 与 `sherpa-onnx/`，因此 Windows 构建不要求物化示例、移动端等无关目录中的 symlink。
+
 ## 产品控制面与投影
 
 - Launcher 的 Chat/Record mode 共用输入主区域；text/audio Record 进入同一个任务中心列表。文字创建仍写 `RecordStore`，开始录音必须先取得 `RecordingManager` 唯一采集槽。

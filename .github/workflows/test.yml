@@ -6,7 +6,7 @@ name: Test
 on:
   pull_request:
   push:
-    branches: [main, 'dev/**']
+    branches: [main, "dev/**"]
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -64,6 +64,7 @@ jobs:
             librsvg2-dev \
             libxdo-dev \
             libssl-dev \
+            libpipewire-0.3-dev \
             build-essential \
             file
       - uses: dtolnay/rust-toolchain@1.92.0
@@ -109,6 +110,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify selective Sherpa source extraction on Windows
+        run: node --test scripts/sherpa-source-extraction.test.mjs
       - uses: dtolnay/rust-toolchain@1.92.0
       - uses: Swatinem/rust-cache@v2
         with:

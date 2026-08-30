@@ -135,6 +135,7 @@ describe('ThoughtPanel Record search', () => {
     render(<ThoughtPanel />);
 
     await screen.findByText(AUDIO_RECORD.title);
+    fireEvent.click(screen.getByTitle('更多操作'));
     fireEvent.click(screen.getByRole('button', { name: '多选' }));
     fireEvent.click(screen.getByRole('button', { name: '删除' }));
 

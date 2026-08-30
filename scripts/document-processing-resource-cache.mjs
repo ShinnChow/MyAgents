@@ -370,6 +370,25 @@ export function validatePreparedBundle(root, expected) {
   }
 }
 
+export function documentRuntimeFromPreparedBundle(root, expected) {
+  if (!validatePreparedBundle(root, expected)) return null;
+  const manifest = JSON.parse(
+    readFileSync(join(root, "manifest.json"), "utf8"),
+  );
+  const runtime = manifest.files.onnxRuntime;
+  return Object.freeze({
+    target: expected.target,
+    platform: manifest.platform,
+    architecture: manifest.architecture,
+    bundleRoot: root,
+    path: resolve(root, runtime.path),
+    license: runtime.license,
+    upstreamRevision: runtime.upstreamRevision,
+    sha256: runtime.sha256,
+    size: runtime.size,
+  });
+}
+
 function processIsAlive(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   try {

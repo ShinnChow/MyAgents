@@ -29,6 +29,42 @@ export const REQUIRED_SPEECH_LEGAL_FILES = [
   'SPEECH_INFERENCE_NOTICES.md',
 ];
 
+export function validateDocumentRuntimeDescriptor(runtime, expected) {
+  if (
+    runtime?.target !== expected.target ||
+    runtime.platform !== expected.platform ||
+    runtime.architecture !== expected.architecture ||
+    runtime.license !== 'MIT' ||
+    runtime.upstreamRevision !== expected.upstreamRevision ||
+    typeof runtime.bundleRoot !== 'string' ||
+    runtime.bundleRoot.length === 0 ||
+    typeof runtime.path !== 'string' ||
+    runtime.path.length === 0 ||
+    !/^[0-9a-f]{64}$/.test(runtime.sha256 ?? '') ||
+    !Number.isSafeInteger(runtime.size) ||
+    runtime.size <= 0
+  ) {
+    throw new Error(
+      `Document-processing ONNX Runtime does not match speech target ${expected.target}`,
+    );
+  }
+  const root = resolve(runtime.bundleRoot);
+  const path = resolve(runtime.path);
+  if (!path.startsWith(`${root}${sep}`)) {
+    throw new Error('Document-processing ONNX Runtime path is unsafe');
+  }
+  const metadata = lstatSync(path);
+  if (
+    !metadata.isFile() ||
+    metadata.isSymbolicLink() ||
+    metadata.size !== runtime.size ||
+    sha256File(path) !== runtime.sha256
+  ) {
+    throw new Error('Document-processing ONNX Runtime integrity mismatch');
+  }
+  return Object.freeze({ ...runtime, path });
+}
+
 function validLockedSource(entry) {
   return (
     typeof entry?.url === 'string' &&
@@ -65,6 +101,7 @@ export function validateSpeechBuildLock(lock) {
     speech.nativeIncrementHardLimitBytes <= 0 ||
     speech.nativeIncrementHardLimitBytes > 80 * 1024 * 1024 ||
     !validLockedSource(speech.source) ||
+    speech.source.archiveRoot !== `sherpa-onnx-${speech.sherpaOnnxCommit}` ||
     !Array.isArray(speech.dependencies)
   ) {
     return false;
