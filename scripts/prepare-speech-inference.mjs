@@ -28,7 +28,10 @@ import {
   validatePreparedSpeechBundle,
   validateSpeechBuildLock,
 } from './speech-inference-resource-cache.mjs';
-import { extractSherpaBuildSource } from './sherpa-source-extraction.mjs';
+import {
+  extractSherpaBuildSource,
+  patchSherpaWindowsOnnxRuntimeImport,
+} from './sherpa-source-extraction.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const appVersion = JSON.parse(
@@ -476,12 +479,15 @@ export async function prepareSpeechInference(options, documentResult) {
   if (existsSync(preparedRoot)) {
     rmSync(preparedRoot, { recursive: true, force: true });
   }
-  const workParent = join(cacheRoot, 'speech-work');
+  // MSBuild FileTracker still creates MAX_PATH-sensitive nested tlog paths.
+  // Keep transient build segments short while the final cache and projection
+  // retain their descriptive, target-scoped names.
+  const workParent = join(cacheRoot, 'w');
   mkdirSync(workParent, { recursive: true });
-  const workRoot = mkdtempSync(join(workParent, `${target}-`));
-  const stageRoot = join(workRoot, 'v1');
-  const extractRoot = join(workRoot, 'extract');
-  const buildRoot = join(workRoot, 'build');
+  const workRoot = mkdtempSync(join(workParent, 's-'));
+  const stageRoot = join(workRoot, 'v');
+  const extractRoot = join(workRoot, 'x');
+  const buildRoot = join(workRoot, 'b');
   mkdirSync(join(stageRoot, 'native'), { recursive: true });
   mkdirSync(join(stageRoot, 'legal'), { recursive: true });
   mkdirSync(extractRoot, { recursive: true });
@@ -492,19 +498,22 @@ export async function prepareSpeechInference(options, documentResult) {
       speechLock.source,
       speechLock.source.archiveName,
     );
-    const sourceExtract = join(extractRoot, 'sherpa-source');
+    const sourceExtract = join(extractRoot, 's');
     mkdirSync(sourceExtract, { recursive: true });
     const sherpaSource = extractSherpaBuildSource({
       archive: sourceArchive,
       destination: sourceExtract,
       archiveRoot: speechLock.source.archiveRoot,
     });
+    if (targetLock.platform === 'windows') {
+      patchSherpaWindowsOnnxRuntimeImport(sherpaSource);
+    }
     for (const dependency of speechLock.dependencies) {
       const archive = await acquire(dependency, dependency.archiveName);
       copyFileSync(archive, join(sherpaSource, dependency.archiveName));
     }
 
-    const ortBuildRoot = join(workRoot, 'onnxruntime');
+    const ortBuildRoot = join(workRoot, 'o');
     const ortLibraryRoot = join(ortBuildRoot, 'lib');
     mkdirSync(ortLibraryRoot, { recursive: true });
     const runtimeBuildName =
@@ -560,7 +569,7 @@ export async function prepareSpeechInference(options, documentResult) {
       );
     }
 
-    const sherpaBuild = join(buildRoot, 'sherpa');
+    const sherpaBuild = join(buildRoot, 's');
     execFileSync(
       'cmake',
       [
@@ -620,8 +629,16 @@ export async function prepareSpeechInference(options, documentResult) {
         `${targetLock.platform === 'windows' ? '' : 'lib'}sherpa-onnx-c-api${sharedLibraryExtension}`,
       'sherpa-onnx C API shared library',
     );
+    const sherpaLinkLibrary =
+      targetLock.platform === 'windows'
+        ? findOne(
+            sherpaBuild,
+            (path) => basename(path) === 'sherpa-onnx-c-api.lib',
+            'sherpa-onnx C API import library',
+          )
+        : sherpaLibrary;
 
-    const adapterBuild = join(buildRoot, 'adapter');
+    const adapterBuild = join(buildRoot, 'a');
     const hclustIncludeRoot = join(sherpaBuild, '_deps', 'hclust_cpp-src');
     if (!existsSync(join(hclustIncludeRoot, 'fastcluster-all-in-one.h'))) {
       throw new Error(
@@ -637,7 +654,7 @@ export async function prepareSpeechInference(options, documentResult) {
         adapterBuild,
         '-DCMAKE_BUILD_TYPE=Release',
         `-DMYAGENTS_SHERPA_INCLUDE_DIR=${sherpaSource}`,
-        `-DMYAGENTS_SHERPA_LIBRARY_DIR=${dirname(sherpaLibrary)}`,
+        `-DMYAGENTS_SHERPA_LIBRARY=${sherpaLinkLibrary}`,
         `-DMYAGENTS_HCLUST_INCLUDE_DIR=${hclustIncludeRoot}`,
         ...configurePlatformArgs(),
       ],

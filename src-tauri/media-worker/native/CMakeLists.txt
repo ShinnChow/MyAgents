@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.28)
 project(myagents_speech_adapter LANGUAGES CXX)
 
-foreach(required IN ITEMS MYAGENTS_SHERPA_INCLUDE_DIR MYAGENTS_SHERPA_LIBRARY_DIR MYAGENTS_HCLUST_INCLUDE_DIR)
+foreach(required IN ITEMS MYAGENTS_SHERPA_INCLUDE_DIR MYAGENTS_SHERPA_LIBRARY MYAGENTS_HCLUST_INCLUDE_DIR)
   if(NOT DEFINED ${required} OR "${${required}}" STREQUAL "")
     message(FATAL_ERROR "${required} is required")
   endif()
@@ -21,11 +21,10 @@ target_include_directories(
   myagents-speech-adapter
   SYSTEM PRIVATE "${MYAGENTS_HCLUST_INCLUDE_DIR}"
 )
-target_link_directories(
+target_link_libraries(
   myagents-speech-adapter
-  PRIVATE "${MYAGENTS_SHERPA_LIBRARY_DIR}"
+  PRIVATE "${MYAGENTS_SHERPA_LIBRARY}"
 )
-target_link_libraries(myagents-speech-adapter PRIVATE sherpa-onnx-c-api)
 set_target_properties(
   myagents-speech-adapter
   PROPERTIES
@@ -49,7 +48,7 @@ elseif(UNIX)
 endif()
 
 if(MSVC)
-  target_compile_options(myagents-speech-adapter PRIVATE /W4 /WX /EHsc)
+  target_compile_options(myagents-speech-adapter PRIVATE /W4 /WX /EHsc /utf-8)
 else()
   target_compile_options(
     myagents-speech-adapter

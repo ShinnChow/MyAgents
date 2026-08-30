@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import {
   existsSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -10,7 +11,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { extractSherpaBuildSource } from './sherpa-source-extraction.mjs';
+import {
+  extractSherpaBuildSource,
+  patchSherpaWindowsOnnxRuntimeImport,
+} from './sherpa-source-extraction.mjs';
 
 // A tiny tar.gz with the required build tree plus an unrelated symlink. The
 // extractor must never ask the host tar to materialize that symlink on Windows.
@@ -57,6 +61,65 @@ test('rejects an archive root that could escape the extraction destination', () 
           archiveRoot: '../outside',
         }),
       /invalid archive root/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('patches the locked Sherpa Windows CPU import to use the DLL and import library pair', () => {
+  const root = mkdtempSync(join(tmpdir(), 'myagents-sherpa-ort-import-'));
+  const cmakeRoot = join(root, 'cmake');
+  const cmakePath = join(cmakeRoot, 'onnxruntime.cmake');
+  mkdirSync(cmakeRoot, { recursive: true });
+  writeFileSync(
+    cmakePath,
+    `before\n    elseif(WIN32)
+      if(SHERPA_ONNX_ENABLE_GPU)
+        set(location_onnxruntime_lib $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.dll)
+        set(location_onnxruntime_lib2 $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.lib)
+      else()
+        set(location_onnxruntime_lib $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.lib)
+        if(SHERPA_ONNX_ENABLE_DIRECTML)
+          include(onnxruntime-win-x64-directml)
+        endif()
+      endif()
+after\n`,
+  );
+
+  try {
+    assert.equal(patchSherpaWindowsOnnxRuntimeImport(root), true);
+    const patched = readFileSync(cmakePath, 'utf8');
+    assert.match(
+      patched,
+      /set\(location_onnxruntime_lib \$ENV\{SHERPA_ONNXRUNTIME_LIB_DIR\}\/onnxruntime\.dll\)/,
+    );
+    assert.match(
+      patched,
+      /set\(location_onnxruntime_lib2 \$ENV\{SHERPA_ONNXRUNTIME_LIB_DIR\}\/onnxruntime\.lib\)/,
+    );
+    assert.doesNotMatch(patched, /if\(SHERPA_ONNX_ENABLE_GPU\)/);
+    assert.equal(patchSherpaWindowsOnnxRuntimeImport(root), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rejects Sherpa CMake drift instead of applying an ambiguous patch', () => {
+  const root = mkdtempSync(join(tmpdir(), 'myagents-sherpa-ort-drift-'));
+  const cmakeRoot = join(root, 'cmake');
+  const cmakePath = join(cmakeRoot, 'onnxruntime.cmake');
+  mkdirSync(cmakeRoot, { recursive: true });
+  writeFileSync(cmakePath, 'unexpected upstream content\n');
+
+  try {
+    assert.throws(
+      () => patchSherpaWindowsOnnxRuntimeImport(root),
+      /no longer matches the expected Windows CPU import block/,
+    );
+    assert.equal(
+      readFileSync(cmakePath, 'utf8'),
+      'unexpected upstream content\n',
     );
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { lstatSync, mkdirSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const SHERPA_BUILD_MEMBERS = Object.freeze([
@@ -9,6 +9,26 @@ export const SHERPA_BUILD_MEMBERS = Object.freeze([
   'sherpa-onnx',
 ]);
 
+const WINDOWS_ORT_IMPORT_BROKEN = `    elseif(WIN32)
+      if(SHERPA_ONNX_ENABLE_GPU)
+        set(location_onnxruntime_lib $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.dll)
+        set(location_onnxruntime_lib2 $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.lib)
+      else()
+        set(location_onnxruntime_lib $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.lib)
+        if(SHERPA_ONNX_ENABLE_DIRECTML)
+          include(onnxruntime-win-x64-directml)
+        endif()
+      endif()
+`;
+
+const WINDOWS_ORT_IMPORT_FIXED = `    elseif(WIN32)
+      set(location_onnxruntime_lib $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.dll)
+      set(location_onnxruntime_lib2 $ENV{SHERPA_ONNXRUNTIME_LIB_DIR}/onnxruntime.lib)
+      if(SHERPA_ONNX_ENABLE_DIRECTML)
+        include(onnxruntime-win-x64-directml)
+      endif()
+`;
+
 function requireEntry(path, kind) {
   const metadata = lstatSync(path);
   const valid =
@@ -17,6 +37,30 @@ function requireEntry(path, kind) {
   if (!valid) {
     throw new Error(`Sherpa build source ${kind} is unavailable: ${path}`);
   }
+}
+
+export function patchSherpaWindowsOnnxRuntimeImport(sourceRoot) {
+  const cmakePath = join(sourceRoot, 'cmake', 'onnxruntime.cmake');
+  requireEntry(cmakePath, 'file');
+  const source = readFileSync(cmakePath, 'utf8');
+  if (source.includes(WINDOWS_ORT_IMPORT_FIXED)) {
+    return false;
+  }
+  const firstMatch = source.indexOf(WINDOWS_ORT_IMPORT_BROKEN);
+  if (
+    firstMatch < 0 ||
+    source.indexOf(WINDOWS_ORT_IMPORT_BROKEN, firstMatch + 1) >= 0
+  ) {
+    throw new Error(
+      'Locked Sherpa ONNX Runtime CMake no longer matches the expected Windows CPU import block',
+    );
+  }
+  writeFileSync(
+    cmakePath,
+    source.replace(WINDOWS_ORT_IMPORT_BROKEN, WINDOWS_ORT_IMPORT_FIXED),
+    'utf8',
+  );
+  return true;
 }
 
 export function extractSherpaBuildSource({
