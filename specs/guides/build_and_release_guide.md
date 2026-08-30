@@ -97,7 +97,7 @@ myagents-releases/
 
 **注意**：如果未设置 `TAURI_SIGNING_PRIVATE_KEY`，脚本会显示警告并询问是否继续。构建出的应用**无法使用自动更新功能**。
 
-MyAgents 支持 macOS 13，而官方 ONNX Runtime 1.28 arm64 archive 的最低系统版本是 macOS 14，且没有 x64 archive。因此 Apple Silicon 与 Intel 都从锁定源码按 deployment target 13.0 构建共享 ONNX Runtime。`build_macos.sh` 会在正式构建前通过 `scripts/prepare-native-inference.mjs` 统一检查并准备 document/speech 两个 capability；已有当前 fingerprint 的完整 prepared cache 时不会强制要求源码构建工具。脚本不会自动执行 Homebrew 或修改系统环境，缺项时会给出对应的安装与验证命令。
+MyAgents 支持 macOS 13，而官方 ONNX Runtime 1.28 arm64 archive 的最低系统版本是 macOS 14，且没有 x64 archive。因此 Apple Silicon 与 Intel 都从锁定源码按 deployment target 13.0 构建共享 ONNX Runtime。`build_macos.sh` 会在正式构建前对每个所选 target 调用 `scripts/prepare-native-inference.mjs`；顶层入口只解析一次 target，并以 exact target prepared cache（而非当前 `resources/*/v1` 投影）完成 document/speech 预检和准备。因此在 Apple Silicon 上选择 Both 时，先前的 arm64 投影不会参与 x86_64 的 cache 或 ORT identity 决策。已有当前 fingerprint 的完整 prepared cache 时不会强制要求源码构建工具。脚本不会自动执行 Homebrew 或修改系统环境，缺项时会给出对应的安装与验证命令。
 
 native inference 的受支持 target 由 `src-tauri/document-worker/resource-lock.json::targets` 唯一锁定：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`。每个正式产物都必须由同一 `prepare-native-inference` 入口生成 document/speech 两份 target manifest；speech bundle 只携带 media Worker、sherpa adapter/native 依赖与 legal inventory，ONNX Runtime 必须引用同 target document artifact，不能复制第二份。真实发布验收需在对应 target 机器/runner 上检查签名、notices、Worker 最小加载和至少一份媒体 smoke；不能用 host-only 单测替代五 target 产物证据。
 
@@ -370,11 +370,15 @@ curl -s https://download.myagents.io/update/darwin-aarch64.json | jq .
 
 ### 6. 提交代码和打 Tag
 
+feature 分支 push 后，必须等待现有 GitHub `Test` workflow 对 feature HEAD 的精确 SHA 成功，再以 `--no-ff` 合并并 push `main`。随后再次等待 `Test` 对最终 main SHA 成功；没有 run、run 被取消或任一 job 失败都停止发布，不能拿父 commit 或其它分支的绿色结果替代。测试内容只由该 workflow 定义，发布步骤不复制一份 job 清单。
+
 ```bash
 git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock CHANGELOG.md
 git commit -m "chore: release v0.1.0" -m "Prepare the tracked version metadata and changelog for the v0.1.0 release."
-git tag v0.1.0
-git push origin main --tags
+git push origin main
+# 确认 Test 对当前 git rev-parse HEAD 的 run 已 terminal success
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
 ```
 
 ---

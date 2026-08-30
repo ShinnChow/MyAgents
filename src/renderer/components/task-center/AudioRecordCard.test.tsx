@@ -71,7 +71,13 @@ describe('AudioRecordCard', () => {
     const user = userEvent.setup();
     const onDiscuss = vi.fn();
     render(
-      <AudioRecordCard record={RECORD} onOpen={vi.fn()} onArchive={vi.fn()} onDelete={vi.fn()} onDiscuss={onDiscuss} />,
+      <AudioRecordCard
+        record={RECORD}
+        onOpen={vi.fn()}
+        onArchive={vi.fn()}
+        onDelete={vi.fn()}
+        onDiscuss={onDiscuss}
+      />,
     );
 
     await user.click(screen.getByRole('button', { name: 'AI 讨论' }));
@@ -126,7 +132,30 @@ describe('AudioRecordCard', () => {
 
     await user.click(screen.getByRole('button', { name: /Weekly meeting/ }));
     expect(onOpen).toHaveBeenCalledWith(RECORD.id, 42_000, false);
-    expect(screen.queryByText('Alice: roadmap decision')).not.toBeInTheDocument();
+    expect(screen.getByText('Alice: roadmap decision')).toBeInTheDocument();
+  });
+
+  it('keeps the search snippet visible in selection mode', () => {
+    render(
+      <AudioRecordCard
+        record={RECORD}
+        onOpen={vi.fn()}
+        onArchive={vi.fn()}
+        onDelete={vi.fn()}
+        selectMode
+        selected={false}
+        onToggleSelect={vi.fn()}
+        searchHit={{
+          recordId: RECORD.id,
+          kind: 'audio',
+          title: RECORD.title,
+          snippet: 'Alice: roadmap decision',
+          mediaMs: 42_000,
+        }}
+      />,
+    );
+
+    expect(screen.getByText('Alice: roadmap decision')).toBeInTheDocument();
   });
 
   it('opens from the whole card while keeping floating controls independent', async () => {
@@ -156,7 +185,14 @@ describe('AudioRecordCard', () => {
 
   it('keeps AI discussion and playback out of the More menu', async () => {
     const user = userEvent.setup();
-    render(<AudioRecordCard record={RECORD} onOpen={vi.fn()} onArchive={vi.fn()} onDelete={vi.fn()} />);
+    render(
+      <AudioRecordCard
+        record={RECORD}
+        onOpen={vi.fn()}
+        onArchive={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
 
     expect(screen.queryByRole('button', { name: '播放' })).toBeNull();
     await user.click(screen.getByTitle('更多操作'));

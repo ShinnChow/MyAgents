@@ -21,14 +21,14 @@ import { fileURLToPath } from 'node:url';
 import {
   acquireLockedResource,
   computeBuildFingerprint,
-  hostDocumentTarget,
   sha256File,
-  withResourcePrepareLock,
 } from './document-processing-resource-cache.mjs';
 import {
+  validateDocumentRuntimeDescriptor,
   validatePreparedSpeechBundle,
   validateSpeechBuildLock,
 } from './speech-inference-resource-cache.mjs';
+import { extractSherpaBuildSource } from './sherpa-source-extraction.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const appVersion = JSON.parse(
@@ -42,35 +42,11 @@ if (!validateSpeechBuildLock(lock)) {
   throw new Error('Speech inference source lock is invalid or incomplete');
 }
 
-const args = process.argv.slice(2);
-const positional = args.filter((argument) => !argument.startsWith('--'));
-const unknownFlags = args.filter(
-  (argument) =>
-    argument.startsWith('--') &&
-    !['--force', '--offline', '--check-prerequisites'].includes(argument),
-);
-if (positional.length > 1 || unknownFlags.length > 0) {
-  throw new Error(
-    'Usage: node scripts/prepare-speech-inference.mjs [target] [--force] [--offline] [--check-prerequisites]',
-  );
-}
-const target = positional[0] ?? hostDocumentTarget();
-const force = args.includes('--force');
-const checkPrerequisites = args.includes('--check-prerequisites');
-const offline =
-  args.includes('--offline') ||
-  process.env.MYAGENTS_NATIVE_RESOURCES_OFFLINE === '1' ||
-  process.env.MYAGENTS_DOCUMENT_RESOURCES_OFFLINE === '1';
-if (checkPrerequisites && (force || args.includes('--offline'))) {
-  throw new Error(
-    '--check-prerequisites cannot be combined with --force or --offline',
-  );
-}
-if (!lock.targets[target]) {
-  throw new Error(`Unsupported speech-inference target: ${target}`);
-}
-
-const targetLock = lock.targets[target];
+let target;
+let force;
+let checkPrerequisites;
+let offline;
+let targetLock;
 const speechLock = lock.speechInference;
 const cacheRoot = join(
   projectRoot,
@@ -83,13 +59,6 @@ const legacyCacheRoot = join(
   'src-tauri',
   'target',
   'document-processing-cache',
-);
-const documentResourceRoot = join(
-  projectRoot,
-  'src-tauri',
-  'resources',
-  'document-processing',
-  'v1',
 );
 const resourceRoot = join(
   projectRoot,
@@ -109,6 +78,11 @@ const sharedHelperPath = join(
   projectRoot,
   'scripts',
   'document-processing-resource-cache.mjs',
+);
+const extractionHelperPath = join(
+  projectRoot,
+  'scripts',
+  'sherpa-source-extraction.mjs',
 );
 const buildJobs = String(
   Math.max(
@@ -184,18 +158,6 @@ function filesUnder(root, result = []) {
   return result;
 }
 
-function firstDirectory(root) {
-  const directories = readdirSync(root, { withFileTypes: true }).filter(
-    (entry) => entry.isDirectory(),
-  );
-  if (directories.length !== 1) {
-    throw new Error(
-      `Expected one source directory under ${root}, found ${directories.length}`,
-    );
-  }
-  return join(root, directories[0].name);
-}
-
 function findOne(root, predicate, description) {
   const matches = filesUnder(root).filter(predicate);
   if (matches.length !== 1) {
@@ -217,124 +179,93 @@ async function acquire(entry, cacheName) {
   });
 }
 
-function documentRuntimeReference() {
-  const manifestPath = join(documentResourceRoot, 'manifest.json');
-  const manifestMetadata = lstatSync(manifestPath);
-  if (!manifestMetadata.isFile() || manifestMetadata.isSymbolicLink()) {
-    throw new Error('Document-processing resource manifest is unavailable');
-  }
-  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
-  const runtime = manifest.files?.onnxRuntime;
-  if (
-    manifest.schemaVersion !== 1 ||
-    manifest.platform !== targetLock.platform ||
-    manifest.architecture !== targetLock.architecture ||
-    runtime?.license !== 'MIT' ||
-    runtime.upstreamRevision !== speechLock.onnxRuntimeUpstreamRevision ||
-    typeof runtime.path !== 'string' ||
-    runtime.path.length === 0 ||
-    !/^[0-9a-f]{64}$/.test(runtime.sha256 ?? '') ||
-    !Number.isSafeInteger(runtime.size) ||
-    runtime.size <= 0
-  ) {
-    throw new Error(
-      `Document-processing ONNX Runtime does not match speech target ${target}`,
-    );
-  }
-  const path = resolve(documentResourceRoot, runtime.path);
-  if (
-    !path.startsWith(
-      `${resolve(documentResourceRoot)}${process.platform === 'win32' ? '\\' : '/'}`,
-    )
-  ) {
-    throw new Error('Document-processing ONNX Runtime path is unsafe');
-  }
-  const metadata = lstatSync(path);
-  if (
-    !metadata.isFile() ||
-    metadata.isSymbolicLink() ||
-    metadata.size !== runtime.size ||
-    sha256File(path) !== runtime.sha256
-  ) {
-    throw new Error('Document-processing ONNX Runtime integrity mismatch');
-  }
-  return { ...runtime, path };
-}
-
 const appleSigningIdentity = process.env.APPLE_SIGNING_IDENTITY?.trim();
 const windowsSignTool = process.env.WINDOWS_SIGNTOOL_PATH?.trim();
 const windowsCertificateSha1 = process.env.WINDOWS_CERTIFICATE_SHA1?.trim();
-if (
-  targetLock.platform === 'windows' &&
-  Boolean(windowsSignTool) !== Boolean(windowsCertificateSha1)
-) {
-  throw new Error(
-    'WINDOWS_SIGNTOOL_PATH and WINDOWS_CERTIFICATE_SHA1 must be set together',
-  );
-}
-const signingKind =
-  targetLock.platform === 'macos'
-    ? 'codesign'
-    : targetLock.platform === 'windows'
-      ? 'authenticode'
-      : 'sha256-manifest';
-const signingIdentity =
-  targetLock.platform === 'macos'
-    ? appleSigningIdentity || 'adhoc-development-build'
-    : targetLock.platform === 'windows'
-      ? windowsCertificateSha1?.toLowerCase() || 'development-build'
-      : 'MyAgents-resource-manifest-v1';
 const rustcIdentity = execFileSync('rustc', ['-Vv'], {
   encoding: 'utf8',
 }).trim();
-const buildFingerprint = computeBuildFingerprint({
-  projectRoot,
-  metadata: {
-    prepareSchemaVersion: 1,
-    appVersion,
-    target,
-    targetLock,
-    speechLock,
-    rustcIdentity,
-    signingIdentity,
-    windowsSignTool: windowsSignTool || '',
-    windowsTimestampUrl: process.env.WINDOWS_TIMESTAMP_URL?.trim() || '',
-  },
-  inputs: [
-    preparePath,
-    helperPath,
-    sharedHelperPath,
-    lockPath,
-    join(projectRoot, 'rust-toolchain.toml'),
-    join(mediaWorkerRoot, 'Cargo.toml'),
-    join(mediaWorkerRoot, 'Cargo.lock'),
-    join(mediaWorkerRoot, 'SPEECH_INFERENCE_NOTICES.md'),
-    join(mediaWorkerRoot, 'native'),
-    join(mediaWorkerRoot, 'src'),
-    join(projectRoot, 'src-tauri', 'media-worker-protocol'),
-  ],
-});
-const sharedRuntime = documentRuntimeReference();
-const expectedBundle = {
-  adapterAbiVersion: speechLock.adapterAbiVersion,
-  platform: targetLock.platform,
-  architecture: targetLock.architecture,
-  buildFingerprint,
-  sherpaOnnxVersion: speechLock.sherpaOnnxVersion,
-  sherpaOnnxCommit: speechLock.sherpaOnnxCommit,
-  onnxRuntimeVersion: speechLock.onnxRuntimeVersion,
-  onnxRuntimeUpstreamRevision: speechLock.onnxRuntimeUpstreamRevision,
-  onnxRuntimeSha256: sharedRuntime.sha256,
-  onnxRuntimeSize: sharedRuntime.size,
-  nativeIncrementHardLimitBytes: speechLock.nativeIncrementHardLimitBytes,
-  signingKind,
-};
-const preparedRoot = join(
-  cacheRoot,
-  'prepared-speech',
-  target,
-  buildFingerprint,
-);
+let signingKind;
+let signingIdentity;
+let buildFingerprint;
+let preparedRoot;
+
+function configurePreparation(options) {
+  target = options.target;
+  force = options.force;
+  checkPrerequisites = options.checkPrerequisites;
+  offline = options.speechOffline;
+  targetLock = lock.targets[target];
+  if (!targetLock) {
+    throw new Error(`Unsupported speech-inference target: ${target}`);
+  }
+  if (
+    targetLock.platform === 'windows' &&
+    Boolean(windowsSignTool) !== Boolean(windowsCertificateSha1)
+  ) {
+    throw new Error(
+      'WINDOWS_SIGNTOOL_PATH and WINDOWS_CERTIFICATE_SHA1 must be set together',
+    );
+  }
+  signingKind =
+    targetLock.platform === 'macos'
+      ? 'codesign'
+      : targetLock.platform === 'windows'
+        ? 'authenticode'
+        : 'sha256-manifest';
+  signingIdentity =
+    targetLock.platform === 'macos'
+      ? appleSigningIdentity || 'adhoc-development-build'
+      : targetLock.platform === 'windows'
+        ? windowsCertificateSha1?.toLowerCase() || 'development-build'
+        : 'MyAgents-resource-manifest-v1';
+  buildFingerprint = computeBuildFingerprint({
+    projectRoot,
+    metadata: {
+      prepareSchemaVersion: 2,
+      appVersion,
+      target,
+      targetLock,
+      speechLock,
+      rustcIdentity,
+      signingIdentity,
+      windowsSignTool: windowsSignTool || '',
+      windowsTimestampUrl: process.env.WINDOWS_TIMESTAMP_URL?.trim() || '',
+    },
+    inputs: [
+      preparePath,
+      helperPath,
+      sharedHelperPath,
+      extractionHelperPath,
+      lockPath,
+      join(projectRoot, 'rust-toolchain.toml'),
+      join(mediaWorkerRoot, 'Cargo.toml'),
+      join(mediaWorkerRoot, 'Cargo.lock'),
+      join(mediaWorkerRoot, 'SPEECH_INFERENCE_NOTICES.md'),
+      join(mediaWorkerRoot, 'native'),
+      join(mediaWorkerRoot, 'src'),
+      join(projectRoot, 'src-tauri', 'media-worker-protocol'),
+    ],
+  });
+  preparedRoot = join(cacheRoot, 'prepared-speech', target, buildFingerprint);
+}
+
+function expectedSpeechBundle(runtime) {
+  return {
+    adapterAbiVersion: speechLock.adapterAbiVersion,
+    platform: targetLock.platform,
+    architecture: targetLock.architecture,
+    buildFingerprint,
+    sherpaOnnxVersion: speechLock.sherpaOnnxVersion,
+    sherpaOnnxCommit: speechLock.sherpaOnnxCommit,
+    onnxRuntimeVersion: speechLock.onnxRuntimeVersion,
+    onnxRuntimeUpstreamRevision: speechLock.onnxRuntimeUpstreamRevision,
+    onnxRuntimeSha256: runtime.sha256,
+    onnxRuntimeSize: runtime.size,
+    nativeIncrementHardLimitBytes: speechLock.nativeIncrementHardLimitBytes,
+    signingKind,
+  };
+}
 
 function recoverProjection() {
   mkdirSync(resourceRoot, { recursive: true });
@@ -358,7 +289,7 @@ function recoverProjection() {
   }
 }
 
-function publishPreparedBundle(source) {
+function publishPreparedBundle(source, expectedBundle) {
   if (validatePreparedSpeechBundle(publishRoot, expectedBundle)) return false;
   const token = `${process.pid}-${randomUUID()}`;
   const projectionStage = join(resourceRoot, `.v1-staging-${token}`);
@@ -501,446 +432,435 @@ function signNativeFiles(paths) {
   }
 }
 
-await withResourcePrepareLock(
-  cacheRoot,
-  async () => {
-    if (checkPrerequisites) {
-      if (
-        validatePreparedSpeechBundle(publishRoot, expectedBundle) ||
-        validatePreparedSpeechBundle(preparedRoot, expectedBundle)
-      ) {
-        console.log(
-          `Speech-inference build prerequisites not needed for ${target} (prepared cache hit)`,
-        );
-        return;
-      }
-      assertPrerequisites();
-      return;
-    }
-    recoverProjection();
-    if (!force && validatePreparedSpeechBundle(publishRoot, expectedBundle)) {
+export async function prepareSpeechInference(options, documentResult) {
+  configurePreparation(options);
+  if (checkPrerequisites && !documentResult?.runtime) {
+    assertPrerequisites();
+    return Object.freeze({ target, needsBuild: true });
+  }
+  const sharedRuntime = validateDocumentRuntimeDescriptor(
+    documentResult?.runtime,
+    {
+      target,
+      platform: targetLock.platform,
+      architecture: targetLock.architecture,
+      upstreamRevision: speechLock.onnxRuntimeUpstreamRevision,
+    },
+  );
+  const expectedBundle = expectedSpeechBundle(sharedRuntime);
+  if (checkPrerequisites) {
+    if (validatePreparedSpeechBundle(preparedRoot, expectedBundle)) {
       console.log(
-        `Speech-inference resources already ready for ${target} (fingerprint ${buildFingerprint.slice(0, 12)})`,
+        `Speech-inference build prerequisites not needed for ${target} (prepared cache hit)`,
       );
-      return;
-    }
-    if (!force && validatePreparedSpeechBundle(preparedRoot, expectedBundle)) {
-      publishPreparedBundle(preparedRoot);
-      console.log(
-        `Restored cached speech-inference resources for ${target} (fingerprint ${buildFingerprint.slice(0, 12)})`,
-      );
-      return;
-    }
-    if (offline) {
-      throw new Error(
-        `Offline prepared speech bundle cache miss for ${target} (${preparedRoot}); run the prepare command online once`,
-      );
+      return Object.freeze({ target, needsBuild: false });
     }
     assertPrerequisites();
-    const runtime = sharedRuntime;
-    if (existsSync(preparedRoot)) {
-      rmSync(preparedRoot, { recursive: true, force: true });
-    }
-    const workParent = join(cacheRoot, 'speech-work');
-    mkdirSync(workParent, { recursive: true });
-    const workRoot = mkdtempSync(join(workParent, `${target}-`));
-    const stageRoot = join(workRoot, 'v1');
-    const extractRoot = join(workRoot, 'extract');
-    const buildRoot = join(workRoot, 'build');
-    mkdirSync(join(stageRoot, 'native'), { recursive: true });
-    mkdirSync(join(stageRoot, 'legal'), { recursive: true });
-    mkdirSync(extractRoot, { recursive: true });
-    mkdirSync(buildRoot, { recursive: true });
+    return Object.freeze({ target, needsBuild: true });
+  }
+  recoverProjection();
+  if (!force && validatePreparedSpeechBundle(preparedRoot, expectedBundle)) {
+    publishPreparedBundle(preparedRoot, expectedBundle);
+    console.log(
+      `Restored cached speech-inference resources for ${target} (fingerprint ${buildFingerprint.slice(0, 12)})`,
+    );
+    return Object.freeze({ target, needsBuild: false });
+  }
+  if (offline) {
+    throw new Error(
+      `Offline prepared speech bundle cache miss for ${target} (${preparedRoot}); run the prepare command online once`,
+    );
+  }
+  assertPrerequisites();
+  const runtime = sharedRuntime;
+  if (existsSync(preparedRoot)) {
+    rmSync(preparedRoot, { recursive: true, force: true });
+  }
+  const workParent = join(cacheRoot, 'speech-work');
+  mkdirSync(workParent, { recursive: true });
+  const workRoot = mkdtempSync(join(workParent, `${target}-`));
+  const stageRoot = join(workRoot, 'v1');
+  const extractRoot = join(workRoot, 'extract');
+  const buildRoot = join(workRoot, 'build');
+  mkdirSync(join(stageRoot, 'native'), { recursive: true });
+  mkdirSync(join(stageRoot, 'legal'), { recursive: true });
+  mkdirSync(extractRoot, { recursive: true });
+  mkdirSync(buildRoot, { recursive: true });
 
-    try {
-      const sourceArchive = await acquire(
-        speechLock.source,
-        speechLock.source.archiveName,
+  try {
+    const sourceArchive = await acquire(
+      speechLock.source,
+      speechLock.source.archiveName,
+    );
+    const sourceExtract = join(extractRoot, 'sherpa-source');
+    mkdirSync(sourceExtract, { recursive: true });
+    const sherpaSource = extractSherpaBuildSource({
+      archive: sourceArchive,
+      destination: sourceExtract,
+      archiveRoot: speechLock.source.archiveRoot,
+    });
+    for (const dependency of speechLock.dependencies) {
+      const archive = await acquire(dependency, dependency.archiveName);
+      copyFileSync(archive, join(sherpaSource, dependency.archiveName));
+    }
+
+    const ortBuildRoot = join(workRoot, 'onnxruntime');
+    const ortLibraryRoot = join(ortBuildRoot, 'lib');
+    mkdirSync(ortLibraryRoot, { recursive: true });
+    const runtimeBuildName =
+      targetLock.platform === 'windows'
+        ? 'onnxruntime.dll'
+        : targetLock.platform === 'macos'
+          ? 'libonnxruntime.dylib'
+          : 'libonnxruntime.so';
+    copyFileSync(runtime.path, join(ortLibraryRoot, runtimeBuildName));
+
+    let ortIncludeRoot;
+    if (targetLock.onnxRuntime.sourceBuild) {
+      ortIncludeRoot = join(
+        cacheRoot,
+        'source',
+        `onnxruntime-${targetLock.onnxRuntime.sourceBuild.commit}`,
+        'include',
+        'onnxruntime',
+        'core',
+        'session',
       );
-      const sourceExtract = join(extractRoot, 'sherpa-source');
-      mkdirSync(sourceExtract, { recursive: true });
-      execFileSync('tar', ['-xf', sourceArchive, '-C', sourceExtract], {
+    } else {
+      const ortArchive = await acquire(
+        targetLock.onnxRuntime,
+        `${target}-onnxruntime-${basename(new URL(targetLock.onnxRuntime.url).pathname)}`,
+      );
+      const ortExtract = join(extractRoot, 'onnxruntime');
+      mkdirSync(ortExtract, { recursive: true });
+      execFileSync('tar', ['-xf', ortArchive, '-C', ortExtract], {
         stdio: 'inherit',
       });
-      const sherpaSource = firstDirectory(sourceExtract);
-      for (const dependency of speechLock.dependencies) {
-        const archive = await acquire(dependency, dependency.archiveName);
-        copyFileSync(archive, join(sherpaSource, dependency.archiveName));
-      }
-
-      const ortBuildRoot = join(workRoot, 'onnxruntime');
-      const ortLibraryRoot = join(ortBuildRoot, 'lib');
-      mkdirSync(ortLibraryRoot, { recursive: true });
-      const runtimeBuildName =
-        targetLock.platform === 'windows'
-          ? 'onnxruntime.dll'
-          : targetLock.platform === 'macos'
-            ? 'libonnxruntime.dylib'
-            : 'libonnxruntime.so';
-      copyFileSync(runtime.path, join(ortLibraryRoot, runtimeBuildName));
-
-      let ortIncludeRoot;
-      if (targetLock.onnxRuntime.sourceBuild) {
-        ortIncludeRoot = join(
-          cacheRoot,
-          'source',
-          `onnxruntime-${targetLock.onnxRuntime.sourceBuild.commit}`,
-          'include',
-          'onnxruntime',
-          'core',
-          'session',
-        );
-      } else {
-        const ortArchive = await acquire(
-          targetLock.onnxRuntime,
-          `${target}-onnxruntime-${basename(new URL(targetLock.onnxRuntime.url).pathname)}`,
-        );
-        const ortExtract = join(extractRoot, 'onnxruntime');
-        mkdirSync(ortExtract, { recursive: true });
-        execFileSync('tar', ['-xf', ortArchive, '-C', ortExtract], {
-          stdio: 'inherit',
-        });
-        ortIncludeRoot = dirname(
+      ortIncludeRoot = dirname(
+        findOne(
+          ortExtract,
+          (path) => basename(path) === 'onnxruntime_c_api.h',
+          'ONNX Runtime C API header',
+        ),
+      );
+      if (targetLock.platform === 'windows') {
+        copyFileSync(
           findOne(
             ortExtract,
-            (path) => basename(path) === 'onnxruntime_c_api.h',
-            'ONNX Runtime C API header',
+            (path) => basename(path).toLowerCase() === 'onnxruntime.lib',
+            'ONNX Runtime import library',
           ),
-        );
-        if (targetLock.platform === 'windows') {
-          copyFileSync(
-            findOne(
-              ortExtract,
-              (path) => basename(path).toLowerCase() === 'onnxruntime.lib',
-              'ONNX Runtime import library',
-            ),
-            join(ortLibraryRoot, 'onnxruntime.lib'),
-          );
-        }
-      }
-      if (!existsSync(join(ortIncludeRoot, 'onnxruntime_c_api.h'))) {
-        throw new Error(
-          `ONNX Runtime headers are unavailable: ${ortIncludeRoot}`,
+          join(ortLibraryRoot, 'onnxruntime.lib'),
         );
       }
-
-      const sherpaBuild = join(buildRoot, 'sherpa');
-      execFileSync(
-        'cmake',
-        [
-          '-S',
-          sherpaSource,
-          '-B',
-          sherpaBuild,
-          '-DCMAKE_BUILD_TYPE=Release',
-          '-DCMAKE_CXX_FLAGS=-DSHERPA_ONNX_DISABLE_COREML=1',
-          '-DBUILD_SHARED_LIBS=ON',
-          '-DSHERPA_ONNX_ENABLE_C_API=ON',
-          '-DSHERPA_ONNX_ENABLE_BINARY=OFF',
-          '-DSHERPA_ONNX_ENABLE_CHECK=OFF',
-          '-DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF',
-          '-DSHERPA_ONNX_ENABLE_PYTHON=OFF',
-          '-DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=ON',
-          '-DSHERPA_ONNX_ENABLE_TESTS=OFF',
-          '-DSHERPA_ONNX_ENABLE_TTS=OFF',
-          '-DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF',
-          '-DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=ON',
-          ...configurePlatformArgs(),
-        ],
-        {
-          env: {
-            ...process.env,
-            SHERPA_ONNXRUNTIME_INCLUDE_DIR: ortIncludeRoot,
-            SHERPA_ONNXRUNTIME_LIB_DIR: ortLibraryRoot,
-          },
-          stdio: 'inherit',
-        },
-      );
-      execFileSync(
-        'cmake',
-        [
-          '--build',
-          sherpaBuild,
-          '--config',
-          'Release',
-          '--target',
-          'sherpa-onnx-c-api',
-          '--parallel',
-          buildJobs,
-        ],
-        { stdio: 'inherit' },
-      );
-      const sharedLibraryExtension =
-        targetLock.platform === 'windows'
-          ? '.dll'
-          : targetLock.platform === 'macos'
-            ? '.dylib'
-            : '.so';
-      const sherpaLibrary = findOne(
-        sherpaBuild,
-        (path) =>
-          basename(path) ===
-          `${targetLock.platform === 'windows' ? '' : 'lib'}sherpa-onnx-c-api${sharedLibraryExtension}`,
-        'sherpa-onnx C API shared library',
-      );
-
-      const adapterBuild = join(buildRoot, 'adapter');
-      const hclustIncludeRoot = join(sherpaBuild, '_deps', 'hclust_cpp-src');
-      if (!existsSync(join(hclustIncludeRoot, 'fastcluster-all-in-one.h'))) {
-        throw new Error(
-          `Locked hclust-cpp headers are unavailable: ${hclustIncludeRoot}`,
-        );
-      }
-      execFileSync(
-        'cmake',
-        [
-          '-S',
-          join(mediaWorkerRoot, 'native'),
-          '-B',
-          adapterBuild,
-          '-DCMAKE_BUILD_TYPE=Release',
-          `-DMYAGENTS_SHERPA_INCLUDE_DIR=${sherpaSource}`,
-          `-DMYAGENTS_SHERPA_LIBRARY_DIR=${dirname(sherpaLibrary)}`,
-          `-DMYAGENTS_HCLUST_INCLUDE_DIR=${hclustIncludeRoot}`,
-          ...configurePlatformArgs(),
-        ],
-        { stdio: 'inherit' },
-      );
-      execFileSync(
-        'cmake',
-        [
-          '--build',
-          adapterBuild,
-          '--config',
-          'Release',
-          '--parallel',
-          buildJobs,
-        ],
-        { stdio: 'inherit' },
-      );
-      const adapterLibrary = findOne(
-        adapterBuild,
-        (path) =>
-          basename(path) ===
-          `${targetLock.platform === 'windows' ? '' : 'lib'}myagents-speech-adapter${sharedLibraryExtension}`,
-        'MyAgents speech adapter shared library',
-      );
-
-      execFileSync(
-        'cargo',
-        [
-          'build',
-          '--locked',
-          '--release',
-          '--target',
-          target,
-          '--manifest-path',
-          join(mediaWorkerRoot, 'Cargo.toml'),
-        ],
-        {
-          cwd: projectRoot,
-          env: { ...process.env, CARGO_INCREMENTAL: '0' },
-          stdio: 'inherit',
-        },
-      );
-      const workerName =
-        targetLock.platform === 'windows'
-          ? 'myagents-media-worker.exe'
-          : 'myagents-media-worker';
-      const workerSource = join(
-        mediaWorkerRoot,
-        'target',
-        target,
-        'release',
-        workerName,
-      );
-      if (!existsSync(workerSource)) {
-        throw new Error(`Media Worker build did not produce ${workerSource}`);
-      }
-
-      const workerDestination = join(stageRoot, workerName);
-      const adapterDestination = join(
-        stageRoot,
-        'native',
-        `myagents-speech-adapter${sharedLibraryExtension}`,
-      );
-      const sherpaDestination = join(
-        stageRoot,
-        'native',
-        `sherpa-onnx-c-api${sharedLibraryExtension}`,
-      );
-      copyFileSync(workerSource, workerDestination);
-      copyFileSync(adapterLibrary, adapterDestination);
-      copyFileSync(sherpaLibrary, sherpaDestination);
-      if (targetLock.platform !== 'windows') {
-        chmodSync(workerDestination, statSync(workerDestination).mode | 0o111);
-      }
-      signNativeFiles([
-        sherpaDestination,
-        adapterDestination,
-        workerDestination,
-      ]);
-
-      const legalRoot = join(stageRoot, 'legal');
-      copyFileSync(
-        join(mediaWorkerRoot, 'SPEECH_INFERENCE_NOTICES.md'),
-        join(legalRoot, 'SPEECH_INFERENCE_NOTICES.md'),
-      );
-      copyFileSync(
-        join(sherpaSource, 'LICENSE'),
-        join(legalRoot, 'SHERPA-ONNX-LICENSE'),
-      );
-      const dependencySourceRoot = join(sherpaBuild, '_deps');
-      const dependencyBuildNames = {
-        eigen: 'eigen',
-        'hclust-cpp': 'hclust_cpp',
-        'kaldi-decoder': 'kaldi_decoder',
-        'kaldi-native-fbank': 'kaldi_native_fbank',
-        kaldifst: 'kaldifst',
-        kissfft: 'kissfft',
-        'nlohmann-json': 'json',
-        openfst: 'openfst',
-        'simple-sentencepiece': 'simple-sentencepiece',
-      };
-      for (const dependency of speechLock.dependencies) {
-        const buildName = dependencyBuildNames[dependency.id];
-        copyLegalTree(
-          join(dependencySourceRoot, `${buildName}-src`),
-          legalRoot,
-          dependency.id.toUpperCase(),
-        );
-      }
-      const opus2Root = cargoPackageRoot('opus2', speechLock.opus2Version);
-      copyFileSync(
-        join(opus2Root, 'LICENSE-APACHE'),
-        join(legalRoot, 'OPUS2-LICENSE-APACHE'),
-      );
-      copyFileSync(
-        join(opus2Root, 'LICENSE-MIT'),
-        join(legalRoot, 'OPUS2-LICENSE-MIT'),
-      );
-      const libopusRoot = cargoPackageRoot(
-        'libopus_sys',
-        speechLock.libopusSysVersion,
-      );
-      copyFileSync(
-        join(libopusRoot, 'opus', 'COPYING'),
-        join(legalRoot, 'LIBOPUS-LICENSE'),
-      );
-      copyFileSync(
-        join(libopusRoot, 'LICENSE'),
-        join(legalRoot, 'LIBOPUS-SYS-LICENSE'),
-      );
-      for (const [packageName, version, prefix] of [
-        ['hdbscan', speechLock.hdbscanVersion, 'HDBSCAN'],
-        ['kdtree', speechLock.kdtreeVersion, 'KDTREE'],
-        ['num-traits', speechLock.numTraitsVersion, 'NUM-TRAITS'],
-      ]) {
-        const packageRoot = cargoPackageRoot(packageName, version);
-        copyFileSync(
-          join(packageRoot, 'LICENSE-APACHE'),
-          join(legalRoot, `${prefix}-LICENSE-APACHE`),
-        );
-        copyFileSync(
-          join(packageRoot, 'LICENSE-MIT'),
-          join(legalRoot, `${prefix}-LICENSE-MIT`),
-        );
-      }
-
-      function integrityFile(path) {
-        return {
-          path: relative(stageRoot, path).replaceAll('\\', '/'),
-          sha256: sha256File(path),
-          size: statSync(path).size,
-        };
-      }
-      function nativeFile(path, license, upstreamRevision, artifactSource) {
-        return {
-          ...integrityFile(path),
-          license,
-          upstreamRevision,
-          artifactSource,
-          signing: { kind: signingKind, identity: signingIdentity },
-        };
-      }
-      const files = {
-        mediaWorker: nativeFile(
-          workerDestination,
-          'AGPL-3.0-only',
-          `MyAgents/${appVersion}`,
-          'current MyAgents source tree',
-        ),
-        adapter: nativeFile(
-          adapterDestination,
-          'AGPL-3.0-only',
-          `MyAgents/${appVersion}; adapter ABI ${speechLock.adapterAbiVersion}`,
-          'current MyAgents source tree',
-        ),
-        sherpaOnnx: nativeFile(
-          sherpaDestination,
-          speechLock.source.license,
-          speechLock.source.upstreamRevision,
-          speechLock.source.url,
-        ),
-      };
-      const nativeIncrementBytes = Object.values(files).reduce(
-        (sum, entry) => sum + entry.size,
-        0,
-      );
-      if (nativeIncrementBytes > speechLock.nativeIncrementHardLimitBytes) {
-        throw new Error(
-          `Speech native bundle exceeds 80 MiB: ${nativeIncrementBytes} bytes`,
-        );
-      }
-      const manifest = {
-        schemaVersion: 1,
-        capability: 'speech-inference',
-        adapterAbiVersion: speechLock.adapterAbiVersion,
-        platform: targetLock.platform,
-        architecture: targetLock.architecture,
-        buildFingerprint,
-        nativeIncrementBytes,
-        framework: {
-          sherpaOnnxVersion: speechLock.sherpaOnnxVersion,
-          sherpaOnnxCommit: speechLock.sherpaOnnxCommit,
-          onnxRuntimeVersion: speechLock.onnxRuntimeVersion,
-          onnxRuntimeUpstreamRevision: speechLock.onnxRuntimeUpstreamRevision,
-        },
-        files,
-        onnxRuntime: {
-          sha256: runtime.sha256,
-          size: runtime.size,
-          license: runtime.license,
-          upstreamRevision: runtime.upstreamRevision,
-        },
-        legalFiles: filesUnder(legalRoot).sort().map(integrityFile),
-      };
-      writeFileSync(
-        join(stageRoot, 'manifest.json'),
-        `${JSON.stringify(manifest, null, 2)}\n`,
-        { mode: 0o600 },
-      );
-      if (!validatePreparedSpeechBundle(stageRoot, expectedBundle)) {
-        throw new Error(
-          `Newly prepared speech-inference resources failed validation for ${target}`,
-        );
-      }
-      mkdirSync(dirname(preparedRoot), { recursive: true });
-      renameSync(stageRoot, preparedRoot);
-      publishPreparedBundle(preparedRoot);
-      console.log(
-        `Prepared locked speech-inference resources for ${target} ` +
-          `(fingerprint ${buildFingerprint.slice(0, 12)}; native ${(nativeIncrementBytes / 1024 / 1024).toFixed(1)} MiB; ` +
-          `cache hits ${cacheStats.hits}, migrated ${cacheStats.migrated}, downloaded ${cacheStats.downloaded})`,
-      );
-    } finally {
-      rmSync(workRoot, { recursive: true, force: true });
     }
-  },
-  {
-    onWait: () =>
-      console.log(
-        '  [lock] another native resource preparation is active; waiting...',
+    if (!existsSync(join(ortIncludeRoot, 'onnxruntime_c_api.h'))) {
+      throw new Error(
+        `ONNX Runtime headers are unavailable: ${ortIncludeRoot}`,
+      );
+    }
+
+    const sherpaBuild = join(buildRoot, 'sherpa');
+    execFileSync(
+      'cmake',
+      [
+        '-S',
+        sherpaSource,
+        '-B',
+        sherpaBuild,
+        '-DCMAKE_BUILD_TYPE=Release',
+        '-DCMAKE_CXX_FLAGS=-DSHERPA_ONNX_DISABLE_COREML=1',
+        '-DBUILD_SHARED_LIBS=ON',
+        '-DSHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF',
+        '-DSHERPA_ONNX_ENABLE_C_API=ON',
+        '-DSHERPA_ONNX_ENABLE_BINARY=OFF',
+        '-DSHERPA_ONNX_ENABLE_CHECK=OFF',
+        '-DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF',
+        '-DSHERPA_ONNX_ENABLE_PYTHON=OFF',
+        '-DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=ON',
+        '-DSHERPA_ONNX_ENABLE_TESTS=OFF',
+        '-DSHERPA_ONNX_ENABLE_TTS=OFF',
+        '-DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF',
+        '-DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=ON',
+        ...configurePlatformArgs(),
+      ],
+      {
+        env: {
+          ...process.env,
+          SHERPA_ONNXRUNTIME_INCLUDE_DIR: ortIncludeRoot,
+          SHERPA_ONNXRUNTIME_LIB_DIR: ortLibraryRoot,
+        },
+        stdio: 'inherit',
+      },
+    );
+    execFileSync(
+      'cmake',
+      [
+        '--build',
+        sherpaBuild,
+        '--config',
+        'Release',
+        '--target',
+        'sherpa-onnx-c-api',
+        '--parallel',
+        buildJobs,
+      ],
+      { stdio: 'inherit' },
+    );
+    const sharedLibraryExtension =
+      targetLock.platform === 'windows'
+        ? '.dll'
+        : targetLock.platform === 'macos'
+          ? '.dylib'
+          : '.so';
+    const sherpaLibrary = findOne(
+      sherpaBuild,
+      (path) =>
+        basename(path) ===
+        `${targetLock.platform === 'windows' ? '' : 'lib'}sherpa-onnx-c-api${sharedLibraryExtension}`,
+      'sherpa-onnx C API shared library',
+    );
+
+    const adapterBuild = join(buildRoot, 'adapter');
+    const hclustIncludeRoot = join(sherpaBuild, '_deps', 'hclust_cpp-src');
+    if (!existsSync(join(hclustIncludeRoot, 'fastcluster-all-in-one.h'))) {
+      throw new Error(
+        `Locked hclust-cpp headers are unavailable: ${hclustIncludeRoot}`,
+      );
+    }
+    execFileSync(
+      'cmake',
+      [
+        '-S',
+        join(mediaWorkerRoot, 'native'),
+        '-B',
+        adapterBuild,
+        '-DCMAKE_BUILD_TYPE=Release',
+        `-DMYAGENTS_SHERPA_INCLUDE_DIR=${sherpaSource}`,
+        `-DMYAGENTS_SHERPA_LIBRARY_DIR=${dirname(sherpaLibrary)}`,
+        `-DMYAGENTS_HCLUST_INCLUDE_DIR=${hclustIncludeRoot}`,
+        ...configurePlatformArgs(),
+      ],
+      { stdio: 'inherit' },
+    );
+    execFileSync(
+      'cmake',
+      ['--build', adapterBuild, '--config', 'Release', '--parallel', buildJobs],
+      { stdio: 'inherit' },
+    );
+    const adapterLibrary = findOne(
+      adapterBuild,
+      (path) =>
+        basename(path) ===
+        `${targetLock.platform === 'windows' ? '' : 'lib'}myagents-speech-adapter${sharedLibraryExtension}`,
+      'MyAgents speech adapter shared library',
+    );
+
+    execFileSync(
+      'cargo',
+      [
+        'build',
+        '--locked',
+        '--release',
+        '--target',
+        target,
+        '--manifest-path',
+        join(mediaWorkerRoot, 'Cargo.toml'),
+      ],
+      {
+        cwd: projectRoot,
+        env: { ...process.env, CARGO_INCREMENTAL: '0' },
+        stdio: 'inherit',
+      },
+    );
+    const workerName =
+      targetLock.platform === 'windows'
+        ? 'myagents-media-worker.exe'
+        : 'myagents-media-worker';
+    const workerSource = join(
+      mediaWorkerRoot,
+      'target',
+      target,
+      'release',
+      workerName,
+    );
+    if (!existsSync(workerSource)) {
+      throw new Error(`Media Worker build did not produce ${workerSource}`);
+    }
+
+    const workerDestination = join(stageRoot, workerName);
+    const adapterDestination = join(
+      stageRoot,
+      'native',
+      `myagents-speech-adapter${sharedLibraryExtension}`,
+    );
+    const sherpaDestination = join(
+      stageRoot,
+      'native',
+      `sherpa-onnx-c-api${sharedLibraryExtension}`,
+    );
+    copyFileSync(workerSource, workerDestination);
+    copyFileSync(adapterLibrary, adapterDestination);
+    copyFileSync(sherpaLibrary, sherpaDestination);
+    if (targetLock.platform !== 'windows') {
+      chmodSync(workerDestination, statSync(workerDestination).mode | 0o111);
+    }
+    signNativeFiles([sherpaDestination, adapterDestination, workerDestination]);
+
+    const legalRoot = join(stageRoot, 'legal');
+    copyFileSync(
+      join(mediaWorkerRoot, 'SPEECH_INFERENCE_NOTICES.md'),
+      join(legalRoot, 'SPEECH_INFERENCE_NOTICES.md'),
+    );
+    copyFileSync(
+      join(sherpaSource, 'LICENSE'),
+      join(legalRoot, 'SHERPA-ONNX-LICENSE'),
+    );
+    const dependencySourceRoot = join(sherpaBuild, '_deps');
+    const dependencyBuildNames = {
+      eigen: 'eigen',
+      'hclust-cpp': 'hclust_cpp',
+      'kaldi-decoder': 'kaldi_decoder',
+      'kaldi-native-fbank': 'kaldi_native_fbank',
+      kaldifst: 'kaldifst',
+      kissfft: 'kissfft',
+      'nlohmann-json': 'json',
+      openfst: 'openfst',
+      'simple-sentencepiece': 'simple-sentencepiece',
+    };
+    for (const dependency of speechLock.dependencies) {
+      const buildName = dependencyBuildNames[dependency.id];
+      copyLegalTree(
+        join(dependencySourceRoot, `${buildName}-src`),
+        legalRoot,
+        dependency.id.toUpperCase(),
+      );
+    }
+    const opus2Root = cargoPackageRoot('opus2', speechLock.opus2Version);
+    copyFileSync(
+      join(opus2Root, 'LICENSE-APACHE'),
+      join(legalRoot, 'OPUS2-LICENSE-APACHE'),
+    );
+    copyFileSync(
+      join(opus2Root, 'LICENSE-MIT'),
+      join(legalRoot, 'OPUS2-LICENSE-MIT'),
+    );
+    const libopusRoot = cargoPackageRoot(
+      'libopus_sys',
+      speechLock.libopusSysVersion,
+    );
+    copyFileSync(
+      join(libopusRoot, 'opus', 'COPYING'),
+      join(legalRoot, 'LIBOPUS-LICENSE'),
+    );
+    copyFileSync(
+      join(libopusRoot, 'LICENSE'),
+      join(legalRoot, 'LIBOPUS-SYS-LICENSE'),
+    );
+    for (const [packageName, version, prefix] of [
+      ['hdbscan', speechLock.hdbscanVersion, 'HDBSCAN'],
+      ['kdtree', speechLock.kdtreeVersion, 'KDTREE'],
+      ['num-traits', speechLock.numTraitsVersion, 'NUM-TRAITS'],
+    ]) {
+      const packageRoot = cargoPackageRoot(packageName, version);
+      copyFileSync(
+        join(packageRoot, 'LICENSE-APACHE'),
+        join(legalRoot, `${prefix}-LICENSE-APACHE`),
+      );
+      copyFileSync(
+        join(packageRoot, 'LICENSE-MIT'),
+        join(legalRoot, `${prefix}-LICENSE-MIT`),
+      );
+    }
+
+    function integrityFile(path) {
+      return {
+        path: relative(stageRoot, path).replaceAll('\\', '/'),
+        sha256: sha256File(path),
+        size: statSync(path).size,
+      };
+    }
+    function nativeFile(path, license, upstreamRevision, artifactSource) {
+      return {
+        ...integrityFile(path),
+        license,
+        upstreamRevision,
+        artifactSource,
+        signing: { kind: signingKind, identity: signingIdentity },
+      };
+    }
+    const files = {
+      mediaWorker: nativeFile(
+        workerDestination,
+        'AGPL-3.0-only',
+        `MyAgents/${appVersion}`,
+        'current MyAgents source tree',
       ),
-  },
-);
+      adapter: nativeFile(
+        adapterDestination,
+        'AGPL-3.0-only',
+        `MyAgents/${appVersion}; adapter ABI ${speechLock.adapterAbiVersion}`,
+        'current MyAgents source tree',
+      ),
+      sherpaOnnx: nativeFile(
+        sherpaDestination,
+        speechLock.source.license,
+        speechLock.source.upstreamRevision,
+        speechLock.source.url,
+      ),
+    };
+    const nativeIncrementBytes = Object.values(files).reduce(
+      (sum, entry) => sum + entry.size,
+      0,
+    );
+    if (nativeIncrementBytes > speechLock.nativeIncrementHardLimitBytes) {
+      throw new Error(
+        `Speech native bundle exceeds 80 MiB: ${nativeIncrementBytes} bytes`,
+      );
+    }
+    const manifest = {
+      schemaVersion: 1,
+      capability: 'speech-inference',
+      adapterAbiVersion: speechLock.adapterAbiVersion,
+      platform: targetLock.platform,
+      architecture: targetLock.architecture,
+      buildFingerprint,
+      nativeIncrementBytes,
+      framework: {
+        sherpaOnnxVersion: speechLock.sherpaOnnxVersion,
+        sherpaOnnxCommit: speechLock.sherpaOnnxCommit,
+        onnxRuntimeVersion: speechLock.onnxRuntimeVersion,
+        onnxRuntimeUpstreamRevision: speechLock.onnxRuntimeUpstreamRevision,
+      },
+      files,
+      onnxRuntime: {
+        sha256: runtime.sha256,
+        size: runtime.size,
+        license: runtime.license,
+        upstreamRevision: runtime.upstreamRevision,
+      },
+      legalFiles: filesUnder(legalRoot).sort().map(integrityFile),
+    };
+    writeFileSync(
+      join(stageRoot, 'manifest.json'),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    if (!validatePreparedSpeechBundle(stageRoot, expectedBundle)) {
+      throw new Error(
+        `Newly prepared speech-inference resources failed validation for ${target}`,
+      );
+    }
+    mkdirSync(dirname(preparedRoot), { recursive: true });
+    renameSync(stageRoot, preparedRoot);
+    publishPreparedBundle(preparedRoot, expectedBundle);
+    console.log(
+      `Prepared locked speech-inference resources for ${target} ` +
+        `(fingerprint ${buildFingerprint.slice(0, 12)}; native ${(nativeIncrementBytes / 1024 / 1024).toFixed(1)} MiB; ` +
+        `cache hits ${cacheStats.hits}, migrated ${cacheStats.migrated}, downloaded ${cacheStats.downloaded})`,
+    );
+    return Object.freeze({ target, needsBuild: false });
+  } finally {
+    rmSync(workRoot, { recursive: true, force: true });
+  }
+}

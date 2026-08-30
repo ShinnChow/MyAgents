@@ -14,12 +14,14 @@ import {
   acquireLockedResource,
   computeBuildFingerprint,
   contentAddressedDownloadPath,
+  documentRuntimeFromPreparedBundle,
   hostDocumentTarget,
   sha256File,
   validateLockedFile,
   validatePreparedBundle,
   withResourcePrepareLock,
 } from "./document-processing-resource-cache.mjs";
+import { validateDocumentRuntimeDescriptor } from "./speech-inference-resource-cache.mjs";
 
 function scratch() {
   const root = mkdtempSync(join(tmpdir(), "myagents-document-cache-test-"));
@@ -99,7 +101,7 @@ test("build fingerprint is deterministic and invalidates source or metadata chan
   );
 });
 
-function createPreparedBundle(root, fingerprint) {
+function createPreparedBundle(root, fingerprint, architecture = "arm64") {
   const files = {
     worker: "myagents-document-worker",
     onnxRuntime: "native/onnxruntime.dylib",
@@ -156,7 +158,7 @@ function createPreparedBundle(root, fingerprint) {
       schemaVersion: 1,
       pipelineVersion: "pipeline-v1",
       platform: "macos",
-      architecture: "arm64",
+      architecture,
       buildFingerprint: fingerprint,
       worker: resource(files.worker),
       files: {
@@ -169,6 +171,24 @@ function createPreparedBundle(root, fingerprint) {
       legalFiles,
     }),
   );
+}
+
+function expectedPreparedBundle(target, architecture, buildFingerprint) {
+  return {
+    target,
+    pipelineVersion: "pipeline-v1",
+    platform: "macos",
+    architecture,
+    buildFingerprint,
+    requiredLegalFiles: [
+      "NOTICE",
+      "ANYDOC",
+      "OFFICE",
+      "PADDLE",
+      "ORT",
+      "PDFIUM",
+    ],
+  };
 }
 
 test("prepared bundle validation closes warm-cache corruption and target drift", () => {
@@ -218,6 +238,72 @@ test("prepared bundle validation closes warm-cache corruption and target drift",
 
   writeFileSync(join(root, "models", "det.onnx"), "corrupt");
   assert.equal(validatePreparedBundle(root, expected), false);
+});
+
+test("exact-target prepared runtime ignores the opposite packaging projection", () => {
+  const root = scratch();
+  const armFingerprint = "a".repeat(64);
+  const x64Fingerprint = "b".repeat(64);
+  const armExpected = expectedPreparedBundle(
+    "aarch64-apple-darwin",
+    "arm64",
+    armFingerprint,
+  );
+  const x64Expected = expectedPreparedBundle(
+    "x86_64-apple-darwin",
+    "x64",
+    x64Fingerprint,
+  );
+
+  const armProjection = join(root, "arm-current-projection");
+  const x64Prepared = join(root, "prepared", "x86_64-apple-darwin");
+  createPreparedBundle(armProjection, armFingerprint, "arm64");
+  createPreparedBundle(x64Prepared, x64Fingerprint, "x64");
+
+  const x64Runtime = documentRuntimeFromPreparedBundle(
+    x64Prepared,
+    x64Expected,
+  );
+  assert.equal(x64Runtime.target, "x86_64-apple-darwin");
+  assert.equal(x64Runtime.architecture, "x64");
+  assert.equal(
+    documentRuntimeFromPreparedBundle(armProjection, x64Expected),
+    null,
+  );
+  assert.equal(
+    validateDocumentRuntimeDescriptor(x64Runtime, {
+      target: x64Expected.target,
+      platform: x64Expected.platform,
+      architecture: x64Expected.architecture,
+      upstreamRevision: "fixture-v1",
+    }).target,
+    x64Expected.target,
+  );
+  assert.throws(
+    () =>
+      validateDocumentRuntimeDescriptor(x64Runtime, {
+        target: armExpected.target,
+        platform: armExpected.platform,
+        architecture: armExpected.architecture,
+        upstreamRevision: "fixture-v1",
+      }),
+    /does not match speech target aarch64-apple-darwin/,
+  );
+
+  const x64Projection = join(root, "x64-current-projection");
+  const armPrepared = join(root, "prepared", "aarch64-apple-darwin");
+  createPreparedBundle(x64Projection, x64Fingerprint, "x64");
+  createPreparedBundle(armPrepared, armFingerprint, "arm64");
+  const armRuntime = documentRuntimeFromPreparedBundle(
+    armPrepared,
+    armExpected,
+  );
+  assert.equal(armRuntime.target, "aarch64-apple-darwin");
+  assert.equal(armRuntime.architecture, "arm64");
+  assert.equal(
+    documentRuntimeFromPreparedBundle(x64Projection, armExpected),
+    null,
+  );
 });
 
 test("prepare lock serializes concurrent callers in one repository cache", async () => {

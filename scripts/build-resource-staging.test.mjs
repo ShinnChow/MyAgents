@@ -557,6 +557,10 @@ test('speech inference builds a signed exact native inventory around the shared 
   assert.equal(speech.numTraitsVersion, '0.2.19');
   assert.equal(speech.nativeIncrementHardLimitBytes, 80 * 1024 * 1024);
   assert.match(speech.source.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(
+    speech.source.archiveRoot,
+    `sherpa-onnx-${speech.sherpaOnnxCommit}`,
+  );
   assert.deepEqual(speech.dependencies.map(({ id }) => id).sort(), [
     'eigen',
     'hclust-cpp',
@@ -576,9 +580,11 @@ test('speech inference builds a signed exact native inventory around the shared 
   }
 
   assert.match(speechResourceScript, /acquireLockedResource/);
-  assert.match(speechResourceScript, /documentRuntimeReference/);
+  assert.match(speechResourceScript, /validateDocumentRuntimeDescriptor/);
+  assert.match(speechResourceScript, /extractSherpaBuildSource/);
   assert.match(speechResourceScript, /nativeIncrementHardLimitBytes/);
   assert.match(speechResourceScript, /SHERPA_ONNXRUNTIME_LIB_DIR/);
+  assert.match(speechResourceScript, /SHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF/);
   assert.match(
     speechResourceScript,
     /CMAKE_CXX_FLAGS=-DSHERPA_ONNX_DISABLE_COREML=1/,

@@ -10,7 +10,10 @@ import {
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
-import type { RecordSummary, RecordingSnapshot } from '@/../shared/types/record';
+import type {
+  RecordSummary,
+  RecordingSnapshot,
+} from '@/../shared/types/record';
 import type { RecordSearchHit } from '@/api/searchClient';
 import { Popover } from '@/components/ui/Popover';
 import { relativeTime } from '@/utils/taskCenterUtils';
@@ -19,7 +22,11 @@ import { RecordWorkspacePicker } from './RecordWorkspacePicker';
 
 interface Props {
   record: RecordSummary;
-  onOpen: (recordId: string, mediaMs?: number, activeRecording?: boolean) => void;
+  onOpen: (
+    recordId: string,
+    mediaMs?: number,
+    activeRecording?: boolean,
+  ) => void;
   onArchive: (recordId: string, archived: boolean) => void | Promise<void>;
   onDelete: (recordId: string) => void | Promise<void>;
   onDiscuss?: (record: RecordSummary, workspaceId: string) => void;
@@ -66,12 +73,19 @@ export function AudioRecordCard({
   const discussAnchorRef = useRef<HTMLButtonElement>(null);
   const locale = isSupportedLocale(i18n.language) ? i18n.language : 'zh-CN';
   const audio = record.audio;
-  const activeSnapshot = activeRecordingSnapshot?.recordId === record.id ? activeRecordingSnapshot : null;
-  const effectiveCaptureStatus = activeSnapshot?.captureStatus ?? audio?.captureStatus;
+  const activeSnapshot =
+    activeRecordingSnapshot?.recordId === record.id
+      ? activeRecordingSnapshot
+      : null;
+  const effectiveCaptureStatus =
+    activeSnapshot?.captureStatus ?? audio?.captureStatus;
   const active = effectiveCaptureStatus
-    ? ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(effectiveCaptureStatus)
+    ? ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(
+        effectiveCaptureStatus,
+      )
     : false;
-  const displayedDurationMs = activeSnapshot?.mediaDurationMs ?? audio?.mediaDurationMs ?? 0;
+  const displayedDurationMs =
+    activeSnapshot?.mediaDurationMs ?? audio?.mediaDurationMs ?? 0;
   if (!audio) return null;
   const dateLabel = relativeTime(record.createdAt, locale);
   const openRecord = () =>
@@ -111,7 +125,9 @@ export function AudioRecordCard({
   return (
     <article
       role={selectMode ? 'checkbox' : 'button'}
-      aria-label={selectMode ? undefined : record.title || t('records.untitled')}
+      aria-label={
+        selectMode ? undefined : record.title || t('records.untitled')
+      }
       aria-checked={selectMode ? selected : undefined}
       aria-disabled={selectMode && active ? true : undefined}
       tabIndex={selectMode && active ? undefined : 0}
@@ -181,7 +197,9 @@ export function AudioRecordCard({
                 ) : (
                   <Archive className="h-3.5 w-3.5" strokeWidth={1.5} />
                 )}
-                {record.archived ? t('thoughts.unarchive') : t('thoughts.archive')}
+                {record.archived
+                  ? t('thoughts.unarchive')
+                  : t('thoughts.archive')}
               </button>
               <button
                 type="button"
@@ -200,11 +218,19 @@ export function AudioRecordCard({
       </div>
 
       {selectMode ? (
-        <div className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left">{summary}</div>
+        <div className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left">
+          {summary}
+        </div>
       ) : (
         <div className="flex w-full min-w-0 max-w-full items-center gap-2.5 text-left">
           {summary}
         </div>
+      )}
+
+      {searchHit?.snippet && (
+        <p className="mt-2 line-clamp-2 text-left text-xs leading-5 text-[var(--ink-muted)]">
+          {searchHit.snippet}
+        </p>
       )}
 
       {onDiscuss && (

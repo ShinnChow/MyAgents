@@ -2030,7 +2030,7 @@ mod nav_guard_tests {
         let updater = include_str!("updater.rs");
         let restart_command = updater
             .split_once("pub fn restart_app")
-            .and_then(|(_, tail)| tail.split_once("/// Command: Check if a pending update exists"))
+            .and_then(|(_, tail)| tail.split_once("pub fn check_pending_update"))
             .map(|(command, _)| command)
             .expect("restart command source");
         assert!(restart_command.contains("app.request_restart()"));

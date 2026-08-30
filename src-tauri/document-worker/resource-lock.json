@@ -50,7 +50,8 @@
       "size": 11564315,
       "license": "Apache-2.0",
       "upstreamRevision": "v1.13.6@1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911",
-      "archiveName": "sherpa-onnx-1.13.6.tar.gz"
+      "archiveName": "sherpa-onnx-1.13.6.tar.gz",
+      "archiveRoot": "sherpa-onnx-1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911"
     },
     "dependencies": [
       {

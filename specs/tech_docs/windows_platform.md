@@ -196,7 +196,7 @@ let client = proxy_config::build_client_with_proxy(builder)?;
 
 ### 关键清理步骤
 
-正式 Windows x64 构建在 Tauri snapshot 前运行 `scripts/prepare-native-inference.mjs x86_64-pc-windows-msvc`，在同一锁和 content-addressed cache 下准备 document 与 speech capability：按 `resource-lock.json` 下载并校验共享 ONNX Runtime CPU、PDFium、PP-OCRv6 模型/字典，使用锁定 Rust toolchain 构建 `myagents-document-worker.exe`、`myagents-media-worker.exe` 与 sherpa adapter，再生成各自包含最终文件 hash/签名的 target manifest。运行时只从 manifest 的绝对路径加载 DLL；不得搜索 PATH、系统目录或联网补 native 资源。安装包 smoke 必须在无系统 ONNX Runtime/PDFium/ffmpeg、断网环境验证文档/语音最小推理、WASAPI capture、Job Object 取消、notices 与安装包签名。
+正式 Windows x64 构建在 Tauri snapshot 前运行 `scripts/prepare-native-inference.mjs x86_64-pc-windows-msvc`，在同一锁和 content-addressed cache 下准备 document 与 speech capability：按 `resource-lock.json` 下载并校验共享 ONNX Runtime CPU、PDFium、PP-OCRv6 模型/字典，使用锁定 Rust toolchain 构建 `myagents-document-worker.exe`、`myagents-media-worker.exe` 与 sherpa adapter，再生成各自包含最终文件 hash/签名的 target manifest。Sherpa 源码继续由锁定 archive 的 size/SHA-256/revision 裁决，但系统 tar 只展开根 `CMakeLists.txt`、`LICENSE`、`cmake/` 与 `sherpa-onnx/`；无关示例、移动端和仓库元数据中的 symlink 不属于 Windows build input，不要求 Developer Mode、管理员权限或长路径开关。运行时只从 manifest 的绝对路径加载 DLL；不得搜索 PATH、系统目录或联网补 native 资源。安装包 smoke 必须在无系统 ONNX Runtime/PDFium/ffmpeg、断网环境验证文档/语音最小推理、WASAPI capture、Job Object 取消、notices 与安装包签名。
 
 文档 source/output 的每个已存在祖先都拒绝 reparse point；source 使用 no-follow regular-file handle，输出发布前再次比较 held directory identity。Worker 由 `process_cmd::spawn_tree()` 在 resume 前加入 kill-on-close Job Object；不能退回裸 `Command` 或 `taskkill`。详细跨平台资源矩阵和错误码见 `document_processing.md`。
 
