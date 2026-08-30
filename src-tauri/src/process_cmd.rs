@@ -25,14 +25,17 @@
 use std::ffi::OsStr;
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 #[cfg(unix)]
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, OnceLock};
 use std::time::Duration;
 
 #[cfg(target_os = "windows")]
 pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const GRACEFUL_TREE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const FORCE_TREE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const GRACEFUL_TREE_TERMINATION_TIMEOUT: Duration = Duration::from_secs(10);
+const CHILD_SETTLEMENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Create a new [`Command`] with platform-specific GUI flags applied.
 ///
@@ -123,24 +126,63 @@ impl ChildTree {
         self.kill()?;
         let started = std::time::Instant::now();
         loop {
-            let root_exited = self.child.try_wait()?.is_some();
-            #[cfg(unix)]
-            let tree_exited = !unix_group_exists(-(pid as i32));
-            #[cfg(not(unix))]
-            let tree_exited = root_exited;
-
-            if root_exited && tree_exited {
+            if self.try_wait_tree(pid)? {
                 return Ok(());
             }
-            if started.elapsed() >= GRACEFUL_TREE_SHUTDOWN_TIMEOUT {
+            if started.elapsed() >= FORCE_TREE_SHUTDOWN_TIMEOUT {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("process tree {pid} did not exit after force-stop"),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(CHILD_SETTLEMENT_POLL_INTERVAL);
         }
     }
+
+    fn try_wait_tree(&mut self, pid: u32) -> std::io::Result<bool> {
+        let root_exited = self.child.try_wait()?.is_some();
+        #[cfg(unix)]
+        let tree_exited = !unix_group_exists(-(pid as i32));
+        #[cfg(not(unix))]
+        let tree_exited = root_exited;
+        Ok(root_exited && tree_exited)
+    }
+}
+
+/// Let an exact owned process tree exit naturally for `natural_grace`, then
+/// force-stop it with the globally bounded [`ChildTree::kill_and_wait`]
+/// fallback. Each poll releases the outer mutex so cancellation, yield, and
+/// shutdown watchdogs can still obtain the same child authority.
+pub(crate) fn settle_tree(
+    child: &Arc<Mutex<ChildTree>>,
+    natural_grace: Duration,
+) -> std::io::Result<()> {
+    let pid = child.lock().map_err(|_| child_lock_error())?.child.id();
+    let started = std::time::Instant::now();
+    loop {
+        let exited = child
+            .lock()
+            .map_err(|_| child_lock_error())?
+            .try_wait_tree(pid)?;
+        if exited {
+            return Ok(());
+        }
+        if started.elapsed() >= natural_grace {
+            return child
+                .lock()
+                .map_err(|_| child_lock_error())?
+                .kill_and_wait();
+        }
+        std::thread::sleep(
+            natural_grace
+                .saturating_sub(started.elapsed())
+                .min(CHILD_SETTLEMENT_POLL_INTERVAL),
+        );
+    }
+}
+
+fn child_lock_error() -> std::io::Error {
+    std::io::Error::other("owned process tree lock poisoned")
 }
 
 /// Wait until every Unix graceful-termination worker has either observed the
@@ -257,7 +299,7 @@ fn terminate_unix_group(pid: u32, force: bool) -> std::io::Result<()> {
                 }
                 let wrapper_grace_elapsed = root_exited_at
                     .is_some_and(|exited| exited.elapsed() >= Duration::from_millis(500));
-                if wrapper_grace_elapsed || started.elapsed() >= GRACEFUL_TREE_SHUTDOWN_TIMEOUT {
+                if wrapper_grace_elapsed || started.elapsed() >= GRACEFUL_TREE_TERMINATION_TIMEOUT {
                     unsafe {
                         libc::kill(pgid, libc::SIGKILL);
                     }
@@ -510,6 +552,43 @@ mod tests {
         assert!(
             crate::process_cleanup::find_live_processes_by_pid(&[parent_pid, child_pid]).is_empty(),
             "replacement may spawn only after the old tree can no longer execute"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_tree_allows_natural_exit_within_grace() {
+        let mut command = new("sh");
+        command
+            .args(["-c", "sleep 0.05"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let tree = Arc::new(Mutex::new(
+            spawn_tree(&mut command).expect("spawn naturally exiting process tree"),
+        ));
+
+        settle_tree(&tree, Duration::from_secs(1)).expect("observe natural process-tree exit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_tree_force_stops_after_natural_grace() {
+        let mut command = new("sh");
+        command
+            .args(["-c", "sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let tree = Arc::new(Mutex::new(
+            spawn_tree(&mut command).expect("spawn long-running process tree"),
+        ));
+        let pid = tree.lock().unwrap().id();
+
+        settle_tree(&tree, Duration::from_millis(50)).expect("force-stop process tree after grace");
+        assert!(
+            crate::process_cleanup::find_live_processes_by_pid(&[pid]).is_empty(),
+            "bounded settlement must not return while the old tree can execute"
         );
     }
 

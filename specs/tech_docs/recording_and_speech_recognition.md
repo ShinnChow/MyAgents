@@ -7,7 +7,7 @@
 
 - `RecordStore` 是 `~/.myagents/records/` 下 text/audio Record、artifact、timeline、transcript revision、diarization projection、speaker override 与 export source 的持久权威。旧 `thoughts/` 只作为幂等迁移输入；迁移完成后产品不再双写。
 - `RecordingManager` 拥有 App-global 唯一采集槽、设备流、Ogg Opus 归档、pause/stop/recovery 和录音期 wake lock。Renderer 与托盘只消费其 snapshot。录音控制命令的 revision fence 以 Manager 最近一次控制变更为下界、RecordStore 当前持久 revision 为上界；录音期笔记、Mark 或元数据写入可以推进全局 Record revision，但不能使同一 generation 的 pause/stop 失效。
-- `SpeechRecognitionManager` 拥有 durable speech job、FIFO、Worker generation、重试/取消/退出收敛，以及向 `RecordStore` 发布 transcript / diarization projection 的授权。
+- `SpeechRecognitionManager` 拥有 durable speech job、优先级队列、Worker generation、重试/取消/退出收敛，以及向 `RecordStore` 发布 transcript / diarization projection 的授权。
 - `SpeechModelPackManager` 是 `SpeechRecognitionManager` 内的模型权重子 owner：只管理显式安装、校验、active revision 和移除，不拥有 job terminal 或 Record 内容。
 - `LocalInferenceRuntimeRegistry` 只解析 App bundle 中经过 manifest 校验的共享 `onnx-cpu` identity；`LocalComputeCoordinator` 只授予重型推理 lease。
 - `myagents-media-worker` 是单 workload、单 generation 的受管子进程。它不监听端口、不下载资源、不读配置，也不直接写 Record 或公开 artifact。
@@ -68,6 +68,10 @@ job metadata 位于：
 
 Record backfill / diarization 在 App 重启后保留原 job ID，清除旧 Worker generation 并按持久顺序重排；Agent job 在进程边界收敛为 `interrupted`。每个 job 的 `pipeline` 在 admission 时冻结 provider、model-pack revision 与 ONNX Runtime revision。队列执行必须按该 snapshot 解析资源，active pack 的后续变化只影响新 job。
 
+App-global compute admission 固定为 `RecordLive > RecordBackfill > RecordDiarization > AgentAttachment/DocumentOcr/SpeechModelValidation > BackgroundResourceValidation`，同优先级按 coordinator ticket FIFO。Speech 自己的 durable queue 在申请 lease 前也按同一 kind priority 选下一项，因此较晚到达的 backfill 不会被已经等待 lease 的 attachment 隐藏。只有 `RecordLive` waiter 会要求已运行 workload cooperative yield；其它优先级只裁决下一次 admission。speech batch/live 收到 yield signal 后立即向 exact generation 发 `Yield`，从信号时刻计 15 秒后 force-stop，job ID 保持不变并以新 generation 重排。
+
+Worker settlement 统一有界：合法 `Completed/Failed` 后最多给 30 秒自然退出；`Yielded`、本地 protocol/cancel 路径先给 15 秒 cooperative settlement；App shutdown 给 10 秒；任何路径进入 force-stop 后最多再等 10 秒确认 exact process tree 已无法执行。Manager 在 settlement 完成前不释放 generation/publish authority。
+
 Worker 结果只有同时满足 exact `(jobId, generation)`、协议 shape、业务数量/时间轴上限且当前 generation 仍持有 publish authority 时才能提交。Record ASR 成功后由同一 Manager 排队 diarization；stale generation、cancelled generation 和失败 probe 都不能发布内容。
 
 ### Agent attachment job scope
@@ -84,7 +88,7 @@ Worker 结果只有同时满足 exact `(jobId, generation)`、协议 shape、业
 
 活跃录音中的单路开关仍由 `RecordingManager` 持有：它不热换设备、`CapturePlan` 或 source identity，只令对应 archive/analysis sink 在原回调时序中写入等长静音，并把该路电平归零。这样重新打开后继续同一 generation，双轨、transcript 与笔记共用的媒体时间线不会因关闭一路而压缩或错位。完成态若同时存在 microphone/system 而没有持久 `mixed` artifact，Renderer 直接同步播放两条 Range 数据流形成默认混合监听；单轨选择仍只播放对应物理轨，不为播放额外引入 mixer 进程或派生文件。
 
-Pause 先停止两个 ring 的 admission，再暂停设备；analysis writer 排空、刷新 resampler 并 fsync 后，Manager 以每轨 exact sample boundary 发送 `Flush`。Worker 在该边界强制结束 VAD 句段、发布稳定整句并重置 VAD，不写虚假静音，也不把 wall pause 算入媒体时间。Resume 从同一 append-only spool 继续。
+Pause 先停止两个 ring 的 admission，再暂停设备；analysis writer 排空、刷新 resampler 并 fsync 后，Manager 以每轨 exact sample boundary 发送 `Flush`。Worker 在该边界强制结束 VAD 句段、发布稳定整句并重置 VAD，不写虚假静音，也不把 wall pause 算入媒体时间。暂停不足 10 分钟时保留 live Worker、ASR/VAD session 与 `RecordLive` lease；连续暂停达到 10 分钟后，pause epoch fence 允许 exact generation 用 `Yielded` checkpoint 退出并释放模型/lease。Resume 会使旧 timer 失效；若 Worker 已卸载，则从同一 append-only spool 与 durable transcript journal 的 exact offset 创建新 generation，卸载不消耗 crash retry budget。暂停中 Stop 在已 flush boundary 直接收敛 live journal，不为结束动作重载模型，永久 Ogg 与后续 backfill 不受影响。
 
 live revision 写入 `transcript/revisions.jsonl`，复用 `DurableRecordJournal`。Worker-local ID 不成为产品 identity；RecordStore 按 `track + start + end` 生成稳定 segment ID，同边界重算只递增 revision。generation 失败时从最后 durable segment end 重放，以重建尚未发布的 VAD pending state；每帧 ACK 仍即时校验，但不能仅从最后 ACK 继续，否则会丢掉已 ACK、尚未形成稳定句段的语音。
 
@@ -136,8 +140,8 @@ https://download.myagents.io/models/speech/assets/sha256/<sha256>/<filename>
 3. 从固定第一方地址取得 manifest/signature，验证 byte identity 与 updater Minisign trust root。
 4. 顺序下载锁定 asset 到 0700 private 目录中的 0600 `create_new` 文件；每个响应只允许 HTTPS `download.myagents.io` 固定 host，逐 chunk 执行 exact size、SHA-256 与总下载硬上限。
 5. Rust 内置的 pure-Rust bzip2 decoder + tar reader 只选择 source lock 白名单文件。archive 中任意 traversal、重复路径、symlink 或 special entry 都让整个 staging 失败；运行时不调用系统 tar、Python 或用户 PATH。
-6. manifest 最后写入；Manager 在安装与激活边界要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。后续 App 启动只同步恢复签名 pointer、exact manifest 与文件元数据，完整 pack 校验延迟到首屏和 Global Sidecar 启动之后的 blocking pool；该后台检查期间已激活 pack 仍可被语音功能使用，失败后才撤销内存 active 并投影 repair 状态。queued pipeline 与同步 live admission 都只读取该内存 snapshot，避免在用户操作热路径重复读取整个 pack；Worker 每次实际执行仍独立重开并校验 exact manifest、模型与 legal 文件后才加载模型。
-7. 取得 `SpeechModelValidation` compute lease，让当前随包 Worker 依次真实创建并释放 ASR、VAD 和 diarizer engine。高优先级 workload 到达时 kill exact probe tree、释放 lease 后重试。
+6. manifest 最后写入；Manager 在安装与激活边界要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。后续 App 启动只同步恢复签名 pointer、exact manifest 与文件元数据；等首屏和 Global Sidecar 启动后 10 秒，再用最低优先级、chunk-level 可让路的 `BackgroundResourceValidation` lease 完整校验 pack。该后台检查期间已激活 pack 仍可被语音功能使用，失败后才撤销内存 active 并投影 repair 状态。同步 live admission 不重复读取整个 pack；Worker 每次实际执行仍独立重开并校验 exact manifest、模型与 legal 文件后才加载模型。
+7. 安装/升级的显式验证取得 `SpeechModelValidation` compute lease，让当前随包 Worker 依次真实创建并释放 ASR、VAD 和 diarizer engine。只有 Record live 到达时才 cooperative cancel exact probe tree、释放 lease 后重试；其它 workload 只影响下一次 admission。
 8. staging 以 no-replace directory rename 发布到唯一 pack 目录，最后 atomic replace `active.json`。rename 前明确失败会删除新 pack并保持旧 pointer；rename 已可见但 parent-directory sync 失败时绝不删除 pointer 已引用的 pack，状态保留新 active 并报告 `SPEECH_RESOURCE_ACTIVATION_DURABILITY_UNCONFIRMED`。
 
 安装成功只改变 capability；不会扫描历史 Record，也不会自动创建 backfill job。历史音频必须由用户点击“开始转录”后才进入 admission。

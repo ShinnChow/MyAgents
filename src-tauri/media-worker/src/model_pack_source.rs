@@ -41,6 +41,7 @@ pub enum InstalledPackError {
     MissingFile,
     UnsafePath,
     FileMismatch,
+    Yielded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,7 +448,14 @@ pub fn install_plan() -> Result<ModelPackInstallPlan, SourceLockError> {
 pub fn verify_installed_pack(
     manifest_path: &Path,
 ) -> Result<VerifiedModelPack, InstalledPackError> {
-    inspect_installed_pack_inner(manifest_path, true)
+    inspect_installed_pack_inner(manifest_path, true, &|| false)
+}
+
+pub fn verify_installed_pack_with_yield(
+    manifest_path: &Path,
+    should_yield: &dyn Fn() -> bool,
+) -> Result<VerifiedModelPack, InstalledPackError> {
+    inspect_installed_pack_inner(manifest_path, true, should_yield)
 }
 
 /// Restores an App-activated pack from its immutable manifest and exact file
@@ -457,12 +465,13 @@ pub fn verify_installed_pack(
 pub fn inspect_installed_pack(
     manifest_path: &Path,
 ) -> Result<VerifiedModelPack, InstalledPackError> {
-    inspect_installed_pack_inner(manifest_path, false)
+    inspect_installed_pack_inner(manifest_path, false, &|| false)
 }
 
 fn inspect_installed_pack_inner(
     manifest_path: &Path,
     verify_digests: bool,
+    should_yield: &dyn Fn() -> bool,
 ) -> Result<VerifiedModelPack, InstalledPackError> {
     if !manifest_path.is_absolute() {
         return Err(InstalledPackError::UnsafePath);
@@ -488,7 +497,7 @@ fn inspect_installed_pack_inner(
         .ok_or(InstalledPackError::UnsafePath)?;
     ensure_plain_directory(root)?;
     let expected = expected_installed_files(&lock)?;
-    let verified = inspect_file_inventory(root, &expected, verify_digests)?;
+    let verified = inspect_file_inventory(root, &expected, verify_digests, should_yield)?;
     let path = |relative: &str| {
         verified
             .get(relative)
@@ -549,13 +558,14 @@ fn verify_file_inventory(
     root: &Path,
     expected: &[ExpectedInstalledFile],
 ) -> Result<HashMap<String, PathBuf>, InstalledPackError> {
-    inspect_file_inventory(root, expected, true)
+    inspect_file_inventory(root, expected, true, &|| false)
 }
 
 fn inspect_file_inventory(
     root: &Path,
     expected: &[ExpectedInstalledFile],
     verify_digests: bool,
+    should_yield: &dyn Fn() -> bool,
 ) -> Result<HashMap<String, PathBuf>, InstalledPackError> {
     let mut verified = HashMap::with_capacity(expected.len());
     for file in expected {
@@ -565,7 +575,7 @@ fn inspect_file_inventory(
             || metadata.file_type().is_symlink()
             || has_execute_bits(&metadata)
             || metadata.len() != file.size
-            || (verify_digests && sha256_file(&path)? != file.sha256)
+            || (verify_digests && sha256_file(&path, should_yield)? != file.sha256)
         {
             return Err(InstalledPackError::FileMismatch);
         }
@@ -613,11 +623,14 @@ fn resolve_plain_file(root: &Path, relative: &str) -> Result<PathBuf, InstalledP
     Ok(path)
 }
 
-fn sha256_file(path: &Path) -> Result<String, InstalledPackError> {
+fn sha256_file(path: &Path, should_yield: &dyn Fn() -> bool) -> Result<String, InstalledPackError> {
     let mut file = fs::File::open(path).map_err(|_| InstalledPackError::MissingFile)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
+        if should_yield() {
+            return Err(InstalledPackError::Yielded);
+        }
         let read = file
             .read(&mut buffer)
             .map_err(|_| InstalledPackError::FileMismatch)?;
@@ -804,9 +817,13 @@ mod tests {
             size: 11,
         }];
 
-        assert!(inspect_file_inventory(root.path(), &expected, false).is_ok());
+        assert!(inspect_file_inventory(root.path(), &expected, false, &|| false).is_ok());
         assert_eq!(
-            inspect_file_inventory(root.path(), &expected, true),
+            inspect_file_inventory(root.path(), &expected, true, &|| true),
+            Err(InstalledPackError::Yielded)
+        );
+        assert_eq!(
+            inspect_file_inventory(root.path(), &expected, true, &|| false),
             Err(InstalledPackError::FileMismatch)
         );
     }

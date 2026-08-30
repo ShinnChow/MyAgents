@@ -1077,7 +1077,18 @@ fn run_live(
                             nonce,
                         },
                     )?,
-                    WorkerCommand::Yield { .. } | WorkerCommand::Start(_) => {
+                    WorkerCommand::Yield { .. } => {
+                        write_response(
+                            writer,
+                            WorkerResponse::Yielded {
+                                protocol_version: PROTOCOL_VERSION,
+                                identity: identity.clone(),
+                                checkpoint: checkpoint(&tracks),
+                            },
+                        )?;
+                        return Ok(());
+                    }
+                    WorkerCommand::Start(_) => {
                         return Err("SPEECH_WORKER_PROTOCOL_ERROR");
                     }
                 }

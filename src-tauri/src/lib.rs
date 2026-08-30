@@ -1422,7 +1422,7 @@ pub fn run() {
                             match document_processing::DocumentProcessingManager::initialize(
                                 data_dir.clone(),
                                 resource_dir.clone(),
-                                runtime_registry.as_ref(),
+                                runtime_registry.clone(),
                                 compute_coordinator.clone(),
                             ) {
                                 Ok(manager) => {
@@ -1447,7 +1447,7 @@ pub fn run() {
                             match speech_recognition::SpeechRecognitionManager::initialize(
                                 data_dir,
                                 resource_dir,
-                                runtime_registry.as_ref(),
+                                runtime_registry.clone(),
                                 compute_coordinator.clone(),
                                 record::get_record_store()
                                     .expect("RecordStore initialized before Tauri setup")
@@ -1715,6 +1715,21 @@ pub fn run() {
     // Run with event handler to catch Cmd+Q, Dock quit, and Dock click
     app.run(move |_app_handle, event| {
         match event {
+            tauri::RunEvent::Ready => {
+                if let (Some(runtime_registry), Some(compute_coordinator)) = (
+                    local_inference::global_runtime_registry(),
+                    local_inference::global_compute_coordinator(),
+                ) {
+                    runtime_registry
+                        .start_background_verification(Arc::clone(compute_coordinator));
+                }
+                if let Some(manager) = document_processing::global() {
+                    manager.start_background_resource_validation();
+                }
+                if let Some(manager) = speech_recognition::global() {
+                    manager.start_background_resource_validation();
+                }
+            }
             // Handle app exit events (Cmd+Q, Dock right-click quit, etc.)
             tauri::RunEvent::ExitRequested { code, api, .. } => {
                 if should_request_exit_confirmation(

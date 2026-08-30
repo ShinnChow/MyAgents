@@ -20,6 +20,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock,
 };
+use std::time::Duration as StdDuration;
 use tokio::sync::Notify;
 
 const QUEUE_LIMIT: usize = 16;
@@ -30,7 +31,10 @@ const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_WORKER_STDERR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 pub const DOCUMENT_HISTORY_RETENTION_DAYS: i64 = 30;
 const PROTOCOL_VERSION: u32 = 3;
-const OCR_YIELD_GRACE_SECONDS: u64 = 2;
+const WORKER_TERMINAL_GRACE: StdDuration = StdDuration::from_secs(30);
+const WORKER_CANCEL_GRACE: StdDuration = StdDuration::from_secs(15);
+const WORKER_SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(10);
+const OCR_YIELD_GRACE_SECONDS: u64 = 15;
 const PIPELINE_VERSION: &str = "anydoc-0.1.9_ppocrv6-small_v1";
 const JOB_ID_RANDOM_HEX: usize = 12;
 const JOB_DEADLINE_SECONDS: u64 = 30 * 60;
@@ -388,6 +392,7 @@ pub struct DocumentProcessingManager {
     manifest_path: PathBuf,
     onnx_runtime_path: PathBuf,
     onnx_runtime_version: String,
+    runtime_registry: Arc<LocalInferenceRuntimeRegistry>,
     compute_coordinator: Arc<LocalComputeCoordinator>,
     state: Mutex<ManagerState>,
     wake: Notify,
@@ -397,7 +402,7 @@ impl DocumentProcessingManager {
     pub fn initialize(
         data_root: PathBuf,
         resource_root: PathBuf,
-        runtime_registry: &LocalInferenceRuntimeRegistry,
+        runtime_registry: Arc<LocalInferenceRuntimeRegistry>,
         compute_coordinator: Arc<LocalComputeCoordinator>,
     ) -> Result<ManagedDocumentProcessing, String> {
         let root = data_root.join("document-processing");
@@ -415,8 +420,13 @@ impl DocumentProcessingManager {
         };
         let worker_path = resource_dir.join(worker_name);
         let manifest_path = resource_dir.join("manifest.json");
-        let runtime_validation =
-            validate_resource_surface(&worker_path, &manifest_path, runtime_registry);
+        let runtime_validation = validate_resource_surface(
+            &worker_path,
+            &manifest_path,
+            runtime_registry.as_ref(),
+            false,
+            &|| false,
+        );
         let resource_error = runtime_validation.as_ref().err().cloned();
         let (onnx_runtime_path, onnx_runtime_version) = runtime_validation
             .ok()
@@ -440,6 +450,7 @@ impl DocumentProcessingManager {
             manifest_path,
             onnx_runtime_path,
             onnx_runtime_version,
+            runtime_registry: Arc::clone(&runtime_registry),
             compute_coordinator,
             state: Mutex::new(ManagerState {
                 accepting: true,
@@ -456,6 +467,68 @@ impl DocumentProcessingManager {
         let runner = Arc::clone(&manager);
         tauri::async_runtime::spawn(async move { runner.run_queue().await });
         Ok(manager)
+    }
+
+    pub(crate) fn start_background_resource_validation(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        let runtime_registry = Arc::clone(&self.runtime_registry);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(StdDuration::from_secs(10)).await;
+                let lease = manager
+                    .compute_coordinator
+                    .acquire(ComputeWorkloadIdentity {
+                        kind: ComputeWorkloadKind::BackgroundResourceValidation,
+                        id: "document-resource-validation".to_string(),
+                        generation: 1,
+                    })
+                    .await;
+                let signal = lease.yield_signal();
+                let validator = Arc::clone(&manager);
+                let registry = Arc::clone(&runtime_registry);
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    validate_resource_surface(
+                        &validator.worker_path,
+                        &validator.manifest_path,
+                        registry.as_ref(),
+                        true,
+                        &|| signal.should_yield(),
+                    )
+                })
+                .await;
+                drop(lease);
+                match result {
+                    Ok(Err(error)) if error.code == "DOCUMENT_RESOURCE_VALIDATION_YIELDED" => {
+                        continue;
+                    }
+                    Ok(result) => {
+                        match &result {
+                            Ok(_) => crate::ulog_info!(
+                                "[document] background resource verification completed"
+                            ),
+                            Err(error) => crate::ulog_warn!(
+                                "[document] background resource verification failed code={}",
+                                error.code
+                            ),
+                        }
+                        if let Ok(mut state) = manager.state.lock() {
+                            state.resource_error = result.err();
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        crate::ulog_warn!(
+                            "[document] background resource verification task failed"
+                        );
+                        if let Ok(mut state) = manager.state.lock() {
+                            state.resource_error =
+                                Some(resource_error("DOCUMENT_RESOURCE_INVALID"));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     pub fn submit(
@@ -557,6 +630,10 @@ impl DocumentProcessingManager {
             source_metadata.len().saturating_add(MIN_FREE_RESERVE_BYTES),
             "private",
         )?;
+
+        self.runtime_registry
+            .identity(InferenceRuntimeKind::OnnxCpu)
+            .map_err(|_| resource_error("DOCUMENT_RESOURCE_INVALID"))?;
 
         let mut state = self.state.lock().map_err(|_| manager_unavailable())?;
         if !state.accepting {
@@ -767,7 +844,7 @@ impl DocumentProcessingManager {
                     let manager = Arc::clone(self);
                     let id = job_id.to_string();
                     tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        tokio::time::sleep(WORKER_CANCEL_GRACE).await;
                         if manager.is_running_generation(&id, generation) {
                             if let Ok(mut child) = child.lock() {
                                 let _ = child.kill_and_wait();
@@ -831,9 +908,7 @@ impl DocumentProcessingManager {
         }
         if let Some(running) = running {
             let _ = send_cancel(&running.stdin, &running.job_id, running.generation);
-            if let Ok(mut child) = running.child.lock() {
-                let _ = child.kill_and_wait();
-            }
+            let _ = process_cmd::settle_tree(&running.child, WORKER_SHUTDOWN_GRACE);
         }
         match persistence_error {
             Some(error) => Err(error),
@@ -1069,11 +1144,22 @@ impl DocumentProcessingManager {
                 ocr_lease = Some(lease);
                 Ok(())
             },
+            || {
+                arm_worker_settlement_deadline(
+                    Arc::clone(&child),
+                    Arc::clone(&worker_settled),
+                    WORKER_TERMINAL_GRACE,
+                );
+            },
         );
+        let natural_grace = if terminal.is_ok() {
+            WORKER_TERMINAL_GRACE
+        } else {
+            let _ = send_cancel(&stdin, &job.job_id, generation);
+            WORKER_CANCEL_GRACE
+        };
+        let _ = process_cmd::settle_tree(&child, natural_grace);
         worker_settled.store(true, Ordering::Release);
-        if let Ok(mut child) = child.lock() {
-            let _ = child.wait();
-        }
         drop(ocr_lease);
         if requeue_for_live.load(Ordering::Acquire) {
             self.settle_ocr_yield(&job.job_id, generation, pending);
@@ -1795,6 +1881,7 @@ fn read_worker_responses(
     expected_generation: u64,
     mut progress: impl FnMut(WorkerProgress),
     mut acquire_ocr_lease: impl FnMut() -> Result<(), WorkerResponseReadError>,
+    mut terminal_received: impl FnMut(),
 ) -> Result<WorkerTerminal, WorkerResponseReadError> {
     let mut ready = false;
     let mut ocr_lease_requested = false;
@@ -1936,6 +2023,7 @@ fn read_worker_responses(
                     detected_format: Some(result.detected_format),
                     metrics: Some(result.metrics),
                 });
+                terminal_received();
             }
             WorkerMessage::Failed {
                 protocol_version,
@@ -1964,6 +2052,7 @@ fn read_worker_responses(
                     detected_format: None,
                     metrics: None,
                 });
+                terminal_received();
             }
         }
     }
@@ -2607,6 +2696,8 @@ fn validate_resource_surface(
     worker: &Path,
     manifest: &Path,
     runtime_registry: &LocalInferenceRuntimeRegistry,
+    verify_digests: bool,
+    should_yield: &dyn Fn() -> bool,
 ) -> Result<LocalInferenceRuntimeIdentity, DocumentServiceError> {
     let manifest_metadata =
         fs::symlink_metadata(manifest).map_err(|_| resource_error("DOCUMENT_RESOURCE_MISSING"))?;
@@ -2657,14 +2748,14 @@ fn validate_resource_surface(
     if expected_worker != worker {
         return Err(resource_error("DOCUMENT_RESOURCE_MANIFEST_INVALID"));
     }
-    let worker_metadata = verify_resource_file(root, &parsed.worker)?;
+    let worker_metadata = verify_resource_file(root, &parsed.worker, verify_digests, should_yield)?;
     for file in [
         &parsed.files.pdfium,
         &parsed.files.detector_model,
         &parsed.files.recognizer_model,
         &parsed.files.dictionary,
     ] {
-        verify_resource_file(root, file)?;
+        verify_resource_file(root, file, verify_digests, should_yield)?;
     }
     #[cfg(unix)]
     {
@@ -2713,6 +2804,8 @@ fn resource_path(
 fn verify_resource_file(
     root: &Path,
     resource: &ManagerResourceFile,
+    verify_digest: bool,
+    should_yield: &dyn Fn() -> bool,
 ) -> Result<fs::Metadata, DocumentServiceError> {
     if resource.sha256.len() != 64
         || resource.size == 0
@@ -2727,29 +2820,38 @@ fn verify_resource_file(
     let path = resource_path(root, resource)?;
     let metadata =
         fs::symlink_metadata(&path).map_err(|_| resource_error("DOCUMENT_RESOURCE_MISSING"))?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() != resource.size
-        || sha256_file(&path).map_err(|_| resource_error("DOCUMENT_RESOURCE_INVALID"))?
-            != resource.sha256.to_ascii_lowercase()
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != resource.size {
         return Err(resource_error("DOCUMENT_RESOURCE_INVALID"));
+    }
+    if verify_digest {
+        let digest = sha256_file_interruptible(&path, should_yield)
+            .map_err(|_| resource_error("DOCUMENT_RESOURCE_INVALID"))?
+            .ok_or_else(|| resource_error("DOCUMENT_RESOURCE_VALIDATION_YIELDED"))?;
+        if digest != resource.sha256.to_ascii_lowercase() {
+            return Err(resource_error("DOCUMENT_RESOURCE_INVALID"));
+        }
     }
     Ok(metadata)
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+fn sha256_file_interruptible(
+    path: &Path,
+    should_yield: &dyn Fn() -> bool,
+) -> std::io::Result<Option<String>> {
     let mut file = File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
+        if should_yield() {
+            return Ok(None);
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(Some(format!("{:x}", digest.finalize())))
 }
 
 fn resource_error(code: &str) -> DocumentServiceError {
@@ -3303,14 +3405,36 @@ fn arm_document_ocr_yield(
                 let _ = send_cancel(&stdin, &job_id, generation);
                 tokio::time::sleep(std::time::Duration::from_secs(OCR_YIELD_GRACE_SECONDS)).await;
                 if !settled.load(Ordering::Acquire) {
-                    if let Ok(mut child) = child.lock() {
-                        let _ = child.kill_and_wait();
-                    }
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        if let Ok(mut child) = child.lock() {
+                            let _ = child.kill_and_wait();
+                        }
+                    })
+                    .await;
                 }
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    });
+}
+
+fn arm_worker_settlement_deadline(
+    child: Arc<Mutex<process_cmd::ChildTree>>,
+    settled: Arc<AtomicBool>,
+    grace: StdDuration,
+) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(grace).await;
+        if settled.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill_and_wait();
+            }
+        })
+        .await;
     });
 }
 
@@ -3544,6 +3668,7 @@ mod tests {
             manifest_path: root.join("unused-manifest"),
             onnx_runtime_path: root.join("unused-onnx-runtime"),
             onnx_runtime_version: "1.28.0".into(),
+            runtime_registry: LocalInferenceRuntimeRegistry::initialize(root),
             compute_coordinator: LocalComputeCoordinator::new(),
             state: Mutex::new(ManagerState {
                 accepting: true,
@@ -3584,6 +3709,24 @@ mod tests {
         let current = manager.get(job_id).unwrap();
         assert_eq!(current.stage, "ocr");
         assert!(current.updated_at > previous_updated_at);
+    }
+
+    #[test]
+    fn resource_digest_validation_can_yield_between_chunks() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("resource.bin");
+        fs::write(&path, vec![7_u8; 256 * 1024]).unwrap();
+
+        assert!(sha256_file_interruptible(&path, &|| true)
+            .unwrap()
+            .is_none());
+        let digest = sha256_file_interruptible(&path, &|| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            digest,
+            format!("{:x}", Sha256::digest(vec![7_u8; 256 * 1024]))
+        );
     }
 
     #[test]
@@ -4270,6 +4413,7 @@ mod tests {
             7,
             |_| {},
             || Ok(()),
+            || {},
         )
         .unwrap_err();
         assert_eq!(
@@ -4309,6 +4453,7 @@ mod tests {
                 7,
                 |_| {},
                 || Ok(()),
+                || {},
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("progress identity mismatch".into()),
@@ -4350,6 +4495,7 @@ mod tests {
                 7,
                 |_| {},
                 || Ok(()),
+                || {},
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("completed response shape invalid".into()),
@@ -4393,6 +4539,7 @@ mod tests {
                 grants += 1;
                 Ok(())
             },
+            || {},
         )
         .unwrap();
         assert!(terminal.success);
@@ -4425,6 +4572,7 @@ mod tests {
                 7,
                 |_| {},
                 || Ok(()),
+                || {},
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("completed response shape invalid".into())
@@ -4451,6 +4599,7 @@ mod tests {
                 7,
                 |_| {},
                 || Ok(()),
+                || {},
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("worker emitted duplicate ready".into()),
@@ -4477,6 +4626,7 @@ mod tests {
                 7,
                 |_| {},
                 || Ok(()),
+                || {},
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("failed response shape invalid".into()),
@@ -4503,6 +4653,7 @@ mod tests {
                 7,
                 |_| {},
                 || Ok(()),
+                || {},
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("worker progress stage invalid".into()),
@@ -4537,6 +4688,7 @@ mod tests {
                 7,
                 |_| {},
                 || Ok(()),
+                || {},
             )
             .unwrap_err(),
             WorkerResponseReadError::Protocol("worker emitted a frame after terminal".into()),

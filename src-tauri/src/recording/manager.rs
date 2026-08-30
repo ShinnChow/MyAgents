@@ -1060,7 +1060,7 @@ impl RecordingManager {
             return Err(error);
         }
 
-        let live_boundary_ok = if pause && live_analysis_enabled {
+        let mut live_control_ok = if pause && live_analysis_enabled {
             let checkpoint =
                 match tokio::task::spawn_blocking(move || checkpoint_analyses(&analysis_controls))
                     .await
@@ -1071,7 +1071,7 @@ impl RecordingManager {
             match checkpoint {
                 Ok(offsets) => {
                     if let Some(speech) = speech_recognition::global() {
-                        if let Err(error) = speech.flush_record_live(&record_id, offsets) {
+                        if let Err(error) = speech.pause_record_live(&record_id, offsets) {
                             ulog_warn!(
                                 "[recording] live pause flush failed recordId={} error={}",
                                 record_id,
@@ -1125,6 +1125,26 @@ impl RecordingManager {
                 return Err(error);
             }
         };
+        if !pause && live_analysis_enabled {
+            live_control_ok = if let Some(speech) = speech_recognition::global() {
+                if let Err(error) = speech.resume_record_live(&record_id) {
+                    ulog_warn!(
+                        "[recording] live resume failed recordId={} error={}",
+                        record_id,
+                        error
+                    );
+                    false
+                } else {
+                    true
+                }
+            } else {
+                ulog_warn!(
+                    "[recording] live resume owner unavailable recordId={}",
+                    record_id
+                );
+                false
+            };
+        }
         let snapshot_result = {
             let mut state = self.state.lock().await;
             let Some(RecordingSlot::Live(active)) = state.slot.as_mut() else {
@@ -1135,7 +1155,7 @@ impl RecordingManager {
             }
             active.revision = updated.revision;
             active.capture_status = status;
-            if !live_boundary_ok {
+            if !live_control_ok {
                 active.live_analysis_enabled = false;
             }
             let journal_result = if pause {

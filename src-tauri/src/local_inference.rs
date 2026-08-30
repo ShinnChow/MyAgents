@@ -17,10 +17,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, OnceLock, Weak,
 };
+use std::time::Duration;
 use tokio::sync::Notify;
 
 const MAX_RUNTIME_MANIFEST_BYTES: u64 = 1024 * 1024;
 const DOCUMENT_RUNTIME_MANIFEST: &str = "document-processing/v1/manifest.json";
+const BACKGROUND_VALIDATION_QUIET_PERIOD: Duration = Duration::from_secs(10);
 
 pub type ManagedLocalInferenceRuntimeRegistry = Arc<LocalInferenceRuntimeRegistry>;
 pub type ManagedLocalComputeCoordinator = Arc<LocalComputeCoordinator>;
@@ -126,6 +128,7 @@ pub struct LocalInferenceRuntimeRegistry {
     source_manifest: PathBuf,
     runtimes: HashMap<InferenceRuntimeKind, LocalInferenceRuntimeIdentity>,
     discovery_error: Option<LocalInferenceRuntimeError>,
+    verification_error: Mutex<Option<LocalInferenceRuntimeError>>,
 }
 
 impl LocalInferenceRuntimeRegistry {
@@ -146,6 +149,7 @@ impl LocalInferenceRuntimeRegistry {
             source_manifest,
             runtimes,
             discovery_error,
+            verification_error: Mutex::new(None),
         })
     }
 
@@ -153,6 +157,14 @@ impl LocalInferenceRuntimeRegistry {
         &self,
         kind: InferenceRuntimeKind,
     ) -> Result<LocalInferenceRuntimeIdentity, LocalInferenceRuntimeError> {
+        if let Some(error) = self
+            .verification_error
+            .lock()
+            .map_err(|_| LocalInferenceRuntimeError::new("LOCAL_RUNTIME_UNAVAILABLE"))?
+            .clone()
+        {
+            return Err(error);
+        }
         self.runtimes.get(&kind).cloned().ok_or_else(|| {
             self.discovery_error
                 .clone()
@@ -162,6 +174,90 @@ impl LocalInferenceRuntimeRegistry {
 
     pub fn source_manifest(&self) -> &Path {
         &self.source_manifest
+    }
+
+    pub fn start_background_verification(
+        self: &Arc<Self>,
+        coordinator: Arc<LocalComputeCoordinator>,
+    ) {
+        let registry = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(BACKGROUND_VALIDATION_QUIET_PERIOD).await;
+                let lease = coordinator
+                    .acquire(ComputeWorkloadIdentity {
+                        kind: ComputeWorkloadKind::BackgroundResourceValidation,
+                        id: "shared-onnx-runtime".to_string(),
+                        generation: 1,
+                    })
+                    .await;
+                let signal = lease.yield_signal();
+                let verify_registry = Arc::clone(&registry);
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    verify_registry.verify_runtime_files(&signal)
+                })
+                .await;
+                drop(lease);
+                match result {
+                    Ok(RuntimeVerification::Yielded) => continue,
+                    Ok(RuntimeVerification::Complete(result)) => {
+                        match &result {
+                            Ok(()) => crate::ulog_info!(
+                                "[local-inference] background shared runtime verification completed"
+                            ),
+                            Err(error) => crate::ulog_warn!(
+                                "[local-inference] background shared runtime verification failed code={}",
+                                error.code()
+                            ),
+                        }
+                        if let Ok(mut error) = registry.verification_error.lock() {
+                            *error = result.err();
+                        }
+                        break;
+                    }
+                    Err(_) => {
+                        crate::ulog_warn!(
+                            "[local-inference] background shared runtime verification task failed"
+                        );
+                        if let Ok(mut error) = registry.verification_error.lock() {
+                            *error = Some(LocalInferenceRuntimeError::new("LOCAL_RUNTIME_INVALID"));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn verify_runtime_files(&self, signal: &LocalComputeYieldSignal) -> RuntimeVerification {
+        for identity in self.runtimes.values() {
+            let metadata = match fs::symlink_metadata(&identity.path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    return RuntimeVerification::Complete(Err(LocalInferenceRuntimeError::new(
+                        "LOCAL_RUNTIME_INVALID",
+                    )))
+                }
+            };
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() != identity.size
+            {
+                return RuntimeVerification::Complete(Err(LocalInferenceRuntimeError::new(
+                    "LOCAL_RUNTIME_INVALID",
+                )));
+            }
+            match sha256_file_interruptible(&identity.path, || signal.should_yield()) {
+                Ok(Some(digest)) if digest == identity.sha256 => {}
+                Ok(None) => return RuntimeVerification::Yielded,
+                Ok(Some(_)) | Err(_) => {
+                    return RuntimeVerification::Complete(Err(LocalInferenceRuntimeError::new(
+                        "LOCAL_RUNTIME_INVALID",
+                    )))
+                }
+            }
+        }
+        RuntimeVerification::Complete(Ok(()))
     }
 
     /// Assert that a capability manifest points at the exact runtime identity
@@ -272,13 +368,7 @@ fn discover_onnx_runtime(
     let path = resolve_relative_resource(root, &runtime.path)?;
     let metadata = fs::symlink_metadata(&path)
         .map_err(|_| LocalInferenceRuntimeError::new("LOCAL_RUNTIME_MISSING"))?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.len() != runtime.size
-        || sha256_file(&path)
-            .map_err(|_| LocalInferenceRuntimeError::new("LOCAL_RUNTIME_INVALID"))?
-            != runtime.sha256.to_ascii_lowercase()
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != runtime.size {
         return Err(LocalInferenceRuntimeError::new("LOCAL_RUNTIME_INVALID"));
     }
     let version = runtime
@@ -343,22 +433,34 @@ fn resolve_relative_resource(
     Ok(root.join(relative))
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
+fn sha256_file_interruptible(
+    path: &Path,
+    should_yield: impl Fn() -> bool,
+) -> std::io::Result<Option<String>> {
     let mut file = fs::File::open(path)?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 128 * 1024];
     loop {
+        if should_yield() {
+            return Ok(None);
+        }
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(Some(format!("{:x}", digest.finalize())))
+}
+
+enum RuntimeVerification {
+    Yielded,
+    Complete(Result<(), LocalInferenceRuntimeError>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComputeWorkloadKind {
+    BackgroundResourceValidation,
     DocumentOcr,
     AgentAttachmentAsr,
     SpeechModelValidation,
@@ -368,8 +470,9 @@ pub enum ComputeWorkloadKind {
 }
 
 impl ComputeWorkloadKind {
-    fn priority(self) -> u8 {
+    pub(crate) fn priority(self) -> u8 {
         match self {
+            Self::BackgroundResourceValidation => 0,
             Self::DocumentOcr | Self::AgentAttachmentAsr | Self::SpeechModelValidation => 1,
             Self::RecordDiarization => 2,
             Self::RecordBackfill => 3,
@@ -379,6 +482,7 @@ impl ComputeWorkloadKind {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::BackgroundResourceValidation => "background-resource-validation",
             Self::DocumentOcr => "document-ocr",
             Self::AgentAttachmentAsr => "agent-attachment-asr",
             Self::SpeechModelValidation => "speech-model-validation",
@@ -503,11 +607,11 @@ fn refresh_yield_request(state: &mut CoordinatorState) {
     let Some(active) = state.active.as_ref() else {
         return;
     };
-    let active_priority = active.identity.kind.priority();
     let should_yield = state
         .waiters
         .values()
-        .any(|waiter| waiter.identity.kind.priority() > active_priority);
+        .any(|waiter| waiter.identity.kind == ComputeWorkloadKind::RecordLive)
+        && active.identity.kind != ComputeWorkloadKind::RecordLive;
     active
         .yield_requested
         .store(should_yield, Ordering::Release);
@@ -687,18 +791,24 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_runtime_mutation_and_manifest_aliases() {
+    fn registry_defers_runtime_digest_but_rejects_manifest_aliases_synchronously() {
         let root = tempfile::tempdir().unwrap();
         let runtime = write_runtime_bundle(root.path(), b"verified-runtime");
         fs::write(&runtime, b"mutated-runtime!").unwrap();
         let registry = LocalInferenceRuntimeRegistry::initialize(root.path());
-        assert_eq!(
-            registry
-                .identity(InferenceRuntimeKind::OnnxCpu)
-                .unwrap_err()
-                .code(),
-            "LOCAL_RUNTIME_INVALID"
-        );
+        assert!(registry.identity(InferenceRuntimeKind::OnnxCpu).is_ok());
+        let signal = LocalComputeYieldSignal {
+            requested: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(matches!(
+            registry.verify_runtime_files(&signal),
+            RuntimeVerification::Complete(Err(error)) if error.code() == "LOCAL_RUNTIME_INVALID"
+        ));
+        signal.requested.store(true, Ordering::Release);
+        assert!(matches!(
+            registry.verify_runtime_files(&signal),
+            RuntimeVerification::Yielded
+        ));
 
         let alias_root = tempfile::tempdir().unwrap();
         write_runtime_bundle(alias_root.path(), b"verified-runtime");
@@ -793,5 +903,33 @@ mod tests {
         .await
         .expect("a dropped waiter cannot block the queue");
         assert_eq!(next.identity().id, "next");
+    }
+
+    #[tokio::test]
+    async fn non_live_priority_only_changes_next_admission() {
+        let coordinator = LocalComputeCoordinator::new();
+        let attachment = coordinator
+            .acquire(workload(
+                ComputeWorkloadKind::AgentAttachmentAsr,
+                "attachment",
+            ))
+            .await;
+        let mut backfill = Box::pin(
+            coordinator.acquire(workload(ComputeWorkloadKind::RecordBackfill, "backfill")),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), backfill.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(!attachment.should_yield());
+        drop(attachment);
+        let backfill = tokio::time::timeout(Duration::from_secs(1), backfill.as_mut())
+            .await
+            .expect("higher non-live priority runs after the active workload finishes");
+        assert_eq!(
+            backfill.identity().kind,
+            ComputeWorkloadKind::RecordBackfill
+        );
     }
 }

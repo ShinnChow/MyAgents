@@ -76,11 +76,11 @@ queued/running/cancelling --App restart/shutdown--> interrupted
 - admission 打开 source 的 no-follow regular-file handle；queued job 持有该 handle，避免 path 后续被替换成别的文件。
 - running 首先把 held source 分块复制到私有 `input/source.bin` 并计算 SHA-256；每块检查 cancellation/deadline，实际字节数以及复制前后的 size、mtime/ctime（Windows 为 last-write time）必须与 admission metadata 一致。即使同一 inode 被等长改写也 fail closed 为 `DOCUMENT_SOURCE_CHANGED`。
 - Worker 使用 `process_cmd::new()` + `spawn_tree()`；环境清空，stdin/stdout 仅承载私有协议，stderr 不进入用户错误。
-- job deadline 从 source admission copy 开始计 30 分钟。cancel 先持久化 `cancelling`，再发送 exact `(jobId,generation)` frame，2 秒仍运行才 kill retained `ChildTree`；cancel、timeout 与成功发布在同一 Manager lock 内裁决，发布 IO 后、写入成功终态前再次以 monotonic deadline 确定逻辑 commit time，超时不能因 watchdog 等锁而赢得成功。
-- App shutdown 先关闭 admission，把所有非终态持久化为 `interrupted`，释放 queued handle，随后取消/终止 retained Worker tree。
+- job deadline 从 source admission copy 开始计 30 分钟。cancel 先持久化 `cancelling`，再发送 exact `(jobId,generation)` frame，给 Worker 15 秒 cooperative settlement，之后 force-stop 并最多再等 10 秒确认 exact tree 已退出；cancel、timeout 与成功发布在同一 Manager lock 内裁决，发布 IO 后、写入成功终态前再次以 monotonic deadline 确定逻辑 commit time，超时不能因 watchdog 等锁而赢得成功。
+- App shutdown 先关闭 admission，把所有非终态持久化为 `interrupted`，释放 queued handle，随后发送 cancel 并给 retained Worker tree 10 秒 cooperative settlement；force-stop 后最多再等 10 秒。Worker 已发合法 terminal 时允许最多 30 秒自然退出，terminal 后挂起也必须由同一 `ChildTree` deadline 收敛。
 - Worker crash 不自动重试；当前 job 失败为 `DOCUMENT_WORKER_CRASHED`，用户显式重试会创建新 ID。
 - 结构化解析、native PDF 文本提取和渲染不占本地推理名额。Worker 只有在确认图片或具体 PDF 页需要 PP-OCR 时才发送 exact-generation `ocr_lease_requested`；Manager 从 App-global `LocalComputeCoordinator` 取得 `DocumentOcr` lease 后才回复 `grant_ocr_lease`，Worker 在此之前不能加载 OCR session 或执行 tensor inference。
-- 更高优先级的 Record live ASR 到达时，lease 的只读 yield signal 触发 exact OCR Worker generation cancel，并在 2 秒后兜底终止 retained `ChildTree`。Document job 保持原 ID，authenticated staging 中的未发布内容被清空，私有输入重新准备后回到 FIFO；该过程不写 failed terminal、不发布 partial artifact。用户 cancel / App shutdown 与 yield 竞态时仍由 Document Manager 当前状态裁决，用户 cancel 优先。
+- Record live ASR 到达时，lease 的只读 yield signal 立即触发 exact OCR Worker generation cancel；15 秒仍未退出才 force-stop，并最多再等 10 秒。Document job 保持原 ID，authenticated staging 中的未发布内容被清空，私有输入重新准备后回到 FIFO；该过程不写 failed terminal、不发布 partial artifact。非 live workload 只影响下一次 admission，不抢占已运行 OCR。用户 cancel / App shutdown 与 yield 竞态时仍由 Document Manager 当前状态裁决，用户 cancel 优先。
 
 ## 私有 framed protocol
 
@@ -175,7 +175,7 @@ prepare owner 把生命周期分成三层：
 
 ONNX Runtime 官方 1.28 macOS arm64 archive 的最低系统版本是 macOS 14，且没有 macOS x64 binary；MyAgents 最低支持 macOS 13，因此两个 macOS target 都从精确 commit `da9b5e364c465de65c49d91e696cd6485270757f`、固定 recipe 与 deployment target 13.0 构建 shared library，其余 target 使用锁定官方 archive。该源码路径由 prepare owner 在 cache miss 后、任何资源网络/源码 mutation 前统一检查 Git、Python 3.8+、CMake 3.28+ 与 Apple Clang；`--check-prerequisites` 提供给平台 build 做早期只读预检。已有对应 fingerprint 的有效 prepared bundle 时不要求源码工具，脚本也不自动安装系统包。PDFium 全部使用 `chromium/7999` 锁定 archive。安装资源同时包含 AnyDoc/Paddle/ORT/PDFium license 与 PDFium 第三方 license tree；顶层 `THIRD_PARTY_NOTICES.md` 保留组件分类。speech 使用锁定 sherpa-onnx/codec 源码及其 legal tree，构建时显式关闭 CoreML 并链接上述同一 App-owned CPU ORT。
 
-App 启动时 Manager 校验 manifest target/pipeline、Worker 可执行位和 Worker/native/model/dictionary 的 size + SHA；资源问题只让 document admission fail closed，不阻止 MyAgents UI 启动。Worker 启动后再次校验它实际要加载的五个资源。运行时不得下载、访问 Hugging Face 或使用用户 cache。
+App 启动同步路径只解析 manifest，并校验 target/pipeline、路径、regular-file、size 与 Worker 可执行位，不读取 ORT、PDFium、OCR 模型或字典的完整正文。App ready 后先等 10 秒安静窗口，再由最低优先级 `BackgroundResourceValidation` lease 分块校验：共享 ORT 只由 `LocalInferenceRuntimeRegistry` 校验一次，Document Manager 校验 Worker/PDFium/OCR 模型/字典；Record live 到来时 chunk-level yield，稍后重新等待安静窗口再试。后台失败会阻止新的对应 admission，但不阻止 MyAgents UI 启动；Worker 启动后仍再次完整校验它实际要加载的五个资源并 fail closed。运行时不得下载、访问 Hugging Face 或使用用户 cache。
 
 speech 的用户可移除模型权重不属于本节的 build cache，也不进入 Tauri resource projection。它们由 `SpeechRecognitionManager` 在用户显式操作后写入 App data 下的版本目录；安装前仍复用本节同一 App-owned ORT identity，但下载/签名、模型最小加载、`active.json` 切换与 busy removal 由 speech domain owner 裁决。两者只共享受信任 runtime 和 compute lease，不共享 job store 或模型 activation authority。详见 [`recording_and_speech_recognition.md`](./recording_and_speech_recognition.md)。
 

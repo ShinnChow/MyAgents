@@ -34,7 +34,10 @@ impl WorkloadKind {
     pub fn can_cooperatively_yield(self) -> bool {
         matches!(
             self,
-            Self::RecordBackfillAsr | Self::RecordDiarization | Self::AttachmentAsr
+            Self::RecordLiveAsr
+                | Self::RecordBackfillAsr
+                | Self::RecordDiarization
+                | Self::AttachmentAsr
         )
     }
 }
@@ -1000,7 +1003,7 @@ mod tests {
         assert!(start.has_valid_shape());
         start.workload_kind = WorkloadKind::AttachmentProbe;
         assert!(start.has_valid_shape());
-        assert!(!WorkloadKind::RecordLiveAsr.can_cooperatively_yield());
+        assert!(WorkloadKind::RecordLiveAsr.can_cooperatively_yield());
         assert!(WorkloadKind::AttachmentAsr.can_cooperatively_yield());
         assert!(!WorkloadKind::AttachmentProbe.can_cooperatively_yield());
 

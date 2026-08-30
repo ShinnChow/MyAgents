@@ -6,7 +6,7 @@
 
 use crate::local_inference::{
     ComputeWorkloadIdentity, ComputeWorkloadKind, InferenceRuntimeKind, LocalComputeCoordinator,
-    LocalComputeLease, LocalInferenceRuntimeIdentity, LocalInferenceRuntimeRegistry,
+    LocalComputeLease, LocalComputeYieldSignal, LocalInferenceRuntimeRegistry,
 };
 use crate::process_cmd;
 use crate::record::{
@@ -26,7 +26,7 @@ use crate::workspace_files::path_safety::{
 };
 use chrono::{DateTime, Duration, Utc};
 use myagents_media_worker_protocol::{
-    read_worker_response, write_control_frame, write_pcm_frame, PcmFrame, PcmStreamEnd,
+    read_worker_response, write_control_frame, write_pcm_frame, Checkpoint, PcmFrame, PcmStreamEnd,
     PcmStreamStart, RecordArtifactInput, SpeakerTurn, StartRequest, TrackKind, WorkerCommand,
     WorkerMetrics, WorkerResponse, WorkerStage, WorkloadIdentity, WorkloadInput, WorkloadKind,
     MAX_MEDIA_SAMPLES_PER_TRACK, MAX_PCM_SAMPLES_PER_FRAME, PROTOCOL_VERSION,
@@ -56,6 +56,10 @@ const AGENT_STAGING_MARKER: &str = ".myagents-speech-owner";
 const AGENT_PRIVATE_STAGING_TOKEN: &str = ".staging-token";
 const AGENT_PUBLISH_INTENT: &str = "publish-intent.json";
 const YIELD_GRACE_SECONDS: u64 = 15;
+const WORKER_TERMINAL_GRACE: StdDuration = StdDuration::from_secs(30);
+const WORKER_CANCEL_GRACE: StdDuration = StdDuration::from_secs(15);
+const WORKER_SHUTDOWN_GRACE: StdDuration = StdDuration::from_secs(10);
+const LIVE_PAUSE_WARM_GRACE: StdDuration = StdDuration::from_secs(10 * 60);
 const MAX_TRANSCRIPT_SEGMENTS: usize = 100_000;
 const MAX_TRANSCRIPT_CHARACTERS: usize = 5_000_000;
 const MAX_DIARIZATION_TURNS: usize = 200_000;
@@ -402,6 +406,10 @@ struct LiveControlState {
     flushes: VecDeque<LiveBoundary>,
     finish: Option<LiveBoundary>,
     cancelled: bool,
+    paused: bool,
+    pause_epoch: u64,
+    pause_timer: Option<tauri::async_runtime::JoinHandle<()>>,
+    suspend_requested: bool,
 }
 
 #[derive(Default)]
@@ -419,6 +427,8 @@ impl LiveControl {
             flush: state.flushes.front().cloned(),
             finish: state.finish.clone(),
             cancelled: state.cancelled,
+            paused: state.paused,
+            suspend_requested: state.suspend_requested,
         })
     }
 
@@ -429,12 +439,38 @@ impl LiveControl {
             }
         }
     }
+
+    fn send_yield_if_suspended(
+        &self,
+        stdin: &Arc<Mutex<std::process::ChildStdin>>,
+        identity: &WorkloadIdentity,
+    ) -> Result<bool, ()> {
+        let state = self.state.lock().map_err(|_| ())?;
+        if !state.paused
+            || !state.suspend_requested
+            || !state.flushes.is_empty()
+            || state.finish.is_some()
+            || state.cancelled
+        {
+            return Ok(false);
+        }
+        send_worker_command(
+            stdin,
+            &WorkerCommand::Yield {
+                protocol_version: PROTOCOL_VERSION,
+                identity: identity.clone(),
+            },
+        )?;
+        Ok(true)
+    }
 }
 
 struct LiveControlStateSnapshot {
     flush: Option<LiveBoundary>,
     finish: Option<LiveBoundary>,
     cancelled: bool,
+    paused: bool,
+    suspend_requested: bool,
 }
 
 struct RunningWorker {
@@ -483,12 +519,62 @@ enum SpeechWorkerOutcome {
     Failed {
         code: String,
         retryable: bool,
+        terminal_received: bool,
     },
+}
+
+impl SpeechWorkerOutcome {
+    fn settlement_grace(&self) -> StdDuration {
+        match self {
+            Self::Completed { .. }
+            | Self::Failed {
+                terminal_received: true,
+                ..
+            } => WORKER_TERMINAL_GRACE,
+            Self::Yielded | Self::Failed { .. } => WORKER_CANCEL_GRACE,
+        }
+    }
+
+    fn needs_cancel(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed {
+                terminal_received: false,
+                ..
+            }
+        )
+    }
+}
+
+struct BatchYieldState {
+    sent: Arc<std::sync::atomic::AtomicBool>,
+    settled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BatchYieldState {
+    fn new() -> Self {
+        Self {
+            sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            settled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn finish_reading(&self) {
+        if !self.sent.load(std::sync::atomic::Ordering::Acquire) {
+            self.mark_settled();
+        }
+    }
+
+    fn mark_settled(&self) {
+        self.settled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum LiveAttemptOutcome {
     Finished,
+    Suspended,
     Cancelled,
     Failed { code: String, retryable: bool },
 }
@@ -507,7 +593,7 @@ pub struct SpeechRecognitionManager {
     native_manifest_path: PathBuf,
     worker_path: PathBuf,
     model_pack: Arc<SpeechModelPackManager>,
-    runtime_identity: Option<LocalInferenceRuntimeIdentity>,
+    runtime_registry: Arc<LocalInferenceRuntimeRegistry>,
     compute_coordinator: Arc<LocalComputeCoordinator>,
     record_store: ManagedRecordStore,
     state: Mutex<ManagerState>,
@@ -518,7 +604,7 @@ impl SpeechRecognitionManager {
     pub fn initialize(
         data_root: PathBuf,
         resource_root: PathBuf,
-        runtime_registry: &LocalInferenceRuntimeRegistry,
+        runtime_registry: Arc<LocalInferenceRuntimeRegistry>,
         compute_coordinator: Arc<LocalComputeCoordinator>,
         record_store: ManagedRecordStore,
     ) -> Result<ManagedSpeechRecognition, String> {
@@ -535,7 +621,7 @@ impl SpeechRecognitionManager {
     fn initialize_inner(
         data_root: PathBuf,
         resource_root: PathBuf,
-        runtime_registry: &LocalInferenceRuntimeRegistry,
+        runtime_registry: Arc<LocalInferenceRuntimeRegistry>,
         compute_coordinator: Arc<LocalComputeCoordinator>,
         record_store: ManagedRecordStore,
         start_runner: bool,
@@ -581,7 +667,7 @@ impl SpeechRecognitionManager {
             native_manifest_path,
             worker_path,
             model_pack,
-            runtime_identity,
+            runtime_registry,
             compute_coordinator,
             record_store,
             state: Mutex::new(ManagerState {
@@ -608,10 +694,18 @@ impl SpeechRecognitionManager {
         Ok(manager)
     }
 
+    pub(crate) fn start_background_resource_validation(self: &Arc<Self>) {
+        self.model_pack.start_background_verification();
+    }
+
     pub fn capability_snapshot(&self) -> SpeechCapabilitySnapshot {
         let native_ready = plain_file(&self.worker_path) && plain_file(&self.native_manifest_path);
         let model_pack_revision = self.model_pack.active_pack().map(|pack| pack.revision);
-        let resource_status = if !native_ready || self.runtime_identity.is_none() {
+        let runtime_identity = self
+            .runtime_registry
+            .identity(InferenceRuntimeKind::OnnxCpu)
+            .ok();
+        let resource_status = if !native_ready || runtime_identity.is_none() {
             SpeechResourceStatus::NativeUnavailable
         } else if model_pack_revision.is_none() {
             SpeechResourceStatus::NotInstalled
@@ -621,8 +715,7 @@ impl SpeechRecognitionManager {
         SpeechCapabilitySnapshot {
             resource_status,
             model_pack_revision,
-            onnx_runtime_version: self
-                .runtime_identity
+            onnx_runtime_version: runtime_identity
                 .as_ref()
                 .map(|identity| identity.version().to_string()),
         }
@@ -637,9 +730,9 @@ impl SpeechRecognitionManager {
             .active_pack()
             .ok_or("SPEECH_MODEL_PACK_UNAVAILABLE")?;
         let runtime = self
-            .runtime_identity
-            .as_ref()
-            .ok_or("SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
+            .runtime_registry
+            .identity(InferenceRuntimeKind::OnnxCpu)
+            .map_err(|_| "SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
         // The activated pack was fully verified before entering this in-memory
         // state. Admission only snapshots that identity; every media Worker
         // independently re-opens and hashes the exact pack before model use.
@@ -666,9 +759,9 @@ impl SpeechRecognitionManager {
             return Err("SPEECH_NATIVE_RUNTIME_UNAVAILABLE");
         }
         let runtime = self
-            .runtime_identity
-            .as_ref()
-            .ok_or("SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
+            .runtime_registry
+            .identity(InferenceRuntimeKind::OnnxCpu)
+            .map_err(|_| "SPEECH_NATIVE_RUNTIME_UNAVAILABLE")?;
         if pipeline.provider != "local" || pipeline.onnx_runtime_version != runtime.version() {
             return Err("SPEECH_PIPELINE_REVISION_UNAVAILABLE");
         }
@@ -1203,6 +1296,165 @@ impl SpeechRecognitionManager {
         Ok(())
     }
 
+    pub(crate) fn pause_record_live(
+        self: &Arc<Self>,
+        record_id: &str,
+        offsets: Vec<RecordTranscriptTrackOffset>,
+    ) -> Result<(), String> {
+        self.pause_record_live_with_grace(record_id, offsets, LIVE_PAUSE_WARM_GRACE)
+    }
+
+    fn pause_record_live_with_grace(
+        self: &Arc<Self>,
+        record_id: &str,
+        offsets: Vec<RecordTranscriptTrackOffset>,
+        warm_grace: StdDuration,
+    ) -> Result<(), String> {
+        let (control, boundary) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+            let session = state
+                .live_sessions
+                .get(record_id)
+                .ok_or_else(|| "SPEECH_RECORD_LIVE_NOT_ACTIVE".to_string())?;
+            (
+                Arc::clone(&session.control),
+                normalize_live_boundary(&session.tracks, offsets)?,
+            )
+        };
+        let pause_epoch = {
+            let mut state = control
+                .state
+                .lock()
+                .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+            if state.cancelled || state.finish.is_some() {
+                return Err("SPEECH_RECORD_LIVE_FINALIZING".to_string());
+            }
+            if let Some(previous) = state.flushes.back() {
+                ensure_boundary_monotonic(previous, &boundary)?;
+                if previous != &boundary {
+                    state.flushes.push_back(boundary);
+                }
+            } else {
+                state.flushes.push_back(boundary);
+            }
+            if let Some(timer) = state.pause_timer.take() {
+                timer.abort();
+            }
+            state.paused = true;
+            state.suspend_requested = false;
+            state.pause_epoch = state.pause_epoch.saturating_add(1).max(1);
+            state.pause_epoch
+        };
+        let manager = Arc::clone(self);
+        let record_id = record_id.to_string();
+        let timer_control = Arc::clone(&control);
+        let timer_record_id = record_id.clone();
+        let timer = tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(warm_grace).await;
+            manager.request_live_suspend_if_paused(&timer_record_id, &timer_control, pause_epoch);
+        });
+        let mut state = control
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        if state.paused && state.pause_epoch == pause_epoch && !state.cancelled {
+            state.pause_timer = Some(timer);
+        } else {
+            timer.abort();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn resume_record_live(&self, record_id: &str) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        let session = state
+            .live_sessions
+            .get(record_id)
+            .ok_or_else(|| "SPEECH_RECORD_LIVE_NOT_ACTIVE".to_string())?;
+        let mut control = session
+            .control
+            .state
+            .lock()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE".to_string())?;
+        if control.cancelled || control.finish.is_some() {
+            return Err("SPEECH_RECORD_LIVE_FINALIZING".to_string());
+        }
+        if let Some(timer) = control.pause_timer.take() {
+            timer.abort();
+        }
+        control.paused = false;
+        control.suspend_requested = false;
+        control.pause_epoch = control.pause_epoch.saturating_add(1).max(1);
+        Ok(())
+    }
+
+    fn request_live_suspend_if_paused(
+        self: &Arc<Self>,
+        record_id: &str,
+        control: &Arc<LiveControl>,
+        pause_epoch: u64,
+    ) {
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        let Some(session) = state.live_sessions.get(record_id) else {
+            return;
+        };
+        if !Arc::ptr_eq(&session.control, control) {
+            return;
+        }
+        let Ok(mut control) = control.state.lock() else {
+            return;
+        };
+        if control.paused
+            && control.pause_epoch == pause_epoch
+            && !control.cancelled
+            && control.finish.is_none()
+        {
+            control.pause_timer.take();
+            control.suspend_requested = true;
+            if let Some(running) = state
+                .live_running
+                .as_ref()
+                .filter(|running| running.job_id == record_id)
+            {
+                self.arm_live_suspend_watchdog(
+                    record_id.to_string(),
+                    running.generation,
+                    Arc::clone(&running.child),
+                );
+            }
+        }
+    }
+
+    fn arm_live_suspend_watchdog(
+        self: &Arc<Self>,
+        record_id: String,
+        generation: u64,
+        child: Arc<Mutex<process_cmd::ChildTree>>,
+    ) {
+        let manager = Arc::clone(self);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(WORKER_CANCEL_GRACE).await;
+            let still_running = manager.state.lock().is_ok_and(|state| {
+                state.live_running.as_ref().is_some_and(|running| {
+                    running.job_id == record_id
+                        && running.generation == generation
+                        && Arc::ptr_eq(&running.child, &child)
+                })
+            });
+            if still_running {
+                let _ = tauri::async_runtime::spawn_blocking(move || kill_worker(&child)).await;
+            }
+        });
+    }
+
     pub(crate) fn finish_record_live(
         &self,
         record_id: &str,
@@ -1235,6 +1487,12 @@ impl SpeechRecognitionManager {
         if let Some(previous) = control.flushes.back() {
             ensure_boundary_monotonic(previous, &boundary)?;
         }
+        if let Some(timer) = control.pause_timer.take() {
+            timer.abort();
+        }
+        control.paused = false;
+        control.suspend_requested = false;
+        control.pause_epoch = control.pause_epoch.saturating_add(1).max(1);
         control.finish = Some(boundary);
         Ok(())
     }
@@ -1263,6 +1521,33 @@ impl SpeechRecognitionManager {
                 cancelled = true;
                 break;
             }
+            if control_snapshot.paused && control_snapshot.suspend_requested {
+                loop {
+                    let snapshot = match control.snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(code) => {
+                            terminal_error = Some(code.to_string());
+                            break;
+                        }
+                    };
+                    if snapshot.cancelled {
+                        cancelled = true;
+                        break;
+                    }
+                    if snapshot.finish.is_some() {
+                        finished = true;
+                        break;
+                    }
+                    if !snapshot.paused {
+                        break;
+                    }
+                    thread::sleep(LIVE_POLL_INTERVAL);
+                }
+                if finished || cancelled || terminal_error.is_some() {
+                    break;
+                }
+                continue;
+            }
             let generation = match self.allocate_live_generation(&record_id) {
                 Ok(generation) => generation,
                 Err(code) => {
@@ -1288,13 +1573,23 @@ impl SpeechRecognitionManager {
                 generation,
             };
             let lease = tauri::async_runtime::block_on(self.compute_coordinator.acquire(compute));
-            if control
-                .snapshot()
-                .map_or(true, |snapshot| snapshot.cancelled)
-            {
-                cancelled = true;
-                drop(lease);
-                break;
+            match control.snapshot() {
+                Ok(snapshot) if snapshot.cancelled => {
+                    cancelled = true;
+                    drop(lease);
+                    break;
+                }
+                Ok(snapshot) if snapshot.paused && snapshot.suspend_requested => {
+                    attempts = attempts.saturating_sub(1);
+                    drop(lease);
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    cancelled = true;
+                    drop(lease);
+                    break;
+                }
             }
             let outcome = self.execute_live_attempt(
                 &record_id,
@@ -1309,6 +1604,11 @@ impl SpeechRecognitionManager {
                 LiveAttemptOutcome::Finished => {
                     finished = true;
                     break;
+                }
+                LiveAttemptOutcome::Suspended => {
+                    attempts = attempts.saturating_sub(1);
+                    terminal_error = None;
+                    continue;
                 }
                 LiveAttemptOutcome::Cancelled => {
                     cancelled = true;
@@ -1407,6 +1707,7 @@ impl SpeechRecognitionManager {
         let (child, stdin, stdout) = match self.spawn_live_worker(record_id, generation, resources)
         {
             Ok(worker) => worker,
+            Err("SPEECH_LIVE_SUSPENDED") => return LiveAttemptOutcome::Suspended,
             Err(code) => return live_failed(code, true),
         };
         drop(lifecycle_spawn_permit);
@@ -1474,7 +1775,7 @@ impl SpeechRecognitionManager {
                 code,
                 ..
             }) if failed_identity == identity => {
-                kill_worker(&child);
+                let _ = process_cmd::settle_tree(&child, WORKER_TERMINAL_GRACE);
                 self.clear_live_running(record_id);
                 return live_failed(&code, worker_code_retryable(&code));
             }
@@ -1514,9 +1815,52 @@ impl SpeechRecognitionManager {
                         identity: identity.clone(),
                     },
                 );
-                kill_worker(&child);
+                let _ = process_cmd::settle_tree(&child, WORKER_CANCEL_GRACE);
                 self.clear_live_running(record_id);
                 return LiveAttemptOutcome::Cancelled;
+            }
+            if snapshot.suspend_requested
+                && snapshot.paused
+                && snapshot.flush.is_none()
+                && snapshot.finish.is_none()
+            {
+                let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let yield_sent = control.send_yield_if_suspended(&stdin, &identity);
+                if yield_sent.is_err() {
+                    return settle_live_spawn_failure(
+                        self,
+                        record_id,
+                        generation,
+                        &child,
+                        "SPEECH_WORKER_PROTOCOL_ERROR",
+                        true,
+                    );
+                }
+                if yield_sent == Ok(false) {
+                    continue;
+                }
+                arm_yield_watchdog(&child, &settled);
+                let mut response = receive_live_response(&responses);
+                let valid_yield = matches!(
+                    &response,
+                    Ok(WorkerResponse::Yielded {
+                        identity: yielded_identity,
+                        checkpoint,
+                        ..
+                    }) if yielded_identity == &identity
+                        && live_checkpoint_matches(&cursors, checkpoint)
+                );
+                if let Ok(response) = &mut response {
+                    response.zeroize_sensitive();
+                }
+                let _ = process_cmd::settle_tree(&child, WORKER_CANCEL_GRACE);
+                settled.store(true, std::sync::atomic::Ordering::Release);
+                self.clear_live_running(record_id);
+                return if valid_yield {
+                    LiveAttemptOutcome::Suspended
+                } else {
+                    live_failed("SPEECH_WORKER_PROTOCOL_ERROR", true)
+                };
             }
             let boundary = snapshot.flush.as_ref().or(snapshot.finish.as_ref());
             let mut progressed = false;
@@ -1665,7 +2009,7 @@ impl SpeechRecognitionManager {
                                 identity: identity.clone(),
                             },
                         );
-                        kill_worker(&child);
+                        let _ = process_cmd::settle_tree(&child, WORKER_CANCEL_GRACE);
                         self.clear_live_running(record_id);
                         return LiveAttemptOutcome::Finished;
                     }
@@ -1728,9 +2072,7 @@ impl SpeechRecognitionManager {
                             )
                         }
                     }
-                    if let Ok(mut child) = child.lock() {
-                        let _ = child.wait();
-                    }
+                    let _ = process_cmd::settle_tree(&child, WORKER_TERMINAL_GRACE);
                     self.clear_live_running(record_id);
                     return LiveAttemptOutcome::Finished;
                 }
@@ -1761,11 +2103,18 @@ impl SpeechRecognitionManager {
             .state
             .lock()
             .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
-        if !state.accepting
-            || !state.live_sessions.contains_key(record_id)
-            || state.live_running.is_some()
-        {
+        let Some(session) = state.live_sessions.get(record_id) else {
             return Err("SPEECH_INTERRUPTED");
+        };
+        if !state.accepting || state.live_running.is_some() {
+            return Err("SPEECH_INTERRUPTED");
+        }
+        let snapshot = session
+            .control
+            .snapshot()
+            .map_err(|_| "SPEECH_MANAGER_UNAVAILABLE")?;
+        if snapshot.paused && snapshot.suspend_requested {
+            return Err("SPEECH_LIVE_SUSPENDED");
         }
         let mut child =
             process_cmd::spawn_tree(&mut command).map_err(|_| "SPEECH_WORKER_START_FAILED")?;
@@ -1983,7 +2332,7 @@ impl SpeechRecognitionManager {
                     let manager = Arc::clone(self);
                     let id = job_id.to_string();
                     tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(StdDuration::from_secs(2)).await;
+                        tokio::time::sleep(WORKER_CANCEL_GRACE).await;
                         if manager.job_is_cancelling_generation(&id, generation) {
                             if let Ok(mut child) = child.lock() {
                                 let _ = child.kill_and_wait();
@@ -2016,6 +2365,9 @@ impl SpeechRecognitionManager {
             let live_running = state.live_running.take();
             for session in state.live_sessions.values() {
                 if let Ok(mut control) = session.control.state.lock() {
+                    if let Some(timer) = control.pause_timer.take() {
+                        timer.abort();
+                    }
                     control.cancelled = true;
                 }
             }
@@ -2043,9 +2395,7 @@ impl SpeechRecognitionManager {
                     identity,
                 },
             );
-            if let Ok(mut child) = running.child.lock() {
-                let _ = child.kill_and_wait();
-            }
+            let _ = process_cmd::settle_tree(&running.child, WORKER_SHUTDOWN_GRACE);
         }
         if let Some(running) = live_running {
             let identity = WorkloadIdentity {
@@ -2059,9 +2409,7 @@ impl SpeechRecognitionManager {
                     identity,
                 },
             );
-            if let Ok(mut child) = running.child.lock() {
-                let _ = child.kill_and_wait();
-            }
+            let _ = process_cmd::settle_tree(&running.child, WORKER_SHUTDOWN_GRACE);
         }
         for job in snapshots {
             persist_job(&self.root, &job)?;
@@ -2139,27 +2487,58 @@ impl SpeechRecognitionManager {
         loop {
             self.wake.notified().await;
             loop {
-                let next = match self.take_next_job() {
+                let next = match self.peek_next_job() {
                     Ok(next) => next,
                     Err(error) => {
                         crate::ulog_error!("[speech] queue state error: {}", error);
                         break;
                     }
                 };
-                let Some((job, generation)) = next else {
+                let Some((candidate, generation_hint)) = next else {
                     break;
                 };
-                let resources = self.execution_resources_for_pipeline(&job.pipeline);
                 let compute = ComputeWorkloadIdentity {
-                    kind: compute_kind(job.kind),
-                    id: job.job_id.clone(),
-                    generation,
+                    kind: compute_kind(candidate.kind),
+                    id: candidate.job_id.clone(),
+                    generation: generation_hint,
                 };
+                let mut admission = Box::pin(self.compute_coordinator.acquire(compute));
+                let lease = loop {
+                    tokio::select! {
+                        lease = admission.as_mut() => break Some(lease),
+                        _ = self.wake.notified() => {
+                            let still_selected = self.peek_next_job().ok().flatten().is_some_and(
+                                |(selected, selected_generation)| {
+                                    selected.job_id == candidate.job_id
+                                        && selected_generation == generation_hint
+                                },
+                            );
+                            if !still_selected {
+                                break None;
+                            }
+                        }
+                    }
+                };
+                let Some(lease) = lease else {
+                    continue;
+                };
+                let next = match self.claim_next_job(&candidate.job_id, generation_hint) {
+                    Ok(next) => next,
+                    Err(error) => {
+                        drop(lease);
+                        crate::ulog_error!("[speech] queue claim error: {}", error);
+                        break;
+                    }
+                };
+                let Some((job, generation)) = next else {
+                    drop(lease);
+                    continue;
+                };
+                let resources = self.execution_resources_for_pipeline(&job.pipeline);
                 let manager = Arc::clone(&self);
                 let job_id = job.job_id.clone();
                 let result = match resources {
                     Ok(resources) => {
-                        let lease = self.compute_coordinator.acquire(compute).await;
                         if !self.job_can_execute(&job_id, generation) {
                             drop(lease);
                             self.clear_active(&job_id, generation);
@@ -2171,6 +2550,7 @@ impl SpeechRecognitionManager {
                         .await
                     }
                     Err(code) => {
+                        drop(lease);
                         tauri::async_runtime::spawn_blocking(move || {
                             manager.finish_failed(&job, generation, code, false)
                         })
@@ -2191,7 +2571,44 @@ impl SpeechRecognitionManager {
         }
     }
 
-    fn take_next_job(&self) -> Result<Option<(SpeechJob, u64)>, String> {
+    fn peek_next_job(&self) -> Result<Option<(SpeechJob, u64)>, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "speech manager lock poisoned".to_string())?;
+        if !state.accepting || state.active_job.is_some() {
+            return Ok(None);
+        }
+        if state.queue.iter().any(|job_id| {
+            !state
+                .jobs
+                .get(job_id)
+                .is_some_and(|job| job.state == SpeechJobState::Queued)
+        }) {
+            return Err("speech queue contains an ineligible job".to_string());
+        }
+        let Some((_, job)) = state
+            .queue
+            .iter()
+            .enumerate()
+            .filter_map(|(index, job_id)| state.jobs.get(job_id).map(|job| (index, job)))
+            .max_by(|(left_index, left), (right_index, right)| {
+                compute_kind(left.kind)
+                    .priority()
+                    .cmp(&compute_kind(right.kind).priority())
+                    .then_with(|| right_index.cmp(left_index))
+            })
+        else {
+            return Ok(None);
+        };
+        Ok(Some((job.clone(), state.next_generation)))
+    }
+
+    fn claim_next_job(
+        &self,
+        expected_job_id: &str,
+        expected_generation: u64,
+    ) -> Result<Option<(SpeechJob, u64)>, String> {
         let mut state = self
             .state
             .lock()
@@ -2199,9 +2616,35 @@ impl SpeechRecognitionManager {
         if !state.accepting || state.active_job.is_some() {
             return Ok(None);
         }
-        let Some(job_id) = state.queue.front().cloned() else {
+        if state.next_generation != expected_generation {
+            return Ok(None);
+        }
+        if state.queue.iter().any(|job_id| {
+            !state
+                .jobs
+                .get(job_id)
+                .is_some_and(|job| job.state == SpeechJobState::Queued)
+        }) {
+            return Err("speech queue contains an ineligible job".to_string());
+        }
+        let Some((queue_index, job_id)) = state
+            .queue
+            .iter()
+            .enumerate()
+            .filter_map(|(index, job_id)| state.jobs.get(job_id).map(|job| (index, job_id, job)))
+            .max_by(|(left_index, _, left), (right_index, _, right)| {
+                compute_kind(left.kind)
+                    .priority()
+                    .cmp(&compute_kind(right.kind).priority())
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, job_id, _)| (index, job_id.clone()))
+        else {
             return Ok(None);
         };
+        if job_id != expected_job_id {
+            return Ok(None);
+        }
         let generation = state.next_generation;
         let now = Utc::now();
         let mut job = state
@@ -2221,7 +2664,7 @@ impl SpeechRecognitionManager {
         job.worker_attempts = job.worker_attempts.saturating_add(1);
         job.error = None;
         persist_job(&self.root, &job)?;
-        state.queue.pop_front();
+        state.queue.remove(queue_index);
         state.jobs.insert(job_id.clone(), job.clone());
         state.active_job = Some((job_id, generation));
         state.next_generation = state.next_generation.saturating_add(1).max(1);
@@ -2311,11 +2754,29 @@ impl SpeechRecognitionManager {
             return;
         }
 
-        let outcome =
-            self.collect_worker_result(job, generation, &identity, stdout, &stdin, &child, &lease);
-        if let Ok(mut child) = child.lock() {
-            let _ = child.wait();
+        let yield_state = BatchYieldState::new();
+        let outcome = self.collect_worker_result(
+            job,
+            generation,
+            &identity,
+            stdout,
+            &stdin,
+            &child,
+            &lease,
+            &yield_state,
+        );
+        yield_state.finish_reading();
+        if outcome.needs_cancel() {
+            let _ = send_worker_command(
+                &stdin,
+                &WorkerCommand::Cancel {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                },
+            );
         }
+        let _ = process_cmd::settle_tree(&child, outcome.settlement_grace());
+        yield_state.mark_settled();
         self.clear_running(&job.job_id, generation);
         if !self.job_can_publish(&job.job_id, generation) {
             return;
@@ -2334,9 +2795,9 @@ impl SpeechRecognitionManager {
                 metrics,
             ),
             SpeechWorkerOutcome::Yielded => self.requeue_yielded(job, generation),
-            SpeechWorkerOutcome::Failed { code, retryable } => {
-                self.finish_failed(job, generation, &code, retryable)
-            }
+            SpeechWorkerOutcome::Failed {
+                code, retryable, ..
+            } => self.finish_failed(job, generation, &code, retryable),
         }
     }
 
@@ -2365,16 +2826,22 @@ impl SpeechRecognitionManager {
                     job.source.size_bytes,
                     &pending.source_version,
                     || {
-                        if self.job_can_execute(&job.job_id, generation) {
-                            Ok(())
-                        } else {
+                        if !self.job_can_execute(&job.job_id, generation) {
                             Err("SPEECH_CANCELLED")
+                        } else if lease.should_yield() {
+                            Err("SPEECH_YIELDED")
+                        } else {
+                            Ok(())
                         }
                     },
                 ) {
                     Ok(hash) => hash,
                     Err(code) => {
-                        if code == "SPEECH_CANCELLED" {
+                        if code == "SPEECH_YIELDED" {
+                            let _ = fs::remove_file(&input_path);
+                            self.restore_pending_agent(&job.job_id, generation, pending);
+                            self.requeue_yielded(job, generation);
+                        } else if code == "SPEECH_CANCELLED" {
                             self.finish_cancelled_if_needed(job, generation);
                             cleanup_pending_agent(&pending);
                         } else {
@@ -2441,11 +2908,29 @@ impl SpeechRecognitionManager {
             );
             return;
         }
-        let outcome =
-            self.collect_worker_result(job, generation, &identity, stdout, &stdin, &child, &lease);
-        if let Ok(mut child) = child.lock() {
-            let _ = child.wait();
+        let yield_state = BatchYieldState::new();
+        let outcome = self.collect_worker_result(
+            job,
+            generation,
+            &identity,
+            stdout,
+            &stdin,
+            &child,
+            &lease,
+            &yield_state,
+        );
+        yield_state.finish_reading();
+        if outcome.needs_cancel() {
+            let _ = send_worker_command(
+                &stdin,
+                &WorkerCommand::Cancel {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                },
+            );
         }
+        let _ = process_cmd::settle_tree(&child, outcome.settlement_grace());
+        yield_state.mark_settled();
         self.clear_running(&job.job_id, generation);
         if self.job_is_cancelling_generation(&job.job_id, generation) {
             self.finish_cancelled_if_needed(job, generation);
@@ -2489,7 +2974,9 @@ impl SpeechRecognitionManager {
                 self.restore_pending_agent(&job.job_id, generation, pending);
                 self.requeue_yielded(job, generation);
             }
-            SpeechWorkerOutcome::Failed { code, retryable } => {
+            SpeechWorkerOutcome::Failed {
+                code, retryable, ..
+            } => {
                 self.finish_agent_failure(job, generation, &code, retryable, pending);
             }
         }
@@ -2954,15 +3441,23 @@ impl SpeechRecognitionManager {
         stdin: &Arc<Mutex<std::process::ChildStdin>>,
         child: &Arc<Mutex<process_cmd::ChildTree>>,
         lease: &LocalComputeLease,
+        yield_state: &BatchYieldState,
     ) -> SpeechWorkerOutcome {
         let responses = start_batch_response_reader(stdout);
         let started_at = Instant::now();
         let mut overall_deadline = MAX_AGENT_DEADLINE;
         let mut ready = false;
         let mut media_probed = false;
-        let mut yield_sent = false;
-        let yield_settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _yield_guard = YieldReadGuard(Arc::clone(&yield_settled));
+        if protocol_workload_kind(job.kind).can_cooperatively_yield() {
+            arm_batch_yield_observer(
+                lease.yield_signal(),
+                stdin,
+                child,
+                identity,
+                &yield_state.sent,
+                &yield_state.settled,
+            );
+        }
         let mut transcripts = SensitiveTranscriptSegments::default();
         let mut turns = Vec::new();
         let mut transcript_characters = 0_usize;
@@ -2981,7 +3476,7 @@ impl SpeechRecognitionManager {
             let response = match responses.recv_timeout(response_timeout) {
                 Ok(Ok(Some(response))) => response,
                 Ok(Ok(None) | Err(_)) | Err(std_mpsc::RecvTimeoutError::Disconnected)
-                    if yield_sent =>
+                    if yield_state.sent.load(std::sync::atomic::Ordering::Acquire) =>
                 {
                     return SpeechWorkerOutcome::Yielded;
                 }
@@ -3125,7 +3620,9 @@ impl SpeechRecognitionManager {
                     turns.extend(batch.into_iter().map(record_speaker_turn));
                 }
                 WorkerResponse::Pong { .. } if ready => {}
-                WorkerResponse::Yielded { .. } if ready && yield_sent => {
+                WorkerResponse::Yielded { .. }
+                    if ready && yield_state.sent.load(std::sync::atomic::Ordering::Acquire) =>
+                {
                     return SpeechWorkerOutcome::Yielded;
                 }
                 WorkerResponse::Completed { metrics, .. }
@@ -3155,29 +3652,17 @@ impl SpeechRecognitionManager {
                 }
                 WorkerResponse::Failed { code, .. } => {
                     let retryable = worker_code_retryable(&code);
-                    return SpeechWorkerOutcome::Failed { code, retryable };
+                    return SpeechWorkerOutcome::Failed {
+                        code,
+                        retryable,
+                        terminal_received: true,
+                    };
                 }
                 mut response @ WorkerResponse::TranscriptSegment { .. } => {
                     response.zeroize_sensitive();
                     return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true);
                 }
                 _ => return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true),
-            }
-
-            if ready
-                && !yield_sent
-                && protocol_workload_kind(job.kind).can_cooperatively_yield()
-                && lease.should_yield()
-            {
-                let command = WorkerCommand::Yield {
-                    protocol_version: PROTOCOL_VERSION,
-                    identity: identity.clone(),
-                };
-                if send_worker_command(stdin, &command).is_err() {
-                    return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true);
-                }
-                yield_sent = true;
-                arm_yield_watchdog(child, &yield_settled);
             }
         }
     }
@@ -3593,6 +4078,17 @@ fn cursors_reached(cursors: &[LiveTrackCursor], boundary: &LiveBoundary) -> bool
         .all(|cursor| boundary_sample(boundary, cursor.source.track()) == Some(cursor.position))
 }
 
+fn live_checkpoint_matches(cursors: &[LiveTrackCursor], checkpoint: &Checkpoint) -> bool {
+    checkpoint.streams.len() == cursors.len()
+        && cursors.iter().all(|cursor| {
+            checkpoint.streams.iter().any(|stream| {
+                stream.track == cursor.track
+                    && stream.last_ack_sequence == cursor.last_sequence
+                    && stream.analysis_sample == cursor.position
+            })
+        })
+}
+
 fn send_pcm_frame(
     stdin: &Arc<Mutex<std::process::ChildStdin>>,
     frame: &PcmFrame,
@@ -3753,28 +4249,53 @@ fn read_live_frame_settlement(
 fn settle_live_spawn_failure(
     manager: &SpeechRecognitionManager,
     record_id: &str,
-    _generation: u64,
+    generation: u64,
     child: &Arc<Mutex<process_cmd::ChildTree>>,
     code: &str,
     retryable: bool,
 ) -> LiveAttemptOutcome {
-    kill_worker(child);
+    let (stdin, should_suspend) = manager.state.lock().map_or((None, false), |state| {
+        let stdin = state.live_running.as_ref().and_then(|running| {
+            (running.job_id == record_id && running.generation == generation)
+                .then(|| Arc::clone(&running.stdin))
+        });
+        let should_suspend = state
+            .live_sessions
+            .get(record_id)
+            .and_then(|session| session.control.snapshot().ok())
+            .is_some_and(|snapshot| {
+                snapshot.paused
+                    && snapshot.suspend_requested
+                    && !snapshot.cancelled
+                    && snapshot.finish.is_none()
+            });
+        (stdin, should_suspend)
+    });
+    if let Some(stdin) = stdin {
+        let _ = send_worker_command(
+            &stdin,
+            &WorkerCommand::Cancel {
+                protocol_version: PROTOCOL_VERSION,
+                identity: WorkloadIdentity {
+                    workload_id: record_id.to_string(),
+                    worker_generation: generation,
+                },
+            },
+        );
+    }
+    let _ = process_cmd::settle_tree(child, WORKER_CANCEL_GRACE);
     manager.clear_live_running(record_id);
-    live_failed(code, retryable)
+    if should_suspend {
+        LiveAttemptOutcome::Suspended
+    } else {
+        live_failed(code, retryable)
+    }
 }
 
 fn live_failed(code: &str, retryable: bool) -> LiveAttemptOutcome {
     LiveAttemptOutcome::Failed {
         code: code.to_string(),
         retryable,
-    }
-}
-
-struct YieldReadGuard(Arc<std::sync::atomic::AtomicBool>);
-
-impl Drop for YieldReadGuard {
-    fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -3908,6 +4429,52 @@ fn kill_worker(child: &Arc<Mutex<process_cmd::ChildTree>>) {
     if let Ok(mut child) = child.lock() {
         let _ = child.kill_and_wait();
     }
+}
+
+fn arm_batch_yield_observer(
+    signal: LocalComputeYieldSignal,
+    stdin: &Arc<Mutex<std::process::ChildStdin>>,
+    child: &Arc<Mutex<process_cmd::ChildTree>>,
+    identity: &WorkloadIdentity,
+    yield_sent: &Arc<std::sync::atomic::AtomicBool>,
+    settled: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let stdin = Arc::clone(stdin);
+    let child = Arc::clone(child);
+    let identity = identity.clone();
+    let yield_sent = Arc::clone(yield_sent);
+    let settled = Arc::clone(settled);
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if settled.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            if signal.should_yield() {
+                if yield_sent
+                    .compare_exchange(
+                        false,
+                        true,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    let command = WorkerCommand::Yield {
+                        protocol_version: PROTOCOL_VERSION,
+                        identity,
+                    };
+                    if send_worker_command(&stdin, &command).is_err() {
+                        let _ =
+                            tauri::async_runtime::spawn_blocking(move || kill_worker(&child)).await;
+                    } else {
+                        arm_yield_watchdog(&child, &settled);
+                    }
+                }
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(25)).await;
+        }
+    });
 }
 
 fn arm_yield_watchdog(
@@ -4063,6 +4630,7 @@ fn failed_outcome(code: &str, retryable: bool) -> SpeechWorkerOutcome {
     SpeechWorkerOutcome::Failed {
         code: code.into(),
         retryable,
+        terminal_received: false,
     }
 }
 
@@ -5177,7 +5745,7 @@ mod tests {
         SpeechRecognitionManager::initialize_inner(
             data,
             resources,
-            runtime.as_ref(),
+            runtime,
             LocalComputeCoordinator::new(),
             records,
             false,
@@ -5754,6 +6322,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn speech_queue_selects_compute_priority_and_preserves_fifo_ties() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(&root);
+        let now = Utc::now();
+        let jobs = [
+            fixture_job(
+                "attachment-first",
+                SpeechJobKind::AgentAttachmentAsr,
+                SpeechJobOrigin::Agent {
+                    initiator_session_id: "session-a".into(),
+                    workspace_identity: root.path().display().to_string(),
+                },
+                SpeechJobState::Queued,
+                now,
+            ),
+            fixture_job(
+                "backfill-first",
+                SpeechJobKind::RecordBackfillAsr,
+                SpeechJobOrigin::Record {
+                    record_id: "record-a".into(),
+                },
+                SpeechJobState::Queued,
+                now,
+            ),
+            fixture_job(
+                "backfill-second",
+                SpeechJobKind::RecordBackfillAsr,
+                SpeechJobOrigin::Record {
+                    record_id: "record-b".into(),
+                },
+                SpeechJobState::Queued,
+                now,
+            ),
+        ];
+        {
+            let mut state = manager.state.lock().unwrap();
+            for job in jobs {
+                state.queue.push_back(job.job_id.clone());
+                state.jobs.insert(job.job_id.clone(), job);
+            }
+        }
+
+        let (candidate, generation_hint) = manager.peek_next_job().unwrap().unwrap();
+        assert_eq!(candidate.job_id, "backfill-first");
+        let (claimed, _) = manager
+            .claim_next_job(&candidate.job_id, generation_hint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.job_id, "backfill-first");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn exact_generation_worker_result_commits_record_and_queues_diarization() {
@@ -5806,7 +6426,11 @@ mod tests {
             state.queue.push_back(job.job_id.clone());
             state.jobs.insert(job.job_id.clone(), job);
         }
-        let (job, generation) = manager.take_next_job().unwrap().unwrap();
+        let (candidate, generation_hint) = manager.peek_next_job().unwrap().unwrap();
+        let (job, generation) = manager
+            .claim_next_job(&candidate.job_id, generation_hint)
+            .unwrap()
+            .unwrap();
         let identity = WorkloadIdentity {
             workload_id: job.job_id.clone(),
             worker_generation: generation,
@@ -6138,6 +6762,42 @@ mod tests {
             persisted.audio.unwrap().transcription_status,
             TranscriptionStatus::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn live_pause_grace_is_epoch_fenced_and_resume_cancels_unload() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(&root);
+        let record_id = "record-live-pause";
+        let control = Arc::new(LiveControl::default());
+        manager.state.lock().unwrap().live_sessions.insert(
+            record_id.to_string(),
+            LiveSessionRegistration {
+                control: Arc::clone(&control),
+                tracks: vec![AudioTrackKind::Microphone],
+            },
+        );
+        let offsets = vec![RecordTranscriptTrackOffset {
+            track: AudioTrackKind::Microphone,
+            sample: 16_000,
+        }];
+
+        manager
+            .pause_record_live_with_grace(record_id, offsets.clone(), StdDuration::from_millis(10))
+            .unwrap();
+        manager.resume_record_live(record_id).unwrap();
+        tokio::time::sleep(StdDuration::from_millis(30)).await;
+        let resumed = control.snapshot().unwrap();
+        assert!(!resumed.paused);
+        assert!(!resumed.suspend_requested);
+
+        manager
+            .pause_record_live_with_grace(record_id, offsets, StdDuration::from_millis(10))
+            .unwrap();
+        tokio::time::sleep(StdDuration::from_millis(30)).await;
+        let paused = control.snapshot().unwrap();
+        assert!(paused.paused);
+        assert!(paused.suspend_requested);
     }
 
     #[tokio::test]

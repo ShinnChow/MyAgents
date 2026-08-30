@@ -7,8 +7,9 @@ use crate::local_inference::{
     ComputeWorkloadIdentity, ComputeWorkloadKind, LocalComputeCoordinator, LocalComputeLease,
 };
 use crate::speech_model_pack::{
-    inspect_installed_pack, install_plan, verify_installed_pack, ModelPackAsset,
-    ModelPackAssetFormat, ModelPackInstallPlan, ModelPackLegalSource, MODEL_PACK_SOURCE_LOCK,
+    inspect_installed_pack, install_plan, verify_installed_pack, verify_installed_pack_with_yield,
+    InstalledPackError, ModelPackAsset, ModelPackAssetFormat, ModelPackInstallPlan,
+    ModelPackLegalSource, MODEL_PACK_SOURCE_LOCK,
 };
 use futures_util::StreamExt;
 use myagents_media_worker_protocol::{
@@ -33,10 +34,12 @@ const MODEL_DOWNLOAD_HOST: &str = "download.myagents.io";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_SIGNATURE_BYTES: u64 = 16 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
+const SPEECH_RESOURCE_VALIDATION_YIELDED: &str = "SPEECH_RESOURCE_VALIDATION_YIELDED";
 const MAX_ARCHIVE_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
 const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_PROBE_STDERR_BYTES: u64 = 64 * 1024;
+const APP_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const ACTIVE_POINTER_SCHEMA_VERSION: u32 = 1;
 const MODEL_PACK_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const ACTIVATION_DURABILITY_WARNING: &str = "SPEECH_RESOURCE_ACTIVATION_DURABILITY_UNCONFIRMED";
@@ -180,9 +183,6 @@ impl SpeechModelPackManager {
                 running_probe: None,
             }),
         });
-        if verify_after_startup {
-            manager.start_background_verification();
-        }
         Ok(manager)
     }
 
@@ -349,28 +349,45 @@ impl SpeechModelPackManager {
         }
     }
 
-    fn start_background_verification(self: &Arc<Self>) {
+    pub(crate) fn start_background_verification(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tauri::async_runtime::spawn(async move {
-            // Keep model IO off the first-paint and Global Sidecar startup path.
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let _ = tauri::async_runtime::spawn_blocking(move || {
+            loop {
+                // Keep model IO off the first-paint and Global Sidecar startup path.
+                tokio::time::sleep(Duration::from_secs(10)).await;
                 let pointer = manager
                     .state
                     .lock()
                     .ok()
                     .and_then(|state| state.active_pointer.clone());
-                let result =
-                    pointer
-                        .as_ref()
-                        .ok_or("SPEECH_RESOURCE_CORRUPT")
-                        .and_then(|pointer| {
-                            verify_pointer_and_pack(
-                                &manager.models_root,
-                                pointer,
-                                &manager.plan.pack_revision,
-                            )
-                        });
+                let Some(pointer_for_validation) = pointer.clone() else {
+                    return;
+                };
+                let lease = manager
+                    .compute_coordinator
+                    .acquire(ComputeWorkloadIdentity {
+                        kind: ComputeWorkloadKind::BackgroundResourceValidation,
+                        id: "speech-model-resource-validation".to_string(),
+                        generation: 1,
+                    })
+                    .await;
+                let signal = lease.yield_signal();
+                let validation_manager = Arc::clone(&manager);
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    verify_pointer_and_pack_with_yield(
+                        &validation_manager.models_root,
+                        &pointer_for_validation,
+                        &validation_manager.plan.pack_revision,
+                        &|| signal.should_yield(),
+                    )
+                })
+                .await;
+                drop(lease);
+                let result = match result {
+                    Ok(Err(SPEECH_RESOURCE_VALIDATION_YIELDED)) => continue,
+                    Ok(result) => result,
+                    Err(_) => Err("SPEECH_RESOURCE_CORRUPT"),
+                };
 
                 let Ok(mut state) = manager.state.lock() else {
                     return;
@@ -399,8 +416,8 @@ impl SpeechModelPackManager {
                         );
                     }
                 }
-            })
-            .await;
+                break;
+            }
         });
     }
 
@@ -461,9 +478,7 @@ impl SpeechModelPackManager {
             .ok()
             .and_then(|state| state.running_probe.clone());
         if let Some(running) = running {
-            if let Ok(mut child) = running.lock() {
-                let _ = child.kill_and_wait();
-            }
+            let _ = crate::process_cmd::settle_tree(&running, APP_SHUTDOWN_GRACE);
         }
     }
 
@@ -1218,6 +1233,34 @@ fn verify_pointer_and_pack(
     ensure_plain_directory(&pack_root)?;
     let manifest_path = pack_root.join("manifest.json");
     let verified = verify_installed_pack(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    if verified.pack_revision != pointer.pack_revision {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+    Ok((
+        ActivatedModelPack {
+            revision: verified.pack_revision,
+            manifest_path,
+        },
+        pointer.clone(),
+    ))
+}
+
+fn verify_pointer_and_pack_with_yield(
+    models_root: &Path,
+    pointer: &ActivePointer,
+    expected_revision: &str,
+    should_yield: &dyn Fn() -> bool,
+) -> Result<(ActivatedModelPack, ActivePointer), &'static str> {
+    validate_active_pointer(pointer, expected_revision)?;
+    let pack_root = models_root.join("packs").join(&pointer.directory_name);
+    ensure_plain_directory(&pack_root)?;
+    let manifest_path = pack_root.join("manifest.json");
+    let verified = verify_installed_pack_with_yield(&manifest_path, should_yield).map_err(
+        |error| match error {
+            InstalledPackError::Yielded => SPEECH_RESOURCE_VALIDATION_YIELDED,
+            _ => "SPEECH_RESOURCE_CORRUPT",
+        },
+    )?;
     if verified.pack_revision != pointer.pack_revision {
         return Err("SPEECH_RESOURCE_CORRUPT");
     }
