@@ -2628,6 +2628,18 @@ mod tests {
     use std::thread::JoinHandle;
     use tempfile::tempdir;
 
+    fn assert_audio_artifacts(record: &Record, expected: usize) {
+        let audio_artifacts = record
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == "audio/ogg-opus")
+            .collect::<Vec<_>>();
+        assert_eq!(audio_artifacts.len(), expected);
+        assert!(audio_artifacts
+            .iter()
+            .all(|artifact| artifact.size_bytes > 0));
+    }
+
     #[test]
     fn transcript_latency_uses_media_time_and_completed_pauses() {
         let root = tempdir().unwrap();
@@ -2895,11 +2907,7 @@ mod tests {
             record.audio.as_ref().unwrap().capture_status,
             CaptureStatus::Ready
         );
-        assert_eq!(record.artifacts.len(), 2);
-        assert!(record
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.kind == "audio/ogg-opus" && artifact.size_bytes > 0));
+        assert_audio_artifacts(&record, 2);
     }
 
     #[tokio::test]
@@ -3061,11 +3069,7 @@ mod tests {
             record.audio.as_ref().unwrap().capture_status,
             CaptureStatus::Ready
         );
-        assert_eq!(record.artifacts.len(), 2);
-        assert!(record
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.kind == "audio/ogg-opus" && artifact.size_bytes > 0));
+        assert_audio_artifacts(&record, 2);
     }
 
     #[tokio::test]
@@ -3154,11 +3158,7 @@ mod tests {
             .unwrap();
         assert_eq!(stopped.capture_status, CaptureStatus::Ready);
         let record = store.get(&stopped.record_id).await.unwrap();
-        assert_eq!(record.artifacts.len(), 2);
-        assert!(record
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.size_bytes > 0));
+        assert_audio_artifacts(&record, 2);
     }
 
     #[tokio::test]
@@ -3209,7 +3209,7 @@ mod tests {
             record.audio.as_ref().unwrap().capture_status,
             CaptureStatus::Interrupted
         );
-        assert_eq!(record.artifacts.len(), 1);
+        assert_audio_artifacts(&record, 1);
 
         fs::set_permissions(&journal_path, original_permissions).unwrap();
         let entries = LifecycleJournal::read_entries(&workspace, &record.id).unwrap();
@@ -3284,10 +3284,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stopped.capture_status, CaptureStatus::Ready);
-        assert_eq!(
-            store.get(&stopped.record_id).await.unwrap().artifacts.len(),
-            1
-        );
+        let record = store.get(&stopped.record_id).await.unwrap();
+        assert_audio_artifacts(&record, 1);
     }
 
     #[tokio::test]
@@ -3423,7 +3421,7 @@ mod tests {
             record.audio.as_ref().unwrap().capture_status,
             CaptureStatus::Interrupted
         );
-        assert_eq!(record.artifacts.len(), 1);
+        assert_audio_artifacts(&record, 1);
         let workspace = store.audio_workspace_path(&record.id).await.unwrap();
         let entries = LifecycleJournal::read_entries(&workspace, &record.id).unwrap();
         assert!(entries
@@ -3512,7 +3510,7 @@ mod tests {
             recovered.audio.as_ref().unwrap().capture_status,
             CaptureStatus::Interrupted
         );
-        assert_eq!(recovered.artifacts.len(), 1);
+        assert_audio_artifacts(&recovered, 1);
         assert!(recovered.audio.as_ref().unwrap().media_duration_ms >= 2_000);
         assert!(!analysis_spool.exists());
         assert_eq!(
