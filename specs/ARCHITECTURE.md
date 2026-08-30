@@ -734,6 +734,16 @@ Cmd+W 层级关闭：Overlay → 分屏面板 → Tab，高 z-index 优先。
 
 新增 overlay/可关闭面板 MUST 调用 `useCloseLayer`，否则 Cmd+W 会跳过该面板直接关 Tab。
 
+### 13.1 桌面宠物 (`src-tauri/src/floating_ball.rs` + `src/renderer/floating-ball/`)
+
+`config.json.floatingBallEnabled` 是跨启动 desired state；Rust `floating_ball` 是 native surface lifecycle owner；`SidecarManager` 是 `Companion("floating-ball")` owner set authority；Renderer 只拥有 live WebView 内的派生视觉与调度。focus、visibility 和 companion collapse 不改写 enabled state：普通收起继续保留预热 WebView、SSE 与 Companion owner，只停止 hidden surface 的视觉调度。
+
+**功能关闭事务：** Rust 首先关闭 exact Companion owner admission，使已在途 ensure 在 settlement 后自行释放，然后在 `SidecarManager` 同一把锁下从当前所有 Session key 移除该 exact owner（覆盖 session rotate 的短暂双持有），最后由平台 owner 销毁全部 surface。macOS 依次将 companion / shield / ball 通过 locked `tauri-nspanel` 的 `Panel::to_window()` 摘除 registry 再 `destroy()`；Windows 停止 hover / foreground poller，恢复 exact WndProc，清理 HWND / proc record，再销毁 companion / ball。所有阶段尽力执行并聚合 `stage + label` 错误；任一失败时 admission 重开且 native owner best-effort 恢复完整启用集合。
+
+Renderer 只在上述 Rust 事务成功后才把 durable config 提交为 `false`；若写盘失败，同一 toggle 立即 best-effort 重新 enable native state。启用时反向先提交 desired `true`、再创建 surface，native 失败回滚 config。这些补偿不形成后台 retry / watchdog 或第二份状态 owner。
+
+**渲染契约：** `PetSprite` 以显式 playback policy 将 semantic animation 与调度权分离；idle 为静态首帧，running / dragging 只在持续状态内 loop，blocked / done / error 单周期后固定末帧，settings preview 只在 hover / focus 时 loop。orb CSS 使用同一 policy class，hidden companion 禁用后代 CSS animation 并停止 activity interval；`prefers-reduced-motion` 可将任何动态 policy 降级为静态帧。
+
 ### 14. 全文搜索引擎 (`src-tauri/src/search/`)
 
 基于 Tantivy + tantivy-jieba 的 Rust 子系统。`SearchEngine` Tauri managed state 单例，为三类查询提供全文检索：Session 历史（跨工作区）、Record 与工作区文件内容。
@@ -1010,6 +1020,7 @@ Space 与其它 renderer CSS surface 一样直接继承 `<html>` 上当前 Theme
 | Goal Pause/终态 | 先提交 SessionGoal 状态，再精确 stop queue Turn；确认后才清 authority / 释放 Goal owner并广播 `goal:changed`，不确定时保留 |
 | IM 消息到达 | `ensureSessionSidecar(sessionId, workspace, 'agent', sessionKey)` |
 | IM Session 空闲超时 | `releaseSessionSidecar(sessionId, 'agent', sessionKey)` |
+| 桌面宠物关闭 | Rust 关闭 `Companion("floating-ball")` 准入 → `SidecarManager` 全 Session exact-owner sweep → macOS / Windows 完整 native teardown → Renderer 提交 config `false` |
 | 桌面录音开始 | `RecordingManager.start` 取得 App-global 唯一采集槽并创建 audio Record；不创建 Sidecar |
 | 桌面录音 pause/resume/stop | 同一 Manager 串行控制 exact recording generation；stop 先提交 archive，再收敛 live Worker/backfill |
 | Agent attachment 转录 | 当前 Session Sidecar → Admin API → Management API → `SpeechRecognitionManager`；scope 由进程身份注入，不新增 Sidecar owner |

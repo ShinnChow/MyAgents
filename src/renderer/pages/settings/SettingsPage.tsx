@@ -149,6 +149,7 @@ import FloatingBallPetSettings from '@/components/FloatingBallPetSettings';
 import {
   describeNativeFloatingBallError,
   setNativeFloatingBallEnabled,
+  runFloatingBallToggleTransaction,
 } from '@/floating-ball/nativeFloatingBall';
 import {
   MYAGENTS_GITHUB_URL,
@@ -449,16 +450,18 @@ export default function Settings({
     setFloatingBallGateBusy(true);
     try {
       if (!next) {
-        await setNativeFloatingBallEnabled(false);
+        await runFloatingBallToggleTransaction({
+          enabled: false,
+          nativeStateBeforeChange: config.floatingBallEnabled === true,
+          persistDesiredState: enabled => updateConfig({
+            floatingBallDevGate: enabled,
+            floatingBallEnabled: enabled,
+          }),
+          applyNativeState: setNativeFloatingBallEnabled,
+        });
+      } else {
+        await updateConfig({ floatingBallDevGate: true });
       }
-      await updateConfig(
-        next
-          ? { floatingBallDevGate: true }
-          : {
-              floatingBallDevGate: false,
-              floatingBallEnabled: false,
-            },
-      );
       track('floating_ball_toggle', { gate: true, enabled: next });
       toast.success(
         next
@@ -479,6 +482,7 @@ export default function Settings({
     }
   }, [
     config.floatingBallDevGate,
+    config.floatingBallEnabled,
     floatingBallGateBusy,
     tSettings,
     toast,

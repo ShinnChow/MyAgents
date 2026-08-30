@@ -1425,6 +1425,44 @@ pub async fn release_session_sidecar(
     .map_err(|error| format!("Session owner release task failed: {error:?}"))?
 }
 
+/// Release one exact owner wherever it currently resides.
+///
+/// This is narrower than owner-only routing: it is a lifecycle teardown
+/// operation for an owner whose handover may temporarily span two Sessions.
+/// All removals are committed under one manager lock before any exact process
+/// drain is awaited.
+pub(crate) async fn release_session_owner_everywhere(
+    manager: &ManagedSidecarManager,
+    owner: &SidecarOwner,
+) -> Result<usize, String> {
+    let manager = manager.clone();
+    let owner = owner.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let releases = {
+            let mut manager_guard = manager
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            manager_guard.remove_owner_from_all_sessions(&owner)
+        };
+        let removed_count = releases.len();
+        let mut errors = Vec::new();
+        for (session_id, release) in releases {
+            if let Err(error) = finish_session_owner_release(&manager, release) {
+                errors.push(format!("session={session_id} error={error}"));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(format!(
+                "Failed to finish one or more exact owner releases: {}",
+                errors.join("; ")
+            ));
+        }
+        Ok(removed_count)
+    })
+    .await
+    .map_err(|error| format!("Session owner sweep task failed: {error:?}"))?
+}
+
 /// Transfer a Drop-only release obligation to the async lifecycle owner.
 /// Ordinary control flow must await [`release_session_sidecar`] directly.
 pub fn schedule_release_session_sidecar(
@@ -1500,12 +1538,27 @@ pub async fn cmd_ensure_session_sidecar(
         _ => return Err(format!("Invalid owner type: {}", ownerType)),
     };
 
+    if !crate::floating_ball::sidecar_owner_admitted(&owner) {
+        return Err("Desktop pet Companion owner admission is closed".to_string());
+    }
+
     let workspace_path = PathBuf::from(&workspacePath);
     // The async lifecycle entrypoint owns both the per-session deletion fence
     // and the blocking-thread handoff for the full cold boot/readiness wait.
     let manager = state.inner().clone();
-    ensure_session_sidecar_with_lifecycle(app_handle, manager, sessionId, workspace_path, owner)
-        .await
+    let result = ensure_session_sidecar_with_lifecycle(
+        app_handle,
+        manager.clone(),
+        sessionId.clone(),
+        workspace_path,
+        owner.clone(),
+    )
+    .await?;
+    if !crate::floating_ball::sidecar_owner_admitted(&owner) {
+        release_session_sidecar(&manager, &sessionId, &owner).await?;
+        return Err("Desktop pet Companion owner admission closed during ensure".to_string());
+    }
+    Ok(result)
 }
 
 /// Release an owner from a Session's Sidecar

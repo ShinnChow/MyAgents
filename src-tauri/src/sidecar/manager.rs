@@ -1807,6 +1807,34 @@ impl SidecarManager {
         }
     }
 
+    /// Atomically detach one exact owner token from every current Session key.
+    ///
+    /// Companion session rotation intentionally attaches the new Session
+    /// before releasing the old one, so an owner can temporarily exist in
+    /// multiple entries. Snapshotting ids and releasing later would race a
+    /// rekey; collecting every release under this manager lock gives feature
+    /// teardown one authoritative linearization point.
+    pub(crate) fn remove_owner_from_all_sessions(
+        &mut self,
+        owner: &SidecarOwner,
+    ) -> Vec<(String, SessionOwnerRelease)> {
+        let session_ids = self
+            .sidecars
+            .keys()
+            .chain(self.recovering_sidecars.keys())
+            .filter(|session_id| self.session_has_exact_owner(session_id, owner))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+
+        session_ids
+            .into_iter()
+            .map(|session_id| {
+                let release = self.remove_session_owner(&session_id, owner);
+                (session_id, release)
+            })
+            .collect()
+    }
+
     pub(super) fn prepare_unowned_session_retirement(
         &mut self,
         session_id: &str,
@@ -2251,6 +2279,36 @@ pub fn create_sidecar_state() -> ManagedSidecar {
 #[cfg(test)]
 mod completion_claim_tests {
     use super::*;
+
+    #[test]
+    fn exact_owner_sweep_covers_temporary_multi_session_handover() {
+        let mut manager = SidecarManager::new();
+        let companion = SidecarOwner::Companion("floating-ball".to_string());
+        manager.insert_test_ready_frontend_sidecar(
+            "session-a",
+            32001,
+            SidecarOwner::Tab("tab-a".to_string()),
+        );
+        manager.insert_test_ready_frontend_sidecar(
+            "session-b",
+            32002,
+            SidecarOwner::Tab("tab-b".to_string()),
+        );
+        assert!(manager.add_session_owner("session-a", companion.clone()));
+        assert!(manager.add_session_owner("session-b", companion.clone()));
+
+        let releases = manager.remove_owner_from_all_sessions(&companion);
+
+        assert_eq!(releases.len(), 2);
+        assert!(releases
+            .iter()
+            .all(|(_, release)| release.summary() == (true, false)));
+        assert!(!manager.session_has_exact_owner("session-a", &companion));
+        assert!(!manager.session_has_exact_owner("session-b", &companion));
+        assert!(
+            manager.session_has_exact_owner("session-a", &SidecarOwner::Tab("tab-a".to_string()))
+        );
+    }
 
     #[test]
     fn frontend_and_background_paths_consume_one_generation_claim() {

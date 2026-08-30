@@ -330,10 +330,10 @@ export default function CompanionWindow() {
     const [nowTick, setNowTick] = useState(() => Date.now());
     const hasRunningActivity = session.activities.some((a) => a.running);
     useEffect(() => {
-        if (!hasRunningActivity) return;
+        if (!hasRunningActivity || mode === 'hidden') return;
         const id = setInterval(() => setNowTick(Date.now()), 1000);
         return () => clearInterval(id);
-    }, [hasRunningActivity]);
+    }, [hasRunningActivity, mode]);
     // Eager-captured situation（最前台 app/标题）— 发送时随 user 消息走（D4）。
     const lastCtxRef = useRef<FbCtx | null>(null);
 

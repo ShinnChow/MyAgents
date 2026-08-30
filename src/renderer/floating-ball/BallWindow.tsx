@@ -26,6 +26,7 @@ import {
 } from './hoverIntent';
 import { resolveSelectedPetPack } from './petPackLibrary';
 import { PetSprite } from './PetSprite';
+import { deriveFloatingPetPlayback } from './petPlayback';
 import { getPetAnimationDuration } from './petAtlas';
 import { derivePetAnimation, type FbBallState, type FbPendingKind, type PetDragDirection } from './petStateMapper';
 import './fb.css';
@@ -456,6 +457,16 @@ export default function BallWindow() {
             }),
         [dragDirection, dragging, hasError, pendingKind, pop, state, summonPulse],
     );
+    const petPlayback = useMemo(
+        () => deriveFloatingPetPlayback({
+            ballState: state,
+            dragging,
+            summonPulse,
+            donePulse: pop,
+            hasError,
+        }),
+        [dragging, hasError, pop, state, summonPulse],
+    );
     const handlePetLoadError = useCallback(() => {
         console.warn('[fb-ball] pet spritesheet failed to load; falling back to orb');
         setPetLoadFailed(true);
@@ -465,7 +476,7 @@ export default function BallWindow() {
     return (
         <div className="fbw-ball-stage" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
             <div
-                className={`fbw-ball${usePet ? ' pet-mode' : ''} state-${state}${dragging ? ' dragging' : ''}${pop ? ' pop' : ''}`}
+                className={`fbw-ball${usePet ? ' pet-mode' : ''} state-${state} motion-${petPlayback}${dragging ? ' dragging' : ''}${pop ? ' pop' : ''}`}
                 onPointerDown={onPointerDown}
                 onPointerMove={onPointerMove}
                 onPointerUp={onPointerUp}
@@ -480,6 +491,7 @@ export default function BallWindow() {
                         <PetSprite
                             pack={petPack}
                             animation={petAnimation}
+                            playback={petPlayback}
                             title={`${petPack.displayName} · ${t(`floatingBall.ballState.${state}`)}`}
                             onLoadError={handlePetLoadError}
                         />
