@@ -34,6 +34,7 @@
 | `src/shared/` | renderer / server 共用的纯类型与逻辑 |
 | `src-tauri/` | Tauri v2 Rust 壳、进程与持久化 owner、HTTP/SSE 代理 |
 | `src-tauri/document-worker/` | 独立 Rust 文档转换 Worker；单 job 计算，不拥有队列或持久化 |
+| `src-tauri/media-worker/`、`src-tauri/media-worker-protocol/` | 独立 Rust 音频推理 Worker 与共享 wire protocol；单 workload / generation 计算，不拥有队列或持久化 |
 | `bundled-agents/myagents_helper/` | 内置 MA 小助理 |
 | `bundled-workspaces/` | 随 App 发布的只读工作区模板源码；复制出的用户工作区不由此目录升级覆盖 |
 | `specs/` | 当前架构、设计规范、模块技术文档与构建指南 |
@@ -99,6 +100,7 @@ Builtin SDK 与 Claude Code / Codex / Gemini 等外部 Runtime 的 session 操�
 | SDK 权限 hook / 自定义 Tool | `specs/tech_docs/sdk_canUseTool_guide.md`、`specs/tech_docs/sdk_custom_tools_guide.md` |
 | `myagents` CLI、Admin API、内置小助理、system skill | `specs/tech_docs/cli_architecture.md` |
 | 本地文档转换 / AnyDoc / OCR / Document Worker | `specs/tech_docs/document_processing.md` |
+| Record / 桌面录音 / 本地 Speech / 语音模型包 / Media Worker | `specs/tech_docs/recording_and_speech_recognition.md` |
 | 前端 UI、布局、交互、字号 | `specs/DESIGN.md` 的相关章节；只在主题工作时追加 `specs/tech_docs/theme_system.md` |
 | React state / effect 稳定性 | `specs/tech_docs/react_stability_rules.md` |
 | Tool Attachment / 富媒体 / 外部 URL | `specs/tech_docs/tool_attachment_pipeline.md` |

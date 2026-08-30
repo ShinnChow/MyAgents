@@ -12,6 +12,7 @@
 - [`proxy_config`](#proxy_config) — 子进程 NO_PROXY 注入
 - [`system_binary`](#system_binary) — 系统工具查找（Finder PATH 缺失）
 - [`normalize_external_path`](#normalize_external_path) — Windows `\\?\` 长路径前缀剥离
+- [`filesystem_capacity::available_space`](#filesystem_capacity) — 查询目标路径所属文件系统的可用容量
 - [`tauri::async_runtime::spawn`](#async_runtime) — 防 macOS startup-abort
 - [Session watcher](#session-watcher) — 文件系统观察索引
 
@@ -104,13 +105,13 @@
 
 **Problem.** Windows 上 GUI 应用（Tauri）直接启动子进程（node.exe Sidecar / Plugin Bridge / npm install）会弹出黑色控制台窗口。长生命周期 Node 进程还会创建 SDK / MCP 后代；如果所有者只保存直接 `Child`，正常退出时只能按 argv 猜测哪些后代属于 MyAgents，既可能漏掉后代，也可能误杀同机的外部进程。在 Windows 上先启动再调用 `taskkill /T`，还会留下 wrapper 提前退出、Job Object 尚未绑定的竞态窗口。
 
-**Surface.** `crate::process_cmd::new(program)` 返回已注入 Windows `CREATE_NO_WINDOW` 的 `Command`；`crate::process_cmd::spawn_tree(&mut command)` 为会创建后代的长生命周期进程返回 `ChildTree`。
+**Surface.** `crate::process_cmd::new(program)` 返回已注入 Windows `CREATE_NO_WINDOW` 的 `Command`；`crate::process_cmd::spawn_tree(&mut command)` 为会创建后代的长生命周期进程返回 `ChildTree`；`ChildTree::kill_and_wait()` force-stop exact tree 并最多等待 10 秒确认退出；`crate::process_cmd::settle_tree(child, natural_grace)` 先允许调用方定义的 cooperative / natural grace，再统一落到同一个 bounded force-stop。
 
 **Invariants enforced.** `ChildTree` 在子进程执行用户代码前建立进程树边界：Unix child 进入独立 process group；Windows child 以 suspended 状态创建，绑定 kill-on-close Job Object 后再恢复运行。所有者必须保留 `ChildTree`，显式 stop 与 Drop 只终止这棵精确进程树。应用退出先禁止新的资源创建，等待已经获准的创建流程完成登记或释放，再释放 Sidecar / Plugin Bridge owner；Unix 还要等待有上限的 SIGTERM→SIGKILL 清理任务结束。Windows GUI child 没有可靠的 console signal，stop 直接终止已保留的 Job Object。Task command Detector 同样属于受管进程树：timeout、stdout 超限、Stop、delete 与 App shutdown 都必须通过 retained `ChildTree` 收敛，读取 stdout/stderr 的线程也要 join 后再判断最终上限状态。进程树边界建立失败时必须终止 child 并返回错误，不能降级为未受管理的进程。
 
 **Don't.** 不要直接使用 `std::process::Command::new()`；Sidecar / Plugin Bridge 也不能直接 `.spawn()`。正常 shutdown 不能通过进程名、安装路径或 argv 子串扫描整机来弥补 owner 缺失。`process_cleanup::kill_stale_processes()` 只用于确认前一实例已经退出后的启动恢复，以及更新器的残留进程检查（Windows 更新器另有受保护目录和文件锁验证）；它不是正常生命周期 API。
 
-`myagents-document-worker` 同样走 `process_cmd::new()` + `spawn_tree()`，但它是一 job 一进程的 App-owned 隔离边界，不属于 Sidecar。Manager 必须同时保留 `ChildTree`、stdin 和 active `(jobId, generation)`；4-byte big-endian length + JSON frame 上限 1 MiB，clean EOF 与截断 prefix/payload 必须分开处理，terminal identity 不匹配一律按协议失败。密码不进入 argv/env：只在 start frame 中出现，序列化/接收 buffer 写完即 zeroize；取消先发 exact generation frame，2 秒后仍存活才 kill retained tree。完整协议见 `document_processing.md`。
+`myagents-document-worker` 同样走 `process_cmd::new()` + `spawn_tree()`，但它是一 job 一进程的 App-owned 隔离边界，不属于 Sidecar。Manager 必须同时保留 `ChildTree`、stdin 和 active `(jobId, generation)`；4-byte big-endian length + JSON frame 上限 1 MiB，clean EOF 与截断 prefix/payload 必须分开处理，terminal identity 不匹配一律按协议失败。密码不进入 argv/env：只在 start frame 中出现，序列化/接收 buffer 写完即 zeroize。取消先发 exact generation frame，给 Worker 15 秒 cooperative settlement；App shutdown 使用 10 秒 cooperative settlement；超时后 force-stop retained tree，并最多再等 10 秒确认 exact tree 已退出。完整协议见 `document_processing.md`。
 
 **例外（已内联处理或不适用）：**
 - `#[cfg(windows)]` 守卫内的系统工具命令（taskkill / powershell）
@@ -259,6 +260,12 @@ v0.2.0 Windows 版的 IM Bot 全部启动失败就是这个 trap：`find_tsx_run
 
 **Don't.**
 - 任何单写者文件用裸 append
+- 用 `Atomics.wait` / CPU spin / `while (Date.now() < end)` 做阻塞等待
+- 自己手写 lockdir 协议
+
+ConfigProvider 的 `config/projects/providers/apiKeys/verifyStatus` 属于一个磁盘快照：所有 refresh 必须委托给同一个 snapshot request/commit owner；本地写盘成功后也必须推进同一 revision，再镜像 React state。禁止为 provider/key 单独写一个无 fence 的异步 setter，否则旧的外部读取可以覆盖更新鲜的本地写入。
+
+---
 
 <a id="durable-record-journal"></a>
 ## `DurableRecordJournal` (`src-tauri/src/durable_journal.rs`)
@@ -277,10 +284,6 @@ v0.2.0 Windows 版的 IM Bot 全部启动失败就是这个 trap：`find_tsx_run
 - caller 必须给出领域 event enum 与 projection；helper 不拥有 recording/transcript 状态机，也不扩张成通用 event bus、数据库或跨进程队列
 
 **Don't.** Record-owned append-only 事实不得再裸写 JSONL，或复制一套 checksum/torn-tail repair。普通可原子替换的 snapshot、TaskStore 和 speech job metadata 不应为了“统一”迁入该 journal。
-- 用 `Atomics.wait` / CPU spin / `while (Date.now() < end)` 做阻塞等待
-- 自己手写 lockdir 协议
-
-ConfigProvider 的 `config/projects/providers/apiKeys/verifyStatus` 属于一个磁盘快照：所有 refresh 必须委托给同一个 snapshot request/commit owner；本地写盘成功后也必须推进同一 revision，再镜像 React state。禁止为 provider/key 单独写一个无 fence 的异步 setter，否则旧的外部读取可以覆盖更新鲜的本地写入。
 
 ---
 
