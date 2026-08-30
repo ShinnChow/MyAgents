@@ -530,7 +530,7 @@ export function TaskListPanel({
   return (
     <div className="@container/task-panel flex h-full min-w-0 flex-col">
       {/* Section header — label + persistent search pill + view toggle.
-          h-12 per DESIGN.md §7.4 (aligns with TaskCenter page header).
+          h-12 to align with the Task Center page header.
           v0.1.69 polish: bottom hairline removed; breathing room
           below replaces it as the separator, so the right column
           reads as a single continuous surface from header → buckets. */}

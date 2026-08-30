@@ -131,7 +131,7 @@ export function coerceReasoningEffortSettingForRuntime(
   return choices.includes(trimmed) ? trimmed : undefined;
 }
 
-/** Short UI annotation per level (uniform typography; see DESIGN.md 6.5). */
+/** Short UI annotation per level (uniform menu typography; see DESIGN.md §5.5). */
 export const REASONING_EFFORT_DESCRIPTIONS: Record<string, string> = {
   [REASONING_EFFORT_DEFAULT]: '跟随服务商',
   minimal: '最浅',

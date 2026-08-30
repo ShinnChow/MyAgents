@@ -212,7 +212,7 @@ export function ThoughtCard({
   };
 
   return (
-    // Card rhythm (DESIGN.md §6.2 compact card):
+    // Card rhythm (DESIGN.md §5.3 compact card):
     //   p-4          — 16px all sides (border → inner content gutter)
     //   mb-2 between meta row and body — 8px, tight enough that the
     //                  meta row reads as part of the same card, not a

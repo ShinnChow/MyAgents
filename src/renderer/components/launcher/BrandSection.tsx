@@ -3,8 +3,8 @@
  * Layout: Logo+Slogan pinned to upper area, input box anchored to lower area
  * with workspace selector integrated into the input toolbar.
  *
- * Phase 2 (v0.1.69): a 对话 / 想法 ModeSegment sits between the slogan and the
- * input. Switching to 「想法」 repurposes the input as a freeform Thought entry
+ * Phase 2 (v0.1.69): a 对话 / 记录 ModeSegment sits between the slogan and the
+ * input. Switching to 「记录」 repurposes the input as a freeform Record entry
  * (persisted to ~/.myagents/thoughts/ via `thoughtCreate`), bypassing the full
  * Chat launch flow. Switching back to 「对话」 restores the default behavior.
  */
@@ -262,7 +262,7 @@ export default memo(function BrandSection({
   //
   // Skipped entirely in 对话 mode on mount so user's steady state (most
   // sessions) doesn't pay a full `thoughtList()` round-trip for a `#`
-  // picker they never open. The moment the user flips to 想法, this
+  // picker they never open. The moment the user flips to 记录, this
   // effect re-runs and populates the list before they can open the
   // picker.
   const [thoughts, setThoughts] = useState<Thought[]>([]);
@@ -635,14 +635,14 @@ export default memo(function BrandSection({
         <h1 className="theme-product-wordmark theme-launcher-hero-title">
           {resolvedTheme.hero.productName}
         </h1>
-        {/* 品牌 slogan 的 15px/17px 是 DESIGN.md §15.2 立档的展示型字号（display 用途），
+        {/* 品牌 slogan 的 15px/17px 是 DESIGN.md §3.3 立档的展示型字号（display 用途），
                     不属于正文 Type Scale；这是全仓唯一豁免点（PRD 0.2.34）。 */}
         <p className="theme-launcher-hero-slogan">
           {resolvedTheme.hero.slogans[sloganLocale]}
         </p>
       </div>
 
-      {/* Mode declaration: 对话 / 想法 (see DESIGN.md §6.8, PRD §4.1).
+      {/* Mode declaration: 对话 / 记录 (see DESIGN.md §5.6, PRD §4.1).
                 `mt-6 mb-6` opens breathing room above (separating from
                 the brand group) and below (separating from the input
                 affordance) — deliberately generous so the Launcher
@@ -666,7 +666,7 @@ export default memo(function BrandSection({
       )}
 
       {/* Lower area: Input box with workspace selector in toolbar.
-                When 「想法」 mode is active, a compact Recent Thoughts strip is
+                When 「记录」 mode is active, a compact Recent Records strip is
                 absolute-positioned below the input so it hangs in the existing
                 `pb-[12vh]` bottom space without shifting the brand/input
                 vertically (PRD §4.2). */}
@@ -678,7 +678,7 @@ export default memo(function BrandSection({
            * them. The inactive one is taken out of layout via
            * `hidden` (display:none) so only the active mode
            * contributes to the wrapper height; cards in 对话 vs
-           * 想法 size to their own content independently.
+           * 记录 size to their own content independently.
            */}
           <div className="grid *:col-start-1 *:row-start-1">
             <div

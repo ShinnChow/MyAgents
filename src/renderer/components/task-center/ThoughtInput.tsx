@@ -214,7 +214,7 @@ export const ThoughtInput = forwardRef<ThoughtInputHandle, Props>(
       recordingBusy = false,
       // Guide-style placeholder — tells new users both *what* to write and
       // *how* to tag it, so the empty state doesn't look like dead space.
-      // §6.3 rules the placeholder color (--ink-muted) which is already
+      // DESIGN.md §5.2 rules the placeholder color (--ink-muted) which is already
       // applied by the textarea className below.
       placeholder,
       autoFocus = false,

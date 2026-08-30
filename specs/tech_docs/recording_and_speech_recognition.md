@@ -1,6 +1,7 @@
 # Recording and Speech Recognition
 
-本文记录当前 Record 录音与本地语音识别实现中的 owner、资源生命周期和排障边界。产品范围与验收以对应 PRD 为准；本文只描述已经落入代码的 current state。
+本文记录当前 Record 录音与本地语音识别实现中的 owner、资源生命周期和排障边界。用户可见的入口、布局、播放、转写、现场笔记和 AI 讨论以
+[`../design/records_and_recording.md`](../design/records_and_recording.md) 为当前规范；本文不复制页面规格。
 
 ## Owner 与进程边界
 

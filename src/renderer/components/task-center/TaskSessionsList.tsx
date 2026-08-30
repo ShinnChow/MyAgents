@@ -10,7 +10,7 @@
 // also closes this detail overlay so the user immediately lands in the
 // chat they asked for.
 //
-// Visual language mirrors Launcher's 历史对话 list (DESIGN.md §15.6):
+// Visual language follows Task Detail hierarchy (specs/design/task_center.md §6):
 // `rounded-lg hover:bg-[var(--hover-bg)]` row with a timestamp column on
 // the left and truncated title on the right. Timestamp column is 94px
 // (vs Launcher's 56px w-14) because this list shows `MM-DD HH:mm` whereas

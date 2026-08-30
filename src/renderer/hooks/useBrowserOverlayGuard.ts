@@ -6,8 +6,8 @@
  * The caller (BrowserPanel) uses this in a combined visibility effect to decide
  * whether to show/hide the native Webview.
  *
- * Detection relies on the design system convention (specs/DESIGN.md §6.7):
- * all overlay backdrops use `backdrop-blur` + `position: fixed`. This
+ * Modal backdrops are centrally owned per specs/DESIGN.md §5.5. The current
+ * DOM detection contract is `backdrop-blur` + `position: fixed`; this
  * distinguishes full-screen overlays (modals, panels) from small fixed
  * elements (toasts, tooltips) which don't use backdrop-blur.
  *

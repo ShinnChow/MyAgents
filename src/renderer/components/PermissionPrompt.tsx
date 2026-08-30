@@ -90,7 +90,7 @@ export function PermissionPrompt({ request, onDecision }: PermissionPromptProps)
     return (
         <div className="animate-in fade-in slide-in-from-bottom-2 duration-200">
             {/* 反相版（PRD 0.2.34）：中性白卡 + 淡琥珀「命令盒」承载焦点内容，
-                颜色当重点而非整卡底色。权限语义＝warning 琥珀（对齐 DESIGN.md §10.6）。 */}
+                颜色当重点而非整卡底色。权限语义＝warning 琥珀（对齐 DESIGN.md §8.2）。 */}
             <div className="rounded-xl border border-[var(--line)] bg-[var(--paper-elevated)] p-4 shadow-sm">
                 {showQueueProgress && (
                     <div className="mb-3 animate-in fade-in slide-in-from-top-1 duration-200">

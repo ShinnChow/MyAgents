@@ -308,7 +308,7 @@ export default defineConfig(
         // remaining divergence is text-2xl=22px (official 24).
         //
         // Known escape surface (accepted, do NOT widen the regex without
-        // re-reading DESIGN.md §2.2 边界): rem/em arbitrary values
+        // re-reading DESIGN.md §3.3 边界): rem/em arbitrary values
         // (`text-[2.5rem]` brand title, `text-[0.9em]` inline code) are
         // legitimate relative/display forms; `style={{fontSize}}` API
         // configs (Monaco/xterm/syntax-highlighter) are out of Tailwind's

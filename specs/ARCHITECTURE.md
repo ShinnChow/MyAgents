@@ -1184,7 +1184,7 @@ Windows 无自带 git/bash，NSIS 静默安装 Git for Windows（`src-tauri/nsis
 - [构建问题排查](./guides/build_troubleshooting.md) — Windows 构建 / CSP / Resources 缓存 / 代理
 
 ### 前端
-- [设计系统](./DESIGN.md) — Token / 组件 / 页面规范
+- [设计系统](./DESIGN.md) — 全局视觉、组件、交互原则与功能设计索引
 - [Theme System](./tech_docs/theme_system.md) — Theme/Appearance 状态、注册契约、Token/adapter owner、bootstrap 与跨窗口同步
 - [React 稳定性规范](./tech_docs/react_stability_rules.md) — Context / useEffect / memo 5 条规则
 - [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md) — native surface、container readiness、Virtuoso admission 与 continuity transaction
