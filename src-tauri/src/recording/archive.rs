@@ -238,13 +238,25 @@ pub fn recover_ogg_opus_archive(path: &Path) -> Result<Option<RecoveredArchive>,
     let Some((last_page_offset, mut last_page, granule, had_eos)) = last_data_page else {
         return Ok(None);
     };
+    let pre_skip = pre_skip.ok_or_else(|| "Ogg recovery source is missing pre-skip".to_string())?;
     let valid_len = last_page_offset.saturating_add(last_page.len() as u64);
     let needs_repair = valid_len != original_len || !had_eos;
+    // A checkpoint granule includes encoder lookahead that only later packets
+    // can drain. When recovery promotes that checkpoint to EOS, its last
+    // decodable sample is therefore one pre-skip earlier.
+    let final_granule = if had_eos {
+        granule
+    } else {
+        granule
+            .checked_sub(pre_skip)
+            .ok_or_else(|| "recovered Ogg granule precedes pre-skip".to_string())?
+    };
     if needs_repair {
         file.set_len(valid_len)
             .map_err(|error| format!("truncate torn Ogg tail: {error}"))?;
         if !had_eos {
             last_page[5] |= 0x04;
+            last_page[6..14].copy_from_slice(&final_granule.to_le_bytes());
             last_page[22..26].fill(0);
             let checksum = ogg_crc(&last_page);
             last_page[22..26].copy_from_slice(&checksum.to_le_bytes());
@@ -256,7 +268,7 @@ pub fn recover_ogg_opus_archive(path: &Path) -> Result<Option<RecoveredArchive>,
             .map_err(|error| format!("sync recovered Ogg archive: {error}"))?;
     }
     Ok(Some(RecoveredArchive {
-        media_samples_48k: granule.saturating_sub(pre_skip.unwrap_or(0)),
+        media_samples_48k: final_granule.saturating_sub(pre_skip),
         size_bytes: valid_len,
         repaired: needs_repair,
     }))
@@ -353,7 +365,12 @@ impl OggOpusWriter {
             self.frame_buffer
                 .copy_from_slice(&self.pending_pcm[consumed..consumed + frame_len]);
             let frame = std::mem::take(&mut self.frame_buffer);
-            self.encode_packet(&frame, OPUS_FRAME_SAMPLES as u64, false)?;
+            let end = if (self.encoded_frames + 1) % PAGE_FRAME_COUNT == 0 {
+                PacketWriteEndInfo::EndPage
+            } else {
+                PacketWriteEndInfo::NormalPacket
+            };
+            self.encode_packet(&frame, OPUS_FRAME_SAMPLES as u64, end)?;
             self.frame_buffer = frame;
             consumed += frame_len;
         }
@@ -367,7 +384,7 @@ impl OggOpusWriter {
         &mut self,
         pcm: &[f32],
         media_samples: u64,
-        end_stream: bool,
+        end: PacketWriteEndInfo,
     ) -> Result<(), String> {
         let packet_len = self
             .encoder
@@ -375,13 +392,6 @@ impl OggOpusWriter {
             .map_err(|error| format!("encode Opus packet: {error}"))?;
         self.media_samples = self.media_samples.saturating_add(media_samples);
         self.encoded_frames = self.encoded_frames.saturating_add(1);
-        let end = if end_stream {
-            PacketWriteEndInfo::EndStream
-        } else if self.encoded_frames % PAGE_FRAME_COUNT == 0 {
-            PacketWriteEndInfo::EndPage
-        } else {
-            PacketWriteEndInfo::NormalPacket
-        };
         let granule = self.pre_skip as u64 + self.media_samples;
         self.writer
             .write_packet(
@@ -404,13 +414,29 @@ impl OggOpusWriter {
     fn finish(mut self) -> Result<u64, String> {
         let frame_len = OPUS_FRAME_SAMPLES * self.channels;
         let remaining_frames = self.pending_pcm.len() / self.channels;
-        self.frame_buffer.fill(0.0);
-        let remaining_samples = self.pending_pcm.len().min(frame_len);
-        self.frame_buffer[..remaining_samples]
-            .copy_from_slice(&self.pending_pcm[..remaining_samples]);
-        self.pending_pcm.clear();
-        let final_pcm = std::mem::take(&mut self.frame_buffer);
-        self.encode_packet(&final_pcm, remaining_frames as u64, true)?;
+        // The EOS granule includes pre-skip, so the encoded packet timeline
+        // must cover both the source tail and that encoder lookahead.
+        let tail_packets = (self.pre_skip as usize + remaining_frames).div_ceil(OPUS_FRAME_SAMPLES);
+        for packet_index in 0..tail_packets {
+            self.frame_buffer.fill(0.0);
+            let media_samples = if packet_index == 0 {
+                let remaining_samples = self.pending_pcm.len().min(frame_len);
+                self.frame_buffer[..remaining_samples]
+                    .copy_from_slice(&self.pending_pcm[..remaining_samples]);
+                self.pending_pcm.clear();
+                remaining_frames as u64
+            } else {
+                0
+            };
+            let end = if packet_index + 1 == tail_packets {
+                PacketWriteEndInfo::EndStream
+            } else {
+                PacketWriteEndInfo::NormalPacket
+            };
+            let frame = std::mem::take(&mut self.frame_buffer);
+            self.encode_packet(&frame, media_samples, end)?;
+            self.frame_buffer = frame;
+        }
         let mut file = self.writer.into_inner();
         file.flush()
             .and_then(|()| file.sync_all())
@@ -456,6 +482,23 @@ mod tests {
     use ogg::PacketReader;
     use tempfile::tempdir;
 
+    fn archive_timeline(path: &Path) -> (u64, u64, u64) {
+        let mut reader = PacketReader::new(File::open(path).unwrap());
+        let mut packets = Vec::new();
+        while let Some(packet) = reader.read_packet().unwrap() {
+            packets.push(packet);
+        }
+        let pre_skip = u16::from_le_bytes(packets[0].data[10..12].try_into().unwrap()) as u64;
+        let decoded_samples = packets[2..]
+            .iter()
+            .map(|packet| {
+                opus2::packet::get_nb_samples(&packet.data, ARCHIVE_SAMPLE_RATE).unwrap() as u64
+            })
+            .sum();
+        let final_granule = packets.last().unwrap().absgp_page();
+        (pre_skip, decoded_samples, final_granule)
+    }
+
     #[test]
     fn writes_bounded_valid_ogg_opus_archive() {
         let root = tempdir().unwrap();
@@ -478,6 +521,31 @@ mod tests {
         assert_eq!(&packets[1].data[..8], b"OpusTags");
         assert!(packets.last().unwrap().last_in_stream());
         assert!(path.metadata().unwrap().len() < 128 * 1024);
+    }
+
+    #[test]
+    fn flushes_encoder_lookahead_across_the_tail_frame_boundary() {
+        for channels in [1, 2] {
+            for tail_frames in [648, 649, 832, 959] {
+                let root = tempdir().unwrap();
+                let path = root
+                    .path()
+                    .join(format!("tail-{channels}-{tail_frames}.opus"));
+                let media_frames = OPUS_FRAME_SAMPLES * 2 + tail_frames;
+                let mut writer = OggOpusWriter::create(&path, channels).unwrap();
+                writer
+                    .push_interleaved(&vec![0.02; media_frames * channels])
+                    .unwrap();
+                assert_eq!(writer.finish().unwrap(), media_frames as u64);
+
+                let (pre_skip, decoded_samples, final_granule) = archive_timeline(&path);
+                assert_eq!(final_granule - pre_skip, media_frames as u64);
+                assert!(
+                    final_granule <= decoded_samples,
+                    "EOS granule {final_granule} exceeds {decoded_samples} decoded samples"
+                );
+            }
+        }
     }
 
     #[test]
@@ -504,8 +572,10 @@ mod tests {
 
         let recovered = recover_ogg_opus_archive(&path).unwrap().unwrap();
         assert!(recovered.repaired);
-        assert!(recovered.media_samples_48k >= ARCHIVE_SAMPLE_RATE as u64 * 2);
         assert!(recovered.size_bytes < original.len() as u64);
+        let (pre_skip, decoded_samples, final_granule) = archive_timeline(&path);
+        assert_eq!(final_granule, decoded_samples);
+        assert_eq!(recovered.media_samples_48k, decoded_samples - pre_skip);
         let mut reader = PacketReader::new(File::open(&path).unwrap());
         let mut last = None;
         while let Some(packet) = reader.read_packet().unwrap() {
