@@ -17,14 +17,13 @@ import {
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  acquireLockedResource,
   computeBuildFingerprint,
-  contentAddressedDownloadPath,
   hostDocumentTarget,
-  validateLockedFile,
   validatePreparedBundle,
   withResourcePrepareLock,
 } from './document-processing-resource-cache.mjs';
-import { macX64SourceBuildPrerequisiteFailures } from './document-processing-build-tools.mjs';
+import { macSourceBuildPrerequisiteFailures } from './document-processing-build-tools.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const appVersion = JSON.parse(
@@ -109,7 +108,7 @@ function probeCommand(command, commandArgs) {
 
 function assertSourceBuildPrerequisites() {
   if (!targetLock.onnxRuntime.sourceBuild) return;
-  const failures = macX64SourceBuildPrerequisiteFailures({
+  const failures = macSourceBuildPrerequisiteFailures({
     gitVersion: probeCommand('git', ['--version']),
     pythonVersion: probeCommand('python3', ['--version']),
     cmakeVersion: probeCommand('cmake', ['--version']),
@@ -131,7 +130,7 @@ function assertSourceBuildPrerequisites() {
   throw new Error(
     [
       `Document-processing source build prerequisites are missing for ${target}.`,
-      'MyAgents builds ONNX Runtime from its locked source because upstream does not publish a macOS x64 binary.',
+      "MyAgents builds ONNX Runtime from its locked source so both macOS architectures honor the App's macOS 13 deployment target.",
       ...details,
       'The source cache is preserved; install the missing tools and rerun the same command.',
     ].join('\n'),
@@ -145,92 +144,14 @@ function digestFile(path, algorithm = 'sha256', encoding = 'hex') {
 }
 
 async function download(entry, cacheName) {
-  const destination = contentAddressedDownloadPath(cacheRoot, entry, cacheName);
-  const legacy = join(legacyCacheRoot, cacheName);
-  mkdirSync(dirname(destination), { recursive: true });
-  if (validateLockedFile(destination, entry)) {
-    cacheStats.hits += 1;
-    return destination;
-  }
-  if (validateLockedFile(legacy, entry)) {
-    copyFileSync(legacy, destination);
-    cacheStats.migrated += 1;
-    console.log(
-      `  [cache] migrated ${cacheName} from legacy Cargo target cache`,
-    );
-    return destination;
-  }
-  if (offline) {
-    throw new Error(
-      `Offline document resource cache miss: ${cacheName} (${destination})`,
-    );
-  }
-
-  rmSync(destination, { force: true });
-  const temporary = `${destination}.${process.pid}.${randomUUID()}.partial`;
-  rmSync(temporary, { force: true });
-  console.log(
-    `  [download] ${cacheName} (${(entry.size / 1024 / 1024).toFixed(1)} MiB)`,
-  );
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const response = await fetch(entry.url, { redirect: 'follow' });
-      if (!response.ok || !response.body) {
-        throw new Error(`Download failed (${response.status}): ${entry.url}`);
-      }
-      const bytes = Buffer.from(await response.arrayBuffer());
-      writeFileSync(temporary, bytes, { mode: 0o600 });
-      if (!validateLockedFile(temporary, entry))
-        throw new Error(`Locked size/digest mismatch: ${entry.url}`);
-      renameSync(temporary, destination);
-      lastError = undefined;
-      break;
-    } catch (error) {
-      lastError = error;
-      rmSync(temporary, { force: true });
-      if (attempt < 3) {
-        await new Promise((resolveDelay) =>
-          setTimeout(resolveDelay, attempt * 500),
-        );
-      }
-    }
-  }
-  if (lastError) {
-    console.warn(
-      `  [download] Node fetch failed; falling back to curl: ${lastError.message}`,
-    );
-    let curlError;
-    try {
-      execFileSync(
-        'curl',
-        [
-          '--fail',
-          '--location',
-          '--retry',
-          '3',
-          '--retry-delay',
-          '1',
-          '--output',
-          temporary,
-          entry.url,
-        ],
-        { stdio: 'inherit' },
-      );
-      if (!validateLockedFile(temporary, entry))
-        throw new Error(`Locked size/digest mismatch: ${entry.url}`);
-      renameSync(temporary, destination);
-      curlError = undefined;
-    } catch (error) {
-      curlError = error;
-      rmSync(temporary, { force: true });
-    }
-    if (curlError) throw curlError;
-  }
-  if (!validateLockedFile(destination, entry))
-    throw new Error(`Locked size/digest mismatch: ${entry.url}`);
-  cacheStats.downloaded += 1;
-  return destination;
+  return acquireLockedResource({
+    cacheRoot,
+    legacyCacheRoot,
+    entry,
+    cacheName,
+    offline,
+    stats: cacheStats,
+  });
 }
 
 function filesUnder(root) {
@@ -297,7 +218,7 @@ async function extractArchive(entry, name) {
   return destination;
 }
 
-function prepareMacX64OrtSourceBuild(entry) {
+function prepareMacOrtSourceBuild(entry) {
   const source = join(
     cacheRoot,
     'source',
@@ -320,20 +241,28 @@ function prepareMacX64OrtSourceBuild(entry) {
       { cwd: source, stdio: 'inherit' },
     );
   }
-  execFileSync(
-    'git',
-    ['fetch', '--depth', '1', 'origin', entry.sourceBuild.commit],
-    { cwd: source, stdio: 'inherit' },
-  );
-  execFileSync(
-    'git',
-    ['checkout', '--detach', '--force', entry.sourceBuild.commit],
-    { cwd: source, stdio: 'inherit' },
-  );
-  const actualCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+  let actualCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
     cwd: source,
     encoding: 'utf8',
   }).trim();
+  if (actualCommit !== entry.sourceBuild.commit) {
+    execFileSync(
+      'git',
+      ['fetch', '--depth', '1', 'origin', entry.sourceBuild.commit],
+      { cwd: source, stdio: 'inherit' },
+    );
+    execFileSync(
+      'git',
+      ['checkout', '--detach', '--force', entry.sourceBuild.commit],
+      { cwd: source, stdio: 'inherit' },
+    );
+    actualCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: source,
+      encoding: 'utf8',
+    }).trim();
+  } else {
+    console.log(`  [cache] reused locked ONNX Runtime source ${actualCommit}`);
+  }
   if (actualCommit !== entry.sourceBuild.commit)
     throw new Error(`ONNX Runtime source mismatch: ${actualCommit}`);
   execFileSync('git', ['submodule', 'sync', '--recursive'], {
@@ -351,16 +280,32 @@ function prepareMacX64OrtSourceBuild(entry) {
       '--config',
       'Release',
       '--build_shared_lib',
+      '--build_dir',
+      join(
+        cacheRoot,
+        'source-build',
+        `onnxruntime-${entry.sourceBuild.commit}`,
+        target,
+      ),
       '--parallel',
       '--skip_tests',
       '--cmake_extra_defines',
-      'CMAKE_OSX_ARCHITECTURES=x86_64',
-      'CMAKE_OSX_DEPLOYMENT_TARGET=13.0',
+      `CMAKE_OSX_ARCHITECTURES=${target.startsWith('aarch64-') ? 'arm64' : 'x86_64'}`,
+      `CMAKE_OSX_DEPLOYMENT_TARGET=${entry.sourceBuild.deploymentTarget}`,
       'onnxruntime_BUILD_UNIT_TESTS=OFF',
     ],
     { cwd: source, stdio: 'inherit' },
   );
-  return source;
+  return {
+    artifactRoot: join(
+      cacheRoot,
+      'source-build',
+      `onnxruntime-${entry.sourceBuild.commit}`,
+      target,
+      'Release',
+    ),
+    legalRoot: source,
+  };
 }
 
 const appleSigningIdentity = process.env.APPLE_SIGNING_IDENTITY?.trim();
@@ -549,9 +494,19 @@ await withResourcePrepareLock(
     mkdirSync(join(stageRoot, 'legal'), { recursive: true });
 
     try {
-      const ortExtract = targetLock.onnxRuntime.sourceBuild
-        ? prepareMacX64OrtSourceBuild(targetLock.onnxRuntime)
-        : await extractArchive(targetLock.onnxRuntime, 'onnxruntime');
+      let ortExtract;
+      let ortLegalRoot;
+      if (targetLock.onnxRuntime.sourceBuild) {
+        const prepared = prepareMacOrtSourceBuild(targetLock.onnxRuntime);
+        ortExtract = prepared.artifactRoot;
+        ortLegalRoot = prepared.legalRoot;
+      } else {
+        ortExtract = await extractArchive(
+          targetLock.onnxRuntime,
+          'onnxruntime',
+        );
+        ortLegalRoot = ortExtract;
+      }
       const pdfiumExtract = await extractArchive(targetLock.pdfium, 'pdfium');
       const extension =
         targetLock.platform === 'windows'
@@ -716,7 +671,7 @@ await withResourcePrepareLock(
         join(stageRoot, 'legal', 'PADDLEOCR-LICENSE'),
       );
       for (const [name, root] of [
-        ['ONNXRUNTIME', ortExtract],
+        ['ONNXRUNTIME', ortLegalRoot],
         ['PDFIUM', pdfiumExtract],
       ]) {
         const license = filesUnder(root).find(

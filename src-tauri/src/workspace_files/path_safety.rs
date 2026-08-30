@@ -553,6 +553,34 @@ pub fn read_workspace_file_no_follow(
     requested: &str,
     max_bytes: u64,
 ) -> WfResult<(PathBuf, Vec<u8>)> {
+    let (canonical, mut file) =
+        open_workspace_regular_file_no_follow(workspace_root, requested, "attachment")?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("Failed to inspect opened attachment: {}", e))?;
+    if metadata.len() > max_bytes {
+        return Err(format!("Attachment exceeds {} bytes", max_bytes));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
+    (&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Failed to read attachment: {}", e))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("Attachment exceeds {} bytes", max_bytes));
+    }
+    Ok((canonical, bytes))
+}
+
+/// Open a regular file beneath the exact Workspace root without following a
+/// symlink/reparse-point leaf or any component during the final open. Callers
+/// that need to stream large inputs can retain the returned handle rather than
+/// buffering the file or reopening an attacker-swappable path.
+pub fn open_workspace_regular_file_no_follow(
+    workspace_root: &Path,
+    requested: &str,
+    label: &str,
+) -> WfResult<(PathBuf, fs::File)> {
     let canonical_root = fs::canonicalize(workspace_root)
         .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
     let lexical = if Path::new(requested).is_absolute() {
@@ -578,12 +606,11 @@ pub fn read_workspace_file_no_follow(
     }
 
     #[cfg(unix)]
-    let mut file = open_relative_file_no_follow(&canonical_root, relative, false)?;
+    let file = open_relative_file_no_follow(&canonical_root, relative, false)?;
     #[cfg(windows)]
-    let (mut file, opened_parent) =
-        open_windows_workspace_file_no_follow(&canonical_root, relative)?;
+    let (file, opened_parent) = open_windows_workspace_file_no_follow(&canonical_root, relative)?;
     #[cfg(all(not(unix), not(windows)))]
-    let mut file = {
+    let file = {
         let metadata = fs::symlink_metadata(&canonical)
             .map_err(|e| format!("Failed to inspect attachment: {}", e))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -593,20 +620,9 @@ pub fn read_workspace_file_no_follow(
     };
     let metadata = file
         .metadata()
-        .map_err(|e| format!("Failed to inspect opened attachment: {}", e))?;
+        .map_err(|e| format!("Failed to inspect opened {}: {}", label, e))?;
     if !metadata.is_file() {
-        return Err("Attachment path must be a regular file".to_string());
-    }
-    if metadata.len() > max_bytes {
-        return Err(format!("Attachment exceeds {} bytes", max_bytes));
-    }
-    let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
-    (&mut file)
-        .take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("Failed to read attachment: {}", e))?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!("Attachment exceeds {} bytes", max_bytes));
+        return Err(format!("{} path must be a regular file", label));
     }
     #[cfg(windows)]
     verify_windows_workspace_parent(
@@ -614,7 +630,103 @@ pub fn read_workspace_file_no_follow(
         relative.parent().unwrap_or_else(|| Path::new("")),
         &opened_parent,
     )?;
-    Ok((canonical, bytes))
+    Ok((canonical, file))
+}
+
+/// Create/open a directory beneath the Workspace one component at a time,
+/// rejecting symlink/reparse-point ancestors. The retained directory handle
+/// lets long-running owners bind later publication to the exact directory
+/// admitted here.
+pub fn ensure_workspace_directory_no_follow(
+    workspace_root: &Path,
+    requested: &str,
+) -> WfResult<(PathBuf, fs::File)> {
+    let canonical_root = fs::canonicalize(workspace_root)
+        .map_err(|e| format!("Failed to resolve workspace path: {}", e))?;
+    let lexical = if Path::new(requested).is_absolute() {
+        PathBuf::from(requested)
+    } else {
+        resolve_inside_workspace(&canonical_root, requested)?
+    };
+    let relative = lexical
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Output path escapes the current workspace".to_string())?;
+
+    #[cfg(unix)]
+    let directory = open_relative_directory_no_follow_unix(&canonical_root, relative, true)?;
+    #[cfg(windows)]
+    let directory = resolve_windows_workspace_parent(&canonical_root, relative, true)?;
+    #[cfg(all(not(unix), not(windows)))]
+    let directory = {
+        let canonical = resolve_portable_destination_parent(&canonical_root, relative)?;
+        fs::File::open(&canonical).map_err(|e| format!("Failed to open output directory: {}", e))?
+    };
+
+    let canonical = fs::canonicalize(&lexical)
+        .map_err(|e| format!("Failed to resolve output directory: {}", e))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err("Output path escapes the current workspace".to_string());
+    }
+    Ok((canonical, directory))
+}
+
+#[cfg(unix)]
+fn open_relative_directory_no_follow_unix(
+    root: &Path,
+    relative: &Path,
+    create: bool,
+) -> WfResult<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut root_options = fs::OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut current = root_options
+        .open(root)
+        .map_err(|e| format!("Failed to open workspace root: {}", e))?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err("Unsafe output path component".to_string());
+        };
+        let name = component_cstring(name)?;
+        let mut fd = unsafe {
+            libc::openat(
+                current.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0
+            && create
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        {
+            let created = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o755) };
+            if created < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(format!(
+                    "Failed to create output directory: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+        }
+        if fd < 0 {
+            return Err(format!(
+                "Output path contains an inaccessible or symlinked directory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        current = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    Ok(current)
 }
 
 /// Atomically write bytes beneath `workspace_root`. Parent components are
@@ -1961,6 +2073,44 @@ mod tests {
         symlink(outside.join("missing.txt"), ws.join("broken.txt")).unwrap();
         assert!(write_workspace_file_no_follow(&ws, "broken.txt", b"blocked").is_err());
         assert!(!outside.join("missing.txt").exists());
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_workspace_handles_create_safe_directories_and_reject_links() {
+        use std::os::unix::fs::symlink;
+
+        let ws = make_tmp_workspace();
+        fs::write(ws.join("meeting.wav"), b"audio").unwrap();
+        let (source_path, mut source) =
+            open_workspace_regular_file_no_follow(&ws, "meeting.wav", "speech source").unwrap();
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            source_path,
+            fs::canonicalize(ws.join("meeting.wav")).unwrap()
+        );
+        assert_eq!(bytes, b"audio");
+
+        let (output_path, output) =
+            ensure_workspace_directory_no_follow(&ws, "myagents_files/speech").unwrap();
+        assert_eq!(
+            output_path,
+            fs::canonicalize(ws.join("myagents_files/speech")).unwrap()
+        );
+        assert!(output.metadata().unwrap().is_dir());
+
+        let outside = make_test_workspace("speech_output_outside");
+        symlink(&outside, ws.join("linked-output")).unwrap();
+        assert!(ensure_workspace_directory_no_follow(&ws, "linked-output/jobs").is_err());
+        assert!(open_workspace_regular_file_no_follow(
+            &ws,
+            outside.join("secret.wav").to_string_lossy().as_ref(),
+            "speech source",
+        )
+        .is_err());
         let _ = fs::remove_dir_all(&ws);
         let _ = fs::remove_dir_all(&outside);
     }

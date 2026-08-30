@@ -1,19 +1,19 @@
-# Thought、Task、定时自动化与 Goal Mode
+# Record、Task、定时自动化与 Goal Mode
 
 ## 四种承载方式
 
 | 概念 | 最适合的工作 | 是否有独立持久状态 | 是否自动继续/触发 |
 |---|---|---|---|
-| Thought | 先记下还不成熟的想法 | 是 | 否 |
+| Record | 保存文字想法、笔记或会议录音 | 是 | 否 |
 | Task | 已明确、需要追踪、执行和验收的工作 | 是 | 可手动或按 schedule 触发 |
 | Cron | 用户熟悉的定时任务管理名称；底层仍是 Task | 复用 Task | 按 At/Every/Cron schedule |
 | Goal Mode | 当前 Session 围绕一个目标连续多轮推进 | Session Goal 状态 | 每轮完成后自动继续，直到暂停或终态 |
 
-## Thought
+## Record
 
-Thought 适合低成本收集灵感、待办和问题，不要求立刻定义完整验收标准。用户可以给它加标签、搜索，之后再进入 AI 对齐流程，把成熟内容物化为 Task。
+Record 适合低成本保存灵感、待办、问题和会议录音，不要求立刻定义完整验收标准。用户可以给它加标签、搜索，之后再进入 AI 对齐流程，把成熟内容物化为 Task。
 
-Thought 不是会自动执行的 Task。仅仅记录 Thought 不会启动 Agent 回合。
+Record 不是会自动执行的 Task。仅仅保存 Record 不会启动 Agent 回合；音频 Record 的录制、转写和说话人处理属于记录能力，也不会因此自动创建 Task。
 
 ## Task Center
 
@@ -30,7 +30,7 @@ Task 是任务身份、状态、调度和执行审计的统一权威。一个 Ta
 常见流程：
 
 ```text
-Thought → 与 AI 对齐 → 创建 Task → todo
+Record → 与 AI 对齐 → 创建 Task → todo
       → 手动 run 或到点触发 → running → verifying → done → archived
                                       ↘ blocked / stopped
 blocked / stopped / done / archived → rerun → todo

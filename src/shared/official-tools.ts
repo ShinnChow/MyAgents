@@ -1,6 +1,9 @@
 export const IMAGE_UNDERSTANDING_TOOL_ID = 'image-understanding' as const;
+export const SPEECH_RECOGNITION_TOOL_ID = 'speech-recognition' as const;
 
-export type OfficialToolId = typeof IMAGE_UNDERSTANDING_TOOL_ID;
+export type OfficialToolId =
+  | typeof IMAGE_UNDERSTANDING_TOOL_ID
+  | typeof SPEECH_RECOGNITION_TOOL_ID;
 
 export interface ImageUnderstandingToolSettings {
   providerId?: string;
@@ -34,7 +37,7 @@ export interface OfficialToolDefinition {
   name: string;
   description: string;
   badge: 'CLI';
-  cliGroup: 'vision';
+  cliGroup: 'vision' | 'speech';
   requiresConfig: boolean;
 }
 
@@ -46,6 +49,14 @@ export const OFFICIAL_TOOLS: readonly OfficialToolDefinition[] = [
     badge: 'CLI',
     cliGroup: 'vision',
     requiresConfig: true,
+  },
+  {
+    id: SPEECH_RECOGNITION_TOOL_ID,
+    name: '语音识别',
+    description: '使用 MyAgents 的本地语音模型转写当前工作区内的音频或视频附件。',
+    badge: 'CLI',
+    cliGroup: 'speech',
+    requiresConfig: false,
   },
 ] as const;
 

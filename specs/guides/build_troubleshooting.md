@@ -339,23 +339,23 @@ python3 --version
 
 构建脚本不会自动安装系统包。已经完整验证的 prepared cache 可以继续离线复用，不要求本机保留源码构建工具；失败前已经下载的 source cache 也会保留，安装缺失工具后直接重跑即可。
 
-### 问题：每次构建都重新下载或签名文档转换资源
+### 问题：每次构建都重新下载或签名本地推理资源
 
-文档 Worker、OCR 模型、ONNX Runtime 与 PDFium 由统一入口准备：
+文档 Worker、media Worker、OCR/speech native 依赖、共享 ONNX Runtime 与 PDFium 由统一入口准备：
 
 ```bash
-npm run prepare:document-processing
+npm run prepare:native-inference
 ```
 
-原始下载和完整 prepared bundle 会持久缓存在 `src-tauri/resources/document-processing-cache/`，不受 `npm run clean` 删除 `src-tauri/target` 的影响。只要 App 版本、target、锁文件、相关 Rust 源码/toolchain 与签名配置都没有变化，重复 setup/dev/release build 应直接报告 `already ready`，不会再次下载、展开、编译或签名。提升 App 版本会产生新的 prepared fingerprint，但仍会复用已校验的内容寻址下载；首次升级还会自动迁移旧的 `src-tauri/target/document-processing-cache` 中校验有效的原始文件。
+原始下载和完整 prepared bundle 会持久缓存在 `src-tauri/resources/document-processing-cache/`，不受 `npm run clean` 删除 `src-tauri/target` 的影响。只要 App 版本、target、锁文件、相关 document/media Worker 与 Rust 源码/toolchain、签名配置都没有变化，重复 setup/dev/release build 应直接报告 `already ready`，不会再次下载、展开、编译或签名。提升 App 版本会产生新的 prepared fingerprint，但仍会复用已校验的内容寻址下载；首次升级还会自动迁移旧的 `src-tauri/target/document-processing-cache` 中校验有效的原始文件。
 
 验证机器是否具备完整离线缓存：
 
 ```bash
-npm run prepare:document-processing -- --offline
+npm run prepare:native-inference -- --offline
 ```
 
-离线模式出现 `Offline prepared document bundle cache miss` 说明当前 target/fingerprint 的完整整包从未成功准备；联网重新运行一次即可。缓存文件损坏时不会被静默复用；联网模式会重新准备，离线模式会明确失败。不要手动把 cache 目录复制进 `document-processing/v1`，后者只是 prepare owner 原子发布给 Tauri 的当前投影。
+离线模式出现 document 或 speech prepared cache miss，说明当前 target/fingerprint 的对应整包从未成功准备；联网重新运行一次即可。缓存文件损坏时不会被静默复用；联网模式会重新准备，离线模式会明确失败。不要手动把 cache 目录复制进 `document-processing/v1` 或 `speech-inference/v1`，两者只是 prepare owner 原子发布给 Tauri 的当前投影；speech 还必须引用同 target 的 document ONNX Runtime identity。
 
 ### 问题：配置更新后构建仍使用旧配置
 

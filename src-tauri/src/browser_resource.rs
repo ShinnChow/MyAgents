@@ -851,14 +851,15 @@ fn atomic_write_installed(metadata: &InstalledBrowserRuntime) -> Result<(), Stri
 }
 
 fn ensure_free_space(path: &Path, required: u64) -> Result<(), String> {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let disk = disks
-        .list()
-        .iter()
-        .filter(|disk| path.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().components().count())
-        .ok_or_else(|| "[browser-resource] Free disk space is unavailable".to_string())?;
-    if disk.available_space() < required {
+    let available = crate::filesystem_capacity::available_space(path).map_err(|error| {
+        ulog_warn!(
+            "[browser-resource] disk capacity unavailable target=runtime_root error_kind={:?} os_code={:?}",
+            error.kind(),
+            error.raw_os_error(),
+        );
+        "[browser-resource] Free disk space is unavailable".to_string()
+    })?;
+    if available < required {
         return Err("[browser-resource] Insufficient disk space".to_string());
     }
     Ok(())

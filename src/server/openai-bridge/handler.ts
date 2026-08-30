@@ -726,6 +726,9 @@ export function createBridgeHandler(config: BridgeConfig): BridgeHandler {
         }
         log(`[bridge] Upstream error ${status}: ${safeErrBody.slice(0, 300)}`);
         const translated = translateError(status, safeErrBody);
+        if (status === 429) {
+          log(`[bridge] Upstream 429 classified=${translated.failure.kind} evidence=${translated.failure.evidence}`);
+        }
         if (translated.status !== status) {
           log(`[bridge] Remapped ${status} → ${translated.status} (${translated.body.error.type})`);
         }

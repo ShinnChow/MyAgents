@@ -6,6 +6,10 @@ import { useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { PendingAppRoute } from '@/../shared/appRoute';
+import type {
+  RecordingSnapshot,
+  RecordingSourceSelection,
+} from '@/../shared/types/record';
 import type { Tab } from '@/types/tab';
 import type { MainWindowPresentation } from '@/utils/mainWindowPresentation';
 
@@ -22,15 +26,26 @@ vi.mock('@/context/TabProvider', () => ({
 // Stub the heavy page subtrees so importing App stays cheap and side-effect free.
 const chatRenderSpy = vi.hoisted(() => vi.fn());
 const taskCenterRenderSpy = vi.hoisted(() => vi.fn());
+const taskCenterSnapshotSpy = vi.hoisted(() => vi.fn());
 vi.mock('@/pages/Chat', () => ({
-  default: ({ windowPresentation }: { windowPresentation: MainWindowPresentation }) => {
+  default: ({
+    windowPresentation,
+  }: {
+    windowPresentation: MainWindowPresentation;
+  }) => {
     chatRenderSpy(windowPresentation);
     return <div data-testid="chat" />;
   },
 }));
-vi.mock('@/pages/Launcher', () => ({ default: () => <div data-testid="launcher" /> }));
+vi.mock('@/pages/Launcher', () => ({
+  default: () => <div data-testid="launcher" />,
+}));
 vi.mock('@/pages/Settings', () => ({
-  default: function MockSettings({ mode = 'settings' }: { mode?: 'settings' | 'capabilities' }) {
+  default: function MockSettings({
+    mode = 'settings',
+  }: {
+    mode?: 'settings' | 'capabilities';
+  }) {
     const [draft, setDraft] = useState('');
     return (
       <input
@@ -42,9 +57,30 @@ vi.mock('@/pages/Settings', () => ({
   },
 }));
 vi.mock('@/pages/TaskCenter', () => ({
-  default: ({ pendingRoute }: { pendingRoute?: PendingAppRoute | null }) => {
+  default: ({
+    pendingRoute,
+    activeRecordingSnapshot,
+    onStartRecording,
+  }: {
+    pendingRoute?: PendingAppRoute | null;
+    activeRecordingSnapshot?: RecordingSnapshot | null;
+    onStartRecording?: (
+      selection: RecordingSourceSelection,
+    ) => Promise<void>;
+  }) => {
     taskCenterRenderSpy(pendingRoute ?? null);
-    return <div data-testid="taskcenter" />;
+    taskCenterSnapshotSpy(activeRecordingSnapshot ?? null);
+    return (
+      <div data-testid="taskcenter">
+        <button
+          type="button"
+          data-testid="taskcenter-start-recording"
+          onClick={() =>
+            void onStartRecording?.({ microphone: true, system: false })
+          }
+        />
+      </div>
+    );
   },
 }));
 vi.mock('@/components/ChatBootOverlay', () => ({
@@ -65,8 +101,14 @@ function restoredTab(over: Partial<Tab> = {}): Tab {
   };
 }
 
-const AVAILABLE_PRESENTATION: MainWindowPresentation = { surfaceAvailable: true, generation: 0 };
-const SUSPENDED_PRESENTATION: MainWindowPresentation = { surfaceAvailable: false, generation: 1 };
+const AVAILABLE_PRESENTATION: MainWindowPresentation = {
+  surfaceAvailable: true,
+  generation: 0,
+};
+const SUSPENDED_PRESENTATION: MainWindowPresentation = {
+  surfaceAvailable: false,
+  generation: 1,
+};
 
 const noopProps = {
   windowPresentation: AVAILABLE_PRESENTATION,
@@ -81,6 +123,11 @@ const noopProps = {
   capabilityInitialSelect: undefined,
   onLauncherWorkspaceSelectionChange: vi.fn(),
   onLaunchProject: vi.fn(),
+  onStartRecording: vi.fn(async () => {}),
+  onRecordingSnapshotChange: vi.fn(),
+  onRecordTitleChange: vi.fn(),
+  onRecordDeleted: vi.fn(),
+  onOpenRecord: vi.fn(),
   onOpenHistorySession: vi.fn(async () => {}),
   onNewSession: vi.fn(async () => true),
   onLaunchRuntimeBackedProviderSession: vi.fn(async () => null),
@@ -165,10 +212,18 @@ describe('restored live chat tab', () => {
 
   it('mounts TabProvider immediately for an inactive restored tab too', async () => {
     tabProviderSpy.mockClear();
-    render(<MemoizedTabContent tab={restoredTab()} isActive={false} {...noopProps} />);
+    render(
+      <MemoizedTabContent
+        tab={restoredTab()}
+        isActive={false}
+        {...noopProps}
+      />,
+    );
     expect(tabProviderSpy).toHaveBeenCalledTimes(1);
     expect(await screen.findByTestId('chat')).toBeInTheDocument();
-    expect(screen.getByTestId('tab-provider').parentElement).toHaveClass('invisible');
+    expect(screen.getByTestId('tab-provider').parentElement).toHaveClass(
+      'invisible',
+    );
   });
 
   it('projects native presentation only through the active Chat slot', async () => {
@@ -198,20 +253,40 @@ describe('restored live chat tab', () => {
         windowPresentation={SUSPENDED_PRESENTATION}
       />,
     );
-    await waitFor(() => expect(chatRenderSpy).toHaveBeenLastCalledWith(SUSPENDED_PRESENTATION));
+    await waitFor(() =>
+      expect(chatRenderSpy).toHaveBeenLastCalledWith(SUSPENDED_PRESENTATION),
+    );
   });
 
   it('keeps Settings and Capabilities UI state in their own mounted Tab slots', async () => {
     const settingsTab: Tab = {
-      id: 'settings-tab', agentDir: null, sessionId: null, view: 'settings', title: 'Settings', sidecarConfigDisposition: 'push',
+      id: 'settings-tab',
+      agentDir: null,
+      sessionId: null,
+      view: 'settings',
+      title: 'Settings',
+      sidecarConfigDisposition: 'push',
     };
     const capabilitiesTab: Tab = {
-      id: 'capabilities-tab', agentDir: null, sessionId: null, view: 'capabilities', title: 'Capabilities', sidecarConfigDisposition: 'push',
+      id: 'capabilities-tab',
+      agentDir: null,
+      sessionId: null,
+      view: 'capabilities',
+      title: 'Capabilities',
+      sidecarConfigDisposition: 'push',
     };
     const contents = (active: 'settings' | 'capabilities') => (
       <>
-        <MemoizedTabContent tab={settingsTab} isActive={active === 'settings'} {...noopProps} />
-        <MemoizedTabContent tab={capabilitiesTab} isActive={active === 'capabilities'} {...noopProps} />
+        <MemoizedTabContent
+          tab={settingsTab}
+          isActive={active === 'settings'}
+          {...noopProps}
+        />
+        <MemoizedTabContent
+          tab={capabilitiesTab}
+          isActive={active === 'capabilities'}
+          {...noopProps}
+        />
       </>
     );
     const view = render(contents('settings'));
@@ -261,9 +336,11 @@ describe('restored live chat tab', () => {
         taskPendingRoute={route(1)}
       />,
     );
-    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ generation: 1 }),
-    ));
+    await waitFor(() =>
+      expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ generation: 1 }),
+      ),
+    );
 
     view.rerender(
       <MemoizedTabContent
@@ -273,8 +350,84 @@ describe('restored live chat tab', () => {
         taskPendingRoute={route(2)}
       />,
     );
-    await waitFor(() => expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
-      expect.objectContaining({ generation: 2 }),
-    ));
+    await waitFor(() =>
+      expect(taskCenterRenderSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ generation: 2 }),
+      ),
+    );
+  });
+
+  it('projects active recording ticks into the memoized Task Center slot', async () => {
+    taskCenterSnapshotSpy.mockClear();
+    const taskCenterTab = restoredTab({
+      id: 'task-center-recording',
+      agentDir: null,
+      sessionId: null,
+      view: 'taskcenter',
+      title: 'Task Center',
+    });
+    const snapshot: RecordingSnapshot = {
+      recordId: 'record-1',
+      revision: 1,
+      generation: 1,
+      captureStatus: 'recording',
+      startedAtWallTime: 1_700_000_000_000,
+      mediaDurationMs: 1_000,
+      pausedWallMs: 0,
+      sources: [],
+      sourceActivity: [],
+      warnings: [],
+    };
+    const view = render(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        activeRecordingSnapshot={snapshot}
+      />,
+    );
+
+    view.rerender(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+        activeRecordingSnapshot={{
+          ...snapshot,
+          revision: 2,
+          mediaDurationMs: 2_000,
+        }}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(taskCenterSnapshotSpy).toHaveBeenLastCalledWith(
+        expect.objectContaining({ revision: 2, mediaDurationMs: 2_000 }),
+      ),
+    );
+  });
+
+  it('routes Task Center recording admission through the owning tab id', () => {
+    noopProps.onStartRecording.mockClear();
+    const taskCenterTab = restoredTab({
+      id: 'task-center-record-start',
+      agentDir: null,
+      sessionId: null,
+      view: 'taskcenter',
+      title: 'Task Center',
+    });
+    render(
+      <MemoizedTabContent
+        tab={taskCenterTab}
+        isActive
+        {...noopProps}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('taskcenter-start-recording'));
+    expect(noopProps.onStartRecording).toHaveBeenCalledWith(
+      taskCenterTab.id,
+      { microphone: true, system: false },
+    );
   });
 });

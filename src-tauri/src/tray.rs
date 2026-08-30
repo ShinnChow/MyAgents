@@ -1,12 +1,11 @@
 // System tray implementation for MyAgents
 // Provides minimize-to-tray functionality and right-click menu
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
-#[cfg(target_os = "macos")]
 use tauri::image::Image;
 use tauri::{
-    menu::{CheckMenuItem, CheckMenuItemBuilder, MenuBuilder, MenuItem, MenuItemBuilder},
+    menu::{CheckMenuItem, CheckMenuItemBuilder, Menu, MenuBuilder, MenuItem, MenuItemBuilder},
     tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, Runtime, Wry,
 };
@@ -16,6 +15,7 @@ use crate::{ulog_debug, ulog_error, ulog_info, ulog_warn};
 
 /// Menu item IDs for tray right-click menu
 const MENU_OPEN: &str = "open";
+const MENU_RECORDING: &str = "recording";
 const MENU_SETTINGS: &str = "settings";
 const MENU_FORCE_WAKE_LOCK: &str = "force_wake_lock";
 const MENU_EXIT: &str = "exit";
@@ -47,10 +47,32 @@ pub struct TrayMenuHandles {
     // reads it to update the menu-bar badge/title.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub tray: TrayIcon<Wry>,
+    pub menu: Menu<Wry>,
+    pub base_icon: Image<'static>,
     pub open: MenuItem<Wry>,
+    pub recording: MenuItem<Wry>,
     pub settings: MenuItem<Wry>,
     pub force_wake_lock: CheckMenuItem<Wry>,
     pub exit: MenuItem<Wry>,
+}
+
+#[derive(Default)]
+pub struct TrayProjectionState {
+    inner: std::sync::Mutex<TrayProjection>,
+}
+
+#[derive(Default)]
+struct TrayProjection {
+    recording_record_id: Option<String>,
+    recording_item_visible: bool,
+    notification_count: u32,
+    notification_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TrayOpenRecordIntent {
+    record_id: String,
 }
 
 /// Initialize the system tray with icon and menu.
@@ -62,6 +84,9 @@ pub fn setup_tray(app: &tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error
     // Build the tray menu
     let open_item =
         MenuItemBuilder::with_id(MENU_OPEN, crate::i18n::t("tray.open", locale)).build(app)?;
+    let recording_item =
+        MenuItemBuilder::with_id(MENU_RECORDING, crate::i18n::t("tray.recording", locale))
+            .build(app)?;
     let settings_item =
         MenuItemBuilder::with_id(MENU_SETTINGS, crate::i18n::t("tray.settings", locale))
             .build(app)?;
@@ -90,7 +115,7 @@ pub fn setup_tray(app: &tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error
 
     // Load tray icon - use template icon on macOS for proper menu bar appearance
     #[cfg(target_os = "macos")]
-    let tray_icon = {
+    let base_icon = {
         // Load template icon from embedded bytes (22x22 for best menu bar appearance)
         let icon_bytes = include_bytes!("../icons/trayIconTemplate@2x.png");
         Image::from_bytes(icon_bytes).unwrap_or_else(|_| {
@@ -100,11 +125,11 @@ pub fn setup_tray(app: &tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error
     };
 
     #[cfg(not(target_os = "macos"))]
-    let tray_icon = app.default_window_icon().unwrap().clone();
+    let base_icon = app.default_window_icon().unwrap().clone();
 
     // Build the tray icon
     let tray_builder = TrayIconBuilder::new()
-        .icon(tray_icon)
+        .icon(base_icon.clone())
         .menu(&menu)
         .tooltip("MyAgents")
         .show_menu_on_left_click(false);
@@ -119,6 +144,24 @@ pub fn setup_tray(app: &tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error
                 MENU_OPEN => {
                     ulog_info!("[Tray] Open menu clicked");
                     show_main_window(app);
+                }
+                MENU_RECORDING => {
+                    let record_id = app.try_state::<TrayProjectionState>().and_then(|state| {
+                        state
+                            .inner
+                            .lock()
+                            .ok()
+                            .and_then(|projection| projection.recording_record_id.clone())
+                    });
+                    if let Some(record_id) = record_id {
+                        ulog_info!("[Tray] Active recording clicked recordId={}", record_id);
+                        show_main_window(app);
+                        if let Err(error) =
+                            app.emit("tray:open-record", TrayOpenRecordIntent { record_id })
+                        {
+                            ulog_error!("[Tray] Failed to emit recording navigation: {}", error);
+                        }
+                    }
                 }
                 MENU_SETTINGS => {
                     ulog_info!("[Tray] Settings menu clicked");
@@ -170,8 +213,11 @@ pub fn setup_tray(app: &tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error
                     });
                 }
                 MENU_EXIT => {
-                    ulog_info!("[Tray] Exit menu clicked");
-                    app.exit(0);
+                    ulog_info!("[Tray] Exit menu clicked; requesting unified confirmation");
+                    show_main_window(app);
+                    if let Err(error) = app.emit("tray:exit-requested", ()) {
+                        ulog_error!("[Tray] Failed to request exit confirmation: {}", error);
+                    }
                 }
                 _ => {}
             }
@@ -196,11 +242,15 @@ pub fn setup_tray(app: &tauri::App<Wry>) -> Result<(), Box<dyn std::error::Error
     // thread internally.
     app.manage(TrayMenuHandles {
         tray,
+        menu,
+        base_icon: base_icon.to_owned(),
         open: open_item,
+        recording: recording_item,
         settings: settings_item,
         force_wake_lock: force_wake_lock_item,
         exit: exit_item,
     });
+    app.manage(TrayProjectionState::default());
 
     ulog_info!("[Tray] System tray initialized successfully");
     Ok(())
@@ -218,6 +268,12 @@ pub fn apply_tray_locale<R: Runtime>(
         ulog_error!("[Tray] Failed to update open label: {}", e);
     }
     if let Err(e) = handles
+        .recording
+        .set_text(crate::i18n::t("tray.recording", locale))
+    {
+        ulog_error!("[Tray] Failed to update recording label: {}", e);
+    }
+    if let Err(e) = handles
         .settings
         .set_text(crate::i18n::t("tray.settings", locale))
     {
@@ -232,6 +288,121 @@ pub fn apply_tray_locale<R: Runtime>(
     if let Err(e) = handles.exit.set_text(crate::i18n::t("tray.exit", locale)) {
         ulog_error!("[Tray] Failed to update exit label: {}", e);
     }
+}
+
+pub fn set_recording_projection<R: Runtime>(app: &tauri::AppHandle<R>, record_id: Option<String>) {
+    let Some(state) = app.try_state::<TrayProjectionState>() else {
+        ulog_debug!("[Tray] recording projection skipped; tray state not registered");
+        return;
+    };
+    if let Ok(mut projection) = state.inner.lock() {
+        projection.recording_record_id = record_id;
+    }
+    apply_tray_projection(app);
+}
+
+pub fn set_notification_projection<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    count: u32,
+    enabled: bool,
+) {
+    let Some(state) = app.try_state::<TrayProjectionState>() else {
+        ulog_debug!("[Tray] notification projection skipped; tray state not registered");
+        return;
+    };
+    if let Ok(mut projection) = state.inner.lock() {
+        projection.notification_count = count;
+        projection.notification_enabled = enabled;
+    }
+    apply_tray_projection(app);
+}
+
+fn apply_tray_projection<R: Runtime>(app: &tauri::AppHandle<R>) {
+    let Some(state) = app.try_state::<TrayProjectionState>() else {
+        return;
+    };
+    let Some(handles) = app.try_state::<TrayMenuHandles>() else {
+        return;
+    };
+    let Ok(mut projection) = state.inner.lock() else {
+        ulog_warn!("[Tray] projection state lock poisoned");
+        return;
+    };
+    let recording = projection.recording_record_id.is_some();
+    if recording != projection.recording_item_visible {
+        let result = if recording {
+            handles.menu.insert(&handles.recording, 1)
+        } else {
+            handles.menu.remove(&handles.recording)
+        };
+        match result {
+            Ok(()) => projection.recording_item_visible = recording,
+            Err(error) => ulog_warn!("[Tray] Failed to update recording menu item: {}", error),
+        }
+    }
+
+    let icon = if recording {
+        recording_dot_icon(&handles.base_icon)
+    } else {
+        handles.base_icon.clone()
+    };
+    if let Err(error) = handles.tray.set_icon(Some(icon)) {
+        ulog_warn!("[Tray] Failed to project recording icon: {}", error);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(error) = handles.tray.set_icon_as_template(!recording) {
+            ulog_warn!("[Tray] Failed to update template icon mode: {}", error);
+        }
+        let count = if projection.notification_enabled {
+            projection.notification_count
+        } else {
+            0
+        };
+        let label = if count == 0 {
+            String::new()
+        } else if count > 99 {
+            "99+".to_string()
+        } else {
+            count.to_string()
+        };
+        if let Err(error) = handles.tray.set_title(Some(&label)) {
+            ulog_warn!("[Tray] Failed to project notification title: {}", error);
+        }
+    }
+}
+
+fn recording_dot_icon(base: &Image<'_>) -> Image<'static> {
+    let width = base.width();
+    let height = base.height();
+    let mut rgba = base.rgba().to_vec();
+    if width == 0 || height == 0 || rgba.len() != (width * height * 4) as usize {
+        return Image::new_owned(rgba, width, height);
+    }
+    let scale = width.min(height) as f32 / 32.0;
+    let center_x = width as f32 - 6.0 * scale;
+    let center_y = 6.0 * scale;
+    let outer = 5.0 * scale;
+    let inner = 3.6 * scale;
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 + 0.5 - center_x;
+            let dy = y as f32 + 0.5 - center_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let color = if distance <= inner {
+                Some([239, 68, 68, 255])
+            } else if distance <= outer {
+                Some([255, 255, 255, 255])
+            } else {
+                None
+            };
+            if let Some(color) = color {
+                let offset = ((y * width + x) * 4) as usize;
+                rgba[offset..offset + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    Image::new_owned(rgba, width, height)
 }
 
 /// Show the main window (and focus it).
@@ -326,4 +497,18 @@ pub fn should_minimize_to_tray() -> bool {
     // Default to false (close app instead of minimize to tray)
     ulog_debug!("[Tray] minimizeToTray not configured, using default: false");
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_dot_is_visible_without_replacing_the_base_icon() {
+        let base = Image::new_owned(vec![0_u8; 32 * 32 * 4], 32, 32);
+        let projected = recording_dot_icon(&base);
+        let center = ((6 * 32 + 26) * 4) as usize;
+        assert_eq!(&projected.rgba()[center..center + 4], &[239, 68, 68, 255]);
+        assert_eq!(&projected.rgba()[0..4], &[0, 0, 0, 0]);
+    }
 }

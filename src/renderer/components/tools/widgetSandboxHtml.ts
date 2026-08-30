@@ -32,7 +32,7 @@ export function buildSandboxHtml(
 ${cssVarsBlock}
 *, *::before, *::after { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
-/* body = host prose tier (16px/1.7, DESIGN.md §2.2) — keep in lockstep with
+/* body = host prose tier (16px/1.7, DESIGN.md §3.3) — keep in lockstep with
    --text-base / --text-base--line-height in index.css @theme. The size values
    below (headings + .text-* utilities) are ALSO quoted in the widget design
    contract prompt (src/server/tools/generative-ui-tool.ts SECTION_CORE);

@@ -7,7 +7,7 @@
   },
   "toasts": {
     "workspaceAttachmentsCleared": "Workspace switched. Attachment drafts from the previous workspace were cleared.",
-    "thoughtSaved": "Thought saved. You can find it in Task Center.",
+    "thoughtSaved": "Record saved. You can find it in Task Center.",
     "runtimeNeedsAgent": "This workspace has no Agent configured, so Runtime cannot be changed.",
     "runtimeSwitchFailed": "Failed to switch Runtime. Please try again.",
     "setDefaultFailed": "Failed to set the default workspace. Please try again.",
@@ -89,9 +89,9 @@
     "remove": "Remove"
   },
   "recentThoughts": {
-    "openTaskCenterTitle": "Open Task Center to view all thoughts",
+    "openTaskCenterTitle": "Open Task Center to view all records",
     "more": "More",
-    "emptyThought": "(empty thought)"
+    "emptyThought": "(empty record)"
   },
   "addWorkspaceMenu": {
     "add": "Add",

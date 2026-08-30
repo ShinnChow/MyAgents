@@ -82,6 +82,7 @@ jobs:
           mkdir -p src-tauri/resources/sharp-runtime
           mkdir -p src-tauri/resources/tsx-runtime
           mkdir -p src-tauri/resources/nodejs
+          mkdir -p src-tauri/resources/speech-inference
           mkdir -p src-tauri/resources/playwright-control/@playwright/mcp
           mkdir -p src-tauri/resources/playwright-control/playwright
           mkdir -p src-tauri/resources/playwright-control/playwright-core
@@ -120,6 +121,7 @@ jobs:
             'src-tauri/resources/sharp-runtime',
             'src-tauri/resources/tsx-runtime',
             'src-tauri/resources/nodejs',
+            'src-tauri/resources/speech-inference',
             'src-tauri/resources/cli',
             'src-tauri/resources/playwright-control/@playwright/mcp',
             'src-tauri/resources/playwright-control/playwright',

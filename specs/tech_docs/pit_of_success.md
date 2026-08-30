@@ -12,12 +12,14 @@
 - [`proxy_config`](#proxy_config) — 子进程 NO_PROXY 注入
 - [`system_binary`](#system_binary) — 系统工具查找（Finder PATH 缺失）
 - [`normalize_external_path`](#normalize_external_path) — Windows `\\?\` 长路径前缀剥离
+- [`filesystem_capacity::available_space`](#filesystem_capacity) — 查询目标路径所属文件系统的可用容量
 - [`tauri::async_runtime::spawn`](#async_runtime) — 防 macOS startup-abort
 - [Session watcher](#session-watcher) — 文件系统观察索引
 
 **v0.2.0 结构性重构**
 - [`withConfigLock` / `with_config_lock`](#withconfiglock) — config.json 跨进程串行写入
 - [`withFileLock` / `with_file_lock`](#withfilelock) — 单写者文件原子性
+- [`DurableRecordJournal`](#durable-record-journal) — Record append-only 事实的 typed JSONL durability
 - [`copyPlainText`](#renderer-clipboard) — WebView 普通文本复制 fallback + 真实成功语义
 - [`killWithEscalation`](#killwithescalation) — 子进程 stop 升级链
 - [`withAbortSignal` / `cancellableFetch`](#cancellation) — 统一 cancel 协议
@@ -103,13 +105,13 @@
 
 **Problem.** Windows 上 GUI 应用（Tauri）直接启动子进程（node.exe Sidecar / Plugin Bridge / npm install）会弹出黑色控制台窗口。长生命周期 Node 进程还会创建 SDK / MCP 后代；如果所有者只保存直接 `Child`，正常退出时只能按 argv 猜测哪些后代属于 MyAgents，既可能漏掉后代，也可能误杀同机的外部进程。在 Windows 上先启动再调用 `taskkill /T`，还会留下 wrapper 提前退出、Job Object 尚未绑定的竞态窗口。
 
-**Surface.** `crate::process_cmd::new(program)` 返回已注入 Windows `CREATE_NO_WINDOW` 的 `Command`；`crate::process_cmd::spawn_tree(&mut command)` 为会创建后代的长生命周期进程返回 `ChildTree`。
+**Surface.** `crate::process_cmd::new(program)` 返回已注入 Windows `CREATE_NO_WINDOW` 的 `Command`；`crate::process_cmd::spawn_tree(&mut command)` 为会创建后代的长生命周期进程返回 `ChildTree`；`ChildTree::kill_and_wait()` force-stop exact tree 并最多等待 10 秒确认退出；`crate::process_cmd::settle_tree(child, natural_grace)` 先允许调用方定义的 cooperative / natural grace，再统一落到同一个 bounded force-stop。
 
 **Invariants enforced.** `ChildTree` 在子进程执行用户代码前建立进程树边界：Unix child 进入独立 process group；Windows child 以 suspended 状态创建，绑定 kill-on-close Job Object 后再恢复运行。所有者必须保留 `ChildTree`，显式 stop 与 Drop 只终止这棵精确进程树。应用退出先禁止新的资源创建，等待已经获准的创建流程完成登记或释放，再释放 Sidecar / Plugin Bridge owner；Unix 还要等待有上限的 SIGTERM→SIGKILL 清理任务结束。Windows GUI child 没有可靠的 console signal，stop 直接终止已保留的 Job Object。Task command Detector 同样属于受管进程树：timeout、stdout 超限、Stop、delete 与 App shutdown 都必须通过 retained `ChildTree` 收敛，读取 stdout/stderr 的线程也要 join 后再判断最终上限状态。进程树边界建立失败时必须终止 child 并返回错误，不能降级为未受管理的进程。
 
 **Don't.** 不要直接使用 `std::process::Command::new()`；Sidecar / Plugin Bridge 也不能直接 `.spawn()`。正常 shutdown 不能通过进程名、安装路径或 argv 子串扫描整机来弥补 owner 缺失。`process_cleanup::kill_stale_processes()` 只用于确认前一实例已经退出后的启动恢复，以及更新器的残留进程检查（Windows 更新器另有受保护目录和文件锁验证）；它不是正常生命周期 API。
 
-`myagents-document-worker` 同样走 `process_cmd::new()` + `spawn_tree()`，但它是一 job 一进程的 App-owned 隔离边界，不属于 Sidecar。Manager 必须同时保留 `ChildTree`、stdin 和 active `(jobId, generation)`；4-byte big-endian length + JSON frame 上限 1 MiB，clean EOF 与截断 prefix/payload 必须分开处理，terminal identity 不匹配一律按协议失败。密码不进入 argv/env：只在 start frame 中出现，序列化/接收 buffer 写完即 zeroize；取消先发 exact generation frame，2 秒后仍存活才 kill retained tree。完整协议见 `document_processing.md`。
+`myagents-document-worker` 同样走 `process_cmd::new()` + `spawn_tree()`，但它是一 job 一进程的 App-owned 隔离边界，不属于 Sidecar。Manager 必须同时保留 `ChildTree`、stdin 和 active `(jobId, generation)`；4-byte big-endian length + JSON frame 上限 1 MiB，clean EOF 与截断 prefix/payload 必须分开处理，terminal identity 不匹配一律按协议失败。密码不进入 argv/env：只在 start frame 中出现，序列化/接收 buffer 写完即 zeroize。取消先发 exact generation frame，给 Worker 15 秒 cooperative settlement；App shutdown 使用 10 秒 cooperative settlement；超时后 force-stop retained tree，并最多再等 10 秒确认 exact tree 已退出。完整协议见 `document_processing.md`。
 
 **例外（已内联处理或不适用）：**
 - `#[cfg(windows)]` 守卫内的系统工具命令（taskkill / powershell）
@@ -171,6 +173,17 @@ v0.2.0 Windows 版的 IM Bot 全部启动失败就是这个 trap：`find_tsx_run
 口诀：**路径"出 Rust"的那一刻 normalize**，不是路径产生时也不是消费时——明确的边界规则比"防御性 normalize"更经得起未来扩展。
 
 **Don't.** 把 `resource_dir()` / `current_exe()` / `canonicalize()` 的结果直接喂给 Node / npm / URL / 子进程 arg。也不要在每个 call site 重新发明 `s.strip_prefix("\\\\?\\")`——`path_to_file_url` 之类纯格式化函数应保持纯净，由调用方在边界 normalize。
+
+---
+
+<a id="filesystem_capacity"></a>
+## `filesystem_capacity::available_space` (`src-tauri/src/filesystem_capacity.rs`)
+
+**Problem.** 文件系统容量是“这个现存目标路径属于哪个文件系统”的 OS 事实。枚举 mount 后用 `Path::starts_with()` 推断，在 Windows canonical `\\?\C:\...` 与 `C:\` 表示不一致时会找不到目标盘，也会把无关的未就绪卷带入裁决。
+
+**Surface.** `crate::filesystem_capacity::available_space(path: &Path) -> io::Result<u64>`——直接查询现存路径所属文件系统。调用方继续拥有容量预算、业务错误和 lifecycle。
+
+**Don't.** 不要枚举卷、比较路径字符串、剥掉 `\\?\` 后继续做前缀匹配，也不要为容量查询增加 mount cache、坏盘表或扫描重试。`normalize_external_path` 只用于路径离开 Rust 的边界，不用于修补 Rust 内 filesystem query。
 
 ---
 
@@ -251,6 +264,26 @@ v0.2.0 Windows 版的 IM Bot 全部启动失败就是这个 trap：`find_tsx_run
 - 自己手写 lockdir 协议
 
 ConfigProvider 的 `config/projects/providers/apiKeys/verifyStatus` 属于一个磁盘快照：所有 refresh 必须委托给同一个 snapshot request/commit owner；本地写盘成功后也必须推进同一 revision，再镜像 React state。禁止为 provider/key 单独写一个无 fence 的异步 setter，否则旧的外部读取可以覆盖更新鲜的本地写入。
+
+---
+
+<a id="durable-record-journal"></a>
+## `DurableRecordJournal` (`src-tauri/src/durable_journal.rs`)
+
+**Problem.** Record lifecycle 与 transcript revision 都是 append-only 事实。如果各自实现 JSONL append/recovery，很容易在 torn tail、identity、sequence、checksum、单行上限或 fsync 上漂移；直接套通用数据库/事件框架又会为两个局部日志引入额外进程、schema owner 和迁移面。
+
+**Surface.**
+- `DurableRecordJournal<Event>::open(path, record_id, schema_version, max_line_bytes)`：验证配置、恢复合法前缀并取得 next sequence
+- `append(wall_time_ms, media_ms, event)`：写 typed event，flush + `sync_data` 后才返回已提交 entry
+- `recover_and_read<Event>(...)`：只返回通过 identity/schema/sequence/checksum 校验的 durable entry
+
+**Invariants enforced.**
+- 目标只能是普通文件或不存在；拒绝 symlink/special file
+- 每行固定绑定 `recordId + schemaVersion + seq + eventId`，checksum 覆盖 body；sequence 必须从 1 连续递增
+- 尾部 partial/畸形/超限行只在最后合法字节边界修复；identity/schema mismatch fail closed，不能把其它 Record 的内容截成“可用”日志
+- caller 必须给出领域 event enum 与 projection；helper 不拥有 recording/transcript 状态机，也不扩张成通用 event bus、数据库或跨进程队列
+
+**Don't.** Record-owned append-only 事实不得再裸写 JSONL，或复制一套 checksum/torn-tail repair。普通可原子替换的 snapshot、TaskStore 和 speech job metadata 不应为了“统一”迁入该 journal。
 
 ---
 

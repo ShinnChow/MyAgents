@@ -10,11 +10,11 @@
 // changing the parent's vertical layout.
 
 import { useEffect, useState } from 'react';
-import { ArrowRight } from 'lucide-react';
+import { ArrowRight, Mic } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { thoughtList } from '@/api/taskCenter';
+import { recordList } from '@/api/taskCenter';
 import { relativeTime } from '@/utils/taskCenterUtils';
-import type { Thought } from '@/../shared/types/thought';
+import type { RecordSummary } from '@/../shared/types/record';
 
 interface Props {
   /** Bumped by caller after a thoughtCreate succeeds → triggers refetch. */
@@ -23,15 +23,17 @@ interface Props {
   onOpenTaskCenter: () => void;
   /** Max number of cards before the 「查看更多」 chip. */
   limit?: number;
+  onOpenRecord?: (recordId: string) => void;
 }
 
 export function RecentThoughtsRow({
   refreshKey,
   onOpenTaskCenter,
   limit = 3,
+  onOpenRecord,
 }: Props) {
   const { t } = useTranslation('launcher');
-  const [thoughts, setThoughts] = useState<Thought[]>([]);
+  const [records, setRecords] = useState<RecordSummary[]>([]);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
@@ -41,9 +43,9 @@ export function RecentThoughtsRow({
         // Launcher strip is a passive recent-activity view — archived
         // thoughts shouldn't bubble up here even though search would
         // still find them.
-        const list = await thoughtList({ limit, archived: 'active' });
+        const list = await recordList({ limit, archived: 'active' });
         if (!cancelled) {
-          setThoughts(list);
+          setRecords(list);
           setLoaded(true);
         }
       } catch {
@@ -65,11 +67,15 @@ export function RecentThoughtsRow({
   return (
     <div className="flex w-full items-center gap-2">
       <div className="flex min-w-0 flex-1 items-center gap-2">
-        {thoughts.map((t) => (
-          <ThoughtChip
-            key={t.id}
-            thought={t}
-            onClick={onOpenTaskCenter}
+        {records.map((record) => (
+          <RecordChip
+            key={record.id}
+            record={record}
+            onClick={() =>
+              record.kind === 'audio'
+                ? onOpenRecord?.(record.id)
+                : onOpenTaskCenter()
+            }
           />
         ))}
       </div>
@@ -87,13 +93,12 @@ export function RecentThoughtsRow({
 }
 
 interface ChipProps {
-  thought: Thought;
+  record: RecordSummary;
   onClick: () => void;
 }
 
-function ThoughtChip({ thought, onClick }: ChipProps) {
+function RecordChip({ record, onClick }: ChipProps) {
   const { t } = useTranslation('launcher');
-  const firstLine = firstNonEmptyLine(thought.content);
   // `flex-1 min-w-0` lets the chip shrink when the row is tight, while
   // `truncate` on the label adds an ellipsis so no chip overflows its slot.
   return (
@@ -101,24 +106,19 @@ function ThoughtChip({ thought, onClick }: ChipProps) {
       type="button"
       onClick={onClick}
       className="group flex min-w-0 flex-1 items-center gap-2 rounded-[var(--radius-md)] border border-[var(--line)] bg-[var(--paper-elevated)] px-2.5 py-1.5 text-left transition-all hover:border-[var(--line-strong)] hover:shadow-sm"
-      title={thought.content}
+      title={record.title}
     >
       <span className="min-w-0 flex-1 truncate text-xs text-[var(--ink-secondary)] group-hover:text-[var(--ink)]">
-        {firstLine || t('recentThoughts.emptyThought')}
+        {record.kind === 'audio' && (
+          <Mic className="mr-1 inline h-3 w-3 text-[var(--accent-warm)]" />
+        )}
+        {record.title || t('recentThoughts.emptyThought')}
       </span>
       <span className="shrink-0 text-xs text-[var(--ink-muted)]/70">
-        {relativeTime(thought.createdAt)}
+        {relativeTime(record.createdAt)}
       </span>
     </button>
   );
-}
-
-function firstNonEmptyLine(s: string): string {
-  for (const raw of s.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line) return line;
-  }
-  return '';
 }
 
 export default RecentThoughtsRow;

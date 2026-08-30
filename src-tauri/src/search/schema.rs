@@ -17,6 +17,7 @@ use super::tokenizer::TOKENIZER_NAME;
 /// Schema version marker. Bump whenever the field list or tokenizer changes
 /// so existing indices are nuked and rebuilt on startup.
 pub const SCHEMA_VERSION: u32 = 3;
+pub const RECORD_SCHEMA_VERSION: u32 = 2;
 
 fn chinese_text_options() -> TextOptions {
     TextOptions::default().set_stored().set_indexing_options(
@@ -104,4 +105,40 @@ pub struct FileFields {
     pub name: Field,
     pub content: Field,
     pub ext: Field,
+}
+
+/// Build the global Record index schema. A Record may eventually produce
+/// multiple stable search entries (final transcript segments, notes, speaker
+/// names); `record_id` is therefore the delete/upsert grouping key.
+pub fn record_schema() -> (Schema, RecordFields) {
+    let mut builder = Schema::builder();
+    let text_opts = chinese_text_options();
+
+    let record_id = builder.add_text_field("record_id", STRING | STORED);
+    let kind = builder.add_text_field("kind", STRING | STORED);
+    let title = builder.add_text_field("title", text_opts.clone());
+    let tags = builder.add_text_field("tags", text_opts.clone());
+    let content = builder.add_text_field("content", text_opts);
+    let media_ms = builder.add_u64_field("media_ms", STORED);
+
+    let schema = builder.build();
+    let fields = RecordFields {
+        record_id,
+        kind,
+        title,
+        tags,
+        content,
+        media_ms,
+    };
+    (schema, fields)
+}
+
+#[derive(Clone)]
+pub struct RecordFields {
+    pub record_id: Field,
+    pub kind: Field,
+    pub title: Field,
+    pub tags: Field,
+    pub content: Field,
+    pub media_ms: Field,
 }

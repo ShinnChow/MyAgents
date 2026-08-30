@@ -5,7 +5,7 @@ vi.mock('./utils/cli-tools-registry', () => ({
 }));
 
 const { buildCliToolsAppend, buildSessionInboxSection } = await import('./system-prompt-cli-tools');
-const { IMAGE_UNDERSTANDING_TOOL_ID } = await import('../shared/official-tools');
+const { IMAGE_UNDERSTANDING_TOOL_ID, SPEECH_RECOGNITION_TOOL_ID } = await import('../shared/official-tools');
 
 describe('buildCliToolsAppend', () => {
   it('keeps the PRD-locked Agent / Session collaboration hint exact', () => {
@@ -57,7 +57,9 @@ instructions.
     expect(text).toContain('myagents task readme');
     expect(text).not.toContain('<myagents-cli-cron>');
     expect(text).toContain('<myagents-cli-goal>');
-    expect(text).toContain('<myagents-cli-thought>');
+    expect(text).toContain('<myagents-cli-record>');
+    expect(text).toContain('myagents record create');
+    expect(text).not.toContain('myagents thought create');
     expect(text).toContain('myagents goal --help');
     expect(text).toContain('goal-objective.txt');
     expect(text).toContain('system\ntemp files are both accepted');
@@ -136,5 +138,18 @@ instructions.
     expect(text).toContain('myagents vision --help');
     expect(text).toContain('shell-sensitive');
     expect(text).toContain('user-provided');
+  });
+
+  it('injects only the thin speech discovery hint when the session authorizes it', () => {
+    const text = buildCliToolsAppend(
+      { type: 'desktop' },
+      { includeUserTools: false, enabledOfficialToolIds: [SPEECH_RECOGNITION_TOOL_ID] },
+    );
+
+    expect(text).toContain('<myagents-cli-speech>');
+    expect(text).toContain('myagents-speech-recognition');
+    expect(text).toContain('myagents speech --help');
+    expect(text).toContain('automatically binds');
+    expect(text).not.toContain('myagents speech transcribe --file');
   });
 });

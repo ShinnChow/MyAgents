@@ -194,6 +194,18 @@ afterEach(() => {
 });
 
 describe('admin-api help registry', () => {
+  it('presents Record as canonical and Thought only as a compatibility alias', async () => {
+    const { handleHelp } = await import('./admin-api');
+    const record = String((handleHelp({ path: ['record'] }).data as { text?: string })?.text ?? '');
+    const thought = String((handleHelp({ path: ['thought'] }).data as { text?: string })?.text ?? '');
+
+    expect(record).toContain('Manage unified text and audio Records');
+    expect(record).toContain('--kind text|audio');
+    expect(record).toContain('New workflows use this command');
+    expect(thought).toContain('Legacy compatibility alias');
+    expect(thought).toContain("New Agent workflows use\n'myagents record'");
+  });
+
   it('provides exact multi-level AnyDoc help without a readme command', async () => {
     const { handleHelp } = await import('./admin-api');
     const group = String((handleHelp({ path: ['anydoc'] }).data as { text?: string })?.text ?? '');
@@ -224,6 +236,24 @@ describe('admin-api help registry', () => {
     expect(convert).toContain('Decoded image: 100 megapixels');
     expect(convert).toContain('Published output: 128 MiB');
     expect(convert).toContain('Job deadline: 30 minutes');
+  });
+
+  it('documents speech as an exact Session-scoped async command group', async () => {
+    const { handleHelp } = await import('./admin-api');
+    const group = String((handleHelp({ path: ['speech'] }).data as { text?: string })?.text ?? '');
+    expect(group).toContain('transcribe');
+    expect(group).toContain('Session ID and Workspace are bound automatically');
+
+    for (const leaf of ['transcribe', 'status', 'wait', 'cancel', 'list']) {
+      const text = String((handleHelp({ path: ['speech', leaf] }).data as { text?: string })?.text ?? '');
+      expect(text).toContain(`myagents speech ${leaf}`);
+      expect(text).not.toContain('--session-id');
+      expect(text).not.toMatch(/^\s*--workspace\b/m);
+    }
+    const transcribe = String((handleHelp({ path: ['speech', 'transcribe'] }).data as { text?: string })?.text ?? '');
+    expect(transcribe).toContain('at most 4 GiB and 8 hours');
+    expect(transcribe).toContain('SPEECH_RESOURCE_REQUIRED');
+    expect(transcribe).toContain('does not create a Record or perform diarization');
   });
 
   it('documents dry-run on the exact mutation leaves that implement it', async () => {
@@ -648,6 +678,78 @@ describe('admin-api AnyDoc forwarding', () => {
       ['/api/document/list?limit=20'],
       ['/api/document/cancel', 'POST', { jobId: '20260815_7f3a91c2b6d4' }],
     ]);
+  });
+});
+
+describe('admin-api speech forwarding', () => {
+  function enableSpeechForCurrentSession(): void {
+    writeJson(join(scratch, '.myagents', 'config.json'), {
+      enabledOfficialToolIds: ['speech-recognition'],
+    });
+    writeJson(join(scratch, '.myagents', 'projects.json'), [{
+      id: 'project-speech',
+      name: 'Speech Workspace',
+      path: '/workspace/authoritative',
+      enabledOfficialToolIds: ['speech-recognition'],
+    }]);
+    sessionEngineMocks.state.context = {
+      sessionId: 'session-speech',
+      workspacePath: '/workspace/authoritative',
+    };
+  }
+
+  it('injects only process identity and never accepts caller-supplied Session or Workspace scope', async () => {
+    enableSpeechForCurrentSession();
+    managementApiMocks.managementApi.mockResolvedValue({
+      ok: true,
+      job: { jobId: 'speech_01', state: 'queued' },
+    });
+    const { handleSpeechTranscribe } = await import('./admin-api');
+
+    const result = await handleSpeechTranscribe({
+      sourcePath: '/workspace/authoritative/meeting.m4a',
+      outputRoot: '/workspace/authoritative/transcripts',
+    });
+
+    expect(managementApiMocks.managementApi).toHaveBeenCalledWith(
+      '/api/speech/transcribe',
+      'POST',
+      {
+        sidecarId: 'test-session-sidecar',
+        sourcePath: '/workspace/authoritative/meeting.m4a',
+        outputRoot: '/workspace/authoritative/transcripts',
+      },
+    );
+    expect(result).toEqual({
+      success: true,
+      data: { job: { jobId: 'speech_01', state: 'queued' } },
+    });
+  });
+
+  it('forwards every management lookup as a process-bound POST', async () => {
+    enableSpeechForCurrentSession();
+    const { handleSpeechCancel, handleSpeechList, handleSpeechStatus } = await import('./admin-api');
+
+    await handleSpeechStatus({ jobId: 'speech_01' });
+    await handleSpeechList({ limit: 20 });
+    await handleSpeechCancel({ jobId: 'speech_01' });
+
+    expect(managementApiMocks.managementApi.mock.calls).toEqual([
+      ['/api/speech/status', 'POST', { sidecarId: 'test-session-sidecar', jobId: 'speech_01' }],
+      ['/api/speech/list', 'POST', { sidecarId: 'test-session-sidecar', limit: 20 }],
+      ['/api/speech/cancel', 'POST', { sidecarId: 'test-session-sidecar', jobId: 'speech_01' }],
+    ]);
+  });
+
+  it('rejects Global or incomplete caller context before Rust transport', async () => {
+    const { handleSpeechList } = await import('./admin-api');
+    const result = await handleSpeechList({ limit: 20 });
+
+    expect(result).toMatchObject({
+      success: false,
+      code: 'SPEECH_SESSION_REQUIRED',
+    });
+    expect(managementApiMocks.managementApi).not.toHaveBeenCalled();
   });
 });
 

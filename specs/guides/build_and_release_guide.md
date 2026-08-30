@@ -67,7 +67,7 @@ myagents-releases/
 
 **构建流程**：
 1. 加载 `.env` 签名配置
-2. 检查依赖（Rust 通过 `rustup` 使用仓库 `rust-toolchain.toml` 固定版本、Node.js、codesign；Intel 冷构建额外检查 Git、Python ≥ 3.8、CMake ≥ 3.28 与 Apple Clang）
+2. 检查依赖（Rust 通过 `rustup` 使用仓库 `rust-toolchain.toml` 固定版本、Node.js、codesign；任一 macOS 架构的原生推理资源冷构建额外检查 Git、Python ≥ 3.8、CMake ≥ 3.28 与 Apple Clang）
 3. 配置生产环境 CSP
 4. TypeScript 类型检查
 5. 构建前端和服务端代码
@@ -97,7 +97,9 @@ myagents-releases/
 
 **注意**：如果未设置 `TAURI_SIGNING_PRIVATE_KEY`，脚本会显示警告并询问是否继续。构建出的应用**无法使用自动更新功能**。
 
-Intel 文档资源需要从锁定源码构建 ONNX Runtime。`build_macos.sh` 会在正式构建前通过统一 prepare owner 检查所需工具；已有当前 fingerprint 的完整 prepared cache 时不会强制要求这些源码构建工具。脚本不会自动执行 Homebrew 或修改系统环境，缺项时会给出对应的安装与验证命令。
+MyAgents 支持 macOS 13，而官方 ONNX Runtime 1.28 arm64 archive 的最低系统版本是 macOS 14，且没有 x64 archive。因此 Apple Silicon 与 Intel 都从锁定源码按 deployment target 13.0 构建共享 ONNX Runtime。`build_macos.sh` 会在正式构建前通过 `scripts/prepare-native-inference.mjs` 统一检查并准备 document/speech 两个 capability；已有当前 fingerprint 的完整 prepared cache 时不会强制要求源码构建工具。脚本不会自动执行 Homebrew 或修改系统环境，缺项时会给出对应的安装与验证命令。
+
+native inference 的受支持 target 由 `src-tauri/document-worker/resource-lock.json::targets` 唯一锁定：`aarch64-apple-darwin`、`x86_64-apple-darwin`、`x86_64-pc-windows-msvc`、`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`。每个正式产物都必须由同一 `prepare-native-inference` 入口生成 document/speech 两份 target manifest；speech bundle 只携带 media Worker、sherpa adapter/native 依赖与 legal inventory，ONNX Runtime 必须引用同 target document artifact，不能复制第二份。真实发布验收需在对应 target 机器/runner 上检查签名、notices、Worker 最小加载和至少一份媒体 smoke；不能用 host-only 单测替代五 target 产物证据。
 
 ---
 
@@ -205,6 +207,24 @@ Runtime set 是按平台分片补发的：macOS 主机默认发布 `darwin-arm64
 ```powershell
 .\publish_managed_codex_runtime.ps1 -Yes
 ```
+
+### publish_speech_model_set.sh
+
+**用途**：把当前 App/Worker 已编译锁定的标准语音模型资源与签名清单发布到 R2。当前 `local-standard-speech-v2` 将四个模型 asset 和三个 remote legal source 放在 `models/speech/assets/sha256/<sha256>/<filename>` 的 content-addressed 第一方路径；manifest 目录仍只使用 pack revision，JSON 内的 `schemaVersion: 1` 是 manifest schema，因此文件名不重复带 `-v1` / `-v2`。
+
+本地可用 unsigned 模式验证输出路径与逐字节 identity，但该产物不能发布，也不会被 App 接受：
+
+```bash
+npm run package:speech-model-set -- --allow-unsigned
+```
+
+正式发布从 source lock 自动派生 immutable `packRevision`，复用现有 Tauri updater Minisign 私钥、R2 配置和 Cloudflare 域名；发布机需安装成熟的 `minisign` CLI，脚本会用 App 内同一 updater 公钥在上传前验签：
+
+```bash
+npm run publish:speech-model-set -- -y
+```
+
+发布脚本把运行时 source lock 与 release-only `model-pack-mirror-origin-lock.json` 按 exact ID join，复用构建资源的 content-addressed cache 从锁定的上游 URL 下载并校验七个 source。它先只补传缺失的 immutable source，并逐个从公网完整回读比对；确认全部可用后才上传 `manifest.json` 与 `manifest.json.sig`。远端已有 source/manifest 必须与本地逐字节一致，已有或新签名都必须通过 App updater 公钥验签；任何漂移都要求提升 `packRevision`。脚本不接受 revision、URL、asset 或 trust-root 覆盖，避免发布内容与客户端编译 lock 分叉。模型资源发布是独立 release 动作，不应绑到每次桌面 App build；锁变化或首次启用新 revision 时必须先完成发布和真实安装 smoke。
 
 ### 可选「浏览器」Runtime 资源
 
@@ -332,7 +352,7 @@ cargo metadata --manifest-path src-tauri/Cargo.toml --locked --no-deps --format-
 
 ### 4. 发布到 R2
 
-发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime，也不会处理「浏览器」Runtime。若本客户端版本锁定了新的 Codex runtime set，必须先确认对应平台资源已上传且 exact manifest 可读；若更新了 Browser runtime lock，则确认各平台官方 exact artifact 可读并完成 release-like 安装 smoke。
+发布脚本只上传桌面 App 安装包、自动更新包和更新清单；不会打包或上传 Managed Codex Runtime、Speech model set，也不会处理「浏览器」Runtime。若本客户端版本锁定了新的 Codex runtime set，必须先确认对应平台资源已上传且 exact manifest 可读；若更新了 Speech model source lock，则先运行独立的 `publish:speech-model-set`，确认固定 manifest/signature 可读并完成真实模型安装 smoke；若更新了 Browser runtime lock，则确认各平台官方 exact artifact 可读并完成 release-like 安装 smoke。
 
 ```bash
 ./publish_release.sh

@@ -2,11 +2,22 @@
 
 import type { ImageAttachment } from '@/components/SimpleChatInput';
 import type { PermissionMode } from '@/config/types';
-import type { CronSchedule, CronEndConditions, CronDelivery, ScheduledTaskKind } from '@/types/cronTask';
+import type {
+  CronSchedule,
+  CronEndConditions,
+  CronDelivery,
+  ScheduledTaskKind,
+} from '@/types/cronTask';
 import type { RuntimeBackedProviderIdentity } from '../../shared/providerExecution';
 import type { OfficialToolId } from '../../shared/official-tools';
 import type { ProductSystemSkillRequirement } from '../../shared/systemSkills';
 import type { SessionOrigin } from '../../shared/session-origin';
+import type {
+  CaptureStatus,
+  PreparedRecordingSource,
+  RecordingSourceActivity,
+  RecordingWarning,
+} from '../../shared/types/record';
 
 /** Cron settings drafted in the launcher input. Sent forward via
  *  `InitialMessage.cron` and consumed by Chat's `autoSend` to switch from
@@ -14,33 +25,33 @@ import type { SessionOrigin } from '../../shared/session-origin';
  *  only stages these values; the actual `cmd_create_cron_task` happens after
  *  handoff so a user closing the launcher mid-edit doesn't leave orphan crons. */
 export interface InitialMessageCron {
-    /** Explicit creation surface; never infer Goal identity from schedule shape. */
-    taskKind: ScheduledTaskKind;
-    /** Schedule (e.g. `every 30m`, cron expression, one-shot at). */
-    schedule: CronSchedule;
-    /** Whether each tick uses the same session or spawns a fresh one. */
-    runMode: 'single_session' | 'new_session';
-    endConditions: CronEndConditions;
-    notifyEnabled: boolean;
-    delivery?: CronDelivery;
-    name?: string;
-    /** Plain interval (minutes) for back-compat with the legacy field; we
-     *  pass it through unchanged so `CronTaskConfig` consumers don't need to
-     *  re-derive from the schedule. */
-    intervalMinutes: number;
-    /** UI-level distinction between "run inline in the current chat" and
-     *  "spawn a standalone background task". Mirrors `runMode` semantically
-     *  but is what the modal's edit form needs to round-trip correctly:
-     *  the modal computes `runMode` from this (Goal forces `single_session`),
-     *  so when re-opening the
-     *  editor without this field we'd default to `current_session` and
-     *  silently rewrite a "新开对话" task as "当前对话".
-     *
-     *  Launcher-only path also branches on this — `executionTarget ===
-     *  'new_task'` short-circuits in `Launcher.handleBrandSend` to create
-     *  the task directly without opening a chat tab (matching the modal's
-     *  promise: "创建独立定时任务，不占用当前对话"). */
-    executionTarget?: 'current_session' | 'new_task';
+  /** Explicit creation surface; never infer Goal identity from schedule shape. */
+  taskKind: ScheduledTaskKind;
+  /** Schedule (e.g. `every 30m`, cron expression, one-shot at). */
+  schedule: CronSchedule;
+  /** Whether each tick uses the same session or spawns a fresh one. */
+  runMode: 'single_session' | 'new_session';
+  endConditions: CronEndConditions;
+  notifyEnabled: boolean;
+  delivery?: CronDelivery;
+  name?: string;
+  /** Plain interval (minutes) for back-compat with the legacy field; we
+   *  pass it through unchanged so `CronTaskConfig` consumers don't need to
+   *  re-derive from the schedule. */
+  intervalMinutes: number;
+  /** UI-level distinction between "run inline in the current chat" and
+   *  "spawn a standalone background task". Mirrors `runMode` semantically
+   *  but is what the modal's edit form needs to round-trip correctly:
+   *  the modal computes `runMode` from this (Goal forces `single_session`),
+   *  so when re-opening the
+   *  editor without this field we'd default to `current_session` and
+   *  silently rewrite a "新开对话" task as "当前对话".
+   *
+   *  Launcher-only path also branches on this — `executionTarget ===
+   *  'new_task'` short-circuits in `Launcher.handleBrandSend` to create
+   *  the task directly without opening a chat tab (matching the modal's
+   *  promise: "创建独立定时任务，不占用当前对话"). */
+  executionTarget?: 'current_session' | 'new_task';
 }
 
 /** Message data passed from Launcher to Chat for auto-send on workspace open.
@@ -60,30 +71,30 @@ export interface InitialMessageCron {
  *      creates the task. Failure path restores all of {text, images, cron} to the
  *      Chat input box so the user can retry without losing their draft. */
 export interface InitialMessage {
-    text: string;
-    images?: ImageAttachment[];
-    permissionMode?: PermissionMode;
-    mcpEnabledServers?: string[];
-    /** PRD 0.2.17 — Claude plugin ids the user chose in Launcher's tool
-     *  menu. Carried into the new Tab as initial selection (Chat seeds
-     *  workspaceEnabledPlugins from this); mirrors mcpEnabledServers
-     *  semantics exactly. */
-    enabledPluginIds?: string[];
-    enabledOfficialToolIds?: OfficialToolId[];
-    /** Builtin runtime 的 (provider, model) 选择 — 类型上强制成对 */
-    builtinSelection?: { providerId: string; model: string };
-    /** External runtime 的 model — 没有 provider 概念 */
-    runtimeModel?: string;
-    /** Provider-facing runtime-backed identity, e.g. Managed Codex Provider. */
-    providerExecutionIdentity?: RuntimeBackedProviderIdentity;
-    /** #324 — 推理强度 setting ('default' | level)。手递（hand-carry）进新 Tab：
-     *  launcher 的 agent-config 写盘是异步的，handoff 不能赌它赢过 sidecar 启动
-     *  自解析；与 builtinSelection/runtimeModel 同理。 */
-    reasoningEffort?: string;
-    /** App-owned first-turn workflow admission; never persisted to history. */
-    requiredSystemSkill?: ProductSystemSkillRequirement;
-    /** Optional cron task configuration drafted in launcher (PRD 0.2.7). */
-    cron?: InitialMessageCron;
+  text: string;
+  images?: ImageAttachment[];
+  permissionMode?: PermissionMode;
+  mcpEnabledServers?: string[];
+  /** PRD 0.2.17 — Claude plugin ids the user chose in Launcher's tool
+   *  menu. Carried into the new Tab as initial selection (Chat seeds
+   *  workspaceEnabledPlugins from this); mirrors mcpEnabledServers
+   *  semantics exactly. */
+  enabledPluginIds?: string[];
+  enabledOfficialToolIds?: OfficialToolId[];
+  /** Builtin runtime 的 (provider, model) 选择 — 类型上强制成对 */
+  builtinSelection?: { providerId: string; model: string };
+  /** External runtime 的 model — 没有 provider 概念 */
+  runtimeModel?: string;
+  /** Provider-facing runtime-backed identity, e.g. Managed Codex Provider. */
+  providerExecutionIdentity?: RuntimeBackedProviderIdentity;
+  /** #324 — 推理强度 setting ('default' | level)。手递（hand-carry）进新 Tab：
+   *  launcher 的 agent-config 写盘是异步的，handoff 不能赌它赢过 sidecar 启动
+   *  自解析；与 builtinSelection/runtimeModel 同理。 */
+  reasoningEffort?: string;
+  /** App-owned first-turn workflow admission; never persisted to history. */
+  requiredSystemSkill?: ProductSystemSkillRequirement;
+  /** Optional cron task configuration drafted in launcher (PRD 0.2.7). */
+  cron?: InitialMessageCron;
 }
 
 /**
@@ -92,17 +103,17 @@ export interface InitialMessage {
  * persistence has refreshed App.configRef.
  */
 export interface LaunchSessionBirthHint {
-    /** Product-facing permission; App converts it to runtime vocabulary at birth. */
-    permissionMode?: PermissionMode;
-    mcpEnabledServers?: string[];
-    enabledPluginIds?: string[];
-    enabledOfficialToolIds?: OfficialToolId[];
-    builtinSelection?: { providerId: string; model: string };
-    runtimeModel?: string;
-    providerExecutionIdentity?: RuntimeBackedProviderIdentity;
-    reasoningEffort?: string;
-    /** Explicit metadata origin when a non-Launcher surface delegates birth to App. */
-    origin?: SessionOrigin;
+  /** Product-facing permission; App converts it to runtime vocabulary at birth. */
+  permissionMode?: PermissionMode;
+  mcpEnabledServers?: string[];
+  enabledPluginIds?: string[];
+  enabledOfficialToolIds?: OfficialToolId[];
+  builtinSelection?: { providerId: string; model: string };
+  runtimeModel?: string;
+  providerExecutionIdentity?: RuntimeBackedProviderIdentity;
+  reasoningEffort?: string;
+  /** Explicit metadata origin when a non-Launcher surface delegates birth to App. */
+  origin?: SessionOrigin;
 }
 
 /**
@@ -129,35 +140,59 @@ export type SidecarConfigDisposition = 'pending' | 'push' | 'adopt';
 
 /** Runtime-only request for Chat to open a workspace file once after mount/activation. */
 export interface FilePreviewIntent {
-    id: string;
-    path: string;
-    initialLineNumber?: number;
+  id: string;
+  path: string;
+  initialLineNumber?: number;
 }
 
 export interface Tab {
-    id: string;
-    agentDir: string | null;  // null = showing Launcher
-    sessionId: string | null; // null = not started
-    view: 'launcher' | 'chat' | 'settings' | 'capabilities' | 'taskcenter' | 'space';
-    title: string;            // Display title for the tab
-    /** Runtime-only Launcher selection. The Tab owns this projection so the
-     * global shell can read the active workspace without a second App mirror. */
-    launcherWorkspacePath?: string | null;
-    isGenerating?: boolean;   // true = AI is outputting, used for close confirmation
-    hasUnread?: boolean;      // true = task completed but user hasn't viewed this tab yet
-    initialMessage?: InitialMessage;  // Launcher → Chat auto-send message
-    // Note: cronTaskId and sidecarPort are no longer stored in Tab.
-    // Sidecar lifecycle is now managed by SidecarManager's Owner model.
-    // Use getSessionPort(sessionId) to get the ready port when needed.
-    sidecarConfigDisposition: SidecarConfigDisposition;  // push | adopt | pending — see type doc
-    /** Runtime-only (never persisted). Set by floating-ball path actions to
-     *  ask the target Chat tab to open a workspace file in its preview surface. */
-    pendingFilePreview?: FilePreviewIntent;
+  id: string;
+  agentDir: string | null; // null = showing Launcher
+  sessionId: string | null; // null = not started
+  view:
+    | 'launcher'
+    | 'chat'
+    | 'settings'
+    | 'capabilities'
+    | 'taskcenter'
+    | 'space'
+    | 'record';
+  title: string; // Display title for the tab
+  /** Runtime-only Launcher selection. The Tab owns this projection so the
+   * global shell can read the active workspace without a second App mirror. */
+  launcherWorkspacePath?: string | null;
+  isGenerating?: boolean; // true = AI is outputting, used for close confirmation
+  hasUnread?: boolean; // true = task completed but user hasn't viewed this tab yet
+  initialMessage?: InitialMessage; // Launcher → Chat auto-send message
+  // Note: cronTaskId and sidecarPort are no longer stored in Tab.
+  // Sidecar lifecycle is now managed by SidecarManager's Owner model.
+  // Use getSessionPort(sessionId) to get the ready port when needed.
+  sidecarConfigDisposition: SidecarConfigDisposition; // push | adopt | pending — see type doc
+  /** Runtime-only (never persisted). Set by floating-ball path actions to
+   *  ask the target Chat tab to open a workspace file in its preview surface. */
+  pendingFilePreview?: FilePreviewIntent;
+  /** Product-owned Record Detail identity. Record tabs do not own a Sidecar. */
+  recordId?: string;
+  /** Runtime-only projection from RecordingManager for tab chrome. */
+  recordingStatus?: CaptureStatus;
+  /** Last authoritative media duration; the tab derives display ticks only while recording. */
+  recordingMediaDurationMs?: number;
+  recordingStartedAtWallTime?: number;
+  recordingPausedWallMs?: number;
+  recordingRevision?: number;
+  recordingGeneration?: number;
+  recordingSources?: PreparedRecordingSource[];
+  recordingSourceActivity?: RecordingSourceActivity[];
+  recordingWarnings?: RecordingWarning[];
+  /** Runtime-only navigation intent from a Record search hit. */
+  recordSeekMediaMs?: number;
+  /** Monotonic nonce so repeated opens of the same hit seek again. */
+  recordSeekNonce?: number;
 }
 
 export interface TabState {
-    tabs: Tab[];
-    activeTabId: string | null;
+  tabs: Tab[];
+  activeTabId: string | null;
 }
 
 // Maximum number of tabs allowed. The titlebar uses Chrome-like adaptive tab
@@ -167,43 +202,43 @@ export const MAX_TABS = 12;
 
 // Generate unique tab ID
 export function generateTabId(): string {
-    return `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  return `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 // Generate session title from first message
 export function generateSessionTitle(firstMessage: string): string {
-    const maxLength = 20;
-    const trimmed = firstMessage.trim();
-    if (!trimmed) {
-        return 'New Chat';
-    }
-    if (trimmed.length <= maxLength) {
-        return trimmed;
-    }
-    return trimmed.slice(0, maxLength) + '...';
+  const maxLength = 20;
+  const trimmed = firstMessage.trim();
+  if (!trimmed) {
+    return 'New Chat';
+  }
+  if (trimmed.length <= maxLength) {
+    return trimmed;
+  }
+  return trimmed.slice(0, maxLength) + '...';
 }
 
 // Get folder name from path (supports both / and \ separators)
 export function getFolderName(path: string): string {
-    // Normalize path separators and split
-    const normalized = path.replace(/\\/g, '/');
-    const parts = normalized.split('/').filter(Boolean);
-    return parts[parts.length - 1] || path;
+  // Normalize path separators and split
+  const normalized = path.replace(/\\/g, '/');
+  const parts = normalized.split('/').filter(Boolean);
+  return parts[parts.length - 1] || path;
 }
 
 // Create a new empty tab (shows Launcher)
 export function createNewTab(): Tab {
-    return {
-        id: generateTabId(),
-        agentDir: null,
-        sessionId: null,
-        view: 'launcher',
-        title: 'New Tab',
-        // A launcher tab carries the benign default; when it flips to chat for a
-        // NEW session the flip sets 'push' explicitly anyway. (Never read while
-        // the tab is a launcher — Chat isn't mounted.)
-        sidecarConfigDisposition: 'push',
-    };
+  return {
+    id: generateTabId(),
+    agentDir: null,
+    sessionId: null,
+    view: 'launcher',
+    title: 'New Tab',
+    // A launcher tab carries the benign default; when it flips to chat for a
+    // NEW session the flip sets 'push' explicitly anyway. (Never read while
+    // the tab is a launcher — Chat isn't mounted.)
+    sidecarConfigDisposition: 'push',
+  };
 }
 
 /**
@@ -222,37 +257,39 @@ export function createNewTab(): Tab {
  * "flip to chat without a sessionId" a compile error, not a runtime blank tab.
  */
 export function buildChatFlipPatch(
-    tab: Tab,
-    fields: {
-        agentDir: string;
-        sessionId: string; // D1: non-null by type — cannot flip to chat without one
-        title: string;
-        initialMessage?: InitialMessage;
-        // Required: every chat flip must declare how config reconciles. 'pending'
-        // for an instant flip whose disposition the post-ensure resolver will set;
-        // 'push'/'adopt' when already known. No default — forcing the choice is the
-        // whole point (the old optional boolean is what let the stomp slip through).
-        sidecarConfigDisposition: SidecarConfigDisposition;
-    },
+  tab: Tab,
+  fields: {
+    agentDir: string;
+    sessionId: string; // D1: non-null by type — cannot flip to chat without one
+    title: string;
+    initialMessage?: InitialMessage;
+    // Required: every chat flip must declare how config reconciles. 'pending'
+    // for an instant flip whose disposition the post-ensure resolver will set;
+    // 'push'/'adopt' when already known. No default — forcing the choice is the
+    // whole point (the old optional boolean is what let the stomp slip through).
+    sidecarConfigDisposition: SidecarConfigDisposition;
+  },
 ): Tab {
-    // D1 runtime backstop: `sessionId: string` blocks `null` at compile time but
-    // not `''`. A falsy sessionId here is a permanent blank tab (TabProvider's SSE
-    // connect effect never fires), so fail loud rather than strand the tab.
-    if (!fields.sessionId) {
-        throw new Error('buildChatFlipPatch: sessionId must be a non-empty id (D1) — flipping to chat without one strands the tab');
-    }
-    return {
-        ...tab,
-        agentDir: fields.agentDir,
-        sessionId: fields.sessionId,
-        view: 'chat',
-        title: fields.title,
-        // Only attach when provided — undefined must not clobber a prior value
-        // mid-launch (matches the existing `...(initialMessage ? {…} : {})` idiom).
-        ...(fields.initialMessage ? { initialMessage: fields.initialMessage } : {}),
-        // Always set (required) — a chat flip always declares its disposition, and
-        // it must OVERWRITE any stale value from `...tab` (a reused tab may carry a
-        // prior 'adopt'/'pending').
-        sidecarConfigDisposition: fields.sidecarConfigDisposition,
-    };
+  // D1 runtime backstop: `sessionId: string` blocks `null` at compile time but
+  // not `''`. A falsy sessionId here is a permanent blank tab (TabProvider's SSE
+  // connect effect never fires), so fail loud rather than strand the tab.
+  if (!fields.sessionId) {
+    throw new Error(
+      'buildChatFlipPatch: sessionId must be a non-empty id (D1) — flipping to chat without one strands the tab',
+    );
+  }
+  return {
+    ...tab,
+    agentDir: fields.agentDir,
+    sessionId: fields.sessionId,
+    view: 'chat',
+    title: fields.title,
+    // Only attach when provided — undefined must not clobber a prior value
+    // mid-launch (matches the existing `...(initialMessage ? {…} : {})` idiom).
+    ...(fields.initialMessage ? { initialMessage: fields.initialMessage } : {}),
+    // Always set (required) — a chat flip always declares its disposition, and
+    // it must OVERWRITE any stale value from `...tab` (a reused tab may carry a
+    // prior 'adopt'/'pending').
+    sidecarConfigDisposition: fields.sidecarConfigDisposition,
+  };
 }

@@ -82,9 +82,13 @@ vi.mock('@/hooks/useConfig', () => ({
 }));
 
 vi.mock('@/hooks/useCloseLayer', () => ({ useCloseLayer: vi.fn() }));
-vi.mock('@/components/Toast', () => ({ useToast: () => ({ success: vi.fn(), error: vi.fn() }) }));
+vi.mock('@/components/Toast', () => ({
+  useToast: () => ({ success: vi.fn(), error: vi.fn() }),
+}));
 vi.mock('@/components/OverlayBackdrop', () => ({
-  default: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  default: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
 }));
 vi.mock('./editors/TaskAdvancedConfigEditor', () => ({
   TaskAdvancedConfigEditor: () => <div>高级配置</div>,
@@ -104,11 +108,17 @@ vi.mock('./views/TaskListRow', () => ({
   }) => (
     <div>
       <span>{task?.name}</span>
-      <button type="button" title="更多操作">更多操作</button>
+      <button type="button" title="更多操作">
+        更多操作
+      </button>
       {task?.status === 'todo' ? (
-        <button type="button" onClick={onRun}>立即执行</button>
+        <button type="button" onClick={onRun}>
+          立即执行
+        </button>
       ) : (
-        <button type="button" onClick={onRerun}>重新派发</button>
+        <button type="button" onClick={onRerun}>
+          重新派发
+        </button>
       )}
     </div>
   ),
@@ -155,11 +165,13 @@ describe('Task Center UX refinements', () => {
     taskApiMocks.getSessions.mockResolvedValue([]);
     taskApiMocks.taskReadDoc.mockResolvedValue('# Task body');
     taskApiMocks.taskOpenDocsDir.mockResolvedValue(undefined);
-    taskApiMocks.taskUpdate.mockImplementation(async (input) => task({
-      status: 'stopped',
-      workspaceId: input.workspaceId ?? 'workspace-1',
-      workspacePath: input.workspacePath ?? '/Users/me/mino',
-    }));
+    taskApiMocks.taskUpdate.mockImplementation(async (input) =>
+      task({
+        status: 'stopped',
+        workspaceId: input.workspaceId ?? 'workspace-1',
+        workspacePath: input.workspacePath ?? '/Users/me/mino',
+      }),
+    );
     __setTaskCenterSessionsForTest([]);
   });
 
@@ -169,9 +181,15 @@ describe('Task Center UX refinements', () => {
     render(<TaskListPanel onCreateTask={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByTitle(/列表视图|List view/)).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByTitle(/列表视图|List view/)).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
     });
-    expect(screen.getByTitle(/卡片视图|Card view/)).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByTitle(/卡片视图|Card view/)).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    );
   });
 
   it('keeps an explicit card preference and persists a later list choice', async () => {
@@ -180,23 +198,33 @@ describe('Task Center UX refinements', () => {
     render(<TaskListPanel onCreateTask={vi.fn()} />);
 
     await waitFor(() => {
-      expect(screen.getByTitle(/卡片视图|Card view/)).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByTitle(/卡片视图|Card view/)).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
     });
 
     fireEvent.click(screen.getByTitle(/列表视图|List view/));
 
-    expect(window.localStorage.getItem('myagents:task-center:view')).toBe('list');
-    expect(screen.getByTitle(/列表视图|List view/)).toHaveAttribute('aria-pressed', 'true');
+    expect(window.localStorage.getItem('myagents:task-center:view')).toBe(
+      'list',
+    );
+    expect(screen.getByTitle(/列表视图|List view/)).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
   });
 
   it('separates recoverable work and reveals completed rows ten at a time', async () => {
-    const completed = Array.from({ length: 12 }, (_, index) => task({
-      id: `done-${index + 1}`,
-      name: `已完成任务 ${index + 1}`,
-      status: 'done',
-      executionMode: 'once',
-      updatedAt: Date.parse('2026-08-22T12:00:00+08:00') - index * 1_000,
-    }));
+    const completed = Array.from({ length: 12 }, (_, index) =>
+      task({
+        id: `done-${index + 1}`,
+        name: `已完成任务 ${index + 1}`,
+        status: 'done',
+        executionMode: 'once',
+        updatedAt: Date.parse('2026-08-22T12:00:00+08:00') - index * 1_000,
+      }),
+    );
     taskApiMocks.taskList.mockResolvedValueOnce([
       task({ id: 'active', name: '正在运行任务', status: 'running' }),
       task({ id: 'stopped', name: '等待恢复任务', status: 'stopped' }),
@@ -210,9 +238,18 @@ describe('Task Center UX refinements', () => {
     const recovery = screen.getByText('待恢复');
     const finished = screen.getByText('已完成');
     const planned = screen.getByText('规划中');
-    expect(active.compareDocumentPosition(recovery) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(recovery.compareDocumentPosition(finished) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(finished.compareDocumentPosition(planned) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(
+      active.compareDocumentPosition(recovery) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      recovery.compareDocumentPosition(finished) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      finished.compareDocumentPosition(planned) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     expect(screen.getByText('等待恢复任务')).toBeInTheDocument();
     expect(screen.getByText('已完成任务 10')).toBeInTheDocument();
     expect(screen.queryByText('已完成任务 11')).not.toBeInTheDocument();
@@ -221,18 +258,22 @@ describe('Task Center UX refinements', () => {
 
     expect(screen.getByText('已完成任务 11')).toBeInTheDocument();
     expect(screen.getByText('已完成任务 12')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '加载更多' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: '加载更多' }),
+    ).not.toBeInTheDocument();
   });
 
   it('shows all matching completed rows while searching and resets the list limit afterwards', async () => {
     taskApiMocks.taskList.mockResolvedValueOnce(
-      Array.from({ length: 12 }, (_, index) => task({
-        id: `report-${index + 1}`,
-        name: `归档报告 ${index + 1}`,
-        status: 'done',
-        executionMode: 'once',
-        updatedAt: Date.parse('2026-08-22T12:00:00+08:00') - index * 1_000,
-      })),
+      Array.from({ length: 12 }, (_, index) =>
+        task({
+          id: `report-${index + 1}`,
+          name: `归档报告 ${index + 1}`,
+          status: 'done',
+          executionMode: 'once',
+          updatedAt: Date.parse('2026-08-22T12:00:00+08:00') - index * 1_000,
+        }),
+      ),
     );
 
     render(<TaskListPanel onCreateTask={vi.fn()} />);
@@ -260,7 +301,10 @@ describe('Task Center UX refinements', () => {
         sessionIds: [],
       }),
     ]);
-    taskApiMocks.taskRun.mockResolvedValueOnce({ task: accepted, attemptOrdinal: 6 });
+    taskApiMocks.taskRun.mockResolvedValueOnce({
+      task: accepted,
+      attemptOrdinal: 6,
+    });
 
     render(<TaskListPanel onCreateTask={vi.fn()} />);
 
@@ -268,7 +312,9 @@ describe('Task Center UX refinements', () => {
     fireEvent.click(screen.getByTitle(/更多操作|More actions/));
     fireEvent.click(screen.getByText('立即执行'));
 
-    await waitFor(() => expect(taskApiMocks.taskRun).toHaveBeenCalledWith('task-1'));
+    await waitFor(() =>
+      expect(taskApiMocks.taskRun).toHaveBeenCalledWith('task-1'),
+    );
     expect(analyticsMocks.track).toHaveBeenCalledWith('task_run', {
       source: 'desktop',
       run_count: 6,
@@ -287,7 +333,9 @@ describe('Task Center UX refinements', () => {
     fireEvent.click(screen.getByTitle(/更多操作|More actions/));
     fireEvent.click(screen.getByText('立即执行'));
 
-    await waitFor(() => expect(taskApiMocks.taskRun).toHaveBeenCalledWith('task-1'));
+    await waitFor(() =>
+      expect(taskApiMocks.taskRun).toHaveBeenCalledWith('task-1'),
+    );
     expect(analyticsMocks.track).not.toHaveBeenCalled();
   });
 
@@ -309,7 +357,9 @@ describe('Task Center UX refinements', () => {
     fireEvent.click(screen.getByTitle(/更多操作|More actions/));
     fireEvent.click(screen.getByText('重新派发'));
 
-    await waitFor(() => expect(taskApiMocks.taskRerun).toHaveBeenCalledWith('task-1'));
+    await waitFor(() =>
+      expect(taskApiMocks.taskRerun).toHaveBeenCalledWith('task-1'),
+    );
     expect(analyticsMocks.track).toHaveBeenCalledWith('task_run', {
       source: 'desktop',
       run_count: 5,
@@ -321,20 +371,24 @@ describe('Task Center UX refinements', () => {
       <TaskCardItem
         task={task({
           executionMode: 'once',
-          statusHistory: [{
-            from: 'running',
-            to: 'blocked',
-            at: Date.parse('2026-06-27T11:12:00+08:00'),
-            actor: 'system',
-            source: 'crash',
-            message: '上次运行被应用重启中断，调度器将在下次计划时间继续',
-          }],
+          statusHistory: [
+            {
+              from: 'running',
+              to: 'blocked',
+              at: Date.parse('2026-06-27T11:12:00+08:00'),
+              actor: 'system',
+              source: 'crash',
+              message: '上次运行被应用重启中断，调度器将在下次计划时间继续',
+            },
+          ],
         })}
         onOpen={vi.fn()}
       />,
     );
 
-    expect(screen.queryByText(/上次运行被应用重启中断/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/上次运行被应用重启中断/),
+    ).not.toBeInTheDocument();
   });
 
   it('keeps exact lifecycle status out of cards while retaining the execution category', () => {
@@ -429,22 +483,29 @@ describe('Task Center UX refinements', () => {
 
     render(<TaskSessionsList task={task({ sessionIds: ['session-1'] })} />);
 
-    expect(await screen.findByText('每日 AI 行业新闻采集与总结')).toBeInTheDocument();
+    expect(
+      await screen.findByText('每日 AI 行业新闻采集与总结'),
+    ).toBeInTheDocument();
     expect(screen.queryByText('New Chat')).not.toBeInTheDocument();
 
-    const timestamp = screen.getByText(expectedTaskSessionTimestamp(session.lastActiveAt));
+    const timestamp = screen.getByText(
+      expectedTaskSessionTimestamp(session.lastActiveAt),
+    );
     expect(timestamp).toHaveClass('whitespace-nowrap', 'tabular-nums');
     expect(taskApiMocks.getSessions).toHaveBeenCalledWith('/Users/me/mino');
   });
 
   it('reveals Task execution sessions five at a time with compact row typography', async () => {
-    const sessions: SessionMetadata[] = Array.from({ length: 12 }, (_, index) => ({
-      id: `session-${index + 1}`,
-      agentDir: '/Users/me/mino',
-      title: `Execution ${index + 1}`,
-      createdAt: new Date(Date.UTC(2026, 5, 27, 3, index)).toISOString(),
-      lastActiveAt: new Date(Date.UTC(2026, 5, 27, 3, index)).toISOString(),
-    }));
+    const sessions: SessionMetadata[] = Array.from(
+      { length: 12 },
+      (_, index) => ({
+        id: `session-${index + 1}`,
+        agentDir: '/Users/me/mino',
+        title: `Execution ${index + 1}`,
+        createdAt: new Date(Date.UTC(2026, 5, 27, 3, index)).toISOString(),
+        lastActiveAt: new Date(Date.UTC(2026, 5, 27, 3, index)).toISOString(),
+      }),
+    );
     taskApiMocks.getSessions.mockResolvedValueOnce(sessions);
 
     render(
@@ -466,7 +527,9 @@ describe('Task Center UX refinements', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '展开更多' }));
     expect(screen.getByText('Execution 1')).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '展开更多' })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: '展开更多' }),
+    ).not.toBeInTheDocument();
   });
 
   it('shows the canonical Task path with a home-relative prefix and no redundant heading', async () => {
@@ -493,7 +556,9 @@ describe('Task Center UX refinements', () => {
       }),
     ).toBeInTheDocument();
     expect(screen.queryByText('task.md · 执行 Prompt')).not.toBeInTheDocument();
-    expect(screen.queryByText('/Users/zhihu/.myagents/tasks/task-1/task.md')).not.toBeInTheDocument();
+    expect(
+      screen.queryByText('/Users/zhihu/.myagents/tasks/task-1/task.md'),
+    ).not.toBeInTheDocument();
   });
 
   it('starts the manual create form with one canonical task document and workspace configuration', async () => {
@@ -510,10 +575,20 @@ describe('Task Center UX refinements', () => {
     expect(screen.queryByText('基本信息')).not.toBeInTheDocument();
     expect(screen.queryByText('简短描述')).not.toBeInTheDocument();
     expect(screen.queryByText('标签')).not.toBeInTheDocument();
-    expect(screen.queryByPlaceholderText('以逗号分隔，例如 MyAgents, 维护')).not.toBeInTheDocument();
+    expect(
+      screen.queryByPlaceholderText('以逗号分隔，例如 MyAgents, 维护'),
+    ).not.toBeInTheDocument();
     expect(screen.getByText('任务需求 Task.md')).toBeInTheDocument();
-    expect(screen.queryByText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。')).not.toBeInTheDocument();
-    expect(screen.getByPlaceholderText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。')).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        'AI 执行时看到的 prompt，默认取自记录原文。你可以补充细节、目标、约束。',
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByPlaceholderText(
+        'AI 执行时看到的 prompt，默认取自记录原文。你可以补充细节、目标、约束。',
+      ),
+    ).toBeInTheDocument();
 
     const name = screen.getByText('任务名称');
     const taskDemand = screen.getByText('任务需求 Task.md');
@@ -521,8 +596,14 @@ describe('Task Center UX refinements', () => {
     expect(screen.queryByText('验收清单')).not.toBeInTheDocument();
 
     await waitFor(() => {
-      expect(name.compareDocumentPosition(taskDemand) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      expect(taskDemand.compareDocumentPosition(workspace) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(
+        name.compareDocumentPosition(taskDemand) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        taskDemand.compareDocumentPosition(workspace) &
+          Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
     });
   });
 
@@ -571,8 +652,14 @@ describe('Task Center UX refinements', () => {
     const taskDocument = screen.getByText('task.md · 执行 Prompt');
     const workspace = screen.getByText('Agent 工作区');
     const advanced = screen.getAllByText('高级配置')[0];
-    expect(taskDocument.compareDocumentPosition(workspace) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(workspace.compareDocumentPosition(advanced) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(
+      taskDocument.compareDocumentPosition(workspace) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      workspace.compareDocumentPosition(advanced) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
 
     expect(screen.queryByText('会话策略')).not.toBeInTheDocument();
     expect(screen.queryByText('触发前检测')).not.toBeInTheDocument();
@@ -612,16 +699,18 @@ describe('Task Center UX refinements', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Research Agent' }));
     fireEvent.click(screen.getByRole('button', { name: '保存' }));
 
-    await waitFor(() => expect(taskApiMocks.taskUpdate).toHaveBeenCalledWith(
-      expect.objectContaining({
-        workspaceId: 'workspace-2',
-        workspacePath: '/Users/me/research',
-        executionMode: 'once',
-        runMode: 'new-session',
-        preselectedSessionId: '',
-        clearTrigger: true,
-      }),
-    ));
+    await waitFor(() =>
+      expect(taskApiMocks.taskUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          workspaceId: 'workspace-2',
+          workspacePath: '/Users/me/research',
+          executionMode: 'once',
+          runMode: 'new-session',
+          preselectedSessionId: '',
+          clearTrigger: true,
+        }),
+      ),
+    );
     const payload = taskApiMocks.taskUpdate.mock.calls[0][0];
     expect(payload).not.toHaveProperty('description');
     expect(payload).not.toHaveProperty('tags');
@@ -640,32 +729,45 @@ describe('Task Center UX refinements', () => {
       />,
     );
 
-    expect(screen.getByRole('dialog', { name: '新建任务' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('dialog', { name: '新建任务' }),
+    ).toBeInTheDocument();
     const smartTab = screen.getByRole('tab', { name: '智能' });
     expect(smartTab).toHaveAttribute('aria-selected', 'true');
     const prompt = screen.getByPlaceholderText(/请输入您希望创建或推进任务/);
     fireEvent.change(prompt, { target: { value: '每天检查高危依赖' } });
     fireEvent.click(screen.getByRole('button', { name: '与 AI 讨论' }));
 
-    await waitFor(() => expect(onDiscuss).toHaveBeenCalledWith(expect.objectContaining({
-      content: '每天检查高危依赖',
-      workspaceId: 'workspace-1',
-      workspacePath: '/Users/me/mino',
-    })));
-    await waitFor(() => expect(screen.getByRole('button', { name: '与 AI 讨论' })).toBeEnabled());
+    await waitFor(() =>
+      expect(onDiscuss).toHaveBeenCalledWith(
+        expect.objectContaining({
+          content: '每天检查高危依赖',
+          workspaceId: 'workspace-1',
+          workspacePath: '/Users/me/mino',
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: '与 AI 讨论' })).toBeEnabled(),
+    );
     expect(prompt).toHaveValue('每天检查高危依赖');
     expect(onClose).not.toHaveBeenCalled();
 
     fireEvent.keyDown(smartTab, { key: 'ArrowRight' });
-    expect(screen.getByRole('tab', { name: '手动' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: '手动' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
   });
 
   it('submits the manual task.md directly as the canonical task document', async () => {
-    taskApiMocks.taskCreateDirect.mockResolvedValue(task({
-      name: '整理交付清单',
-      executionMode: 'once',
-      status: 'todo',
-    }));
+    taskApiMocks.taskCreateDirect.mockResolvedValue(
+      task({
+        name: '整理交付清单',
+        executionMode: 'once',
+        status: 'todo',
+      }),
+    );
     taskApiMocks.taskRun.mockResolvedValue(true);
     render(
       <DispatchTaskDialog
@@ -677,28 +779,40 @@ describe('Task Center UX refinements', () => {
       />,
     );
 
-    fireEvent.change(screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'), {
-      target: { value: '整理交付清单' },
-    });
-    fireEvent.change(screen.getByPlaceholderText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。'), {
-      target: { value: '# 目标\n整理本周交付。' },
-    });
+    fireEvent.change(
+      screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'),
+      {
+        target: { value: '整理交付清单' },
+      },
+    );
+    fireEvent.change(
+      screen.getByPlaceholderText(
+        'AI 执行时看到的 prompt，默认取自记录原文。你可以补充细节、目标、约束。',
+      ),
+      {
+        target: { value: '# 目标\n整理本周交付。' },
+      },
+    );
     fireEvent.click(screen.getByRole('button', { name: '创建任务' }));
 
-    await waitFor(() => expect(taskApiMocks.taskCreateDirect).toHaveBeenCalledWith(
-      expect.objectContaining({
-        taskMdContent: '# 目标\n整理本周交付。',
-      }),
-    ));
+    await waitFor(() =>
+      expect(taskApiMocks.taskCreateDirect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          taskMdContent: '# 目标\n整理本周交付。',
+        }),
+      ),
+    );
     expect(taskApiMocks.taskWriteDoc).not.toHaveBeenCalled();
   });
 
   it('creates a blank task without exposing or synthesizing tags', async () => {
-    taskApiMocks.taskCreateDirect.mockResolvedValue(task({
-      name: '整理交付清单',
-      executionMode: 'once',
-      status: 'todo',
-    }));
+    taskApiMocks.taskCreateDirect.mockResolvedValue(
+      task({
+        name: '整理交付清单',
+        executionMode: 'once',
+        status: 'todo',
+      }),
+    );
     taskApiMocks.taskRun.mockResolvedValue(true);
 
     render(
@@ -711,12 +825,20 @@ describe('Task Center UX refinements', () => {
       />,
     );
 
-    fireEvent.change(screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'), {
-      target: { value: '整理交付清单' },
-    });
-    fireEvent.change(screen.getByPlaceholderText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。'), {
-      target: { value: '整理本周交付内容并输出检查清单。' },
-    });
+    fireEvent.change(
+      screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'),
+      {
+        target: { value: '整理交付清单' },
+      },
+    );
+    fireEvent.change(
+      screen.getByPlaceholderText(
+        'AI 执行时看到的 prompt，默认取自记录原文。你可以补充细节、目标、约束。',
+      ),
+      {
+        target: { value: '整理本周交付内容并输出检查清单。' },
+      },
+    );
     fireEvent.click(screen.getByRole('button', { name: '创建任务' }));
 
     await waitFor(() => {
@@ -747,12 +869,14 @@ describe('Task Center UX refinements', () => {
       lastActiveAt: '2026-08-02T02:00:00.000Z',
     };
     __setTaskCenterSessionsForTest([other, existing]);
-    taskApiMocks.taskCreateDirect.mockResolvedValue(task({
-      executionMode: 'recurring',
-      runMode: 'single-session',
-      preselectedSessionId: existing.id,
-      status: 'todo',
-    }));
+    taskApiMocks.taskCreateDirect.mockResolvedValue(
+      task({
+        executionMode: 'recurring',
+        runMode: 'single-session',
+        preselectedSessionId: existing.id,
+        status: 'todo',
+      }),
+    );
     taskApiMocks.taskRun.mockResolvedValue(true);
 
     render(
@@ -765,28 +889,44 @@ describe('Task Center UX refinements', () => {
         onDiscuss={vi.fn()}
       />,
     );
-    fireEvent.change(screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'), {
-      target: { value: '等待构建完成' },
-    });
-    fireEvent.change(screen.getByPlaceholderText('AI 执行时看到的 prompt，默认取自想法原文。你可以补充细节、目标、约束。'), {
-      target: { value: '构建失败后分析日志。' },
-    });
+    fireEvent.change(
+      screen.getByPlaceholderText('例如: 升级 OpenClaw lark 适配器到 v2.4'),
+      {
+        target: { value: '等待构建完成' },
+      },
+    );
+    fireEvent.change(
+      screen.getByPlaceholderText(
+        'AI 执行时看到的 prompt，默认取自记录原文。你可以补充细节、目标、约束。',
+      ),
+      {
+        target: { value: '构建失败后分析日志。' },
+      },
+    );
     fireEvent.click(screen.getByRole('button', { name: '周期触发' }));
     fireEvent.click(screen.getByRole('button', { name: '连续对话' }));
     // The actual current Session is selected by default; opening that selector
     // must still expose the distinction from other workspace Sessions.
-    fireEvent.click(screen.getByRole('button', { name: '当前 Session · 构建排障上下文' }));
-    const currentSessionButtons = screen.getAllByRole('button', { name: '当前 Session · 构建排障上下文' });
+    fireEvent.click(
+      screen.getByRole('button', { name: '当前 Session · 构建排障上下文' }),
+    );
+    const currentSessionButtons = screen.getAllByRole('button', {
+      name: '当前 Session · 构建排障上下文',
+    });
     expect(currentSessionButtons).toHaveLength(2);
-    expect(screen.getByRole('button', { name: '其他 Session · 其他排障上下文' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: '其他 Session · 其他排障上下文' }),
+    ).toBeInTheDocument();
     fireEvent.click(currentSessionButtons[1]);
     fireEvent.click(screen.getByRole('button', { name: '创建任务' }));
 
-    await waitFor(() => expect(taskApiMocks.taskCreateDirect).toHaveBeenCalledWith(
-      expect.objectContaining({
-        runMode: 'single-session',
-        preselectedSessionId: 'session-existing',
-      }),
-    ));
+    await waitFor(() =>
+      expect(taskApiMocks.taskCreateDirect).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runMode: 'single-session',
+          preselectedSessionId: 'session-existing',
+        }),
+      ),
+    );
   });
 });

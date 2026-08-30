@@ -37,6 +37,20 @@ export interface SessionSearchHit {
     turnCount: number | null;
 }
 
+export interface RecordSearchResult {
+    hits: RecordSearchHit[];
+    total: number;
+    queryTimeMs: number;
+}
+
+export interface RecordSearchHit {
+    recordId: string;
+    kind: 'text' | 'audio';
+    title: string;
+    snippet: string;
+    mediaMs: number | null;
+}
+
 export interface FileSearchResult {
     folderHits: FolderSearchHit[];
     hits: FileSearchHit[];
@@ -78,6 +92,17 @@ export async function searchSessions(
         return { hits: [], totalCount: 0, queryTimeMs: 0 };
     }
     return invoke<SessionSearchResult>('cmd_search_sessions', { query, limit });
+}
+
+/** Search canonical Records from the Rust-owned derived index. */
+export async function searchRecords(
+    query: string,
+    limit = 50,
+): Promise<RecordSearchResult> {
+    if (!query.trim()) {
+        return { hits: [], total: 0, queryTimeMs: 0 };
+    }
+    return invoke<RecordSearchResult>('cmd_search_records', { query, limit });
 }
 
 /**

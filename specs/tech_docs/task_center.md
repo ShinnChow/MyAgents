@@ -4,12 +4,14 @@
 
 ## 1. 所有权
 
-两个 Store 位于 `~/.myagents/`：
+两个当前 Store 位于 `~/.myagents/`：
 
 | Store | 文件 | Owner |
 |---|---|---|
-| `ThoughtStore` | `thoughts/<YYYY-MM>/<id>.md` | 想法与 Task 关联 |
+| `RecordStore` | `records/<YYYY-MM>/<id>/` | 文字/音频 Record、timeline/transcript/speaker projection、artifact 与 Task 关联 |
 | `TaskStore` | `tasks.jsonl` + `tasks/<id>/task.md` + 可选 `comments.jsonl` | Task 身份、状态、调度、完整任务契约、本地评论、运行统计与审计 |
+
+`thoughts/` 是升级输入，不再是新产品 surface 的权威。`RecordStore` 在启动时按幂等锁把旧 Thought 迁入 text Record，保留原 identity/provenance；`myagents thought` 仅是 `myagents record` 的兼容 alias。audio Record 的录音、转录和说话人状态仍由 Record/Recording/Speech owner 管理，不写入 Task row，也不让 TaskStore 代管媒体 artifact。
 
 新 Task 的唯一语义文档是完整 `task.md`。旧 `verify.md/progress.md/alignment.md` 仍可读取；其中旧 `verify.md` 在 task read/edit/dispatch 前通过 TaskStore 的幂等迁移原样追加为 `# verify.md` 章节。新建和编辑不得继续维持平行四文档协议。
 
@@ -198,13 +200,16 @@ Goal 是 Session 状态，不是 Task execution mode：
 - Rust：`src-tauri/src/task.rs`、`task_application.rs`、`task_scheduler.rs`、`task_execution.rs`
 - Legacy compatibility：`src-tauri/src/cron_task/*`、`legacy_upgrade.rs`
 - Management API：`/api/task/*`（含 comment/list/context/retry、turn admitted、trigger validate/test/check-now/reset 与 run-now）及兼容 `/api/cron/*`
-- CLI：`myagents task ...` 是 Agent-facing canonical surface，覆盖通用 `create-direct`、评论写回、创建/启停、历史、exit、Trigger test/check-now/run-now/reset；`myagents cron ...` 只保留外部兼容
+- CLI：`myagents task ...` 是 Agent-facing canonical surface，覆盖通用 `create-direct`、评论写回、创建/启停、历史、exit、Trigger test/check-now/run-now/reset；`myagents record ...` 是 Record canonical surface，`myagents thought ...` 只保留兼容；`myagents cron ...` 只保留外部兼容
 - Renderer：`src/renderer/components/task-center/`、`useCronTask`（兼容展示 hook）
 
-App Shell 只挂一个 `DispatchTaskDialog`：侧边栏和 Task Center 默认智能 Tab，Thought 派发默认手动 Tab。智能 Tab 与 Thought AI 讨论共用 Task discussion builder、runtime selection、required product Skill 和新 Chat launch；确认前不写 Task。手动创建与 Task 编辑只编辑完整 `task.md`，不再提供第二份验收输入、简短描述或标签输入；Agent 工作区在高级配置之前选择，编辑时 `workspaceId + workspacePath` 必须由 TaskStore 在同一写锁内成对更新。会话策略、触发前检测和结束条件只属于周期触发，立即执行与定时一次统一投影为 `new-session` 且不提交隐藏 trigger / Session 选择。既有 Task 的 description、tags 和列表过滤仍保留为持久化兼容数据，但表单不再写回它们。
+用户可见的创建、列表、详情与评论交互以
+[`../design/task_center.md`](../design/task_center.md) 为唯一当前规范；text/audio Record 卡片和录音详情见
+[`../design/records_and_recording.md`](../design/records_and_recording.md)。本技术文档只保留下列投影边界：
 
-Task detail 是全高、可路由的大 Drawer：主栏阅读完整 `task.md`，正文前只显示折叠 home 的 `~/.myagents/.../task.md` 路径，不显示重复的文档标题；flex/Markdown/代码/表格宽度约束必须让长内容停留在主栏内，代码与表格在自身滚动。主栏承载按时间正序排列的 Comment 时间线和紧凑吸底 composer，composer 不重复投影 Session routing hint；Comment 正文继续以字符串 Markdown source 持久化，由共享 compact Markdown renderer 展示，14px 主身份行复用 App 的 Session singleton 导航。已加载父评论的回复引用使用轻量底色，占满可用单行后由 CSS 省略；页外 parent summary 与注入 reminder 继续各自保持既有有界 quote。宽窗使用约 360–400px 属性栏展示状态、schedule/trigger、workspace/runtime/Session 和通知，摘要为无 Card 的扁平信息组；执行 Session 默认 5 条并以整行“展开更多 + 行尾箭头”每次追加 5 条。空间不足时切换为属性 sheet。完整 status history、`progress.md` 与独立 legacy `verify.md` 不在详情投影，底层事实和兼容文件不变。Header 保持单行，编辑位于更多菜单并打开 Drawer 内独立表单 sheet，dirty close 必须确认。Task list、Bell、OS toast 与 deep link 都进入这一 surface；App Shell 的 memo projection 必须比较 `taskPendingRoute`，保证 Task Center 已激活时新的 generation 仍到达 Drawer。
-
-Task Center 分桶只是 Task status 的 Renderer 投影，不拥有或转换生命周期：`running/verifying` 属于“进行中”，`stopped/blocked` 属于“待恢复”，`done/archived` 属于“已完成”，`todo` 属于“规划中”。列表和卡片不重复渲染状态 tag，只保留 execution category；精确 durable status / transient executionState 继续在详情 Header 展示。列表模式已完成项按 `updatedAt DESC` 默认展示 10 条并每次追加 10 条，搜索时展示全部匹配项；卡片模式不截断。列表尾部的 Session action 与日期共用一个固定槽位，hover/focus 原位替换而非通过透明元素额外占宽。
-
-Task Center 在创建/编辑中提供 always/command、结构化 argv、cwd、timeout 和无提交 test；command Task 显示标识与 runtime health/checkpoint/pending/error 投影，并把 test、check-now、run-now、reset 明确分成四个动作。新建 `single-session` Task 必须先 materialize 并持久化一个真实 `preselectedSessionId`，可选择当前或任意已有 Session。
+- App Shell 只挂一个 `DispatchTaskDialog`。智能创建与 Record AI 讨论共用 discussion builder、runtime selection、required product Skill 和新 Chat launch；确认前不写 Task。
+- text Record 把当前完整正文作为用户可见 query；audio Record 只引用 `RecordStore` 在源 Record 根目录保证刷新的唯一 `content.md`。隐藏 reminder 只携带执行所需的 scope、Record identity/path 和文稿路径。
+- 手动创建与编辑只写完整 `task.md`。`workspaceId + workspacePath` 由 TaskStore 在同一写锁内成对更新；周期专属字段不能从隐藏表单值进入一次性 Task。
+- 任务中心的 Record 区只订阅 RecordStore change event，不轮询或复制 Recording/Speech 状态；详情从对应 authority 读取 snapshot。Record 与 Task 删除是独立事务。
+- Task 分桶只是 durable status 的只读 Renderer projection，不拥有状态转换。详情 route 使用递增 generation；页面已经激活也不能吞掉新的 Task/Comment deep link。
+- Command Task 的 test、check-now、run-now、reset 分别调用对应应用入口。新建 `single-session` Task 必须先 materialize 并持久化真实 `preselectedSessionId`。

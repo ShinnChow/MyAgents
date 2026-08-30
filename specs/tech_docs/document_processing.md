@@ -76,17 +76,19 @@ queued/running/cancelling --App restart/shutdown--> interrupted
 - admission 打开 source 的 no-follow regular-file handle；queued job 持有该 handle，避免 path 后续被替换成别的文件。
 - running 首先把 held source 分块复制到私有 `input/source.bin` 并计算 SHA-256；每块检查 cancellation/deadline，实际字节数以及复制前后的 size、mtime/ctime（Windows 为 last-write time）必须与 admission metadata 一致。即使同一 inode 被等长改写也 fail closed 为 `DOCUMENT_SOURCE_CHANGED`。
 - Worker 使用 `process_cmd::new()` + `spawn_tree()`；环境清空，stdin/stdout 仅承载私有协议，stderr 不进入用户错误。
-- job deadline 从 source admission copy 开始计 30 分钟。cancel 先持久化 `cancelling`，再发送 exact `(jobId,generation)` frame，2 秒仍运行才 kill retained `ChildTree`；cancel、timeout 与成功发布在同一 Manager lock 内裁决，发布 IO 后、写入成功终态前再次以 monotonic deadline 确定逻辑 commit time，超时不能因 watchdog 等锁而赢得成功。
-- App shutdown 先关闭 admission，把所有非终态持久化为 `interrupted`，释放 queued handle，随后取消/终止 retained Worker tree。
+- job deadline 从 source admission copy 开始计 30 分钟。cancel 先持久化 `cancelling`，再发送 exact `(jobId,generation)` frame，给 Worker 15 秒 cooperative settlement，之后 force-stop 并最多再等 10 秒确认 exact tree 已退出；cancel、timeout 与成功发布在同一 Manager lock 内裁决，发布 IO 后、写入成功终态前再次以 monotonic deadline 确定逻辑 commit time，超时不能因 watchdog 等锁而赢得成功。
+- App shutdown 先关闭 admission，把所有非终态持久化为 `interrupted`，释放 queued handle，随后发送 cancel 并给 retained Worker tree 10 秒 cooperative settlement；force-stop 后最多再等 10 秒。Worker 已发合法 terminal 时允许最多 30 秒自然退出，terminal 后挂起也必须由同一 `ChildTree` deadline 收敛。
 - Worker crash 不自动重试；当前 job 失败为 `DOCUMENT_WORKER_CRASHED`，用户显式重试会创建新 ID。
+- 结构化解析、native PDF 文本提取和渲染不占本地推理名额。Worker 只有在确认图片或具体 PDF 页需要 PP-OCR 时才发送 exact-generation `ocr_lease_requested`；Manager 从 App-global `LocalComputeCoordinator` 取得 `DocumentOcr` lease 后才回复 `grant_ocr_lease`，Worker 在此之前不能加载 OCR session 或执行 tensor inference。
+- Record live ASR 到达时，lease 的只读 yield signal 立即触发 exact OCR Worker generation cancel；15 秒仍未退出才 force-stop，并最多再等 10 秒。Document job 保持原 ID，authenticated staging 中的未发布内容被清空，私有输入重新准备后回到 FIFO；该过程不写 failed terminal、不发布 partial artifact。非 live workload 只影响下一次 admission，不抢占已运行 OCR。用户 cancel / App shutdown 与 yield 竞态时仍由 Document Manager 当前状态裁决，用户 cancel 优先。
 
 ## 私有 framed protocol
 
-Manager 与 Worker 使用 4-byte big-endian payload length + UTF-8 JSON；单 frame 最大 1 MiB。第一帧必须为 `start`，后续 Manager 只能发 `cancel`。Worker 必须依次发送一个 `ready`、零到多个 `progress`，以及恰好一个 `completed` 或 `failed`，之后 clean EOF。
+Manager 与 Worker 使用 4-byte big-endian payload length + UTF-8 JSON；单 frame 最大 1 MiB。第一帧必须为 `start`，后续 Manager 只可发 exact-generation `cancel`，或在收到唯一一次 `ocr_lease_requested` 后发 `grant_ocr_lease`。Worker 必须依次发送一个 `ready`、零到多个 `progress`、按需唯一一次 `ocr_lease_requested`，以及恰好一个 `completed` 或 `failed`，之后 clean EOF。`pagesOcr > 0` 与 lease request 必须严格对应；无 OCR 的 fast path 不得请求 lease。
 
 每帧都有 `protocolVersion`，所有响应都有 `jobId` 与 `workerGeneration`。Manager 只接受 exact identity 和固定 stage；`current/total/unit` 要么同时存在且是有效真实单位，要么全部省略，不传假百分比。旧 generation、畸形 JSON、空/超限 frame、截断 prefix/payload、ready 前 progress、重复 ready、重复终态、终态后消息或字段 shape 错误都返回 `DOCUMENT_WORKER_PROTOCOL_ERROR`；Worker 未给合法终态即退出才返回 `DOCUMENT_WORKER_CRASHED`。clean EOF 只有在一个 prefix byte 都没读到时成立。
 
-密码不进入 Worker argv、环境变量、job store、日志或 recovery command。它只出现在 CLI argv（用户已接受其 shell history/process-list 风险）、Sidecar/Rust 请求内存和 start frame；Rust secret wrapper Drop zeroize，Manager 写完 IPC 立即清除自己的副本，发送与接收 JSON buffer 写完/解析完立即 zeroize。恢复命令只使用 `<password>` 占位符。
+密码不进入 Worker argv、环境变量、job store、日志或 recovery command。它只出现在 CLI argv（用户已接受其 shell history/process-list 风险）、Sidecar/Rust 请求内存和 start frame；Rust secret wrapper Drop zeroize，发送与接收 JSON buffer 写完/解析完立即 zeroize。Manager 只在当前 admitted job 内存中保留一份 secret 到 terminal，以便 OCR 被 live ASR 抢占时重启同一 job 而不再次询问用户；job 结束、取消或失败时随 `PendingJob` Drop 清零。恢复命令只使用 `<password>` 占位符。
 
 ## 转换 pipeline
 
@@ -139,6 +141,8 @@ Adapter 负责 detector resize/normalize、DB bitmap/box filtering、crop/order�
 
 AnyDoc 自身 package entry、展开与 asset hard cap 继续生效。上限不是设置项或环境变量；修改必须有压力/性能证据并同步代码、help、测试和本文。
 
+两次容量 admission 都通过 Rust OS boundary 的 `filesystem_capacity::available_space(existing_path)` 查询目标路径所属文件系统，不枚举 mount、比较路径前缀或受其它未就绪卷影响。Manager 仍分别拥有 output/private 预算和 `DOCUMENT_INSUFFICIENT_DISK_SPACE` / `DOCUMENT_DISK_SPACE_UNAVAILABLE` 映射；共享 helper 不拥有业务错误或状态。
+
 ## 路径与 artifact 安全
 
 - CLI 仅做 cwd-relative lexical absolute resolution；Rust 才是 regular-file、链接、大小、权限、identity 与持久化 authority。
@@ -151,13 +155,13 @@ AnyDoc 自身 package entry、展开与 asset hard cap 继续生效。上限不�
 
 ## 随包资源与构建
 
-权威供应链锁为 `src-tauri/document-worker/resource-lock.json`，唯一 prepare owner 为 `scripts/prepare-document-processing.mjs`。`setup.sh`、`setup_windows.ps1`、macOS/Windows dev build、三平台 release build 与 `npm run tauri:dev` 都只能调用该 owner，不得各自实现下载、展开、Worker 构建或签名逻辑。
+权威供应链锁为 `src-tauri/document-worker/resource-lock.json`，App 原生推理资源的唯一顶层 prepare owner 为 `scripts/prepare-native-inference.mjs`。`setup.sh`、`setup_windows.ps1`、macOS/Windows dev build、三平台 release build 与 `npm run tauri:dev` 都只能调用该 owner，不得各自实现下载、展开、Worker 构建或签名逻辑。顶层 owner 在同一把仓库级锁下依次调用 document 与 speech capability preparer；`prepare-document-processing.mjs`、`prepare-speech-inference.mjs` 是内部能力构建器，不是新的 build 入口。二者通过 `document-processing-resource-cache.mjs` 共用 content-addressed 下载和 App-owned ORT authority。
 
 prepare owner 把生命周期分成三层：
 
 - `src-tauri/resources/document-processing-cache/downloads/` 是按锁定 digest 内容寻址的原始下载缓存；每次命中仍校验 regular file、size 与 SHA，损坏文件不得命中。旧版 `src-tauri/target/document-processing-cache` 中的有效原始文件仅作为一次性迁移源。
-- `.../prepared/<target>/<build-fingerprint>/` 是完整的已验证 bundle 缓存。fingerprint 覆盖 App 版本、target、resource lock、prepare/helper 源码、Worker/AnyDoc/office-crypto 源码与 Cargo lock、固定 Rust toolchain identity 和签名 identity/配置；只有这些输入完全相同时才能复用，因此版本发布或任一构建输入变化都会生成新 bundle，完全相同版本的 warm build 才不重复下载、展开、Worker build 或签名。
-- `src-tauri/resources/document-processing/v1` 只是当前 Tauri build 要快照的投影，不是缓存 authority。prepare 在仓库级跨进程锁内使用唯一 work/staging，完整校验 manifest 与所有 artifact 后才切换投影；切换失败会恢复上一份有效投影。
+- `.../prepared/<target>/<build-fingerprint>/` 与 `.../prepared-speech/<target>/<build-fingerprint>/` 是 document/speech 各自完整的已验证 bundle 缓存。fingerprint 覆盖 App 版本、target、resource lock、prepare/helper 源码、对应 Worker/adapter 源码与 Cargo lock、固定 Rust toolchain identity 和签名 identity/配置；只有这些输入完全相同时才能复用，因此版本发布或任一构建输入变化都会生成新 bundle，完全相同版本的 warm build 才不重复下载、展开、Worker build 或签名。
+- `src-tauri/resources/document-processing/v1` 与 `src-tauri/resources/speech-inference/v1` 只是当前 Tauri build 要快照的 capability 投影，不是缓存 authority。prepare 在仓库级跨进程锁内使用唯一 work/staging，完整校验 manifest 与所有 artifact 后才切换投影；切换失败会恢复上一份有效投影。speech manifest 只记录并校验 document projection 中的 ORT 绝对引用、revision、size 与 hash，不复制 ORT；其 Worker、sherpa adapter、sherpa C API 与 legal inventory 的 target-specific 安装增量硬上限为 80 MiB。
 
 持久缓存不入 Git，也不在 `npm run clean`/Cargo `target` 生命周期内；这是刻意的 repo-local derived cache，不读取用户级模型 cache，也不会随 App 打包。可用 `--offline` 验证全离线路径，缓存缺项时 fail closed；`--force` 只用于显式重建当前 fingerprint。构建 Worker 使用 `cargo build --locked --release --target ...`。macOS 有 signing identity 时先 codesign native 文件和 Worker；Windows 同时提供 `WINDOWS_SIGNTOOL_PATH` 与 `WINDOWS_CERTIFICATE_SHA1` 时先做 Authenticode 签名与验证。manifest 最后按签名后的实际 bytes 生成，并记录 fingerprint、每个 artifact 的来源及 signing kind/identity。
 
@@ -169,9 +173,11 @@ prepare owner 把生命周期分成三层：
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
 
-ONNX Runtime 官方 1.28 release 未提供 macOS x64 binary，因此该 target 从精确 commit `da9b5e364c465de65c49d91e696cd6485270757f`、固定 recipe 构建 x86_64 shared library；其余 target 使用锁定官方 archive。该源码路径由 prepare owner 在 cache miss 后、任何文档资源网络/源码 mutation 前统一检查 Git、Python 3.8+、CMake 3.28+ 与 Apple Clang；`--check-prerequisites` 提供给平台 build 做早期只读预检。已有有效 prepared bundle 时不要求源码工具，脚本也不自动安装系统包。PDFium 全部使用 `chromium/7999` 锁定 archive。安装资源同时包含 AnyDoc/Paddle/ORT/PDFium license 与 PDFium 第三方 license tree；顶层 `THIRD_PARTY_NOTICES.md` 保留组件分类。
+ONNX Runtime 官方 1.28 macOS arm64 archive 的最低系统版本是 macOS 14，且没有 macOS x64 binary；MyAgents 最低支持 macOS 13，因此两个 macOS target 都从精确 commit `da9b5e364c465de65c49d91e696cd6485270757f`、固定 recipe 与 deployment target 13.0 构建 shared library，其余 target 使用锁定官方 archive。该源码路径由 prepare owner 在 cache miss 后、任何资源网络/源码 mutation 前统一检查 Git、Python 3.8+、CMake 3.28+ 与 Apple Clang；`--check-prerequisites` 提供给平台 build 做早期只读预检。已有对应 fingerprint 的有效 prepared bundle 时不要求源码工具，脚本也不自动安装系统包。PDFium 全部使用 `chromium/7999` 锁定 archive。安装资源同时包含 AnyDoc/Paddle/ORT/PDFium license 与 PDFium 第三方 license tree；顶层 `THIRD_PARTY_NOTICES.md` 保留组件分类。speech 使用锁定 sherpa-onnx/codec 源码及其 legal tree，构建时显式关闭 CoreML 并链接上述同一 App-owned CPU ORT。
 
-App 启动时 Manager 校验 manifest target/pipeline、Worker 可执行位和 Worker/native/model/dictionary 的 size + SHA；资源问题只让 document admission fail closed，不阻止 MyAgents UI 启动。Worker 启动后再次校验它实际要加载的五个资源。运行时不得下载、访问 Hugging Face 或使用用户 cache。
+App 启动同步路径只解析 manifest，并校验 target/pipeline、路径、regular-file、size 与 Worker 可执行位，不读取 ORT、PDFium、OCR 模型或字典的完整正文。App ready 后先等 10 秒安静窗口，再由最低优先级 `BackgroundResourceValidation` lease 分块校验：共享 ORT 只由 `LocalInferenceRuntimeRegistry` 校验一次，Document Manager 校验 Worker/PDFium/OCR 模型/字典；Record live 到来时 chunk-level yield，稍后重新等待安静窗口再试。后台失败会阻止新的对应 admission，但不阻止 MyAgents UI 启动；Worker 启动后仍再次完整校验它实际要加载的五个资源并 fail closed。运行时不得下载、访问 Hugging Face 或使用用户 cache。
+
+speech 的用户可移除模型权重不属于本节的 build cache，也不进入 Tauri resource projection。它们由 `SpeechRecognitionManager` 在用户显式操作后写入 App data 下的版本目录；安装前仍复用本节同一 App-owned ORT identity，但下载/签名、模型最小加载、`active.json` 切换与 busy removal 由 speech domain owner 裁决。两者只共享受信任 runtime 和 compute lease，不共享 job store 或模型 activation authority。详见 [`recording_and_speech_recognition.md`](./recording_and_speech_recognition.md)。
 
 ## Skill 与 help 防漂移
 

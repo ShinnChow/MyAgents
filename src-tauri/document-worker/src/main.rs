@@ -10,10 +10,89 @@ use protocol::{
 use std::io;
 use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use zeroize::Zeroize;
+
+struct WorkerControl {
+    cancelled: AtomicBool,
+    ocr_lease_granted: AtomicBool,
+    changed: Condvar,
+    gate: Mutex<()>,
+}
+
+impl WorkerControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            ocr_lease_granted: AtomicBool::new(false),
+            changed: Condvar::new(),
+            gate: Mutex::new(()),
+        })
+    }
+
+    fn wait_for_ocr_lease(&self) -> Result<(), String> {
+        let mut guard = self
+            .gate
+            .lock()
+            .map_err(|_| "DOCUMENT_WORKER_PROTOCOL_ERROR".to_string())?;
+        loop {
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err("DOCUMENT_CANCELLED".into());
+            }
+            if self.ocr_lease_granted.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            guard = self
+                .changed
+                .wait(guard)
+                .map_err(|_| "DOCUMENT_WORKER_PROTOCOL_ERROR".to_string())?;
+        }
+    }
+}
+
+struct PipelineReporter<'a, W: io::Write> {
+    writer: &'a mut W,
+    job_id: &'a str,
+    generation: u64,
+    control: &'a WorkerControl,
+    ocr_lease_requested: bool,
+}
+
+impl<W: io::Write> pipeline::PipelineEvents for PipelineReporter<'_, W> {
+    fn progress(&mut self, stage: &str, _value: u8) {
+        let _ = write_frame(
+            self.writer,
+            &WorkerResponse::Progress {
+                protocol_version: PROTOCOL_VERSION,
+                job_id: self.job_id,
+                worker_generation: self.generation,
+                stage,
+                current: None,
+                total: None,
+                unit: None,
+            },
+        );
+    }
+
+    fn acquire_ocr_lease(&mut self) -> Result<(), String> {
+        if self.ocr_lease_requested {
+            return Err("DOCUMENT_WORKER_PROTOCOL_ERROR".into());
+        }
+        self.ocr_lease_requested = true;
+        write_frame(
+            self.writer,
+            &WorkerResponse::OcrLeaseRequested {
+                protocol_version: PROTOCOL_VERSION,
+                job_id: self.job_id,
+                worker_generation: self.generation,
+            },
+        )
+        .map_err(|_| "DOCUMENT_WORKER_PROTOCOL_ERROR".to_string())?;
+        self.control.wait_for_ocr_lease()
+    }
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -54,26 +133,44 @@ fn run() -> Result<(), String> {
         .map_err(|_| "failed to write ready frame".to_string())?;
     }
     drop(stdin);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let cancel_flag = cancelled.clone();
+    let control = WorkerControl::new();
+    let control_reader = Arc::clone(&control);
     let cancel_job = job_id.clone();
     std::thread::spawn(move || {
         let mut stdin = io::stdin().lock();
         while let Ok(Some(frame)) = read_frame(&mut stdin) {
-            let Ok(WorkerRequest::Cancel {
-                protocol_version,
-                job_id,
-                worker_generation,
-            }) = serde_json::from_slice::<WorkerRequest>(&frame)
-            else {
+            let Ok(request) = serde_json::from_slice::<WorkerRequest>(&frame) else {
                 continue;
             };
-            if protocol_version == PROTOCOL_VERSION
-                && job_id == cancel_job
-                && worker_generation == generation
-            {
-                cancel_flag.store(true, Ordering::Relaxed);
-                break;
+            match request {
+                WorkerRequest::Cancel {
+                    protocol_version,
+                    job_id,
+                    worker_generation,
+                } if protocol_version == PROTOCOL_VERSION
+                    && job_id == cancel_job
+                    && worker_generation == generation =>
+                {
+                    control_reader.cancelled.store(true, Ordering::Release);
+                    control_reader.changed.notify_all();
+                    break;
+                }
+                WorkerRequest::GrantOcrLease {
+                    protocol_version,
+                    job_id,
+                    worker_generation,
+                } if protocol_version == PROTOCOL_VERSION
+                    && job_id == cancel_job
+                    && worker_generation == generation =>
+                {
+                    control_reader
+                        .ocr_lease_granted
+                        .store(true, Ordering::Release);
+                    control_reader.changed.notify_all();
+                }
+                WorkerRequest::Start(_)
+                | WorkerRequest::Cancel { .. }
+                | WorkerRequest::GrantOcrLease { .. } => {}
             }
         }
     });
@@ -82,30 +179,28 @@ fn run() -> Result<(), String> {
         Ok(resources) => resources,
         Err(code) => return terminal_error(&job_id, generation, &code),
     };
+    if !runtime_identity_matches(&start.onnx_runtime_path, &resources.onnx_runtime) {
+        return terminal_error(&job_id, generation, "DOCUMENT_RESOURCE_MANIFEST_INVALID");
+    }
     let mut stdout = io::stdout().lock();
-    let mut progress = |stage: &str, _value: u8| {
-        let _ = write_frame(
-            &mut stdout,
-            &WorkerResponse::Progress {
-                protocol_version: PROTOCOL_VERSION,
-                job_id: &job_id,
-                worker_generation: generation,
-                stage,
-                current: None,
-                total: None,
-                unit: None,
-            },
-        );
+    let result = {
+        let mut reporter = PipelineReporter {
+            writer: &mut stdout,
+            job_id: &job_id,
+            generation,
+            control: &control,
+            ocr_lease_requested: false,
+        };
+        pipeline::convert(
+            Path::new(&start.input_path),
+            &start.source_name,
+            Path::new(&start.staging_path),
+            start.password.as_ref().map(|password| password.expose()),
+            &resources,
+            &control.cancelled,
+            &mut reporter,
+        )
     };
-    let result = pipeline::convert(
-        Path::new(&start.input_path),
-        &start.source_name,
-        Path::new(&start.staging_path),
-        start.password.as_ref().map(|password| password.expose()),
-        &resources,
-        &cancelled,
-        &mut progress,
-    );
     match result {
         Ok(output) => write_frame(
             &mut stdout,
@@ -136,6 +231,11 @@ fn run() -> Result<(), String> {
             .map_err(|_| "failed to write terminal frame".to_string())
         }
     }
+}
+
+fn runtime_identity_matches(requested: &str, verified: &Path) -> bool {
+    let requested = Path::new(requested);
+    requested.is_absolute() && requested == verified
 }
 
 fn terminal_error(job_id: &str, generation: u64, code: &str) -> Result<(), String> {
@@ -195,7 +295,7 @@ fn public_error_message(code: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::public_error_code;
+    use super::{public_error_code, runtime_identity_matches};
 
     #[test]
     fn internal_worker_failures_normalize_to_the_public_error_contract() {
@@ -215,5 +315,20 @@ mod tests {
             public_error_code("DOCUMENT_PDF_PAGE_COVERAGE_INVALID"),
             "DOCUMENT_WORKER_PROTOCOL_ERROR"
         );
+    }
+
+    #[test]
+    fn worker_accepts_only_the_manager_supplied_verified_runtime_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let verified = root.path().join("onnxruntime");
+        assert!(runtime_identity_matches(
+            verified.to_str().unwrap(),
+            &verified
+        ));
+        assert!(!runtime_identity_matches("relative/onnxruntime", &verified));
+        assert!(!runtime_identity_matches(
+            root.path().join("other").to_str().unwrap(),
+            &verified
+        ));
     }
 }

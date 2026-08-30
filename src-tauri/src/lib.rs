@@ -15,6 +15,9 @@ mod crash_artifact_retention;
 pub mod cron_task;
 pub mod device_identity;
 pub mod document_processing;
+mod durable_fs;
+mod durable_journal;
+mod filesystem_capacity;
 pub mod floating_ball;
 pub mod floating_ball_pets;
 mod global_shortcut;
@@ -26,6 +29,7 @@ mod keyed_lifecycle;
 pub mod legacy_upgrade;
 mod litellm_cache;
 pub mod local_http;
+pub mod local_inference;
 pub mod logger;
 #[cfg(target_os = "macos")]
 mod macos_arrow_filter;
@@ -34,6 +38,7 @@ mod macos_traffic_light;
 pub mod managed_codex;
 pub mod management_api;
 pub mod mcp_startup_admission;
+pub use myagents_media_worker_protocol as media_worker_protocol;
 pub mod memory_auto_update;
 pub mod memory_evolution;
 pub mod notification;
@@ -43,6 +48,10 @@ pub mod process_cleanup;
 pub mod process_cmd;
 mod proxy_config;
 mod proxy_spill;
+pub mod record;
+mod record_analytics;
+pub mod recording;
+mod resource_signature;
 pub mod runtime_launch_guard;
 pub mod search;
 pub mod session_goal;
@@ -51,6 +60,10 @@ pub mod session_visibility;
 mod sidecar;
 pub mod space_cloud;
 mod space_cloud_mock;
+#[path = "../media-worker/src/model_pack_source.rs"]
+pub mod speech_model_pack;
+mod speech_model_pack_manager;
+pub mod speech_recognition;
 mod sse_proxy;
 pub mod system_binary;
 pub mod task;
@@ -210,6 +223,10 @@ fn classify_navigation(url: &Url) -> NavDecision {
     NavDecision::BlockSilently
 }
 
+fn should_request_exit_confirmation(code: Option<i32>, confirmed: bool) -> bool {
+    code != Some(tauri::RESTART_EXIT_CODE) && !confirmed
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // ── DIAGNOSTIC PANIC HOOK (April 2026 crash investigation) ─────────────
@@ -278,6 +295,9 @@ pub fn run() {
     let cleanup_done_for_wakelock_monitor = cleanup_done.clone();
     let cleanup_done_for_agent_monitor = cleanup_done.clone();
     let cleanup_done_for_terminal_forwarder = cleanup_done.clone();
+    let frontend_exit_confirmed = Arc::new(AtomicBool::new(false));
+    let frontend_exit_confirmed_for_setup = frontend_exit_confirmed.clone();
+    let frontend_exit_confirmed_for_exit = frontend_exit_confirmed.clone();
 
     // Create terminal manager state
     let terminal_state = terminal::TerminalManager::new();
@@ -287,15 +307,21 @@ pub fn run() {
     let browser_state = browser::BrowserManager::new();
     let browser_state_for_exit = browser_state.clone();
 
-    // Create Task Center state (v0.1.69 — thought & task stores)
+    // RecordStore is the sole authority for both canonical Records and the
+    // legacy Thought compatibility surface. Its startup adapter migrates old
+    // Thought files before the in-memory snapshot becomes visible.
     let data_dir = app_dirs::myagents_data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let thought_state: thought::ManagedThoughtStore =
-        Arc::new(thought::ThoughtStore::new(data_dir.join("thoughts")));
+    let record_state: record::ManagedRecordStore = Arc::new(record::RecordStore::new(
+        data_dir.join("records"),
+        Some(data_dir.join("thoughts")),
+    ));
+    record::set_record_store(record_state.clone());
+    let recording_state = recording::RecordingManager::new(record_state.clone());
+    let recording_state_for_exit = recording_state.clone();
     let task_state: task::ManagedTaskStore = Arc::new(task::TaskStore::new(data_dir.clone()));
     // Expose the same Arcs via OnceLock singletons so the Rust Management API
     // (used by Bun CLI bridge → /api/admin/task/*) can read/write tasks without
     // access to Tauri `State`. They point at the same inner store.
-    thought::set_thought_store(thought_state.clone());
     task::set_task_store(task_state.clone());
 
     // Create SSE proxy state
@@ -378,7 +404,8 @@ pub fn run() {
         .manage(agent_state)
         .manage(terminal_state)
         .manage(browser_state)
-        .manage(thought_state)
+        .manage(record_state)
+        .manage(recording_state)
         .manage(task_state)
         .manage(app_route_queue)
         .manage(notification_center)
@@ -445,6 +472,10 @@ pub fn run() {
             managed_codex::cmd_managed_codex_login_status,
             managed_codex::cmd_managed_codex_login,
             managed_codex::cmd_managed_codex_logout,
+            speech_recognition::cmd_speech_model_pack_status,
+            speech_recognition::cmd_speech_model_pack_install,
+            speech_recognition::cmd_speech_model_pack_remove,
+            speech_recognition::cmd_speech_record_transcribe,
             grok_auth::cmd_grok_auth_status,
             grok_auth::cmd_grok_login_start,
             grok_auth::cmd_grok_login_status,
@@ -659,12 +690,44 @@ pub fn run() {
             workspace_files::watcher::cmd_workspace_watch_stop,
             // Full-text search commands
             search::cmd_search_sessions,
+            search::cmd_search_records,
             search::cmd_search_workspace_files,
             search::cmd_search_index_status,
             search::cmd_invalidate_workspace_index,
             search::cmd_refresh_workspace_index,
             search::cmd_search_thoughts,
             search::cmd_search_tasks,
+            // Canonical Record commands.
+            record::cmd_record_create,
+            record::cmd_record_list,
+            record::cmd_record_get,
+            record::cmd_record_discussion_context,
+            record::cmd_record_transcript,
+            record::cmd_record_transcript_delta,
+            record::cmd_record_diarization,
+            record::cmd_record_rename_speaker,
+            record::cmd_record_merge_speakers,
+            record::cmd_record_reassign_segment_speaker,
+            record::cmd_record_timeline,
+            record::cmd_record_add_note,
+            record::cmd_record_add_mark,
+            record::cmd_record_update_note,
+            record::cmd_record_delete_timeline_item,
+            record::cmd_record_update_text,
+            record::cmd_record_update_audio_metadata,
+            record::cmd_record_export_audio,
+            record::cmd_record_export_text,
+            record::cmd_record_set_archived,
+            record::cmd_record_delete,
+            record::cmd_record_merge_text,
+            record_analytics::cmd_record_analytics_bridge_ready,
+            recording::manager::cmd_recording_snapshot,
+            recording::manager::cmd_recording_start,
+            recording::manager::cmd_recording_pause,
+            recording::manager::cmd_recording_resume,
+            recording::manager::cmd_recording_set_source_enabled,
+            recording::manager::cmd_recording_stop,
+            recording::privacy_settings::cmd_open_recording_privacy_settings,
             // Task Center — Thought commands (v0.1.69)
             thought::cmd_thought_create,
             thought::cmd_thought_list,
@@ -739,7 +802,7 @@ pub fn run() {
             // PRD 0.2.35 — global "always-on" wake-lock toggle
             wake_lock::cmd_set_force_wake_lock,
         ])
-        .setup(|app| {
+        .setup(move |app| {
             // Initialize logging before acquire_lock() and cleanup_stale_sidecars()
             // because those paths need a logger backend for log::warn!/info! calls.
             use tauri_plugin_log::{Target, TargetKind};
@@ -771,6 +834,80 @@ pub fn run() {
             // calls (extremely early startup) fall back to a synchronous
             // append protected by a mutex.
             logger::init_buffered_writer();
+            let analytics_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut milestones = record_analytics::subscribe();
+                loop {
+                    match milestones.recv().await {
+                        Ok(milestone) => {
+                            if let Err(error) =
+                                analytics_handle.emit(record_analytics::TAURI_EVENT, milestone)
+                            {
+                                ulog_warn!(
+                                    "[analytics] failed to emit Record milestone: {}",
+                                    error
+                                );
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            ulog_warn!(
+                                "[analytics] Record milestone bridge lagged; skipped {} events",
+                                skipped
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            let record_store = app.state::<record::ManagedRecordStore>().inner().clone();
+            let record_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut changes = record_store.subscribe_changes();
+                loop {
+                    match changes.recv().await {
+                        Ok(change) => {
+                            if let Err(error) = record_handle.emit("record:changed", change) {
+                                ulog_warn!("[record] failed to emit state change: {}", error);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            ulog_warn!(
+                                "[record] UI event bridge lagged; skipped {} state changes",
+                                skipped
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+            let recording_manager = app
+                .state::<recording::ManagedRecordingManager>()
+                .inner()
+                .clone();
+            let recording_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut changes = recording_manager.subscribe_changes();
+                loop {
+                    match changes.recv().await {
+                        Ok(change) => {
+                            tray::set_recording_projection(
+                                &recording_handle,
+                                change.snapshot.as_ref().map(|snapshot| snapshot.record_id.clone()),
+                            );
+                            if let Err(error) = recording_handle.emit("recording:changed", change) {
+                                ulog_warn!("[recording] failed to emit state change: {}", error);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            ulog_warn!(
+                                "[recording] UI event bridge lagged; skipped {} state changes",
+                                skipped
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
             // Only users who completed the explicit first install have opted
             // into Browser resources. Future app-locked revisions maintain
             // themselves in the background; a never-installed app stays idle.
@@ -1142,6 +1279,8 @@ pub fn run() {
             let app_handle_for_tray = app.handle().clone();
             app.listen("tray:confirm-exit", move |_| {
                 ulog_info!("[App] Frontend confirmed exit, delegating to run-loop cleanup");
+                frontend_exit_confirmed_for_setup
+                    .store(true, std::sync::atomic::Ordering::Release);
                 app_handle_for_tray.exit(0);
             });
 
@@ -1255,14 +1394,36 @@ pub fn run() {
             // The Desktop App owns one global document queue and at most one
             // isolated Worker. Initialize it before the Management API starts
             // so every Sidecar observes the same durable job authority.
+            let compute_coordinator = local_inference::LocalComputeCoordinator::new();
+            if let Err(error) = local_inference::set_global_compute_coordinator(
+                compute_coordinator.clone(),
+            ) {
+                ulog_error!("[local-inference] Failed to register compute coordinator: {}", error);
+            } else {
+                app.manage(compute_coordinator.clone());
+            }
             match app.path().resource_dir() {
                 Ok(resource_dir) => {
                     let resource_dir = sidecar::normalize_external_path(resource_dir);
+                    let runtime_registry =
+                        local_inference::LocalInferenceRuntimeRegistry::initialize(&resource_dir);
+                    if let Err(error) = local_inference::set_global_runtime_registry(
+                        runtime_registry.clone(),
+                    ) {
+                        ulog_error!(
+                            "[local-inference] Failed to register runtime registry: {}",
+                            error
+                        );
+                    } else {
+                        app.manage(runtime_registry.clone());
+                    }
                     match app_dirs::myagents_data_dir() {
                         Some(data_dir) => {
                             match document_processing::DocumentProcessingManager::initialize(
-                                data_dir,
-                                resource_dir,
+                                data_dir.clone(),
+                                resource_dir.clone(),
+                                runtime_registry.clone(),
+                                compute_coordinator.clone(),
                             ) {
                                 Ok(manager) => {
                                     if let Err(error) =
@@ -1283,6 +1444,34 @@ pub fn run() {
                                     );
                                 }
                             }
+                            match speech_recognition::SpeechRecognitionManager::initialize(
+                                data_dir,
+                                resource_dir,
+                                runtime_registry.clone(),
+                                compute_coordinator.clone(),
+                                record::get_record_store()
+                                    .expect("RecordStore initialized before Tauri setup")
+                                    .clone(),
+                            ) {
+                                Ok(manager) => {
+                                    if let Err(error) =
+                                        speech_recognition::set_global(manager.clone())
+                                    {
+                                        ulog_error!(
+                                            "[speech] Failed to register manager: {}",
+                                            error
+                                        );
+                                    } else {
+                                        app.manage(manager);
+                                    }
+                                }
+                                Err(error) => {
+                                    ulog_error!(
+                                        "[speech] Failed to initialize manager: {}",
+                                        error
+                                    );
+                                }
+                            }
                         }
                         None => {
                             ulog_error!(
@@ -1295,6 +1484,18 @@ pub fn run() {
                     ulog_error!("[document] Failed to resolve resource directory: {}", error);
                 }
             }
+
+            // Recovery runs after speech registration so a capture that had
+            // already admitted live transcription can enqueue its exact
+            // permanent-audio backfill. Historical recordings that never
+            // started transcription remain untouched.
+            let recording_manager = app
+                .state::<recording::ManagedRecordingManager>()
+                .inner()
+                .clone();
+            tauri::async_runtime::spawn(async move {
+                recording_manager.recover_interrupted().await;
+            });
 
             // Subscribe before automation recovery can create or release a
             // Session Sidecar. The receiver buffers the short gap until its
@@ -1366,7 +1567,7 @@ pub fn run() {
             if let Some(data_dir) = app_dirs::myagents_data_dir() {
                 match search::SearchEngine::new(data_dir) {
                     Ok(engine) => {
-                        engine.start_background_indexing();
+                        engine.start_background_indexing(app.handle().clone());
                         app.manage(Arc::new(engine));
                         ulog_info!("[App] SearchEngine initialized");
                     }
@@ -1514,8 +1715,48 @@ pub fn run() {
     // Run with event handler to catch Cmd+Q, Dock quit, and Dock click
     app.run(move |_app_handle, event| {
         match event {
+            tauri::RunEvent::Ready => {
+                if let (Some(runtime_registry), Some(compute_coordinator)) = (
+                    local_inference::global_runtime_registry(),
+                    local_inference::global_compute_coordinator(),
+                ) {
+                    runtime_registry
+                        .start_background_verification(Arc::clone(compute_coordinator));
+                }
+                if let Some(manager) = document_processing::global() {
+                    manager.start_background_resource_validation();
+                }
+                if let Some(manager) = speech_recognition::global() {
+                    manager.start_background_resource_validation();
+                }
+            }
             // Handle app exit events (Cmd+Q, Dock right-click quit, etc.)
-            tauri::RunEvent::ExitRequested { code, .. } => {
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
+                if should_request_exit_confirmation(
+                    code,
+                    frontend_exit_confirmed_for_exit
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    api.prevent_exit();
+                    tray::show_main_window(_app_handle);
+                    if let Err(error) = _app_handle.emit("tray:exit-requested", ()) {
+                        ulog_error!(
+                            "[App] failed to route native exit request to the frontend: {}",
+                            error
+                        );
+                    }
+                    return;
+                }
+                if let Err(error) = tauri::async_runtime::block_on(
+                    recording_state_for_exit.stop_for_app_exit(),
+                ) {
+                    ulog_error!(
+                        "[recording] app exit blocked because capture finalization is not durable: {}",
+                        error
+                    );
+                    api.prevent_exit();
+                    return;
+                }
                 // Only cleanup once (Relaxed is sufficient for simple flag)
                 use std::sync::atomic::Ordering::Relaxed;
                 if !cleanup_done_for_exit.swap(true, Relaxed) {
@@ -1549,6 +1790,15 @@ pub fn run() {
                         if let Err(error) = manager.shutdown() {
                             ulog_error!(
                                 "[document] shutdown failed reason={} error={}",
+                                shutdown_reason,
+                                error
+                            );
+                        }
+                    }
+                    if let Some(manager) = speech_recognition::global() {
+                        if let Err(error) = manager.shutdown() {
+                            ulog_error!(
+                                "[speech] shutdown failed reason={} error={}",
                                 shutdown_reason,
                                 error
                             );
@@ -1613,15 +1863,26 @@ pub fn run() {
 #[cfg(test)]
 mod nav_guard_tests {
     use super::{
-        classify_navigation, theme_bootstrap_paper, theme_bootstrap_script, NavDecision,
-        THEME_BOOTSTRAP_APPEARANCE_MARKER, THEME_BOOTSTRAP_RUN_ID_MARKER,
-        THEME_BOOTSTRAP_WINDOW_LABEL_MARKER,
+        classify_navigation, should_request_exit_confirmation, theme_bootstrap_paper,
+        theme_bootstrap_script, NavDecision, THEME_BOOTSTRAP_APPEARANCE_MARKER,
+        THEME_BOOTSTRAP_RUN_ID_MARKER, THEME_BOOTSTRAP_WINDOW_LABEL_MARKER,
     };
     use crate::config_io::ThemeBootstrapSelection;
     use tauri::{utils::config::Color, Theme, Url};
 
     fn decide(s: &str) -> NavDecision {
         classify_navigation(&Url::parse(s).expect("parse url"))
+    }
+
+    #[test]
+    fn native_exit_requires_the_shared_frontend_confirmation_except_for_restart() {
+        assert!(should_request_exit_confirmation(None, false));
+        assert!(should_request_exit_confirmation(Some(0), false));
+        assert!(!should_request_exit_confirmation(None, true));
+        assert!(!should_request_exit_confirmation(
+            Some(tauri::RESTART_EXIT_CODE),
+            false
+        ));
     }
 
     #[test]
@@ -1756,7 +2017,7 @@ mod nav_guard_tests {
         }
 
         let exit_handler = source
-            .split_once("tauri::RunEvent::ExitRequested { code, .. } => {")
+            .split_once("tauri::RunEvent::ExitRequested { code, api, .. } => {")
             .and_then(|(_, tail)| tail.split_once("// Handle Dock icon click on macOS"))
             .map(|(handler, _)| handler)
             .expect("app exit handler source");

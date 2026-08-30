@@ -178,6 +178,12 @@ Bridge 在流式阶段只保留三种终止权：下游明确取消、真实 tra
 `[DONE]`，Responses 以 `response.completed` / `response.failed` 结束下游并释放仍 linger 的 upstream
 socket，不等待 TCP EOF。禁止重新增加 stream byte-idle timer、用户可配置 body timeout 或伪 heartbeat。
 
+### OpenAI Bridge 错误与重试语义
+
+OpenAI→Anthropic translator 是上游错误 status/code/type/message 变成 SDK 可执行语义的唯一 owner。它在 wire 投影前形成结构化 failure fact：原始 429 默认保持 `429/rate_limit_error`，由 Claude Agent SDK 拥有同一次 API 请求的 retry lifecycle；只有结构化 `insufficient_quota` / `billing_not_active` 等 code/type，或明确 payment、billing hard-limit、余额不足证据，才把 429 投影为非重试的 402。泛化的 `quota exceeded` 文案不能单独获得永久失败 authority，因为 Provider 也会用它表达短时并发或窗口配额。
+
+上游直接 402 仍按永久失败处理。产品 Turn lifecycle 不为 API error 建立第二套 retry/replay；`api_retry` 继续来自 SDK。Provider verify 读取 Bridge 已投影的结构化 status：429 只在当次响应携带 `retryable`，Settings 显示稍后重试且不覆盖既有 `providerVerifyStatus=valid`；不新增持久化第三态、retry cache 或 coordinator。错误日志只记录 classification/evidence，不记录凭据或请求正文。
+
 ### Runtime-backed Provider（Managed Codex）
 
 `codex-sub` 是 Provider 列表中的订阅型入口，但它不 materialize 为 Claude Agent SDK 的 `ProviderEnv`。它的 `Provider.execution.kind === 'runtime-backed'`，选择后会生成 `RuntimeBackedProviderIdentity { providerId:'codex-sub', runtime:'codex', runtimeSource:'managed-provider', model }`，由 Sidecar 以 Codex Runtime 执行。

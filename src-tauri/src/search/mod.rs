@@ -11,6 +11,7 @@
 //! `SidecarManager` and `TaskStore`.
 
 mod file_indexer;
+mod record_indexer;
 mod schema;
 mod searcher;
 mod session_indexer;
@@ -21,9 +22,10 @@ mod watcher;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::Emitter;
 
 use crate::workspace_files::path_safety::validate_workspace_root;
-use crate::{ulog_error, ulog_info};
+use crate::{ulog_error, ulog_info, ulog_warn};
 
 pub use searcher::{
     FileMatchLine, FileSearchHit, FileSearchResult, SessionSearchHit, SessionSearchResult,
@@ -45,6 +47,7 @@ pub use searcher::{
 pub struct SearchEngine {
     data_dir: PathBuf,
     session_index: Arc<session_indexer::SessionIndex>,
+    record_index: Arc<record_indexer::RecordIndex>,
     file_indices: Arc<file_indexer::FileIndexManager>,
 }
 
@@ -58,12 +61,15 @@ impl SearchEngine {
         let session_index =
             session_indexer::SessionIndex::new(index_dir.join("sessions"), data_dir.clone())
                 .map_err(|e| format!("Failed to create session index: {}", e))?;
+        let record_index = record_indexer::RecordIndex::new(index_dir.join("records"))
+            .map_err(|e| format!("Failed to create Record index: {}", e))?;
 
         let file_manager = file_indexer::FileIndexManager::new(index_dir.join("workspaces"));
 
         Ok(Self {
             data_dir,
             session_index: Arc::new(session_index),
+            record_index: Arc::new(record_index),
             file_indices: Arc::new(file_manager),
         })
     }
@@ -76,9 +82,74 @@ impl SearchEngine {
     /// `tokio::spawn` would panic and, because `.setup()` is invoked through an
     /// ObjC callback on macOS, the panic cannot unwind across the FFI boundary
     /// and aborts the process (`panic_cannot_unwind` in `did_finish_launching`).
-    pub fn start_background_indexing(&self) {
+    pub fn start_background_indexing(&self, app_handle: tauri::AppHandle) {
         let data_dir = self.data_dir.clone();
         let session_index = self.session_index.clone();
+
+        if let Some(store) = crate::record::get_record_store().cloned() {
+            let mut changes = store.subscribe_changes();
+            let record_index = self.record_index.clone();
+            tauri::async_runtime::spawn(async move {
+                let baseline = store.all_search_documents().await;
+                match record_index.rebuild(&baseline) {
+                    Ok(()) => {
+                        let _ = app_handle.emit("record-search-index-ready", ());
+                        ulog_info!(
+                            "[search] Record baseline ready: {} search document(s)",
+                            baseline.len()
+                        );
+                    }
+                    Err(error) => {
+                        ulog_error!("[search] Record baseline indexing failed: {}", error);
+                    }
+                }
+
+                loop {
+                    match changes.recv().await {
+                        Ok(change) => {
+                            let result = match change.kind {
+                                crate::record::RecordChangeKind::Upsert => {
+                                    match store.search_documents(&change.id).await {
+                                        Ok(documents) => {
+                                            record_index.upsert(&change.id, &documents)
+                                        }
+                                        Err(error) if error.starts_with("Record not found:") => {
+                                            record_index.delete(&change.id)
+                                        }
+                                        Err(error) => Err(error),
+                                    }
+                                }
+                                crate::record::RecordChangeKind::Delete => {
+                                    record_index.delete(&change.id)
+                                }
+                                crate::record::RecordChangeKind::Transcript => Ok(()),
+                            };
+                            if let Err(error) = result {
+                                ulog_error!(
+                                    "[search] Record change {} (sequence {}) failed: {}",
+                                    change.id,
+                                    change.sequence,
+                                    error
+                                );
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            ulog_warn!(
+                                "[search] Record observer lagged by {} event(s); rebuilding",
+                                count
+                            );
+                            let snapshot = store.all_search_documents().await;
+                            if let Err(error) = record_index.rebuild(&snapshot) {
+                                ulog_error!("[search] Record lag recovery failed: {}", error);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        } else {
+            ulog_error!("[search] RecordStore unavailable; Record index observer not started");
+        }
 
         tauri::async_runtime::spawn(async move {
             ulog_info!("[search] Starting background session indexing...");
@@ -136,6 +207,22 @@ impl SearchEngine {
         self.session_index.search(query, limit)
     }
 
+    pub async fn search_records(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<RecordSearchResult, String> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(RecordSearchResult {
+                hits: Vec::new(),
+                total: 0,
+                query_time_ms: 0.0,
+            });
+        }
+        self.record_index.search(query, limit)
+    }
+
     /// Search workspace files (name + content).
     pub async fn search_files(
         &self,
@@ -158,6 +245,7 @@ impl SearchEngine {
     pub async fn get_status(&self) -> Result<IndexStatus, String> {
         Ok(IndexStatus {
             session_doc_count: self.session_index.doc_count()?,
+            record_doc_count: self.record_index.doc_count()?,
             index_dir: self.data_dir.join("search_index").display().to_string(),
         })
     }
@@ -199,7 +287,7 @@ impl SearchEngine {
         query: &str,
         limit: usize,
     ) -> Result<ThoughtSearchResult, String> {
-        let Some(store) = crate::thought::get_thought_store() else {
+        let Some(store) = crate::record::get_record_store() else {
             return Ok(ThoughtSearchResult {
                 hits: vec![],
                 total: 0,
@@ -208,11 +296,13 @@ impl SearchEngine {
         let start = std::time::Instant::now();
         // Search intentionally spans archived thoughts too (v0.2.16 PRD
         // §2.2 decision 4 — mailbox-archive semantics). The default
-        // ThoughtListFilter hides archived since v0.2.16, so we have to
+        // The compatibility search is text-only but reads the canonical
+        // RecordStore and intentionally spans archived Records.
         // ask for `All` explicitly here.
         let all = store
-            .list(crate::thought::ThoughtListFilter {
-                archived: Some(crate::thought::ThoughtArchiveFilter::All),
+            .list_full(crate::record::RecordListFilter {
+                kind: Some(crate::record::RecordKind::Text),
+                archived: Some(crate::record::RecordArchiveFilter::All),
                 ..Default::default()
             })
             .await;
@@ -223,7 +313,11 @@ impl SearchEngine {
                 if needle.is_empty() {
                     return true;
                 }
-                t.content.to_lowercase().contains(&needle)
+                t.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&needle)
                     || t.tags
                         .iter()
                         .any(|tag| tag.to_lowercase().contains(&needle))
@@ -231,7 +325,7 @@ impl SearchEngine {
             .take(limit)
             .map(|t| ThoughtSearchHit {
                 id: t.id,
-                snippet: make_snippet(&t.content, &needle, 180),
+                snippet: make_snippet(t.content.as_deref().unwrap_or_default(), &needle, 180),
                 tags: t.tags,
                 updated_at: t.updated_at,
             })
@@ -387,6 +481,24 @@ pub struct ThoughtSearchHit {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSearchResult {
+    pub hits: Vec<RecordSearchHit>,
+    pub total: usize,
+    pub query_time_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordSearchHit {
+    pub record_id: String,
+    pub kind: String,
+    pub title: String,
+    pub snippet: String,
+    pub media_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TaskSearchResult {
     pub hits: Vec<TaskSearchHit>,
     pub total: u64,
@@ -407,6 +519,7 @@ pub struct TaskSearchHit {
 #[derive(Debug, Serialize)]
 pub struct IndexStatus {
     pub session_doc_count: u64,
+    pub record_doc_count: u64,
     pub index_dir: String,
 }
 
@@ -428,6 +541,15 @@ pub async fn cmd_search_sessions(
         });
     }
     state.search_sessions(query, limit.unwrap_or(50)).await
+}
+
+#[tauri::command]
+pub async fn cmd_search_records(
+    state: tauri::State<'_, Arc<SearchEngine>>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<RecordSearchResult, String> {
+    state.search_records(&query, limit.unwrap_or(50)).await
 }
 
 /// Search workspace files.

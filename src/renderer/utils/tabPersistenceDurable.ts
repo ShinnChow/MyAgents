@@ -52,7 +52,7 @@ async function clearDurable(path: string): Promise<void> {
     }
 }
 
-/** Durably persist the current open chat tabs right before an abrupt
+/** Durably persist the current open Chat / Record tabs right before an abrupt
  *  update-restart. AWAITED by handleRestartAndUpdate so the fsync completes
  *  before the process exits. Clears the snapshot when nothing is restorable
  *  (e.g. only a launcher tab is open) so the next boot won't resurrect tabs the

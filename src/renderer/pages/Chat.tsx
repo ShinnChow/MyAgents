@@ -3330,7 +3330,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     chatSearchSetQueryRef.current('');
   }, []);
   // Esc / Cmd+W closes the panel first. z-index 100 sits between the split
-  // panel (0) and overlay layers (200+), matching the DESIGN.md layer system.
+  // panel (0) and overlay layers (200+), matching the shared overlay hierarchy.
   useCloseLayer(() => {
     if (!chatSearchOpen) return false;
     closeChatSearch();

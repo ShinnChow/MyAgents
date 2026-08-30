@@ -1,5 +1,5 @@
 //! Narrow application owner for Task mutations that cross TaskStore,
-//! scheduler, and ThoughtStore boundaries.
+//! scheduler, and RecordStore boundaries.
 //!
 //! Transports stamp caller identity and map DTOs/errors. Compatibility and
 //! system domains call these use cases directly instead of importing an HTTP
@@ -8,13 +8,13 @@
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
+use crate::record::RecordStore;
 use crate::task::{
     StatusTransition, Task, TaskComment, TaskCommentAdmissionState, TaskCommentAuthor,
     TaskCreateAttachedInput, TaskCreateDirectInput, TaskStatus, TaskStore, TaskUpdateInput,
     TaskUpdateStatusInput,
 };
 use crate::task_scheduler::TaskControlGuard;
-use crate::thought::ThoughtStore;
 use crate::ulog_warn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -125,20 +125,20 @@ pub struct TaskStatusMutationResult {
 
 pub struct TaskApplication<'a> {
     tasks: &'a TaskStore,
-    thoughts: Option<&'a ThoughtStore>,
+    records: Option<&'a RecordStore>,
 }
 
 impl<'a> TaskApplication<'a> {
-    pub fn new(tasks: &'a TaskStore, thoughts: Option<&'a ThoughtStore>) -> Self {
-        Self { tasks, thoughts }
+    pub fn new(tasks: &'a TaskStore, records: Option<&'a RecordStore>) -> Self {
+        Self { tasks, records }
     }
 
     pub fn from_globals() -> Result<TaskApplication<'static>, TaskApplicationError> {
         let tasks = crate::task::get_task_store()
             .map(std::sync::Arc::as_ref)
             .ok_or_else(TaskApplicationError::store_unavailable)?;
-        let thoughts = crate::thought::get_thought_store().map(std::sync::Arc::as_ref);
-        Ok(TaskApplication::new(tasks, thoughts))
+        let records = crate::record::get_record_store().map(std::sync::Arc::as_ref);
+        Ok(TaskApplication::new(tasks, records))
     }
 
     async fn ordinary_task(&self, task_id: &str) -> Result<Task, TaskApplicationError> {
@@ -163,31 +163,31 @@ impl<'a> TaskApplication<'a> {
             .ok_or_else(|| TaskApplicationError::not_found(task_id))
     }
 
-    async fn link_source_thought(&self, task: &Task) {
-        let (Some(thought_id), Some(thoughts)) = (task.source_thought_id.as_deref(), self.thoughts)
+    async fn link_source_record(&self, task: &Task) {
+        let (Some(record_id), Some(records)) = (task.source_record_id.as_deref(), self.records)
         else {
             return;
         };
-        if let Err(error) = thoughts.link_task(thought_id, &task.id).await {
+        if let Err(error) = records.link_task(record_id, &task.id).await {
             // Preserve the established partial-success contract: Task is the
             // durable primary fact and a Thought projection failure is visible
             // in logs without rolling the Task back.
             ulog_warn!(
-                "[task-application] created {} but thought link failed: {}",
+                "[task-application] created {} but Record link failed: {}",
                 task.id,
                 error
             );
         }
     }
 
-    async fn unlink_source_thought(&self, task: &Task) {
-        let (Some(thought_id), Some(thoughts)) = (task.source_thought_id.as_deref(), self.thoughts)
+    async fn unlink_source_record(&self, task: &Task) {
+        let (Some(record_id), Some(records)) = (task.source_record_id.as_deref(), self.records)
         else {
             return;
         };
-        if let Err(error) = thoughts.unlink_task(thought_id, &task.id).await {
+        if let Err(error) = records.unlink_task(record_id, &task.id).await {
             ulog_warn!(
-                "[task-application] deleted {} but thought unlink failed: {}",
+                "[task-application] deleted {} but Record unlink failed: {}",
                 task.id,
                 error
             );
@@ -217,7 +217,7 @@ impl<'a> TaskApplication<'a> {
             .create_direct_with_origin(input, actor, source)
             .await
             .map_err(TaskApplicationError::mutation)?;
-        self.link_source_thought(&task).await;
+        self.link_source_record(&task).await;
         Ok(task)
     }
 
@@ -639,7 +639,7 @@ impl<'a> TaskApplication<'a> {
             .delete_with_origin(&task.id, actor, source)
             .await
             .map_err(TaskApplicationError::mutation)?;
-        self.unlink_source_thought(&task).await;
+        self.unlink_source_record(&task).await;
         Ok(())
     }
 
@@ -896,11 +896,11 @@ impl<'a> TaskApplication<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::record::{RecordStore, TextRecordCreateInput};
     use crate::task::{
         TaskDispatchOrigin, TaskExecutionMode, TaskExecutor, TaskRunMode, TaskStatus,
         TransitionActor, TransitionSource,
     };
-    use crate::thought::{ThoughtCreateInput, ThoughtStore};
     use tempfile::tempdir;
 
     fn direct_input(workspace: &std::path::Path) -> TaskCreateDirectInput {
@@ -929,39 +929,39 @@ mod tests {
             runtime_config: None,
             mcp_enabled_servers: None,
             managed_kind: None,
-            source_thought_id: None,
+            source_record_id: None,
             tags: Vec::new(),
             notification: None,
         }
     }
 
     #[tokio::test]
-    async fn create_and_delete_share_thought_projection_policy() {
+    async fn create_and_delete_share_record_projection_policy() {
         let temp = tempdir().unwrap();
         let tasks = TaskStore::new(temp.path().join("task-store"));
-        let thoughts = ThoughtStore::new(temp.path().join("thought-store"));
-        let thought = thoughts
-            .create(ThoughtCreateInput {
-                content: "Source thought".to_string(),
+        let records = RecordStore::new(temp.path().join("record-store"), None);
+        let record = records
+            .create_text(TextRecordCreateInput {
+                content: "Source Record".to_string(),
                 images: Vec::new(),
             })
             .await
             .unwrap();
-        let application = TaskApplication::new(&tasks, Some(&thoughts));
+        let application = TaskApplication::new(&tasks, Some(&records));
         let mut input = direct_input(temp.path());
-        input.source_thought_id = Some(thought.id.clone());
+        input.source_record_id = Some(record.id.clone());
 
         let created = application.create_direct(input).await.unwrap();
-        assert!(thoughts
-            .get(&thought.id)
+        assert!(records
+            .get(&record.id)
             .await
             .unwrap()
             .converted_task_ids
             .contains(&created.id));
 
         application.delete_ordinary(&created.id).await.unwrap();
-        assert!(!thoughts
-            .get(&thought.id)
+        assert!(!records
+            .get(&record.id)
             .await
             .unwrap()
             .converted_task_ids

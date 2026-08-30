@@ -114,6 +114,8 @@ src-tauri/target/x86_64-pc-windows-msvc/debug/myagents.exe
 
 `build_dev_win.ps1` 会清理 `debug/resources` 缓存、启用 `VITE_DEBUG_MODE=true`、构建 web/Sidecar/Plugin Bridge/CLI 一次，并在 Tauri build 阶段禁用重复的 `beforeBuildCommand`；这条路径用于快速测试，不替代正式发布构建。
 
+两条 Windows 构建路径都会在 Tauri snapshot 前调用 `scripts/prepare-native-inference.mjs x86_64-pc-windows-msvc`，统一准备 document/speech capability。正式安装器验证除既有文档转换外，还必须检查 `speech-inference/v1` 的签名 manifest、media Worker/sherpa native inventory、与 `document-processing/v1` 共享的 ONNX Runtime identity，以及无系统 ORT/ffmpeg/Python 时的 WASAPI microphone/loopback、转录与 Job Object 取消。
+
 ### build_windows.ps1
 
 **运行方式**：

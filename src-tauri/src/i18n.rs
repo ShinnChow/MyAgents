@@ -151,6 +151,7 @@ fn persist_to_disk(value: UiLanguage) -> Result<(), String> {
 pub fn t<'a>(key: &'a str, locale: SupportedLocale) -> &'a str {
     match (locale, key) {
         (SupportedLocale::ZhCn, "tray.open") => "打开 MyAgents",
+        (SupportedLocale::ZhCn, "tray.recording") => "正在录音…",
         (SupportedLocale::ZhCn, "tray.settings") => "设置",
         (SupportedLocale::ZhCn, "tray.forceWakeLock") => "阻止电脑睡眠",
         (SupportedLocale::ZhCn, "tray.exit") => "退出",
@@ -163,6 +164,7 @@ pub fn t<'a>(key: &'a str, locale: SupportedLocale) -> &'a str {
         (SupportedLocale::ZhCn, "notification.centerAnnouncementTitle") => "MyAgents 公告",
         (SupportedLocale::ZhCn, "notification.centerCommentTitle") => "Issue 有新评论",
         (SupportedLocale::EnUs, "tray.open") => "Open MyAgents",
+        (SupportedLocale::EnUs, "tray.recording") => "Recording…",
         (SupportedLocale::EnUs, "tray.settings") => "Settings",
         (SupportedLocale::EnUs, "tray.forceWakeLock") => "Prevent computer sleep",
         (SupportedLocale::EnUs, "tray.exit") => "Quit",

@@ -120,6 +120,17 @@ describe('myagents CLI command grammar', () => {
       suggestedCommand: 'myagents anydoc --help',
     });
   });
+
+  it('publishes the Session-scoped speech commands without exposing scope arguments', () => {
+    expect(TOP_HELP).toContain('speech');
+    expect(validateCliCommand(['speech', 'transcribe'])).toBeUndefined();
+    expect(validateCliCommand(['speech', 'wait'])).toBeUndefined();
+    expect(buildRoute('speech', 'wait', ['speech_01'])).toBe('speech/status');
+    expect(validateCliCommand(['speech', 'unknown'])).toMatchObject({
+      code: 'UNKNOWN_COMMAND',
+      suggestedCommand: 'myagents speech --help',
+    });
+  });
 });
 
 describe('myagents CLI AnyDoc contracts', () => {
@@ -309,6 +320,102 @@ describe('myagents CLI AnyDoc contracts', () => {
       expect(output).toContain('Stage: ocr');
       expect(output).not.toContain('Document:');
       expect(output).not.toContain('/tmp/future/document.md');
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
+
+describe('myagents CLI speech contracts', () => {
+  it('resolves local paths without forwarding CLI-only wait or caller scope', () => {
+    const parsed = parseArgs([
+      'speech',
+      'transcribe',
+      '--file',
+      './fixtures/meeting.m4a',
+      '--output',
+      './transcripts',
+      '--wait',
+    ]);
+
+    expect(buildRequestBody('speech', 'transcribe', [], parsed.flags)).toEqual({
+      sourcePath: join(process.cwd(), 'fixtures/meeting.m4a'),
+      outputRoot: join(process.cwd(), 'transcripts'),
+    });
+  });
+
+  it('keeps list bounded and management commands tied to one exact job id', () => {
+    expect(buildRequestBody('speech', 'list', [], {})).toEqual({ limit: 20 });
+    expect(buildRequestBody('speech', 'list', [], { limit: '100' })).toEqual({ limit: 100 });
+    expect(buildRequestBody('speech', 'status', ['speech_01'], {})).toEqual({ jobId: 'speech_01' });
+    expect(buildRequestBody('speech', 'wait', ['speech_01'], {})).toEqual({ jobId: 'speech_01' });
+    expect(buildRequestBody('speech', 'cancel', ['speech_01'], {})).toEqual({ jobId: 'speech_01' });
+  });
+
+  it('rejects URLs, repeated files, scope flags, dry-run, and invalid list bounds', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as typeof process.exit);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      expect(() => buildRequestBody('speech', 'transcribe', [], {
+        file: ['https://example.test/meeting.m4a'],
+      })).toThrow('process.exit(2)');
+      expect(() => buildRequestBody('speech', 'transcribe', [], {
+        file: ['one.wav', 'two.wav'],
+      })).toThrow('process.exit(2)');
+      expect(() => buildRequestBody('speech', 'transcribe', [], {
+        file: ['meeting.wav'],
+        sessionId: 'forged-session',
+      })).toThrow('process.exit(2)');
+      expect(() => buildRequestBody('speech', 'transcribe', [], {
+        file: ['meeting.wav'],
+        workspace: '/tmp/forged-workspace',
+      })).toThrow('process.exit(2)');
+      expect(() => buildRequestBody('speech', 'transcribe', [], {
+        file: ['meeting.wav'],
+        dryRun: true,
+      })).toThrow('process.exit(2)');
+      expect(() => buildRequestBody('speech', 'list', [], { limit: '101' }))
+        .toThrow('process.exit(2)');
+    } finally {
+      exit.mockRestore();
+      error.mockRestore();
+    }
+  });
+
+  it('prints accepted jobs and does not advertise an unavailable artifact', () => {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      printResult('speech', 'transcribe', {
+        success: true,
+        data: {
+          job: {
+            jobId: 'speech_01',
+            state: 'queued',
+            output: { transcriptMarkdownPath: '/workspace/transcripts/speech_01/transcript.md' },
+          },
+        },
+      }, false);
+      printResult('speech', 'status', {
+        success: true,
+        data: {
+          job: {
+            jobId: 'speech_failed',
+            state: 'failed',
+            output: {
+              transcriptMarkdownPath: '/workspace/transcripts/speech_failed/transcript.md',
+              artifactAvailable: false,
+            },
+          },
+        },
+      }, false);
+
+      const output = log.mock.calls.flat().join('\n');
+      expect(output).toContain('myagents speech status speech_01');
+      expect(output).toContain('myagents speech cancel speech_01');
+      expect(output).toContain('Transcript: unavailable');
+      expect(output).not.toContain('/workspace/transcripts/speech_failed/transcript.md');
     } finally {
       log.mockRestore();
     }
@@ -915,6 +1022,62 @@ describe('myagents CLI Space issue contracts', () => {
       positional: ['maybe'],
       flags: { humanOnly: true, humanOnlyInvalidValue: 'maybe', json: true },
     });
+    expect(parseArgs(['record', 'list', '--all', '-p', 'next'])).toMatchObject({
+      positional: ['record', 'list'],
+      flags: { all: true, prompt: 'next' },
+    });
+  });
+
+  it('keeps canonical Record requests and legacy Thought aliases distinct', () => {
+    expect(TOP_HELP).toContain('record    Manage unified text and audio Records');
+    expect(TOP_HELP).toContain('thought   Legacy compatibility alias');
+    expect(TOP_HELP).toContain('myagents record list');
+    expect(TOP_HELP).not.toContain('  myagents thought list');
+    expect(buildRoute('record', 'list', [])).toBe('record/list');
+    expect(buildRoute('record', 'create', [])).toBe('record/create');
+    expect(buildRequestBody('record', 'list', [], {
+      kind: 'audio',
+      tag: 'meeting',
+      query: 'roadmap',
+      limit: '20',
+      all: true,
+    })).toEqual({
+      kind: 'audio',
+      tag: 'meeting',
+      query: 'roadmap',
+      limit: 20,
+      archived: 'all',
+    });
+    expect(buildRequestBody('record', 'create', ['  # Note  '], {})).toEqual({
+      content: '# Note',
+    });
+    expect(buildRoute('thought', 'list', [])).toBe('thought/list');
+    expect(buildRequestBody('thought', 'list', [], {
+      archived: true,
+    })).toEqual({
+      kind: undefined,
+      tag: undefined,
+      query: undefined,
+      limit: undefined,
+      archived: 'archived',
+    });
+  });
+
+  it('rejects canonical-only Record kind filters on the legacy Thought alias', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as typeof process.exit);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      expect(() => buildRequestBody('thought', 'list', [], { kind: 'audio' }))
+        .toThrow('process.exit(1)');
+      expect(error).toHaveBeenLastCalledWith(
+        'Error: thought list does not support --kind. Use myagents record list --kind text|audio.',
+      );
+    } finally {
+      exit.mockRestore();
+      error.mockRestore();
+    }
   });
 
   it('accepts the existing goalId alias and each single body source for update', () => {

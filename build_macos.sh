@@ -168,7 +168,7 @@ echo -e "${GREEN}  ✓ mino 内置工作区模板已就绪${NC}"
 # The prepare owner keeps this target/cache-aware; build_macos does not mirror
 # CMake/Python/Git version policy or install system packages itself.
 for TARGET in "${BUILD_TARGETS[@]}"; do
-    node "${PROJECT_DIR}/scripts/prepare-document-processing.mjs" "$TARGET" --check-prerequisites
+    node "${PROJECT_DIR}/scripts/prepare-native-inference.mjs" "$TARGET" --check-prerequisites
 done
 
 echo -e "${GREEN}✓ 依赖检查通过${NC}"
@@ -695,8 +695,8 @@ for TARGET in "${BUILD_TARGETS[@]}"; do
         exit 1
     fi
 
-    echo -e "  ${CYAN}准备离线文档转换 Worker / OCR / PDFium 资源 (${TARGET})...${NC}"
-    node "${PROJECT_DIR}/scripts/prepare-document-processing.mjs" "$TARGET"
+    echo -e "  ${CYAN}准备离线文档与语音推理资源 (${TARGET})...${NC}"
+    node "${PROJECT_DIR}/scripts/prepare-native-inference.mjs" "$TARGET"
 
     npm run tauri:build -- --target "$TARGET"
 

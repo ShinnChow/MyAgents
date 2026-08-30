@@ -20,22 +20,58 @@ import {
 describe('systemReminder', () => {
   it('builds Task discussion context while keeping only the user request visible', () => {
     const raw = buildTaskDiscussionReminder({
-      discussionId: 'discussion-1',
-      discussionDir: '/Users/me/.myagents/task-discussions/discussion-1',
       candidatesDir: '/Users/me/.myagents/task-discussions/discussion-1/candidates',
       workspaceId: 'workspace-1',
       workspacePath: '/Users/me/project<&',
-      sourceThoughtId: 'thought-1',
-      sourceThoughtTags: ['release', '<urgent>'],
+      sourceRecordId: 'record-1',
+      sourceRecordAudioPaths: [
+        {
+          track: 'microphone',
+          path: '/Users/me/.myagents/records/a<&/audio/microphone.opus',
+        },
+        {
+          track: 'system',
+          path: '/Users/me/.myagents/records/a<&/audio/system.opus',
+        },
+      ],
+      sourceRecordDocumentPath: '/Users/me/.myagents/records/a<&/content.md',
       visibleUserMessage: '每周整理一次发布记录',
     });
 
     const parsed = parseLeadingSystemReminder(raw);
     expect(parsed.kind).toBe(TASK_DISCUSSION_TAG);
     expect(parsed.body).toContain('workspacePath: /Users/me/project&lt;&amp;');
-    expect(parsed.body).toContain('- &lt;urgent&gt;');
+    expect(parsed.body).toContain(
+      '- microphone: /Users/me/.myagents/records/a&lt;&amp;/audio/microphone.opus',
+    );
+    expect(parsed.body).toContain(
+      '- system: /Users/me/.myagents/records/a&lt;&amp;/audio/system.opus',
+    );
+    expect(parsed.body).toContain('sourceRecordDocumentPath: /Users/me/.myagents/records/a&lt;&amp;/content.md');
+    expect(parsed.body.indexOf('sourceRecordId:')).toBeLessThan(
+      parsed.body.indexOf('sourceRecordAudioPaths:'),
+    );
+    expect(parsed.body.indexOf('sourceRecordAudioPaths:')).toBeLessThan(
+      parsed.body.indexOf('sourceRecordDocumentPath:'),
+    );
+    expect(parsed.body).not.toContain('discussionId:');
+    expect(parsed.body).not.toContain('discussionDir:');
+    expect(parsed.body).not.toContain('sourceRecordTags:');
     expect(parsed.visibleText).toBe('每周整理一次发布记录');
     expect(stripLeadingSystemReminder(raw)).toBe('每周整理一次发布记录');
+  });
+
+  it('preserves the complete visible Record body byte-for-byte', () => {
+    const body = '    indented code\nkeep trailing spaces  \n';
+    const reminder = buildTaskDiscussionReminder({
+      candidatesDir: '/tmp/discussion/candidates',
+      workspaceId: 'workspace-1',
+      workspacePath: '/tmp/workspace',
+      sourceRecordId: 'record-1',
+      visibleUserMessage: body,
+    });
+
+    expect(reminder.endsWith(body)).toBe(true);
   });
 
   it('builds a direct Task comment reminder with escaped exact routing context', () => {
@@ -248,17 +284,19 @@ describe('systemReminder', () => {
   });
 
   it('projects only send.request payloads from hidden session events', () => {
-    const request = parseLeadingSystemReminder([
-      '<system-reminder>',
-      '<myagents-session-event',
-      '  version="1"',
-      '  type="send.request"',
-      '  source_label="Planning &amp; Review">',
-      '<event-summary>hidden operational context</event-summary>',
-      '<payload>Please review &lt;/system-reminder&gt; safely.</payload>',
-      '</myagents-session-event>',
-      '</system-reminder>',
-    ].join('\n'));
+    const request = parseLeadingSystemReminder(
+      [
+        '<system-reminder>',
+        '<myagents-session-event',
+        '  version="1"',
+        '  type="send.request"',
+        '  source_label="Planning &amp; Review">',
+        '<event-summary>hidden operational context</event-summary>',
+        '<payload>Please review &lt;/system-reminder&gt; safely.</payload>',
+        '</myagents-session-event>',
+        '</system-reminder>',
+      ].join('\n'),
+    );
     const result = parseSessionSendRequestDisplay(request);
 
     expect(result).toEqual({
@@ -266,14 +304,15 @@ describe('systemReminder', () => {
       sourceLabel: 'Planning & Review',
     });
 
-    const automaticResult = parseLeadingSystemReminder([
-      '<system-reminder>',
-      '<myagents-session-event type="send.result">',
-      '<payload>must stay hidden</payload>',
-      '</myagents-session-event>',
-      '</system-reminder>',
-    ].join('\n'));
+    const automaticResult = parseLeadingSystemReminder(
+      [
+        '<system-reminder>',
+        '<myagents-session-event type="send.result">',
+        '<payload>must stay hidden</payload>',
+        '</myagents-session-event>',
+        '</system-reminder>',
+      ].join('\n'),
+    );
     expect(parseSessionSendRequestDisplay(automaticResult)).toBeNull();
   });
-
 });

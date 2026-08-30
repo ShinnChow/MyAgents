@@ -164,7 +164,7 @@ async fn fetch_attachment_bytes(request: AttachmentRequest) -> Result<FetchedAtt
     Ok(FetchedAttachment { bytes })
 }
 
-fn validate_export_destination(raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_export_destination(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("destinationPath is required".to_string());

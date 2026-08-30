@@ -5,7 +5,7 @@
 // + send button that dispatches LAUNCH_BUG_REPORT, the same event consumed
 // by App.tsx to spin up a helper conversation tab.
 //
-// Visuals follow specs/DESIGN.md v2.2 §6 component tokens; see
+// Visuals follow specs/DESIGN.md shared component semantics; see
 // specs/prd/prd_0.2.7_providers_helper_inline_entry.md §3.3 for the full
 // design rationale.
 

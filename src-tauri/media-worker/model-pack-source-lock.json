@@ -1,0 +1,167 @@
+{
+  "schemaVersion": 1,
+  "packId": "local-standard-speech",
+  "packRevision": "local-standard-speech-v2",
+  "sourceDownloadBytes": 209767948,
+  "installedModelBytes": 280896862,
+  "downloadHardLimitBytes": 314572800,
+  "signaturePolicy": {
+    "algorithm": "minisign-ed25519",
+    "trustRoot": "app-updater",
+    "detachedSignatureRequired": true
+  },
+  "framework": {
+    "sherpaOnnxVersion": "1.13.6",
+    "sherpaOnnxCommit": "1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911",
+    "onnxRuntimeVersion": "1.28.0",
+    "sampleRate": 16000
+  },
+  "assets": [
+    {
+      "id": "sensevoice",
+      "url": "https://download.myagents.io/models/speech/assets/sha256/7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
+      "sha256": "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
+      "size": 163002883,
+      "format": "tar_bz2",
+      "upstreamRevision": "sherpa-onnx/asr-models:sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
+      "license": "FunASR-Model-License-1.1",
+      "selectedFiles": [
+        {
+          "sourcePath": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx",
+          "installPath": "models/sensevoice/model.int8.onnx",
+          "sha256": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51",
+          "size": 239233841,
+          "kind": "model"
+        },
+        {
+          "sourcePath": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/tokens.txt",
+          "installPath": "models/sensevoice/tokens.txt",
+          "sha256": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+          "size": 315894,
+          "kind": "tokens"
+        }
+      ]
+    },
+    {
+      "id": "silero-vad",
+      "url": "https://download.myagents.io/models/speech/assets/sha256/c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20/silero_vad.int8.onnx",
+      "sha256": "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20",
+      "size": 212860,
+      "format": "file",
+      "upstreamRevision": "sherpa-onnx/asr-models:silero_vad.int8.onnx",
+      "license": "MIT",
+      "selectedFiles": [
+        {
+          "sourcePath": "silero_vad.int8.onnx",
+          "installPath": "models/vad/silero_vad.int8.onnx",
+          "sha256": "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20",
+          "size": 212860,
+          "kind": "model"
+        }
+      ]
+    },
+    {
+      "id": "pyannote-segmentation",
+      "url": "https://download.myagents.io/models/speech/assets/sha256/24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+      "sha256": "24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488",
+      "size": 6958444,
+      "format": "tar_bz2",
+      "upstreamRevision": "sherpa-onnx/speaker-segmentation-models:sherpa-onnx-pyannote-segmentation-3-0",
+      "license": "MIT",
+      "selectedFiles": [
+        {
+          "sourcePath": "sherpa-onnx-pyannote-segmentation-3-0/model.int8.onnx",
+          "installPath": "models/diarization/pyannote-segmentation-3.0.int8.onnx",
+          "sha256": "d582f4b4c6b48205de7e0643c57df0df5615a3c176189be3fc461e9d18827b5d",
+          "size": 1540506,
+          "kind": "model"
+        }
+      ]
+    },
+    {
+      "id": "3dspeaker-eres2net",
+      "url": "https://download.myagents.io/models/speech/assets/sha256/1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+      "sha256": "1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b",
+      "size": 39593761,
+      "format": "file",
+      "upstreamRevision": "modelscope/iic/speech_eres2net_base_sv_zh-cn_3dspeaker_16k@v1.0.1",
+      "license": "Apache-2.0",
+      "selectedFiles": [
+        {
+          "sourcePath": "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+          "installPath": "models/diarization/3dspeaker-eres2net-base-zh-16k.onnx",
+          "sha256": "1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b",
+          "size": 39593761,
+          "kind": "model"
+        }
+      ]
+    }
+  ],
+  "legalArtifacts": [
+    {
+      "id": "funasr-model-license",
+      "license": "FunASR-Model-License-1.1",
+      "installPath": "legal/FUNASR-MODEL-LICENSE-1.1.txt",
+      "attribution": "SenseVoiceSmall by FunASR/FunAudioLLM; retain the source, author attribution, and model name.",
+      "source": {
+        "type": "remote",
+        "url": "https://download.myagents.io/models/speech/assets/sha256/7dba975a2069691db4992b0592d70828b330d2f8a30a71450f4e152a554e84f8/MODEL_LICENSE",
+        "sha256": "7dba975a2069691db4992b0592d70828b330d2f8a30a71450f4e152a554e84f8",
+        "size": 5306,
+        "upstreamRevision": "modelscope/FunASR@3c58cb56a56598232c3efffa15d313d7e82a4307"
+      }
+    },
+    {
+      "id": "sensevoice-conversion-reference",
+      "license": "FunASR-Model-License-1.1",
+      "installPath": "legal/SENSEVOICE-CONVERSION-LICENSE-REFERENCE.txt",
+      "attribution": "k2-fsa sherpa-onnx INT8 conversion of SenseVoiceSmall.",
+      "source": {
+        "type": "archive",
+        "assetId": "sensevoice",
+        "sourcePath": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/LICENSE",
+        "sha256": "221c6df10b0931a5629adad671ea48fb7747e034c414b6d2bfa275bc3dd4ea17",
+        "size": 71
+      }
+    },
+    {
+      "id": "silero-license",
+      "license": "MIT",
+      "installPath": "legal/SILERO-VAD-LICENSE.txt",
+      "attribution": "Silero VAD by the Silero Team; INT8 export maintained by k2-fsa.",
+      "source": {
+        "type": "remote",
+        "url": "https://download.myagents.io/models/speech/assets/sha256/2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b/LICENSE",
+        "sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b",
+        "size": 1075,
+        "upstreamRevision": "snakers4/silero-vad@867c2aa692646a1f1de3e94a15c9dd9f614c0acb"
+      }
+    },
+    {
+      "id": "pyannote-segmentation-license",
+      "license": "MIT",
+      "installPath": "legal/PYANNOTE-SEGMENTATION-LICENSE.txt",
+      "attribution": "pyannote segmentation 3.0; ONNX conversion distributed by k2-fsa.",
+      "source": {
+        "type": "archive",
+        "assetId": "pyannote-segmentation",
+        "sourcePath": "sherpa-onnx-pyannote-segmentation-3-0/LICENSE",
+        "sha256": "14d7016ad68e7394d6e6b78d96cc2ae431c905287b89674cfdf021e79e62b8ba",
+        "size": 1061
+      }
+    },
+    {
+      "id": "3dspeaker-license",
+      "license": "Apache-2.0",
+      "installPath": "legal/3D-SPEAKER-LICENSE.txt",
+      "attribution": "ERes2Net-Base speaker embedding model by ModelScope 3D-Speaker.",
+      "source": {
+        "type": "remote",
+        "url": "https://download.myagents.io/models/speech/assets/sha256/c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4/LICENSE",
+        "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+        "size": 11357,
+        "upstreamRevision": "modelscope/3D-Speaker@065629c313eaf1a01c65c640c46d77e61e9607b4"
+      }
+    }
+  ]
+}

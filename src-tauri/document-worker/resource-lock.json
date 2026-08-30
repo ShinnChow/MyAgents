@@ -31,14 +31,122 @@
       "upstreamRevision": "b03f46425e8ff4442b268ce449e3eef758146cd4"
     }
   },
+  "speechInference": {
+    "bundleVersion": "sherpa-onnx-1.13.6_v1",
+    "adapterAbiVersion": 1,
+    "sherpaOnnxVersion": "1.13.6",
+    "sherpaOnnxCommit": "1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911",
+    "onnxRuntimeVersion": "1.28.0",
+    "onnxRuntimeUpstreamRevision": "v1.28.0@da9b5e364c465de65c49d91e696cd6485270757f",
+    "opus2Version": "0.4.0",
+    "libopusSysVersion": "0.3.3",
+    "hdbscanVersion": "0.12.0",
+    "kdtreeVersion": "0.7.0",
+    "numTraitsVersion": "0.2.19",
+    "nativeIncrementHardLimitBytes": 83886080,
+    "source": {
+      "url": "https://codeload.github.com/k2-fsa/sherpa-onnx/tar.gz/1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911",
+      "sha256": "aef29b9ef1695933f7f577f18aa13e34ce8e937602dcedf1bb7f717b8ede917b",
+      "size": 11564315,
+      "license": "Apache-2.0",
+      "upstreamRevision": "v1.13.6@1cb484af5e69d3c7803c1eb0b3b5ab8041e0e911",
+      "archiveName": "sherpa-onnx-1.13.6.tar.gz"
+    },
+    "dependencies": [
+      {
+        "id": "kaldi-native-fbank",
+        "url": "https://github.com/csukuangfj/kaldi-native-fbank/archive/refs/tags/v1.22.3.tar.gz",
+        "sha256": "9176cc66fc7ce1edf85cf355b06e320c57db6297df74277f575183468893cf61",
+        "size": 71144,
+        "archiveName": "kaldi-native-fbank-1.22.3.tar.gz",
+        "license": "Apache-2.0",
+        "upstreamRevision": "v1.22.3"
+      },
+      {
+        "id": "kissfft",
+        "url": "https://github.com/mborgerding/kissfft/archive/febd4caeed32e33ad8b2e0bb5ea77542c40f18ec.zip",
+        "sha256": "497103e664168ebe39580b757adbe616f6cf85a16572af581ca7bc42d0ab13fd",
+        "size": 74252,
+        "archiveName": "kissfft-febd4caeed32e33ad8b2e0bb5ea77542c40f18ec.zip",
+        "license": "BSD-3-Clause",
+        "upstreamRevision": "febd4caeed32e33ad8b2e0bb5ea77542c40f18ec"
+      },
+      {
+        "id": "kaldi-decoder",
+        "url": "https://github.com/k2-fsa/kaldi-decoder/archive/refs/tags/v0.3.0.tar.gz",
+        "sha256": "b9f34cfb4fd3b1344100eead79ef4d37aa15962274b9e3056de345021f76a1b0",
+        "size": 51199,
+        "archiveName": "kaldi-decoder-0.3.0.tar.gz",
+        "license": "Apache-2.0",
+        "upstreamRevision": "v0.3.0"
+      },
+      {
+        "id": "kaldifst",
+        "url": "https://github.com/k2-fsa/kaldifst/archive/refs/tags/v1.8.0.tar.gz",
+        "sha256": "3f247b7e5a2409071202f5e2bc6200060f66728c0a3443c03923ad2723e040b3",
+        "size": 172147,
+        "archiveName": "kaldifst-1.8.0.tar.gz",
+        "license": "Apache-2.0",
+        "upstreamRevision": "v1.8.0"
+      },
+      {
+        "id": "openfst",
+        "url": "https://github.com/csukuangfj/openfst/archive/refs/tags/v1.8.5-2026-07-09.tar.gz",
+        "sha256": "2ff712a32952fcb01d351121a6bc8ccf4fdc6b2aa06ce8df2b3095dedd518c0e",
+        "size": 1501685,
+        "archiveName": "openfst-1.8.5-2026-07-09.tar.gz",
+        "license": "Apache-2.0",
+        "upstreamRevision": "v1.8.5-2026-07-09"
+      },
+      {
+        "id": "eigen",
+        "url": "https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.tar.gz",
+        "sha256": "e9c326dc8c05cd1e044c71f30f1b2e34a6161a3b6ecf445d56b53ff1669e3dec",
+        "size": 2967272,
+        "archiveName": "eigen-5.0.1.tar.gz",
+        "license": "MPL-2.0",
+        "upstreamRevision": "5.0.1"
+      },
+      {
+        "id": "simple-sentencepiece",
+        "url": "https://github.com/pkufool/simple-sentencepiece/archive/refs/tags/v0.7.tar.gz",
+        "sha256": "1748a822060a35baa9f6609f84efc8eb54dc0e74b9ece3d82367b7119fdc75af",
+        "size": 355335,
+        "archiveName": "simple-sentencepiece-0.7.tar.gz",
+        "license": "Apache-2.0",
+        "upstreamRevision": "v0.7"
+      },
+      {
+        "id": "nlohmann-json",
+        "url": "https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz",
+        "sha256": "4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187",
+        "size": 9678593,
+        "archiveName": "json-3.12.0.tar.gz",
+        "license": "MIT",
+        "upstreamRevision": "v3.12.0"
+      },
+      {
+        "id": "hclust-cpp",
+        "url": "https://github.com/csukuangfj/hclust-cpp/archive/refs/tags/2026-02-25.tar.gz",
+        "sha256": "8f14e024c709d73afb40ae69cb22de4b73dba67cbce40f2e518813da8139ab56",
+        "size": 22523,
+        "archiveName": "hclust-cpp-2026-02-25.tar.gz",
+        "license": "BSD-3-Clause",
+        "upstreamRevision": "2026-02-25"
+      }
+    ]
+  },
   "targets": {
     "aarch64-apple-darwin": {
       "platform": "macos",
       "architecture": "arm64",
       "onnxRuntime": {
-        "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.28.0/onnxruntime-osx-arm64-1.28.0.tgz",
-        "sha256": "1268b359718099bde2cedb55787f182a130067bc4f31e8c88478c445b850d3d8",
-        "size": 32396562,
+        "sourceBuild": {
+          "repository": "https://github.com/microsoft/onnxruntime.git",
+          "commit": "da9b5e364c465de65c49d91e696cd6485270757f",
+          "recipeVersion": 2,
+          "deploymentTarget": "13.0"
+        },
         "license": "MIT",
         "upstreamRevision": "v1.28.0@da9b5e364c465de65c49d91e696cd6485270757f",
         "libraryPattern": "libonnxruntime.*dylib"
@@ -59,7 +167,8 @@
         "sourceBuild": {
           "repository": "https://github.com/microsoft/onnxruntime.git",
           "commit": "da9b5e364c465de65c49d91e696cd6485270757f",
-          "recipeVersion": 1
+          "recipeVersion": 2,
+          "deploymentTarget": "13.0"
         },
         "license": "MIT",
         "upstreamRevision": "v1.28.0@da9b5e364c465de65c49d91e696cd6485270757f",

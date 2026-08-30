@@ -20,17 +20,18 @@
 //   • 想法 → Lightbulb (same as `ThoughtPanel` header) — ideation pairs
 //            naturally with the Sparkles affordance.
 
-import { Lightbulb, Sparkles } from 'lucide-react';
+import { NotebookPen, Sparkles } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { retainFocusOnMouseDown } from '@/utils/focusRetention';
 
-export type InputMode = 'task' | 'thought';
+export type InputMode = 'chat' | 'record';
 
 interface ModeSegmentProps {
   value: InputMode;
   onChange: (mode: InputMode) => void;
+  disabled?: boolean;
   /** Optional slot on the right side (e.g. info tooltip). */
   suffix?: ReactNode;
   /**
@@ -47,10 +48,11 @@ export function ModeSegment({
   onChange,
   suffix,
   tabSwitchHint = false,
+  disabled = false,
 }: ModeSegmentProps) {
   const { t } = useTranslation('chat');
-  const taskTitle = tabSwitchHint ? t('input.mode.switchToThought') : undefined;
-  const thoughtTitle = tabSwitchHint ? t('input.mode.switchToChat') : undefined;
+  const chatTitle = tabSwitchHint ? t('input.mode.switchToRecord') : undefined;
+  const recordTitle = tabSwitchHint ? t('input.mode.switchToChat') : undefined;
 
   // Segment button — the `active` state gets a raised paper-elevated
   // background (so the whole row reads as a track with a sliding
@@ -63,8 +65,7 @@ export function ModeSegment({
   // group above it.
   const baseBtn =
     'inline-flex items-center gap-1.5 rounded-[var(--radius-sm)] px-3 py-1 text-sm font-medium transition-all duration-150';
-  const activeBtn =
-    'bg-[var(--paper-elevated)] text-[var(--ink)] shadow-xs';
+  const activeBtn = 'bg-[var(--paper-elevated)] text-[var(--ink)] shadow-xs';
   const inactiveBtn =
     'text-[var(--ink-muted)] hover:text-[var(--ink-secondary)]';
 
@@ -82,25 +83,27 @@ export function ModeSegment({
       <div className="inline-flex gap-0.5 rounded-[var(--radius-md)] bg-[var(--paper-inset)] p-[3px]">
         <button
           type="button"
-          onClick={() => onChange('task')}
+          disabled={disabled}
+          onClick={() => onChange('chat')}
           onMouseDown={retainFocusOnMouseDown}
-          aria-pressed={value === 'task'}
-          title={taskTitle}
-          className={`${baseBtn} ${value === 'task' ? activeBtn : inactiveBtn}`}
+          aria-pressed={value === 'chat'}
+          title={chatTitle}
+          className={`${baseBtn} disabled:cursor-wait disabled:opacity-50 ${value === 'chat' ? activeBtn : inactiveBtn}`}
         >
           <Sparkles className="h-3 w-3" strokeWidth={1.75} />
           {t('input.mode.chat')}
         </button>
         <button
           type="button"
-          onClick={() => onChange('thought')}
+          disabled={disabled}
+          onClick={() => onChange('record')}
           onMouseDown={retainFocusOnMouseDown}
-          aria-pressed={value === 'thought'}
-          title={thoughtTitle}
-          className={`${baseBtn} ${value === 'thought' ? activeBtn : inactiveBtn}`}
+          aria-pressed={value === 'record'}
+          title={recordTitle}
+          className={`${baseBtn} disabled:cursor-wait disabled:opacity-50 ${value === 'record' ? activeBtn : inactiveBtn}`}
         >
-          <Lightbulb className="h-3 w-3" strokeWidth={1.75} />
-          {t('input.mode.thought')}
+          <NotebookPen className="h-3 w-3" strokeWidth={1.75} />
+          {t('input.mode.record')}
         </button>
       </div>
       {suffix && <span className="ml-2 flex items-center">{suffix}</span>}

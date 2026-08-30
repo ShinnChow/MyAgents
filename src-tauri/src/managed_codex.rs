@@ -7,9 +7,9 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
-use minisign_verify::{Error as MinisignError, PublicKey, Signature};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -22,9 +22,6 @@ const CODEX_PROVIDER_ID: &str = "codex-sub";
 pub(crate) const REQUIRED_VERSION: &str = env!("MYAGENTS_MANAGED_CODEX_VERSION");
 pub(crate) const REQUIRED_RUNTIME_SET: &str = env!("MYAGENTS_MANAGED_CODEX_RUNTIME_SET");
 const RUNTIME_SETS_BASE_URL: &str = "https://download.myagents.io/runtimes/codex/sets";
-// Keep this in sync with `src-tauri/tauri.conf.json > plugins.updater.pubkey`.
-// Managed runtime manifests and artifacts use the same minisign trust root as app updates.
-const MYAGENTS_MINISIGN_PUBKEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY3RkQ5QjIzMTE4RTgyRTkKUldUcGdvNFJJNXY5OTB3T2pnUzVUbjFrV203Zk5ZTDg0NVJRdGI0UVRranJzTUsvM0hGcmFlc0IK";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const DOWNLOAD_HOST: &str = "download.myagents.io";
 const DOWNLOAD_PATH_PREFIX: &str = "/runtimes/codex/";
@@ -846,7 +843,8 @@ async fn download_and_verify_artifact_attempt(
     )
     .await?;
     validate_downloaded_artifact_digest(artifact, downloaded_bytes, &actual_sha)?;
-    verify_minisign_file(path, &artifact.signature)?;
+    crate::resource_signature::verify_minisign_file(path, &artifact.signature)
+        .map_err(|error| format!("[managed-codex] {error}"))?;
     Ok((downloaded_bytes, actual_sha))
 }
 
@@ -887,71 +885,6 @@ async fn download_artifact_with_direct_fallback(
                 )
             })
         }
-    }
-}
-
-fn base64_to_string(value: &str, label: &str) -> Result<String, String> {
-    let bytes = general_purpose::STANDARD
-        .decode(value)
-        .map_err(|e| format!("[managed-codex] Invalid {} base64: {}", label, e))?;
-    String::from_utf8(bytes).map_err(|e| format!("[managed-codex] Invalid {} UTF-8: {}", label, e))
-}
-
-fn managed_minisign_public_key() -> Result<PublicKey, String> {
-    let decoded = base64_to_string(MYAGENTS_MINISIGN_PUBKEY, "public key")?;
-    PublicKey::decode(&decoded)
-        .map_err(|e| format!("[managed-codex] Invalid minisign public key: {}", e))
-}
-
-fn managed_minisign_signature(signature: &str, label: &str) -> Result<Signature, String> {
-    let decoded = base64_to_string(signature, label)?;
-    Signature::decode(&decoded).map_err(|e| format!("[managed-codex] Invalid {}: {}", label, e))
-}
-
-pub(crate) fn verify_minisign_bytes(
-    bytes: &[u8],
-    signature: &str,
-    label: &str,
-) -> Result<(), String> {
-    let public_key = managed_minisign_public_key()?;
-    let signature = managed_minisign_signature(signature, label)?;
-    public_key
-        .verify(bytes, &signature, true)
-        .map_err(|e| format!("[managed-codex] {} signature mismatch: {}", label, e))
-}
-
-pub(crate) fn verify_minisign_file(path: &Path, signature: &str) -> Result<(), String> {
-    let public_key = managed_minisign_public_key()?;
-    let signature = managed_minisign_signature(signature, "artifact signature")?;
-    match public_key.verify_stream(&signature) {
-        Ok(mut verifier) => {
-            let mut file = File::open(path)
-                .map_err(|e| format!("[managed-codex] Failed to open artifact: {}", e))?;
-            let mut buf = [0u8; 64 * 1024];
-            loop {
-                let read = file
-                    .read(&mut buf)
-                    .map_err(|e| format!("[managed-codex] Failed to read artifact: {}", e))?;
-                if read == 0 {
-                    break;
-                }
-                verifier.update(&buf[..read]);
-            }
-            verifier
-                .finalize()
-                .map_err(|e| format!("[managed-codex] Artifact signature mismatch: {}", e))
-        }
-        Err(MinisignError::UnsupportedLegacyMode) => {
-            let bytes = fs::read(path)
-                .map_err(|e| format!("[managed-codex] Failed to read artifact: {}", e))?;
-            public_key
-                .verify(&bytes, &signature, true)
-                .map_err(|e| format!("[managed-codex] Artifact signature mismatch: {}", e))
-        }
-        Err(e) => Err(format!(
-            "[managed-codex] Cannot initialize artifact signature verifier: {}",
-            e
-        )),
     }
 }
 
@@ -1312,7 +1245,12 @@ async fn fetch_verified_manifest(
     if signature.is_empty() {
         return Err("[managed-codex] Managed Codex manifest signature is required".to_string());
     }
-    verify_minisign_bytes(&manifest_bytes, signature, "manifest signature")?;
+    crate::resource_signature::verify_minisign_bytes(
+        &manifest_bytes,
+        signature,
+        "manifest signature",
+    )
+    .map_err(|error| format!("[managed-codex] {error}"))?;
     let manifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| format!("[managed-codex] Invalid manifest JSON: {}", e))?;
     Ok((manifest, signature.to_string()))
@@ -3658,19 +3596,5 @@ On a remote or headless machine? Use `codex login --device-auth` instead.";
         assert_eq!(cleanup_abandoned_download_dirs(root.path()).unwrap(), 1);
         assert!(!has_path_entry(&abandoned).unwrap());
         assert!(has_path_entry(&retained).unwrap());
-    }
-
-    #[test]
-    fn managed_codex_pubkey_matches_tauri_updater_pubkey() {
-        let conf_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tauri.conf.json");
-        let content = fs::read_to_string(conf_path).expect("tauri.conf.json");
-        let json: serde_json::Value = serde_json::from_str(&content).expect("valid tauri config");
-        let updater_pubkey = json
-            .get("plugins")
-            .and_then(|v| v.get("updater"))
-            .and_then(|v| v.get("pubkey"))
-            .and_then(|v| v.as_str())
-            .expect("updater pubkey");
-        assert_eq!(updater_pubkey, MYAGENTS_MINISIGN_PUBKEY);
     }
 }

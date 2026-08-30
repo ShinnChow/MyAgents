@@ -1,6 +1,6 @@
-# Task、定时自动化、Goal 与 Thought 诊断
+# Task、定时自动化、Goal 与 Record 诊断
 
-使用场景：Task/Cron 到点没执行、任务状态卡住、Goal 不续跑或终态错误、Thought 异常、需要向另一个 Session 反馈。
+使用场景：Task/Cron 到点没执行、任务状态卡住、Goal 不续跑或终态错误、Record 异常、需要向另一个 Session 反馈。
 
 正确产品语义先读 `/myagents-docs/references/automation.md`。这里仅处理实际行为偏离预期的现场。
 
@@ -63,13 +63,15 @@ rg -n "\\[Goal\\]|goal|token_budget|continuation|complete|blocked|pause|cancel|o
 - 用户取消由 UI/宿主负责，不要用 `goal update --status blocked` 代替取消。
 - Goal 执行中切换 Tab 或关闭可见入口后异常停止：保留 Session ID 和 owner 证据，转 `session-sidecar.md`。
 
-## Thought 与 Session Inbox
+## Record 与 Session Inbox
 
 ```bash
-myagents thought list --json
+myagents record list --json
+myagents record list --kind text --json
+myagents record list --kind audio --json
 ```
 
-Thought 只负责收集，不会自行执行。若内容存在但后续 Task 未创建，先确认用户是否真的走了对齐/物化流程。
+Record 统一保存文字笔记和会议录音，不会自行创建或执行 Task。若 Record 存在但后续 Task 未创建，先确认用户是否真的走了对齐/物化流程；音频 Record 还应分别核对录音、转写和说话人处理状态，不能把“文件已保存”误判为“转写已完成”。`myagents thought` 只是在旧脚本中可能出现的文字 Record 兼容 alias，新诊断命令不主动使用。
 
 当用户明确要求给另一个 Session 反馈、追问或下指令时：
 

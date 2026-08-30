@@ -15,22 +15,23 @@
                          ↓
                    有新版本? → emit updater:download-started (UI 隐藏按钮)
                          ↓
-                   后台下载 (macOS/Linux: 在内存替换；Windows: 写 pending 字节到磁盘)
+                   后台下载 (macOS/Windows: 写 pending 字节到磁盘；Linux: 原地替换)
                          ↓
                    成功 → emit updater:ready-to-restart (UI 显示新版本「重启更新」按钮)
                    失败 → emit updater:download-failed (UI 恢复显示前一版本按钮)
                          ↓
-                   用户点击 → macOS/Linux: cmd_shutdown_for_update → relaunch
+                   用户点击 → macOS: install_pending_update → Update::install(bytes) → 立即受管重启
                             → Windows: install_pending_update 内部完成 verified-clean handoff → Update::install(bytes)
+                            → Linux: cmd_shutdown_for_update → relaunch
                    或
-                   下次启动 → 自动应用 pending 更新 (Windows 走启动期对话框)
+                   下次启动 → Windows/macOS 通过启动期对话框继续提供 pending 更新
 ```
 
 **平台路径差异：**
 
 | 平台 | 下载阶段 | 安装阶段 |
 |------|---------|---------|
-| macOS | `download_and_install` 内存中替换 .app 字节 | `relaunch` 直接生效 |
+| macOS | `download` 后原子写入 pending 字节 | 用户明确点击后 `install_pending_update` 替换 `.app`，随即 `request_restart` |
 | Linux | `download_and_install` 在原地覆盖 AppImage | `relaunch` 直接生效 |
 | Windows | `save_pending_update_to_disk` 写入 NSIS installer 字节 | `install_pending_update` 在 Rust 侧进入 update-quiesce gate，停 IM/Agent/Terminal/Browser/Sidecar，验证进程与关键文件锁清零后再 `Update::install(bytes)`；启动时若发现 pending 字节会弹对话框引导用户安装；安装阶段上游 updater 会在 `%TEMP%` 留下 `MyAgents-<version>-updater-*` 派生目录，由启动期 GC 清理 |
 
@@ -53,7 +54,7 @@
 | `src/renderer/hooks/useUpdater.ts` | 监听 download-started / download-failed / ready-to-restart 三事件、维护 `preparing` 互斥标志、提供 `restartAndUpdate()` |
 | `src/renderer/components/CustomTitleBar.tsx` | 顶栏「重启更新」按钮（`preparing` 时隐藏） |
 | `src/renderer/pages/Settings.tsx` → `pages/settings/SettingsPage.tsx` | 设置页同款按钮；旧路径是 re-export facade |
-| `src/renderer/App.tsx` | Windows 启动期 pending 更新对话框（在 `useUpdater.checkPendingUpdate()` 之上） |
+| `src/renderer/App.tsx` | Windows/macOS 启动期 pending 更新对话框（在 `useUpdater.checkPendingUpdate()` 之上） |
 
 ### 核心流程
 
@@ -64,7 +65,7 @@ check_update_on_startup()
   → check_and_download_silently()
     → updater.check() → Update 对象 (含 version)
     → emit("updater:download-started", { version })   // UI 互斥锁：隐藏按钮
-    → 下载阶段 (平台路径差异见上表)
+    → 下载阶段 (平台路径差异见上表；debug build 禁止真实下载/安装)
     → 成功 → cache_update(update) + emit("updater:ready-to-restart", { version })
        失败 → emit("updater:download-failed", { version })  // UI 恢复前一版本按钮
 
@@ -73,13 +74,15 @@ listen("updater:download-started") → setPreparing(true)
 listen("updater:download-failed")  → setPreparing(false)
 listen("updater:ready-to-restart") → setUpdateReady(true) + setPreparing(false)
 restartAndUpdate()
-  → macOS/Linux: cmd_shutdown_for_update → relaunch()
+  → macOS: install_pending_update()  // 本地 install 成功后立即 request_restart
   → Windows: install_pending_update()  // Rust 内部完成 update-quiesce + verified-clean + Update::install(bytes)
+  → Linux: cmd_shutdown_for_update → relaunch()
 ```
 
 ### 关键不变量
 
-- **cache=disk 一致性**: `LATEST_UPDATE` 内存缓存与磁盘 pending 字节版本必须始终一致。`cache_update()` 只能在以下三个时机调用：①latest-wins 跳过同版本下载、②Windows 检测 disk 已有相同版本短路、③Windows `save_pending_update_to_disk()` 成功之后。**不可**在 `updater.check()` 之后无条件调用——会出现"内存指 v_NEW 但磁盘还是 v_OLD"的窗口期，导致用户在替换中点击破坏 v_OLD 字节。
+- **cache=disk 一致性**: `LATEST_UPDATE` 内存缓存与磁盘 pending 字节版本必须始终一致。`cache_update()` 只能在以下三个时机调用：①latest-wins 跳过同版本下载、②Windows/macOS 检测 disk 已有相同版本短路、③Windows/macOS `save_pending_update_to_disk()` 成功之后。**不可**在 `updater.check()` 之后无条件调用——会出现"内存指 v_NEW 但磁盘还是 v_OLD"的窗口期，导致用户在替换中点击破坏 v_OLD 字节。
+- **macOS live bundle 不可后台替换**: 权限服务会根据运行中进程的可执行路径归因 TCC 请求。后台 `download_and_install` 会把当前 `.app` 移入临时目录并在返回时删除，使仍在运行的进程失去可解析路径，随后麦克风/屏幕录制权限弹窗会静默失败。因此 macOS 只在用户点击安装后替换 bundle，并在成功后立即走 `request_restart`；禁止让旧进程继续交互。
 - **UI 互斥**: `preparing=true` 期间所有「重启更新」入口必须隐藏（顶栏 / Settings / Windows 启动对话框）。下载替换的临界区不允许用户点击。
 - **clear_pending_update_from_disk()** 必须同步 reset `DOWNLOADED_VERSION` 和 `LATEST_UPDATE`，否则 stale latest-wins 决策会用旧缓存填回空磁盘。
 - **Windows updater temp GC**: `%TEMP%/MyAgents-<version>-updater-*` 是 Tauri 上游安装阶段的派生目录，不是 MyAgents 的 pending 更新权威状态。启动期只按"目录名精确匹配 + 普通目录 + 超过 24h"清理这些派生目录；不按当前版本保留，也不读取/修改 `~/.myagents/pending_update.*`。
@@ -90,6 +93,7 @@ restartAndUpdate()
 - **启动时检查**: 应用启动后延迟 **60 秒**（避开冷启动重负载 + 用户首次操作），再 best-effort 清理过期 Windows updater 临时目录并检查更新
 - **定时检查**: 前端每 **30 分钟** 触发一次 `cmd_check_and_download_silently`（`CHECK_INTERVAL_MS` 常量）；即便已有 pending 更新仍会查询，latest-wins 协议保证更新版本会被替换（v_NEW 替换 cached v_OLD 不需要用户重启）
 - **完全静默**: 检查/下载阶段对用户无感；只在 ready-to-restart 时才出现按钮
+- **开发构建不自更新**: `debug_assertions` 下禁止后台及手动下载/安装真实更新，避免线上 release 覆盖本地 debug bundle；联网诊断仍可单独执行。
 
 ---
 

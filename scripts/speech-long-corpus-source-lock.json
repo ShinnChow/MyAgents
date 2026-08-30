@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "corpusVersion": "myagents-speech-long-v1",
+  "preparedManifestSha256": "214295b3f6a136ca0d0a5932f1ad3a14d9c34c7104b44e81db3ddd1263378eaf",
+  "tools": {
+    "ffmpeg": "8.0.1"
+  },
+  "source": {
+    "qualityCorpusVersion": "myagents-speech-quality-v1",
+    "preparedManifestSha256": "b0817942aad1c8cb847bf1b259fbd782e1fd8e553ef49a8e851b2080c208cc42",
+    "caseId": "ami-four-speaker-meeting",
+    "sourcePath": "audio/ami-four-speaker-meeting.ogg",
+    "sourceBytes": 969549,
+    "sourceSha256": "3d16887af38d65c5657994a68aea505707fde75bdf02c1183d35d52e7efea1d4",
+    "speakerCount": 4,
+    "license": "CC-BY-4.0",
+    "upstreamRevision": "AMI Corpus ES2002a 55s-175s"
+  },
+  "cases": [
+    {
+      "id": "meeting-30s",
+      "durationSeconds": 30,
+      "expectedSpeakerCount": 2,
+      "timeoutMs": 600000
+    },
+    {
+      "id": "meeting-2h",
+      "durationSeconds": 7200,
+      "expectedSpeakerCount": 4,
+      "timeoutMs": 7200000
+    },
+    {
+      "id": "meeting-8h",
+      "durationSeconds": 28800,
+      "expectedSpeakerCount": 4,
+      "timeoutMs": 28800000
+    }
+  ]
+}

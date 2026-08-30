@@ -9,7 +9,7 @@
  * Two scopes
  * ----------
  * - `buildCliToolsAppend(scenario)` — MyAgents-CLI capability hints
- *   (Task automation, Task self-exit, Goal Mode, IM media send, thought capture). Universal
+ *   (Task automation, Task self-exit, Goal Mode, IM media send, Record capture). Universal
  *   across runtimes (builtin Claude Agent SDK + Codex / Gemini / Claude Code
  *   CLI) since v0.2.11 dropped the corresponding in-process MCP servers
  *   (`cron-tools`, `im-cron`, `im-media`) and unified on the CLI. Gated by
@@ -24,7 +24,11 @@
 
 import type { InteractionScenario } from './system-prompt';
 import { getUserToolsPromptSection } from './utils/cli-tools-registry';
-import { IMAGE_UNDERSTANDING_TOOL_ID, type OfficialToolId } from '../shared/official-tools';
+import {
+  IMAGE_UNDERSTANDING_TOOL_ID,
+  SPEECH_RECOGNITION_TOOL_ID,
+  type OfficialToolId,
+} from '../shared/official-tools';
 
 // ===== Capability sections =====
 //
@@ -108,9 +112,9 @@ the user explicitly wants.
 Full docs and supported formats: run \`myagents im readme\`.
 </myagents-cli-im-media>`;
 
-const SECTION_THOUGHT = `<myagents-cli-thought>
-The user can ask you to file a passing idea or note into their MyAgents
-thought inbox. Capture it ONLY when the user explicitly asks you to
+const SECTION_RECORD = `<myagents-cli-record>
+The user can ask you to save a passing idea or note into their MyAgents
+Records. Capture it ONLY when the user explicitly asks you to
 save / remember / note specific content for later:
 
   "记一下" / "帮我记" / "帮我记一下" / "记个想法" / "记下来"
@@ -121,11 +125,15 @@ preferences, brainstorming, or unsolicited ideas — those go into the
 discussion, not the inbox. The trigger is the user's explicit ask to
 record, not the presence of recordable content.
 
-  myagents thought list [--tag X] [--limit N] [--json]   # browse
-  myagents thought create '<content>'                    # capture (preferred)
-  myagents thought create --content-file <abs-path>      # if content has CJK
+  myagents record list [--kind text|audio] [--tag X] [--limit N] [--json]
+  myagents record create '<content>'                     # capture a text Record
+  myagents record create --content-file <abs-path>       # if content has CJK
                                                            # / multi-line / shell
                                                            # metachars / on Windows
+
+This CLI capture creates a text Record; it does not start microphone recording.
+Legacy 'myagents thought' remains compatible for published scripts, but never
+emit it in a new workflow.
 
 For \`create\`, ALWAYS wrap the content in single quotes ('...'), not
 double quotes. The user's content is shell data and may contain
@@ -136,7 +144,7 @@ content to a tempfile with your file-writing tool and use
 \`--content-file <abs-path>\` — that path is shell-quote-free and
 works identically across platforms. Tag inline with \`#xxx\` inside
 the content itself — there's no separate --tag flag on create.
-</myagents-cli-thought>`;
+</myagents-cli-record>`;
 
 const SECTION_VISION = `<myagents-cli-vision>
 If the active model/runtime cannot see images, use MyAgents' image-understanding
@@ -155,6 +163,20 @@ For details:
   myagents vision --help
   myagents vision readme
 </myagents-cli-vision>`;
+
+const SECTION_SPEECH = `<myagents-cli-speech>
+MyAgents can transcribe one audio or video attachment from the current
+Workspace with its local speech models. Use the required system skill
+\`myagents-speech-recognition\` when the user asks you to transcribe a local
+meeting, voice note, recording, or media attachment.
+
+Start with the exact command help:
+  myagents speech --help
+
+The command is asynchronous. MyAgents automatically binds every job to the
+current Session and Workspace; never look for or invent Session/Workspace
+scope flags.
+</myagents-cli-speech>`;
 
 /**
  * Single source of truth for the widget trigger rule. Embedded into both the
@@ -242,7 +264,7 @@ export function buildSessionInboxSection(_scenario: InteractionScenario): string
  *   - Task self-exit   only when scenario.type === 'cron' && aiCanExit
  *   - Goal Mode         only in private user-facing scenarios (desktop / IM / agent-channel)
  *   - IM media          only in 'im' / 'agent-channel' scenarios
- *   - thought capture   in 'desktop' / 'im' / 'agent-channel' scenarios.
+ *   - Record capture    in 'desktop' / 'im' / 'agent-channel' scenarios.
  *                       Excluded from cron because cron runs headless against
  *                       a fixed prompt — there's no live user there to file
  *                       an idea on behalf of.
@@ -282,15 +304,19 @@ export function buildCliToolsAppend(
     parts.push(SECTION_IM_MEDIA);
   }
 
-  // Thought capture — interactive scenarios where there's a live user
+  // Record capture — interactive scenarios where there's a live user
   // surfacing ideas. Cron runs are headless against a fixed prompt; no
   // human user to capture for, so the section is suppressed there.
   if (scenario.type === 'desktop' || scenario.type === 'im' || scenario.type === 'agent-channel') {
-    parts.push(SECTION_THOUGHT);
+    parts.push(SECTION_RECORD);
   }
 
   if (options?.enabledOfficialToolIds?.includes(IMAGE_UNDERSTANDING_TOOL_ID)) {
     parts.push(SECTION_VISION);
+  }
+
+  if (options?.enabledOfficialToolIds?.includes(SPEECH_RECOGNITION_TOOL_ID)) {
+    parts.push(SECTION_SPEECH);
   }
 
   // User-registered CLI tools — universal (PRD 0.2.36 cli_first_tool_registry).

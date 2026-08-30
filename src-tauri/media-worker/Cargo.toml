@@ -1,0 +1,39 @@
+[package]
+name = "myagents-media-worker"
+version = "0.4.10"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+publish = false
+
+[lib]
+name = "myagents_media_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myagents-media-worker"
+path = "src/main.rs"
+
+[dependencies]
+hdbscan = { version = "=0.12.0", default-features = false, features = ["serial"] }
+libloading = "0.9.0"
+myagents-media-worker-protocol = { path = "../media-worker-protocol" }
+opus2 = { version = "=0.4.0", default-features = false, features = ["backend-libopus", "bundled", "static"] }
+rubato = { version = "=0.16.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+symphonia = { version = "=0.6.1", default-features = false, features = ["aac", "adpcm", "aiff", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+ogg = "=0.9.2"
+tempfile = "3.10"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1

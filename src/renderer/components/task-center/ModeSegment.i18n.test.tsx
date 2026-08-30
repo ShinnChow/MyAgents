@@ -11,12 +11,18 @@ describe('ModeSegment i18n', () => {
 
   it('renders mode labels and tab hints in English', () => {
     const onChange = vi.fn();
-    render(<ModeSegment value="task" onChange={onChange} tabSwitchHint />);
+    render(<ModeSegment value="chat" onChange={onChange} tabSwitchHint />);
 
-    expect(screen.getByRole('button', { name: 'Chat' })).toHaveAttribute('title', 'Press Tab to switch to Thought');
-    expect(screen.getByRole('button', { name: 'Thought' })).toHaveAttribute('title', 'Press Tab to switch to Chat');
+    expect(screen.getByRole('button', { name: 'Chat' })).toHaveAttribute(
+      'title',
+      'Press Tab to switch to Records',
+    );
+    expect(screen.getByRole('button', { name: 'Records' })).toHaveAttribute(
+      'title',
+      'Press Tab to switch to Chat',
+    );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Thought' }));
-    expect(onChange).toHaveBeenCalledWith('thought');
+    fireEvent.click(screen.getByRole('button', { name: 'Records' }));
+    expect(onChange).toHaveBeenCalledWith('record');
   });
 });

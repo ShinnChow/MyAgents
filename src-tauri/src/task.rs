@@ -546,8 +546,17 @@ pub struct Task {
     /// lists, but kept in task history/session records for auditability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_thought_id: Option<String>,
+    #[serde(
+        default,
+        rename = "sourceRecordId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_record_id: Option<String>,
+    /// Persistence-only ingress for Tasks whose source Thought has not yet
+    /// published a canonical Record. It is hidden from product/API output and
+    /// written back by `persist_locked` until promotion is safe.
+    #[serde(default, rename = "sourceThoughtId", skip_serializing)]
+    legacy_source_thought_id: Option<String>,
     #[serde(default)]
     pub session_ids: Vec<String>,
     pub status: TaskStatus,
@@ -593,6 +602,36 @@ pub struct Task {
 impl Task {
     pub fn effective_trigger(&self) -> TaskTrigger {
         self.trigger.clone().unwrap_or_default()
+    }
+
+    fn promote_legacy_source_if(&mut self, is_published_record: impl FnOnce(&str) -> bool) -> bool {
+        let Some(legacy_id) = self.legacy_source_thought_id.as_deref() else {
+            return false;
+        };
+        if self.source_record_id.is_some() || !is_published_record(legacy_id) {
+            return false;
+        }
+        self.source_record_id = self.legacy_source_thought_id.take();
+        true
+    }
+
+    fn promote_published_legacy_source(&mut self) -> bool {
+        self.promote_legacy_source_if(|id| {
+            crate::record::get_record_store().is_some_and(|store| store.has_published_record(id))
+        })
+    }
+
+    fn serialize_for_disk(&self) -> Result<String, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        if let Some(legacy_id) = self.legacy_source_thought_id.as_ref() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "sourceThoughtId".to_string(),
+                    serde_json::Value::String(legacy_id.clone()),
+                );
+            }
+        }
+        serde_json::to_string(&value)
     }
 }
 
@@ -1099,8 +1138,8 @@ pub struct TaskCreateDirectInput {
     /// Internal system-managed task marker. Only a small allow-list is accepted.
     #[serde(default)]
     pub managed_kind: Option<String>,
-    #[serde(default)]
-    pub source_thought_id: Option<String>,
+    #[serde(default, rename = "sourceRecordId")]
+    pub source_record_id: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -1147,10 +1186,8 @@ pub struct TaskDiscussionMetadata {
     pub discussion_id: String,
     pub workspace_id: String,
     pub workspace_path: String,
-    #[serde(default)]
-    pub source_thought_id: Option<String>,
-    #[serde(default)]
-    pub source_thought_tags: Vec<String>,
+    #[serde(default, rename = "sourceRecordId", alias = "sourceThoughtId")]
+    pub source_record_id: Option<String>,
     pub created_at: i64,
 }
 
@@ -2168,6 +2205,9 @@ impl TaskStore {
         let now = now_ms();
         let mut changed = false;
         for task in map.values_mut() {
+            if task.promote_published_legacy_source() {
+                changed = true;
+            }
             if task.last_scheduled_at.is_none() && task.last_executed_at.is_some() {
                 task.last_scheduled_at = task.last_executed_at;
                 changed = true;
@@ -2279,8 +2319,9 @@ impl TaskStore {
             let mut rows: Vec<&Task> = map.values().collect();
             rows.sort_by_key(|t| t.created_at);
             for t in rows {
-                let line =
-                    serde_json::to_string(t).map_err(|e| format!("serialize task: {}", e))?;
+                let line = t
+                    .serialize_for_disk()
+                    .map_err(|e| format!("serialize task: {}", e))?;
                 file.write_all(line.as_bytes())
                     .map_err(|e| format!("write task line: {}", e))?;
                 file.write_all(b"\n")
@@ -2452,7 +2493,8 @@ impl TaskStore {
             runtime_config: input.runtime_config,
             mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
             managed_kind,
-            source_thought_id: input.source_thought_id,
+            source_record_id: input.source_record_id,
+            legacy_source_thought_id: None,
             session_ids: Vec::new(),
             status: TaskStatus::Todo,
             tags: input.tags,
@@ -2623,7 +2665,8 @@ impl TaskStore {
             runtime_config: input.runtime_config,
             mcp_enabled_servers: normalize_mcp_override(input.mcp_enabled_servers),
             managed_kind,
-            source_thought_id: input.source_thought_id,
+            source_record_id: input.source_record_id,
+            legacy_source_thought_id: None,
             session_ids: Vec::new(),
             status: initial_status,
             tags: input.tags,
@@ -2802,7 +2845,8 @@ impl TaskStore {
             runtime_config: None,
             mcp_enabled_servers: None,
             managed_kind: None,
-            source_thought_id: None,
+            source_record_id: None,
+            legacy_source_thought_id: None,
             session_ids: vec![input.current_session_id.clone()],
             status: TaskStatus::Running,
             tags: input.tags,
@@ -5082,8 +5126,7 @@ pub async fn cmd_task_prepare_discussion(
     discussion_id: String,
     workspace_id: String,
     workspace_path: String,
-    source_thought_id: Option<String>,
-    source_thought_tags: Option<Vec<String>>,
+    source_record_id: Option<String>,
 ) -> Result<PreparedTaskDiscussion, String> {
     validate_safe_id(&discussion_id, "discussionId")?;
     let root = crate::app_dirs::myagents_data_dir()
@@ -5106,17 +5149,16 @@ pub async fn cmd_task_prepare_discussion(
         discussion_id: discussion_id.clone(),
         workspace_id,
         workspace_path,
-        source_thought_id,
-        source_thought_tags: source_thought_tags.unwrap_or_default(),
+        source_record_id,
         created_at: now_ms(),
     };
     let json = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("serialize Task discussion metadata: {e}"))?;
     write_atomic_text(&dir.join("metadata.json"), &json)?;
     ulog_debug!(
-        "[task] prepared discussion id={} thought={:?}",
+        "[task] prepared discussion id={} record={:?}",
         discussion_id,
-        meta.source_thought_id,
+        meta.source_record_id,
     );
     Ok(PreparedTaskDiscussion {
         discussion_id,
@@ -5484,7 +5526,7 @@ mod tests {
             runtime_config: None,
             mcp_enabled_servers: None,
             managed_kind: None,
-            source_thought_id: Some("thought-1".to_string()),
+            source_record_id: Some("record-1".to_string()),
             tags: vec!["MyAgents".to_string()],
             notification: None,
         }
@@ -7891,6 +7933,44 @@ mod tests {
         );
         assert!(value.get("execution_state").is_none());
         assert!(value.get("triggerState").is_none());
+    }
+
+    #[test]
+    fn legacy_source_thought_id_is_preserved_until_its_record_is_published() {
+        let mut task: Task = serde_json::from_value(serde_json::json!({
+            "id": "task-legacy-source",
+            "name": "legacy source",
+            "executor": "agent",
+            "workspaceId": "workspace",
+            "workspacePath": "/tmp/workspace",
+            "executionMode": "once",
+            "sourceThoughtId": "record-1",
+            "sessionIds": [],
+            "status": "stopped",
+            "tags": [],
+            "createdAt": 1,
+            "updatedAt": 1,
+            "statusHistory": [],
+            "dispatchOrigin": "direct"
+        }))
+        .unwrap();
+        assert!(task.source_record_id.is_none());
+        assert_eq!(task.legacy_source_thought_id.as_deref(), Some("record-1"));
+        let api_value = serde_json::to_value(&task).unwrap();
+        assert!(api_value.get("sourceRecordId").is_none());
+        assert!(api_value.get("sourceThoughtId").is_none());
+        assert!(task
+            .serialize_for_disk()
+            .unwrap()
+            .contains("sourceThoughtId"));
+
+        assert!(task.promote_legacy_source_if(|id| id == "record-1"));
+        let persisted = serde_json::to_value(task).unwrap();
+        assert_eq!(
+            persisted.get("sourceRecordId"),
+            Some(&serde_json::json!("record-1"))
+        );
+        assert!(persisted.get("sourceThoughtId").is_none());
     }
 
     #[tokio::test]

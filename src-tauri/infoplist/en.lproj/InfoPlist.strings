@@ -2,3 +2,6 @@
 CFBundleDisplayName = "MyAgents";
 CFBundleName = "MyAgents";
 NSAppleEventsUsageDescription = "MyAgents needs to control other apps so the AI can activate windows, run AppleScript, and perform desktop automation on your behalf.";
+NSMicrophoneUsageDescription = "MyAgents uses the microphone when you record a meeting and stores the recording locally.";
+NSAudioCaptureUsageDescription = "MyAgents captures system audio when you record a meeting and stores the recording locally.";
+NSScreenCaptureUsageDescription = "MyAgents uses Screen Recording permission to capture screen content when you request a screenshot, or to capture system audio with ScreenCaptureKit when you record a meeting; meeting recording doesn't save screen video.";

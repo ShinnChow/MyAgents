@@ -95,7 +95,9 @@ Groups:
   cron      定时 Task 的已发布兼容命令面（不再是 Agent canonical surface）
   goal      管理当前 session Goal Mode（get/create/update）
   task      管理任务中心与定时自动化（create/run/start/stop/runs/exit/Trigger/...）
-  thought   管理任务中心想法（list/create）
+  record    管理统一 Record（list/create；可按 text/audio 过滤）
+  thought   `record` 的历史兼容 alias
+  speech    当前 Session 的本地附件转录（transcribe/status/wait/cancel/list）
   im        IM runtime actions（send-media）
   session   Agent Session 发现与协作（list/start/send/watch）
   diagnose  Runtime / 系统自诊断（runtime <type>）— `runtime diagnose <type>` 的别名糖
@@ -113,6 +115,8 @@ Global flags:
   --port NUM      覆盖端口
   --disable-nonessential  禁用非必要校验
 ```
+
+Agent-facing system prompt、Required Skills 与 help 只推荐 canonical `myagents record` / `sourceRecordId`。`myagents thought`、`/api/admin/thought/*` 与持久层 `sourceThoughtId` 仅在已发布脚本、旧 JSON shape 和升级读取边界保留；兼容面薄映射到 Record owner，不能重新成为产品主入口或第二份 Store。
 
 `mcp add` 是 create-only 操作：自定义 MCP ID 已存在时明确失败并保持原定义不变；需要替换时先检查并显式 `mcp remove`，避免省略的 `args/env/description` 被一次不完整 add 静默清空。
 
@@ -356,7 +360,8 @@ Admin API 注册在 Sidecar 的 `/api/admin/*` 路由下，提供与 GUI 对等�
 | `/api/admin/cron/*` | 定时任务 CRUD、启停、执行历史、状态查询 |
 | `/api/admin/goal/*` | 当前 session Goal Mode：`get` / `create` / `update` |
 | `/api/admin/task/*` | 任务中心：list/get/create/update/run/rerun/run-now、trigger validate/test/check-now/reset、status/session/archive/delete/doc |
-| `/api/admin/thought/*` | 任务中心想法：list/create |
+| `/api/admin/record/*` | 统一 Record：list/create；`thought` 路由仅作兼容 |
+| `/api/admin/speech/*` | 当前 Session 的附件转录 submit/status/cancel/list；`wait` 复用 status 轮询 |
 | `/api/admin/skill/*` | Skills CRUD、远程/本地来源安装、启停、sync；显式相对路径由 CLI 按调用者 cwd 归一化 |
 | `/api/admin/tool/*` | 用户注册 CLI 工具注册表（实验室门控，默认关闭） |
 | `/api/admin/vision/*` | 官方图片理解 CLI 工具：`readme` / `analyze` |
@@ -474,6 +479,14 @@ Human output 以 Rust 查询时派生的 `output.artifactAvailable` 为产物真
 
 Agent 使用说明由 required system Skill `/myagents-anydoc` 渐进加载；`myagents-cli` 只在正文速查中登记 `myagents anydoc --help` 与专属 Skill，不复制协议，且其 frontmatter description 不得出现 AnyDoc。AnyDoc 不进入 `system-prompt-cli-tools.ts` 的 always-on 内容。当前参数、退出码和恢复指引以逐级 exact `--help` 为二进制权威，不提供 `readme` 命令。底层 owner、资源和安全契约见 [`document_processing.md`](./document_processing.md)。
 
+#### `myagents speech` Session-scoped 附件转录
+
+Speech 是官方稳定命令组，不属于 MCP，也不受用户 CLI 工具注册表开关控制。公开 surface 固定为 `transcribe/status/wait/cancel/list`；App backend 始终异步，`wait` 只是 CLI 对 status 的有界退避轮询。`transcribe --file` 只接受当前 authoritative Workspace 内的一份普通本地音视频文件；默认输出根为 `myagents_files/speech-transcriptions`，成功 artifact 由 App owner 原子发布。
+
+调用链为 app bundle CLI → 当前 Session Sidecar `/api/admin/speech/*` → Rust Management API `/api/speech/*` → App-global `SpeechRecognitionManager`。CLI 请求体只包含文件、输出根、job ID 或 limit，不发布 `--sessionId`、`--workspacePath`、`--sidecarId` 等 scope 参数。Node 从 live `SessionEngine` 取得 Sidecar process identity；Rust 用 Management request header 的 process generation 解析 authoritative `sessionId + workspacePath`，并把它冻结到 job。status/cancel/list 必须使用同一 Session identity，不能枚举或操作其它 Session 的 job。
+
+`myagents speech list` 只返回调用 Session 最近的 durable job；这不是用户可选 filter。工具被该 Session 禁用、没有真实 Session/Workspace、caller generation 过期或资源未安装时都 fail closed。`wait` 收到 Ctrl-C 退出 130，但不会取消 App job；用户可用同一 Session 的 status/cancel 继续处理。底层 Worker、模型与恢复契约见 [`recording_and_speech_recognition.md`](./recording_and_speech_recognition.md)。
+
 ### CLI 工具注册表实验门控
 
 用户注册 CLI 工具注册表（`myagents tool ...`、设置页「工具箱 / CLI 工具」、`tool-creator` skill、用户工具 prompt 注入）受 `config.cliToolRegistryEnabled` 控制。该开关位于「设置 → 关于&反馈 → 实验室」，默认关闭，且不能通过通用 `myagents config set cliToolRegistryEnabled ...` 修改，避免 AI 自行绕过人类可见的实验开关。
@@ -485,7 +498,7 @@ Agent 使用说明由 required system Skill `/myagents-anydoc` 渐进加载；`m
 - Node `syncProjectUserConfig()` 不把 `tool-creator` symlink 到工作区 `.claude/skills/`；Rust Launcher 的只读 slash picker 同样把它视为 disabled。
 
 不受影响：
-- 稳定内置 `myagents` CLI 能力（cron / task / thought / im / widget / runtime 等）仍然注入并可用。
+- 稳定内置 `myagents` CLI 能力（cron / task / record / speech / im / widget / runtime 等）仍然注入并可用。
 - 已经存在于 `~/.myagents/bin` 的工具 shim 不会被删除；门控的是 MyAgents 的注册、管理、自动发现和 `tool-creator` 注入，不是用户磁盘上可执行文件的生命周期。
 
 由于系统提示词和 SDK skill 集合只在 session 启动 / pre-warm 时固化，开关变化对已有会话的提示内容不会 retroactive 改写；但实际 `myagents tool ...` 调用会立即被 Admin API 门控。
@@ -564,4 +577,6 @@ PATH 优先级（agent-session.ts::buildClaudeSessionEnv）：
 | `CLI_BOOTSTRAP_FAILED ... LAUNCHER_*` | HOME launcher 无法原子收敛；检查路径 / 权限 / 占用，关闭占用程序后重试或重启 app |
 | 终端 `myagents` 找不到 | 场景 2 需要用完整路径或创建 alias，`~/.myagents/bin` 默认不在 shell PATH |
 | `Management API not available` | Node.js Sidecar 起来了但 Rust Management API 没起 — CLI 会附带 `→ Run: myagents status` 指引 |
+| `SPEECH_SESSION_REQUIRED` | 必须从拥有 authoritative Session + Workspace 的 MyAgents 会话调用；不要补传 scope 参数 |
+| `SPEECH_JOB_NOT_FOUND` | 该 job 不属于当前 Session 或已不存在；先在同一 Session 运行 `myagents speech list` |
 | `MyAgents <new-group>` 进了 GUI | app-binary 直调只兼容已发布 group；canonical `myagents <new-group>` 不受 Rust group 名单约束 |

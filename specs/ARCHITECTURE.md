@@ -13,7 +13,8 @@ MyAgents 是基于 Tauri v2 的桌面 AI Agent 客户端，提供 Claude Agent S
 - 定时任务
 - MCP 工具集成
 - 多 Agent Runtime（Claude Code CLI / Codex CLI / Gemini CLI）
-- 任务中心（想法速记 + 任务编辑 + 调度 + 状态机审计）
+- 任务中心（任务编辑 + 调度 + 状态机审计）
+- 统一 Record（文字速记、桌面录音、本地转录与说话人纠错）
 
 ## 技术栈
 
@@ -123,6 +124,7 @@ pub enum SidecarOwner {
 | Settings | ❌ 不包裹 | Global Sidecar | `apiFetch.ts`（全局） |
 | Capabilities（技能/插件/工具） | ❌ 不包裹 | Global Sidecar | 独立 Tab 页面状态；复用 Settings 能力模块与全局 API |
 | Launcher | ❌ 不包裹 | Global Sidecar | `apiFetch.ts`（全局） |
+| Record detail | ❌ 不包裹 | 不拥有 Sidecar | Tauri `cmd_record_*` / `cmd_recording_*`；语音 job 由 App-global manager 执行 |
 | GlobalSidebar（App Shell） | ❌ 不包裹 | 不直接拥有 Sidecar | App/config/task stores 的投影；变更调用既有 authority，页面打开交回 `App` 规划或聚焦 Tab |
 | IM Bot / Agent Channel | — (Rust 驱动) | Session Sidecar | Rust `ensure_session_sidecar()` |
 
@@ -266,12 +268,14 @@ Global control request
 | `/api/cron/*` | Scheduled Task 兼容 CRUD + 调度控制 | CLI、`im-cron-tool.ts` |
 | `/api/task/*` | Task Center 任务 CRUD、run/run-now/rerun、Trigger validate/test/check-now/reset-checkpoint 与 doc 读写 | CLI、`admin-api.ts` |
 | `/api/document/*`（4 条） | App-owned 本地文档 conversion job submit/status/cancel/list | `admin-api.ts` 的 AnyDoc 薄转发 |
+| `/api/speech/*`（4 条） | Session-scoped attachment transcription submit/status/cancel/list；caller scope 由 Sidecar process identity 注入 | `admin-api.ts` 的 Speech 薄转发 |
+| `/api/record/*` | 文字 Record 的 canonical CLI create/list | CLI、`admin-api.ts` |
 | `/api/mcp/remove-references` | Task 中删除 custom MCP identity 的持久引用 | `admin-api.ts` MCP remove cascade |
 | `/api/app/config-changed` | 将 disk-first AppConfig 失效信号广播到所有 WebView（空 payload，不携带 secret） | `admin-api.ts` model / MCP mutation |
 | `/api/runtime/sdk-child/{admit,settle}` | Rust-owned Claude SDK native child launch circuit；按 executable identity 限流 deterministic exec denial | Global / Session Sidecar 的 `createGuardedSdkQuery()` |
 | `/api/mcp/startup/*` | MyAgents-owned 本地 stdio MCP 的应用级启动准入；优先级、FIFO/aging、取消、过期与 stale settlement | Session Sidecar |
 | Management `/api/browser/*` | 「浏览器」Host capability、受管 Chromium resource resolution 与 Browser Identity checkpoint/CAS | Rust/Tauri；仅当前 Global/Session birth identity 可调用 |
-| `/api/thought/*`（2 条） | 想法 create / list | CLI、`admin-api.ts` |
+| `/api/thought/*`（2 条） | 已发布脚本的文字 Record create/list 兼容 facade | CLI、`admin-api.ts` |
 | `/api/im/*` + `/api/im-bridge/*` | IM Bot 唤醒 + 媒体下发 + Plugin Bridge 回调 | Node.js / 社区插件 Bridge |
 | `/api/plugin/*`（3 条） | OpenClaw 插件 CRUD | CLI |
 | `/api/agent/runtime-status`、`/api/agent/stop-channel(s)` | Agent 运行时状态查询；durable 删除/停用/归档后的精确或整组 Channel 生命周期收敛 | Node.js / 前端 |
@@ -372,7 +376,9 @@ Tab 内 MUST 用 `useTabState()` 的 `apiGet` / `apiPost`，禁止全局 `apiPos
 
 `GlobalSidebar` 挂在 `App` 的 Tab Workspace 之外，是应用级导航和资源投影，不是新的页面容器或 Session owner。顶部 Tab 仍是所有主内容页面的唯一 authority：active、关闭、恢复、拖拽、Sidecar owner token 与 pending-session birth 都继续由现有 Tab 状态机管理。
 
-App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Thought 只提交创建/讨论意图，不各自挂第二个 modal；普通 Task 详情选择属于 Task Center 内部状态，`task.comment` typed route 则由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
+App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Record 只提交创建/讨论意图，不各自挂第二个 modal；普通 Task 详情选择属于 Task Center 内部状态，`task.comment` typed route 则由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
+
+Record detail 也是普通顶部 Tab，但不是 Chat Tab：同一 `recordId` 只打开一个实例，持久 Tab snapshot 只保存 `{ id, view:'record', recordId, title }`。恢复时必须先经 `RecordStore.get` 验证；Record 已删除则保留同一 Tab identity 并退回统一 Record 列表。Record Tab 不创建 Session、Sidecar、owner token，也不持久化录音 snapshot、播放进度或活动电平。
 
 - 桌面主窗口的 renderable surface 投影由 App Shell 拥有：`useTrayEvents` 在 focus、resize、document visibility 与主动 hide 边界采样 Tauri `isVisible() && !isMinimized()`，零尺寸 resize 可先行判为 unavailable；Rust-owned 的全局快捷键 hide/show 通过 `tray::hide_main_window` / `tray::show_main_window` 在现有 Tauri event channel 同步投影同一个 surface edge，避免 WebView suspend 让异步 renderer 采样吞掉完整 hidden interval。`App` 只在 available→unavailable 时推进 presentation generation，并只把该投影交给 active Chat。focus 值仅服务通知/input attention，不拥有 Chat 滚动、窗口可见性或 geometry；仍在展示的窗口即使失焦也持续把 live 消息交给 Virtuoso，失焦/重新聚焦本身不得产生 scroll command。
 - MessageList 外层 viewport 的非零 `ResizeObserver` 结果是当前 presentation generation 的 renderer readiness authority。internal inactive Tab、native minimized/hidden surface 或尚未 ready 的恢复 generation 都冻结 Virtuoso 的 data/index/height input；消息/SSE 与 TabProvider/Sidecar 生命周期继续推进。`useChatScrollController` 是唯一 continuity owner：viewport admission 从 true→false 时保存 follow 或最近可信 message anchor，从 false→true 时只执行一个受 Session/transaction identity 保护的恢复意图；未挂载 anchor 通过 Virtuoso `itemsRendered` 事件结算，禁止 focus snapshot、固定延时、RAF 猜测或把可见的 `align:start` 当最终位置。完整不变量见 [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md)。
@@ -413,7 +419,7 @@ MyAgents 产品级 append 由 `buildSystemPromptAppend()` 统一组装：
 | **L1** 基础身份 | 告诉 AI 运行在 MyAgents 产品中 | 始终 |
 | **L2** 交互方式 | 桌面客户端 / IM Bot / Agent Channel | 互斥选一 |
 | **L3** 场景与产品交互 | Task / IM 心跳 / Registered Agent / 浮球 / Widget / Session 协作                   | 按需叠加 |
-| **L4** CLI 能力发现 | Task / Goal / Thought / IM 媒体 / Vision / 用户注册工具 | 按场景与能力开关叠加 |
+| **L4** CLI 能力发现 | Task / Goal / Record / IM 媒体 / Vision / 用户注册工具 | 按场景与能力开关叠加 |
 
 当前 `InteractionScenario` 包含 desktop、im、agent-channel、cron 和 registeredAgent；
 精确字段、预设片段条件矩阵、四种 Runtime 的投送方式、Workspace 指令兼容和
@@ -424,7 +430,7 @@ pre-warm 不可变语义见
 
 ### 4. 自配置 CLI (`src/cli/` + `src-tauri/src/cli.rs`)
 
-内置命令行 `myagents`，让 AI 和用户都能通过 Bash 管理应用配置（MCP / Provider / Agent / Cron / Goal / Plugin），能力与 GUI 对等。
+内置命令行 `myagents`，让 AI 和用户都能通过 Bash 管理应用配置与产品能力（MCP / Provider / Agent / Cron / Goal / Record / Speech / Plugin），能力与 GUI 对等。
 
 **两个使用场景：**
 
@@ -443,7 +449,21 @@ CLI 业务 bundle 只位于当前 app。由于 SDK 子进程与用户 shell 的 
 
 每个 job 使用一个独立 Rust `myagents-document-worker` 进程。Manager 通过 `process_cmd::spawn_tree()` 保留精确 `ChildTree`，用有界 length-prefixed JSON 私有协议传入单次任务；Worker 只读取 Manager 已复制的私有输入，并在输出根内的隐藏 staging 目录运行 AnyDoc、pdf-inspector、PDFium 与 PP-OCRv6 Small。成功后由 Manager 校验 active `(jobId, generation)` 与输出根 identity，以私有 crash-durable publish intent + 随目录 marker 协调同卷 no-replace rename、目录 sync 和 terminal `job.json`；未知持久化结果必须保留 intent。启动恢复只能由同一个 Manager owner 完成已 durable 的 success，或清理未提交 authenticated public path 后把非终态收敛为 `interrupted`。durable terminal 不可逆；artifact 发布后由用户拥有，删除/修改只影响派生 `artifactAvailable`。公开 artifact 固定为 `<output-root>/<job-id>/document.md` 和实际引用的 `assets/`。Worker crash、取消、超时或 App 退出均不得发布 partial artifact。
 
-ONNX Runtime CPU、PDFium、PP-OCRv6 Small 模型/字典和 Worker 按 target 随 App 资源发布；启动时 Manager 校验 manifest 和所有文件 hash，Worker 使用同一 manifest 再校验并只从绝对资源路径加载。运行时不联网，不依赖 GPT、API key、系统 Python/Node、GPU 或系统安装的 native runtime。详细状态机、限制、资源矩阵和排查见 [`tech_docs/document_processing.md`](./tech_docs/document_processing.md)。
+ONNX Runtime CPU、PDFium、PP-OCRv6 Small 模型/字典和 Worker 按 target 随 App 资源发布。App setup 只做 manifest/target/path/regular-file/size 等浅检查；ready 后等待 10 秒，再以最低优先级、可被 Record live 让路的后台 lease 分块校验完整 hash。共享 ORT 只由 `LocalInferenceRuntimeRegistry` 校验一次，Document Manager 校验其余文档资源；后台失败阻止新的对应 admission。Worker 使用同一 manifest 在实际加载前再次完整校验并只从绝对资源路径加载。ONNX Runtime 是 App-owned 的共享本地推理资源：document 与 speech capability 必须消费同一 target artifact identity，speech bundle 只携带自身 Worker、sherpa adapter/C API 与 legal inventory，禁止复制第二份 ORT。只有 Worker 确认需要 PP-OCR 后，Document Manager 才通过 exact-generation 协议授予 `LocalComputeCoordinator` lease；Record live ASR waiter 会让当前 OCR generation cooperative cancel，将同一 Document job 清理未发布 staging 后安全重排，不改变 job ID 或错误终态。构建入口统一为 `scripts/prepare-native-inference.mjs`，在同一锁和 content-addressed cache 下准备并原子投影两个 capability。运行时不联网，不依赖 GPT、API key、系统 Python/Node、GPU 或系统安装的 native runtime。详细状态机、限制、资源矩阵和排查见 [`tech_docs/document_processing.md`](./tech_docs/document_processing.md)。
+
+#### App-owned 本地语音识别
+
+`RecordStore` 是文字/音频 Record、录音 artifact、timeline、transcript revision、说话人 override、导出 source 与 audio Record 根目录 `content.md` 当前态文稿的持久权威，根目录为 `~/.myagents/records/`；旧 `thoughts/` 只作为一次性迁移输入。`content.md` 是可由当前 Record revision 重建的派生 artifact，只在结束保存后产生，并随最终转写、说话人/元数据/现场笔记/重点 Mark 变化原子覆盖刷新；AI 讨论只消费这一份源文件，不创建平行快照。`RecordingManager` 拥有 App-global 唯一采集槽、设备 identity、pause/resume/stop、Ogg Opus archive、异常恢复和录音期 wake lock。`SpeechRecognitionManager` 是 Record / Agent 语音 job、Worker generation、持久恢复与结果发布的 App-global owner；三者都不属于 Tab、Session 或 Sidecar。
+
+录音控制面是 Renderer/托盘 → Tauri command；数据面在 Rust 内从一个有界 callback fan-out 先进入权威 archive，再可选进入 live analysis。采集使用平台 backend（macOS ScreenCaptureKit + `cpal` microphone、Windows WASAPI loopback + `cpal`、Linux PipeWire + `cpal`），重采样、容器与 codec 分别复用 `rubato`、`ogg` 和 bundled libopus；不得再实现第二套 DSP、媒体容器、设备 watcher 或通用队列。`myagents-media-worker` 是一次一 generation 的受管进程，私有 framed stdin/stdout 不监听端口、不下载资源、不写 Record；Manager 校验 exact `(jobId, generation)` 后才拥有发布权。
+
+可下载模型权重由 `SpeechModelPackManager` 子模块拥有，native Worker、sherpa adapter 和共享 ONNX Runtime 仍属于随 App 发布的受信任执行层。用户安装只访问固定的第一方签名 manifest 和其中编译期锁定的 content-addressed 第一方模型/许可镜像，不接受远端路径或 inventory；上游 GitHub URL 只存在于 release-only origin lock，不进入 App 运行时。五个模型文件和五份许可文件在 private staging 中完成 regular-file、非执行权限、size、SHA-256、manifest byte identity 与 App-updater Minisign trust-root 校验，再由真实 media Worker 最小加载 ASR/VAD/diarization 后发布版本目录并原子切换 `active.json`。安装不会为历史 Record 自动创建 job；没有 transcript 的历史音频只能由详情页“开始转录”显式提交。
+
+模型 revision 与 ONNX Runtime revision 在 workload 接纳时写入 immutable pipeline snapshot。排队执行只解析该 snapshot，不能用届时 active 设置覆盖；Worker 启动后对 exact model/native/runtime 再校验。compute admission 固定为 live > backfill > diarization > attachment/OCR/显式模型验证 > 后台资源校验，同级 FIFO；只有 live 抢占已经运行的 workload，其余优先级只选择下一个 admission。暂停不足 10 分钟保留 live 模型与 lease；到期后用现有 Yield checkpoint 卸载 exact generation，resume 由 durable spool/journal offset 冷恢复。启动只做模型 pack 浅检查，完整 hash 在 10 秒安静窗口后以最低优先级可让路执行；安装期模型最小加载仍使用显式 `SpeechModelValidation` lease。移除仅在没有非终态语音 job / active Worker 时执行，并只删除严格命名的 App-owned pack 目录。详见 [`tech_docs/recording_and_speech_recognition.md`](./tech_docs/recording_and_speech_recognition.md)。
+
+Agent attachment transcription 只经当前 Session Sidecar 的 `myagents speech` 进入：CLI 不接受 `sessionId/workspacePath/sidecarId` scope 参数；Node 从 live Session context 取 process identity，Rust Management API 再用请求 header 的 Sidecar generation 解析 authoritative Session + Workspace。job 持久记录该 caller，status/cancel/list 都按 exact Session 过滤；其它 Session 不可枚举或操作。桌面 Record 不受这个 Agent 列表 scope 约束，继续由 App-global Record UI 管理。
+
+Record 变更经现有 Tauri event 投影到统一 Record 列表、Record detail、托盘和 Tantivy Record index；录音中托盘只增加状态圆点与“正在录音...”入口，点击聚焦 exact Record Tab。产品 analytics 复用现有 renderer `track()` → Tauri event bridge，只发送 typed milestone、枚举和 hash，不建立第二个 endpoint、outbox、retry/store 或日志管道。
 
 ### 5. 定时任务系统
 
@@ -715,13 +735,14 @@ Cmd+W 层级关闭：Overlay → 分屏面板 → Tab，高 z-index 优先。
 
 ### 14. 全文搜索引擎 (`src-tauri/src/search/`)
 
-基于 Tantivy + tantivy-jieba 的 Rust 子系统。`SearchEngine` Tauri managed state 单例，为两类查询提供全文检索：Session 历史（跨工作区）与工作区文件内容。
+基于 Tantivy + tantivy-jieba 的 Rust 子系统。`SearchEngine` Tauri managed state 单例，为三类查询提供全文检索：Session 历史（跨工作区）、Record 与工作区文件内容。
 
 **仅 Tauri 可用** —— 前端通过 `invoke('cmd_search_*')` 直接调 Rust，不经 Sidecar。浏览器开发模式不提供 fallback。
 
 **关键设计：**
 - Session 索引：单一全局索引 `~/.myagents/search_index/sessions/`
 - Session watcher：`notify-debouncer-full` 5s 滑动去抖观察 `~/.myagents/sessions/`，**任何**写入者的变更都自动流入索引
+- Record index：`RecordStore` 的 create/update/delete 广播驱动增量 upsert；索引 title/content/tags/transcript/speaker projection，以 `record_id` 去重并限制每个 Record 只返回一个产品命中
 - 读写并发：`Arc<SessionIndex>`（无外层 mutex）；正常读写共享 state 读锁，仅损坏恢复独占替换
 - 中文分词：`tantivy-jieba`（~37 万词词典），字段 MUST 显式 `"chinese"` tokenizer
 - Schema 版本门控：`SCHEMA_VERSION` + `.schema_version` 磁盘 marker，不一致时自动删除重建
@@ -750,12 +771,12 @@ installer.ts         — analyseTree → staging → 文件锁内复核/rename �
 
 详见 `guides/skill_marketplace.md`。
 
-### 16. 任务中心 (`src-tauri/src/task.rs` + `src-tauri/src/thought.rs` + `src/renderer/components/task-center/`)
+### 16. 任务中心与 Record 列表 (`src-tauri/src/task.rs` + `src-tauri/src/record.rs` + `src/renderer/components/task-center/`)
 
-把“想法/粗略目标 → 讨论或创建 → 调度 → Session 执行 → 本地协作 → 审计”的工作流一等公民化。
+把“文字/音频 Record → 讨论或创建 Task → 调度 → Session 执行 → 本地协作 → 审计”的工作流一等公民化。`thought` 只保留 CLI 与旧数据兼容名；新产品 surface 使用 Record。
 
 **两个持久化 Store：**
-- `ThoughtStore` —— `~/.myagents/thoughts/<YYYY-MM>/<id>.md`
+- `RecordStore` —— `~/.myagents/records/<YYYY-MM>/<id>/`；统一文字、音频、timeline、transcript、speaker override 与 artifact
 - `TaskStore` —— `~/.myagents/tasks.jsonl` + canonical `~/.myagents/tasks/<id>/task.md` + 可选 `comments.jsonl`；旧 `verify.md/progress.md/alignment.md` 仅兼容读取
 
 **关键设计：**
@@ -770,7 +791,8 @@ installer.ts         — analyseTree → staging → 文件锁内复核/rename �
 - Task/Session identity protection 由 per-Session lifecycle guard 串行化：任何 durable mutation（含 legacy migration）只要让 Task 进入受保护状态或新增受保护 Session binding，都与 Session 删除遵循 `lifecycle → TaskStore` 锁序；scheduler active execution 覆盖 Session id 已 claim、Sidecar `Task` owner 尚未附着的窗口，birth guard 只保留到权威 Session metadata 出现（不持满整轮），shared-session joiner 不得提前 adopt。metadata creator 由该 reservation 决定，不绑定 Sidecar `isNew`；被删除的 fixed Session 换新 UUID，不复活旧 identity
 - 同一 Task 的 status、timer、execution claim 与 stop side effect 由 keyed Task-control lifecycle 串行化；stop 使用现有 `queueId` 精确停止当前 Turn。持久 `Running/Stopped` 只表达 scheduler intent，具体 Turn 以非持久 `running/stopping/stop_failed` 投影；stop 未确认时禁止 rerun。Attached Space Task 的终态不能 generic rerun，必须由新的 claim/reopen 创建新 Attached Task
 - Runtime terminal 先由 TaskStore 在一笔原子提交中结算 counter/time/`lastExecution`/连续失败/可选终态，再写 `cron_runs` 审计、通知和释放 Session owner；外围 cleanup 没有 Task 状态写权限。recurring 可重试失败第 5 次才 Blocked，成功清零；永久失败、一次性任务失败或 termination 未确认立即 Blocked，manual run-now 不改 durable status
-- AI 讨论路径：智能创建或 Thought「AI 讨论」→ 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`
+- AI 讨论路径：智能创建或 Record「AI 讨论」→ 选择工作区 → 同一个 Task discussion builder/新 Chat Tab → product-owned `myagents-task-alignment` readiness gate → 可留在 Session，也可在用户确认完整候选 `task.md` 与参数后调用通用 `task create-direct`。text Record 的可见首轮 query 使用完整当前正文；audio Record 的可见 query 以 RecordStore admission 后的唯一 `content.md` 为主，隐藏 reminder 只保留读取与 workspace scope 所需字段，并可带经 RecordStore 验证的实际音轨绝对路径供按需核听
+- Record 列表统一展示 text/audio；文字 Record 可继续派发 Task，audio Record 打开单实例详情完成播放、笔记/Mark、手动补转录、说话人改名/合并/片段重分配与导出。Record 与 Task 生命周期保持独立，不把 transcription job 或录音状态塞进 Task row
 - Agent comment 的本地有界 locator index 由 TaskStore 从 `comments.jsonl` 异步重建并增量维护；App 级通知投影与 Cloud source 合并排序、source-aware 已读和 typed route，但不复制评论正文 authority
 - 状态变更广播 Tauri event `task:status-changed`（非 SSE），所有打开的任务中心 Tab 实时同步
 
@@ -987,12 +1009,15 @@ Space 与其它 renderer CSS surface 一样直接继承 `<html>` 上当前 Theme
 | Goal Pause/终态 | 先提交 SessionGoal 状态，再精确 stop queue Turn；确认后才清 authority / 释放 Goal owner并广播 `goal:changed`，不确定时保留 |
 | IM 消息到达 | `ensureSessionSidecar(sessionId, workspace, 'agent', sessionKey)` |
 | IM Session 空闲超时 | `releaseSessionSidecar(sessionId, 'agent', sessionKey)` |
+| 桌面录音开始 | `RecordingManager.start` 取得 App-global 唯一采集槽并创建 audio Record；不创建 Sidecar |
+| 桌面录音 pause/resume/stop | 同一 Manager 串行控制 exact recording generation；stop 先提交 archive，再收敛 live Worker/backfill |
+| Agent attachment 转录 | 当前 Session Sidecar → Admin API → Management API → `SpeechRecognitionManager`；scope 由进程身份注入，不新增 Sidecar owner |
 | 终端打开 | `cmd_terminal_create(workspace, rows, cols, port, id)` |
 | 终端关闭 / Tab 关闭 | `cmd_terminal_close(terminalId)` |
 | 浏览器打开 | `cmd_browser_create(tabId, url, x, y, width, height)` |
 | 浏览器关闭 / Tab 关闭 | `cmd_browser_close(tabId)` |
 | 任务立即执行 / 重新派发 | `TaskApplication::run*` / `cron run-now` → 直接触发 Task execution use case；不创建 CronTask |
-| Task 软删除 | `TaskApplication::delete_ordinary` → `TaskStore` 写 `→ deleted` 伪状态 + 联动清理 thought |
+| Task 软删除 | `TaskApplication::delete_ordinary` → `TaskStore` 写 `→ deleted` 伪状态 + 联动清理来源 Record |
 | 应用退出 / 普通重启 | Rust `RunEvent::ExitRequested` 统一关闭资源创建入口，等待在途创建完成登记或释放，再通过现有进程树句柄停止 Sidecar / Plugin Bridge 并清理 IM、终端和浏览器；普通重启通过 `request_restart()` 进入同一路径 |
 
 **Owner 释放规则：** 当一个 Session 的所有 Owner 都释放后，Sidecar 才停止。
@@ -1144,6 +1169,7 @@ Windows 无自带 git/bash，NSIS 静默安装 Git for Windows（`src-tauri/nsis
 
 ### 任务中心 / 搜索
 - [任务中心架构](./tech_docs/task_center.md) — TaskStore 权威、直接调度、Legacy Cron 迁移、CLI
+- [Recording and Speech Recognition](./tech_docs/recording_and_speech_recognition.md) — Record/Recording/Speech owner、录音状态、Worker、资源与恢复
 - [Cloud Space 架构](./tech_docs/space_cloud.md) — 实验室 Space 登录、Issue/Skill、registered agent、IssueDelivery/claim 到 attached-session Task
 - [全文搜索架构](./tech_docs/search_architecture.md) — Tantivy + jieba、session watcher、UTF-16 高亮
 
@@ -1158,7 +1184,7 @@ Windows 无自带 git/bash，NSIS 静默安装 Git for Windows（`src-tauri/nsis
 - [构建问题排查](./guides/build_troubleshooting.md) — Windows 构建 / CSP / Resources 缓存 / 代理
 
 ### 前端
-- [设计系统](./DESIGN.md) — Token / 组件 / 页面规范
+- [设计系统](./DESIGN.md) — 全局视觉、组件、交互原则与功能设计索引
 - [Theme System](./tech_docs/theme_system.md) — Theme/Appearance 状态、注册契约、Token/adapter owner、bootstrap 与跨窗口同步
 - [React 稳定性规范](./tech_docs/react_stability_rules.md) — Context / useEffect / memo 5 条规则
 - [Chat 滚动与窗口呈现生命周期](./tech_docs/chat_scroll_presentation_lifecycle.md) — native surface、container readiness、Virtuoso admission 与 continuity transaction

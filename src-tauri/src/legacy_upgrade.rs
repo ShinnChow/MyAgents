@@ -233,7 +233,7 @@ fn migration_input(
             runtime_config: cron.runtime_config.clone(),
             mcp_enabled_servers: cron.mcp_enabled_servers.clone(),
             managed_kind: cron.managed_kind.clone(),
-            source_thought_id: None,
+            source_record_id: None,
             tags: cron
                 .source_bot_id
                 .as_ref()

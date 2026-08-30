@@ -1,21 +1,20 @@
 // Tab restore persistence (Issue #232 / PRD 0.2.25).
 //
-// Persists the list of open *chat* tabs to localStorage so they can be
+// Persists the list of open chat / Record tabs to localStorage so they can be
 // restored after an app restart / update. This module is the PURE core:
 // serialize / deserialize / save / load with no React or sidecar coupling,
 // so the filtering + dedup + validation invariants are unit-testable in the
 // fast pool (see tabPersistence.test.ts).
 //
 // Design (PRD 0.2.25, codex-reviewed):
-//  - Only chat tabs with a REAL sessionId survive. Launcher tabs, pending-
-//    sessions, and non-chat views are dropped — restoring them is meaningless.
-//  - De-duped by sessionId: a session can only live in one tab (singleton
-//    invariant the session-open planner relies on).
+//  - Chat tabs need a REAL sessionId; Record tabs need a stable recordId.
+//    Launcher tabs, pending sessions, and other views are dropped.
+//  - De-duped by owned identity: a Session / Record can only live in one tab.
 //  - persist-on-mutation: callers write synchronously on every structural
 //    change. We do NOT rely on `beforeunload` (unreliable in Tauri WKWebView;
 //    update install exits from the Rust side — see App.handleRestartAndUpdate).
-//  - Hydration creates normal live Chat shapes with a pending sidecar
-//    disposition. App owns validation, merge, materialization, and rollback.
+//  - Hydration creates normal live Tab shapes. App owns validation, merge,
+//    Session materialization, and rollback.
 
 import { MAX_TABS, type Tab } from '@/types/tab';
 import { isPendingSessionId } from '../../shared/constants';
@@ -23,15 +22,25 @@ import { isPendingSessionId } from '../../shared/constants';
 const PERSIST_KEY = 'myagents.openTabs.v1';
 const PERSIST_VERSION = 1 as const;
 
-/** The whitelisted, persisted shape of a restorable chat tab. Intentionally a
- *  subset of `Tab` — runtime-only fields (isGenerating / hasUnread /
- *  sidecarConfigDisposition / initialMessage) are never stored. */
-export interface PersistedTab {
+/** Whitelisted persisted shapes. Runtime-only fields (recording snapshots,
+ *  seek intents, generation state, sidecar disposition, drafts) never cross
+ *  this boundary. */
+export interface PersistedChatTab {
+    view: 'chat';
     id: string;
     agentDir: string; // non-null (launcher tabs filtered out)
     sessionId: string; // real UUID (pending- filtered out)
     title: string;
 }
+
+export interface PersistedRecordTab {
+    view: 'record';
+    id: string;
+    recordId: string;
+    title: string;
+}
+
+export type PersistedTab = PersistedChatTab | PersistedRecordTab;
 
 export interface PersistedTabState {
     version: typeof PERSIST_VERSION;
@@ -39,10 +48,9 @@ export interface PersistedTabState {
     activeTabId: string | null;
 }
 
-/** A tab is restorable iff it is a chat tab pointing at a real Session identity
- *  in a real workspace. Existence-on-disk is validated when the user accepts
- *  the restore pill; here we only enforce the persisted shape. */
-function isRestorable(tab: Tab): tab is Tab & { agentDir: string; sessionId: string } {
+/** Existence-on-disk is validated when the user accepts the restore pill; here
+ *  we only enforce the whitelisted persisted identity shape. */
+function isRestorableChat(tab: Tab): tab is Tab & { agentDir: string; sessionId: string } {
     return (
         tab.view === 'chat' &&
         typeof tab.agentDir === 'string' &&
@@ -53,37 +61,51 @@ function isRestorable(tab: Tab): tab is Tab & { agentDir: string; sessionId: str
     );
 }
 
+function isRestorableRecord(tab: Tab): tab is Tab & { recordId: string } {
+    return tab.view === 'record' && typeof tab.recordId === 'string' && tab.recordId.length > 0;
+}
+
+function persistedIdentity(tab: PersistedTab): string {
+    return tab.view === 'chat' ? `chat:${tab.sessionId}` : `record:${tab.recordId}`;
+}
+
 /**
  * Reduce the live tab list to the persisted shape. Returns null when there is
  * nothing worth persisting (so callers can clear the key instead of writing an
  * empty record).
  *
  * Invariants:
- *  - only restorable chat tabs (see isRestorable)
+ *  - only restorable chat / Record tabs
  *  - field whitelist (no runtime-only fields leak to disk)
- *  - de-duped by sessionId, first occurrence wins
+ *  - de-duped by Session / Record identity, first occurrence wins
  *  - capped at MAX_TABS
  *  - activeTabId is preserved only if it survives filtering; otherwise falls
  *    back to the first surviving tab
  */
 export function serializeTabs(tabs: Tab[], activeTabId: string | null): PersistedTabState | null {
-    const seenSessions = new Set<string>();
+    const seenResources = new Set<string>();
     const seenIds = new Set<string>();
     const persisted: PersistedTab[] = [];
     for (const tab of tabs) {
-        if (!isRestorable(tab)) continue;
-        // De-dupe by BOTH sessionId (one session lives in one tab — the
-        // session-open planner's singleton invariant) and tab id (duplicate ids
-        // would collide as React keys + Rust sidecar owner ids).
-        if (seenSessions.has(tab.sessionId) || seenIds.has(tab.id)) continue;
-        seenSessions.add(tab.sessionId);
+        const entry: PersistedTab | null = isRestorableChat(tab)
+            ? {
+                view: 'chat',
+                id: tab.id,
+                agentDir: tab.agentDir,
+                sessionId: tab.sessionId,
+                title: tab.title,
+            }
+            : isRestorableRecord(tab)
+                ? { view: 'record', id: tab.id, recordId: tab.recordId, title: tab.title }
+                : null;
+        if (!entry) continue;
+        const identity = persistedIdentity(entry);
+        // Duplicate ids collide as React keys and owner ids; duplicate resource
+        // identities violate the existing single-instance navigation contract.
+        if (seenResources.has(identity) || seenIds.has(tab.id)) continue;
+        seenResources.add(identity);
         seenIds.add(tab.id);
-        persisted.push({
-            id: tab.id,
-            agentDir: tab.agentDir,
-            sessionId: tab.sessionId,
-            title: tab.title,
-        });
+        persisted.push(entry);
         if (persisted.length >= MAX_TABS) break;
     }
     if (persisted.length === 0) return null;
@@ -96,16 +118,36 @@ export function serializeTabs(tabs: Tab[], activeTabId: string | null): Persiste
     };
 }
 
-function isValidPersistedTab(value: unknown): value is PersistedTab {
-    if (typeof value !== 'object' || value === null) return false;
+function normalizePersistedTab(value: unknown): PersistedTab | null {
+    if (typeof value !== 'object' || value === null) return null;
     const t = value as Record<string, unknown>;
-    return (
+    if (
+        t.view === 'record' &&
+        typeof t.id === 'string' && t.id.length > 0 &&
+        typeof t.recordId === 'string' && t.recordId.length > 0 &&
+        typeof t.title === 'string'
+    ) {
+        return { view: 'record', id: t.id, recordId: t.recordId, title: t.title };
+    }
+    // Backward compatibility: v1 chat snapshots shipped before the tagged
+    // union had no `view`; normalize them into the current whitelisted shape.
+    if (
+        (t.view === undefined || t.view === 'chat') &&
         typeof t.id === 'string' && t.id.length > 0 &&
         typeof t.agentDir === 'string' && t.agentDir.length > 0 &&
         typeof t.sessionId === 'string' && t.sessionId.length > 0 &&
         !isPendingSessionId(t.sessionId) &&
         typeof t.title === 'string'
-    );
+    ) {
+        return {
+            view: 'chat',
+            id: t.id,
+            agentDir: t.agentDir,
+            sessionId: t.sessionId,
+            title: t.title,
+        };
+    }
+    return null;
 }
 
 /**
@@ -129,20 +171,17 @@ export function deserializeTabs(raw: string | null): PersistedTabState | null {
     if (obj.version !== PERSIST_VERSION) return null;
     if (!Array.isArray(obj.tabs)) return null;
 
-    const seenSessions = new Set<string>();
+    const seenResources = new Set<string>();
     const seenIds = new Set<string>();
     const tabs: PersistedTab[] = [];
     for (const candidate of obj.tabs) {
-        if (!isValidPersistedTab(candidate)) continue;
-        if (seenSessions.has(candidate.sessionId) || seenIds.has(candidate.id)) continue;
-        seenSessions.add(candidate.sessionId);
-        seenIds.add(candidate.id);
-        tabs.push({
-            id: candidate.id,
-            agentDir: candidate.agentDir,
-            sessionId: candidate.sessionId,
-            title: candidate.title,
-        });
+        const tab = normalizePersistedTab(candidate);
+        if (!tab) continue;
+        const identity = persistedIdentity(tab);
+        if (seenResources.has(identity) || seenIds.has(tab.id)) continue;
+        seenResources.add(identity);
+        seenIds.add(tab.id);
+        tabs.push(tab);
         if (tabs.length >= MAX_TABS) break;
     }
     if (tabs.length === 0) return null;
@@ -181,21 +220,30 @@ export function loadPersistedTabs(): PersistedTabState | null {
     }
 }
 
-/** Hydrate a validated PersistedTabState into normal live Chat Tab shapes.
- *  They remain only in the restore candidate until the user accepts the pill;
- *  App validates and atomically mounts the surviving Tabs before resolving the
- *  pending sidecar disposition. Shared by localStorage and durable recovery. */
+/** Hydrate a validated PersistedTabState into normal live Tab shapes. They
+ *  remain only in the restore candidate until the user accepts the pill; App
+ *  validates and atomically mounts survivors. */
 export function hydratePersistedState(state: PersistedTabState): { tabs: Tab[]; activeTabId: string | null } {
-    const tabs: Tab[] = state.tabs.map((t) => ({
-        id: t.id,
-        agentDir: t.agentDir,
-        sessionId: t.sessionId,
-        view: 'chat',
-        title: t.title,
-        // App commits this live Chat before ensure, matching normal persisted-
-        // session navigation. The exact ensure result resolves push|adopt.
-        sidecarConfigDisposition: 'pending',
-    }));
+    const tabs: Tab[] = state.tabs.map((t) => t.view === 'record'
+        ? {
+            id: t.id,
+            agentDir: null,
+            sessionId: null,
+            view: 'record',
+            title: t.title,
+            recordId: t.recordId,
+            sidecarConfigDisposition: 'push',
+        }
+        : {
+            id: t.id,
+            agentDir: t.agentDir,
+            sessionId: t.sessionId,
+            view: 'chat',
+            title: t.title,
+            // App commits this live Chat before ensure, matching normal persisted-
+            // session navigation. The exact ensure result resolves push|adopt.
+            sidecarConfigDisposition: 'pending',
+        });
     return { tabs, activeTabId: state.activeTabId };
 }
 
@@ -240,20 +288,29 @@ export function parseCleanMarker(raw: string | null): boolean {
     }
 }
 
-/** Decide whether to surface the "restore last session" pill on boot (Issue
+/** Decide whether to surface the "restore previous tabs" pill on boot (Issue
  *  #309). We offer restore ONLY when the last exit was NOT a deliberate user
  *  quit (i.e. a crash or an update-restart) AND there is a non-empty restorable
- *  snapshot. A clean quit means the user chose to end their session → boot
+ *  snapshot. A clean quit means the user chose to end the window state → boot
  *  fresh, no nag. Pure + unit-tested; the title-bar pill and the App boot
  *  effect share this single predicate. */
 export function shouldOfferRestore(lastExitWasClean: boolean, restorableTabCount: number): boolean {
     return !lastExitWasClean && restorableTabCount > 0;
 }
 
-/** Plan how clicking the "恢复对话" pill (Issue #309) merges the previous
- *  session into the currently-open tabs. Replaces a still-pristine lone launcher
- *  (the boot default); otherwise APPENDS the candidate tabs — de-duped by
- *  sessionId against what's already open and capped at MAX_TABS — so it never
+function restoreResourceIdentity(tab: Tab): string | null {
+    if (tab.view === 'chat' && tab.sessionId) return `chat:${tab.sessionId}`;
+    if (tab.view === 'record' && tab.recordId) return `record:${tab.recordId}`;
+    // App may replace a missing persisted Record with the existing Record-list
+    // surface at the same tab id. It is a one-restore fallback, not persisted.
+    if (tab.view === 'taskcenter') return `record-list-fallback:${tab.id}`;
+    return null;
+}
+
+/** Plan how clicking the restore pill (Issue #309) merges the previous tabs
+ *  into the currently-open tabs. Replaces a still-pristine lone launcher (the
+ *  boot default); otherwise APPENDS candidate tabs — de-duped by Session or
+ *  Record identity and capped at MAX_TABS — so it never
  *  disturbs work the user already started.
  *
  *  Crucially the merged list AND the surviving `activeTabId` are computed from
@@ -272,8 +329,11 @@ export function planRestoreTabs(
     const onlyPristineLauncher =
         prev.length === 1 && prev[0]?.view === 'launcher' && !prev[0]?.sessionId;
     const base = onlyPristineLauncher ? [] : prev;
-    const openSessions = new Set(base.map((t) => t.sessionId).filter(Boolean));
-    const toAdd = candidate.tabs.filter((t) => t.sessionId && !openSessions.has(t.sessionId));
+    const openResources = new Set(base.map(restoreResourceIdentity).filter(Boolean));
+    const toAdd = candidate.tabs.filter((tab) => {
+        const identity = restoreResourceIdentity(tab);
+        return identity != null && !openResources.has(identity);
+    });
     if (toAdd.length === 0) return null; // everything is already open — nothing to bring back
 
     const tabs = [...base, ...toAdd].slice(0, maxTabs);

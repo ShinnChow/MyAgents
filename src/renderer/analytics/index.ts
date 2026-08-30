@@ -32,7 +32,13 @@ export {
 } from './tracker';
 
 // 隐私哈希（v0.2.19）
-export { hashAgentName, hashAgentNameSync } from './hash';
+export {
+  hashAgentName,
+  hashAgentNameSync,
+  hashPrivateIdentity,
+  hashPrivateIdentitySync,
+} from './hash';
+export type { PrivateIdentityDomain } from './hash';
 
 // Pending birth context registry —— session_new 之前 caller 打入口上下文，consumer 消费
 export {
@@ -66,7 +72,14 @@ export type {
   TaskStopParams,
   TaskDeleteParams,
   LauncherModeSwitchParams,
-  ThoughtCreateParams,
+  RecordCreateParams,
+  RecordingStartResultParams,
+  RecordingFinishParams,
+  RecordingRecoveryParams,
+  SpeechProcessingFinishParams,
+  RecordUseParams,
+  SpeechResourceMutationParams,
+  SpeechAttachmentJobParams,
   AgentChannelMutationParams,
   AgentChannelToggleParams,
   TrackEvent,

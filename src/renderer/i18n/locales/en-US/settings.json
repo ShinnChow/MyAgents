@@ -1492,6 +1492,64 @@
         "unsupported": "This platform is not supported"
       }
     },
+    "speechResource": {
+      "capabilities": "Speech recognition capabilities",
+      "diarization": "Speaker separation",
+      "loading": "Reading local model status…",
+      "install": "Install models",
+      "installingAction": "Installing",
+      "update": "Update models",
+      "retry": "Retry installation",
+      "reinstall": "Reinstall",
+      "retryRemove": "Retry removal",
+      "removingAction": "Removing",
+      "remove": "Remove",
+      "downloadProgress": "{{downloaded}} / {{total}} downloaded",
+      "size": "{{download}} download · {{installed}} installed",
+      "authorizationHint": "The switch above only controls Agent access. Local recordings can always use installed speech capabilities.",
+      "operationFailed": "Speech model installation failed. Resources that did not pass verification were not activated.",
+      "removeFailed": "The speech models could not be removed. A job may still be using them.",
+      "activationWarning": "The models are installed, but directory synchronization could not be confirmed. They are usable now and may need reinstalling after a sudden power loss.",
+      "states": {
+        "checking": "Checking the official model manifest",
+        "not_installed": "Local models are not installed",
+        "downloading": "Downloading local models",
+        "verifying": "Verifying local models",
+        "installing": "Loading and activating local models",
+        "removing": "Removing local models",
+        "ready": "Local models are ready",
+        "update_available": "A local model update is available",
+        "error": "Local model operation failed"
+      },
+      "progress": {
+        "checking": "Verifying the manifest and signature…",
+        "verifying": "Securely extracting and checking files…",
+        "installing": "Loading models and activating atomically…",
+        "removing": "Removing models…"
+      },
+      "errors": {
+        "default": "Local speech resources are unavailable. Check the network and disk space, then try again.",
+        "SPEECH_RESOURCE_NETWORK": "The official manifest or a pinned upstream resource could not be reached. Check the network or proxy and try again.",
+        "SPEECH_RESOURCE_MANIFEST_INVALID": "The official manifest does not match this app version. No resources were installed.",
+        "SPEECH_RESOURCE_SIGNATURE_INVALID": "The official manifest signature is invalid. No untrusted resources were installed.",
+        "SPEECH_RESOURCE_DOWNLOAD_INVALID": "A model download was incomplete or failed verification. Corrupted resources were not installed.",
+        "SPEECH_RESOURCE_ARCHIVE_INVALID": "A model archive did not match the safe inventory. Its contents were not installed.",
+        "SPEECH_RESOURCE_PACK_INVALID": "The extracted model files were incomplete or failed verification. The resource was not activated.",
+        "SPEECH_RESOURCE_STORE_WRITE_FAILED": "The model resource could not be written safely. Check disk space and directory permissions, then try again.",
+        "SPEECH_RESOURCE_ACTIVATION_FAILED": "The models passed verification but could not be activated safely. Check disk space and directory permissions, then try again.",
+        "SPEECH_NATIVE_RUNTIME_UNAVAILABLE": "This app build does not include the local speech runtime, so models cannot be installed.",
+        "SPEECH_MODEL_LOAD_FAILED": "The model loading self-check failed. The resource was not activated.",
+        "SPEECH_MODEL_LOAD_TIMEOUT": "The model loading self-check timed out. The resource was not activated; try again later.",
+        "SPEECH_WORKER_START_FAILED": "The built-in speech engine could not start. Restart MyAgents and try again.",
+        "SPEECH_WORKER_PROTOCOL_ERROR": "The built-in speech engine returned an invalid response. Restart or update MyAgents and try again.",
+        "SPEECH_PATH_ENCODING_UNSUPPORTED": "The current app or data-directory path cannot be used by the local speech engine. Move it to a standard Unicode path and try again.",
+        "SPEECH_RESOURCE_INSTALL_INTERRUPTED": "Model installation was interrupted. Resources that did not pass full verification were not activated.",
+        "SPEECH_RESOURCE_CHANGED": "The local model state changed. Refresh and retry removal.",
+        "SPEECH_RESOURCE_REMOVE_FAILED": "The local models could not be removed safely. Check directory permissions and try again.",
+        "SPEECH_RESOURCE_CORRUPT": "The installed models are incomplete or corrupted. Install them again.",
+        "SPEECH_RESOURCE_BUSY": "Speech resources are in use by a job. Try again later."
+      }
+    },
     "dialogs": {
       "vision": {
         "title": "Image Understanding Settings",

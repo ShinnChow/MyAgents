@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -13,6 +13,11 @@ pub const MAX_CONTROL_FRAME_BYTES: usize = 1024 * 1024;
 pub enum WorkerRequest {
     Start(StartRequest),
     Cancel {
+        protocol_version: u32,
+        job_id: String,
+        worker_generation: u64,
+    },
+    GrantOcrLease {
         protocol_version: u32,
         job_id: String,
         worker_generation: u64,
@@ -29,6 +34,7 @@ pub struct StartRequest {
     pub source_name: String,
     pub staging_path: String,
     pub resource_manifest_path: String,
+    pub onnx_runtime_path: String,
     pub password: Option<SecretString>,
 }
 
@@ -121,6 +127,11 @@ pub enum WorkerResponse<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         unit: Option<&'a str>,
     },
+    OcrLeaseRequested {
+        protocol_version: u32,
+        job_id: &'a str,
+        worker_generation: u64,
+    },
     Completed {
         protocol_version: u32,
         job_id: &'a str,
@@ -202,5 +213,27 @@ mod tests {
     fn secret_debug_is_redacted() {
         let secret = SecretString("marker-password".into());
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
+    }
+
+    #[test]
+    fn ocr_lease_grant_is_bound_to_the_exact_generation() {
+        let payload = br#"{
+          "type":"grant_ocr_lease",
+          "protocolVersion":3,
+          "jobId":"20260824_0123456789ab",
+          "workerGeneration":9
+        }"#;
+        let request: WorkerRequest = serde_json::from_slice(payload).unwrap();
+        let WorkerRequest::GrantOcrLease {
+            protocol_version,
+            job_id,
+            worker_generation,
+        } = request
+        else {
+            panic!("expected OCR lease grant");
+        };
+        assert_eq!(protocol_version, PROTOCOL_VERSION);
+        assert_eq!(job_id, "20260824_0123456789ab");
+        assert_eq!(worker_generation, 9);
     }
 }

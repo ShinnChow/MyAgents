@@ -985,6 +985,8 @@ const SYSTEM_SKILLS: readonly string[] = [
   'myagents-cli',
   // v49: progressive instructions for the bundled offline document converter.
   'myagents-anydoc',
+  // v54: progressive instructions for Session-scoped local attachment ASR.
+  'myagents-speech-recognition',
   // v44: one Agent workflow for scheduled, future and conditional Task
   // automation; command Detector protocol is progressively disclosed inside.
   'myagents-task-automation',
@@ -1301,6 +1303,10 @@ async function routeAdminApi(
   if (route === 'anydoc/status') return await api.handleAnydocStatus(payload as Parameters<typeof api.handleAnydocStatus>[0]);
   if (route === 'anydoc/cancel') return await api.handleAnydocCancel(payload as Parameters<typeof api.handleAnydocCancel>[0]);
   if (route === 'anydoc/list') return await api.handleAnydocList(payload as Parameters<typeof api.handleAnydocList>[0]);
+  if (route === 'speech/transcribe') return await api.handleSpeechTranscribe(payload as Parameters<typeof api.handleSpeechTranscribe>[0]);
+  if (route === 'speech/status') return await api.handleSpeechStatus(payload as Parameters<typeof api.handleSpeechStatus>[0]);
+  if (route === 'speech/cancel') return await api.handleSpeechCancel(payload as Parameters<typeof api.handleSpeechCancel>[0]);
+  if (route === 'speech/list') return await api.handleSpeechList(payload as Parameters<typeof api.handleSpeechList>[0]);
   if (route === 'vision/readme') return await api.handleVisionReadme();
   if (route === 'vision/models') return api.handleVisionModels();
   if (route === 'vision/analyze') return await api.handleVisionAnalyze(payload as Parameters<typeof api.handleVisionAnalyze>[0]);
@@ -1427,6 +1433,8 @@ async function routeAdminApi(
   if (route === 'task/write-doc') return await api.handleTaskWriteDoc(payload as Parameters<typeof api.handleTaskWriteDoc>[0]);
   if (route === 'thought/list') return await api.handleThoughtList(payload as Parameters<typeof api.handleThoughtList>[0]);
   if (route === 'thought/create') return await api.handleThoughtCreate(payload as Parameters<typeof api.handleThoughtCreate>[0]);
+  if (route === 'record/list') return await api.handleRecordList(payload as Parameters<typeof api.handleRecordList>[0]);
+  if (route === 'record/create') return await api.handleRecordCreate(payload as Parameters<typeof api.handleRecordCreate>[0]);
 
   // MyAgents Cloud Space — Registered Agent CLI bridge.
   if (route === 'space/list') return await api.handleSpaceList();

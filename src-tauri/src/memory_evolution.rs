@@ -246,7 +246,7 @@ async fn ensure_job_running(
                     runtime_config: request.runtime_config.clone(),
                     mcp_enabled_servers: request.mcp_enabled_servers.clone(),
                     managed_kind: Some(spec.managed_kind.to_string()),
-                    source_thought_id: None,
+                    source_record_id: None,
                     tags: vec![
                         "system".to_string(),
                         "memory".to_string(),

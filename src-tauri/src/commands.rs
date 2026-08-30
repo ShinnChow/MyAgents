@@ -953,7 +953,7 @@ pub fn cmd_copy_folder_to_templates(
 
 // ============= Admin Agent Sync =============
 
-const ADMIN_AGENT_VERSION: &str = "26";
+const ADMIN_AGENT_VERSION: &str = "27";
 
 /// Helper-bundled paths (relative to `~/.myagents/`) that previous versions
 /// shipped but that have since been retired.
@@ -1070,7 +1070,7 @@ fn sync_admin_agent_blocking<R: Runtime>(app_handle: AppHandle<R>) -> Result<boo
 // matching exclusion list in src/server/index.ts::seedBundledSkills
 // MUST be kept in sync (comment there points back here).
 
-const SYSTEM_SKILLS_VERSION: &str = "53";
+const SYSTEM_SKILLS_VERSION: &str = "56";
 
 /// One process-wide transaction owner for the versioned system-skill
 /// snapshot. Startup automation and ConfigProvider may request convergence at
@@ -1104,6 +1104,10 @@ const SYSTEM_SKILLS: &[&str] = &[
     // converter. It is required because every Runtime must discover the same
     // App-owned job surface without an always-on prompt section.
     "myagents-anydoc",
+    // v54: progressive instructions for the Session-scoped local attachment
+    // transcription CLI. Identity stays product-injected; the Skill exposes
+    // only the public job and artifact contract.
+    "myagents-speech-recognition",
     // v53: Task automation documents the stable Agent-facing receipt,
     // idempotent run semantics, and existing result channels. Command
     // Detector protocol remains a progressive reference, not a competing
@@ -1580,14 +1584,15 @@ mod system_skills_tests {
     }
 
     #[test]
-    fn v53_keeps_task_cli_automation_and_creator_skills_aligned() {
-        assert_eq!(SYSTEM_SKILLS_VERSION, "53");
+    fn v56_keeps_task_cli_speech_automation_and_creator_skills_aligned() {
+        assert_eq!(SYSTEM_SKILLS_VERSION, "56");
         assert!(SYSTEM_SKILLS.contains(&"myagents-task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-alignment"));
         assert!(RETIRED_SYSTEM_SKILLS.contains(&"task-implement"));
         assert!(SYSTEM_SKILLS.contains(&"skill-creator"));
         let bundled = include_str!("../../bundled-skills/myagents-cli/SKILL.md");
         let anydoc = include_str!("../../bundled-skills/myagents-anydoc/SKILL.md");
+        let speech = include_str!("../../bundled-skills/myagents-speech-recognition/SKILL.md");
         let description = bundled
             .split("---")
             .nth(1)
@@ -1597,6 +1602,9 @@ mod system_skills_tests {
         assert!(bundled.contains("myagents anydoc --help"));
         assert!(bundled.contains("/myagents-anydoc"));
         assert!(anydoc.contains("myagents anydoc convert --file <input>"));
+        assert!(bundled.contains("/myagents-speech-recognition"));
+        assert!(speech.contains("myagents speech transcribe --file <input>"));
+        assert!(!speech.contains("--session-id"));
         assert!(bundled.contains("myagents space list --json"));
         assert!(bundled.contains("myagents space whoami --space <slug> --json"));
         assert!(bundled.contains("myagents space goal list --space <slug> --json"));
@@ -1613,10 +1621,16 @@ mod system_skills_tests {
         assert!(bundled.contains("enabled/runtime/runtimeConfig/providerId/model/permissionMode"));
         assert!(bundled.contains("--providerId X --model X"));
         assert!(bundled.contains("--query X --limit N"));
+        assert!(bundled.contains("myagents record create"));
+        assert!(bundled.contains("--sourceRecordId X"));
+        assert!(!bundled.contains("myagents thought create '...'"));
+        assert!(!bundled.contains("--sourceThoughtId X"));
         assert!(bundled.contains("没有 30 天恢复或 undelete 承诺"));
         assert!(!bundled.contains("myagents-sensor"));
 
         let automation = include_str!("../../bundled-skills/myagents-task-automation/SKILL.md");
+        assert!(automation.contains("Task 与立即执行/Record/Goal 的边界"));
+        assert!(!automation.contains("Task 与立即执行/Thought/Goal 的边界"));
         assert!(automation.contains("references/command-detector.md"));
         assert!(automation.contains("--startAt"));
         assert!(automation.contains("默认在 `run` 后约 2 秒"));
@@ -1652,6 +1666,7 @@ mod system_skills_tests {
         assert!(product_docs.contains("它面向软件使用而非源码开发"));
         assert!(product_docs.contains("随后加载 `/myagents-cli`"));
         assert!(product_docs.contains("在内置小助理里加载 `/support`"));
+        assert!(product_docs.contains("Record / Task / Cron / Goal"));
         assert!(SYSTEM_SKILLS.contains(&"myagents-docs"));
 
         for content in [
@@ -1762,8 +1777,8 @@ mod system_skills_tests {
     }
 
     #[test]
-    fn v26_helper_routes_product_knowledge_diagnosis_and_tool_install() {
-        assert_eq!(ADMIN_AGENT_VERSION, "26");
+    fn v27_helper_routes_product_knowledge_diagnosis_and_tool_install() {
+        assert_eq!(ADMIN_AGENT_VERSION, "27");
         let helper = include_str!("../../bundled-agents/myagents_helper/CLAUDE.md");
         let support =
             include_str!("../../bundled-agents/myagents_helper/.claude/skills/support/SKILL.md");
@@ -1771,6 +1786,8 @@ mod system_skills_tests {
             "../../bundled-agents/myagents_helper/.claude/skills/tool-install/SKILL.md"
         );
         assert!(helper.contains("`/myagents-docs`"));
+        assert!(helper.contains("Record、Task、定时调度和 Goal"));
+        assert!(!helper.contains("Thought、Task、定时调度和 Goal"));
         assert!(helper.contains("`/myagents-cli`"));
         assert!(helper.contains("`/support`"));
         assert!(helper.contains("`/tool-install`"));

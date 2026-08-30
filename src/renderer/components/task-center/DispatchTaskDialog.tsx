@@ -2,7 +2,7 @@
 // Two invocation paths, single surface:
 //   • `thought` present → "派发为任务": prefills name/body from the thought and
 //     preserves its existing tags as provenance without exposing extra form chrome,
-//     links `sourceThoughtId` so the thought card knows about the derived task.
+//     links `sourceRecordId` so the Record card knows about the derived task.
 //   • `thought` absent  → "新建任务": starts from a blank slate. Used by the
 //     Launcher recent-tasks "+" button and the Task Center overlay header.
 //
@@ -71,8 +71,8 @@ const DEFAULT_EVENTS: NonNullable<NotificationConfig['events']> = [
 const CREATE_MODES = ['smart', 'manual'] as const;
 
 interface Props {
-  /** When provided, the task is derived from this thought; otherwise the dialog
-   *  starts blank and `sourceThoughtId` is omitted. */
+  /** When provided, the task is derived from this Record; otherwise the dialog
+   *  starts blank and `sourceRecordId` is omitted. */
   thought?: TaskCreateIntent['thought'];
   /** Optional workspace hint for the 'new' flow (e.g. Launcher selection). */
   defaultWorkspacePath?: string;
@@ -344,7 +344,7 @@ export function DispatchTaskDialog({
         runtimeConfig: executionOverrides.runtimeConfig as Record<string, unknown> | undefined,
         permissionMode: advPermissionMode,
         mcpEnabledServers: advMcpEnabledServers,
-        sourceThoughtId: thought?.id,
+        sourceRecordId: thought?.id,
         tags: thought?.tags ?? [],
         notification,
       });
@@ -408,8 +408,7 @@ export function DispatchTaskDialog({
         content: smartPrompt.trim(),
         workspaceId: workspace.id,
         workspacePath: workspace.path,
-        sourceThoughtId: thought?.id,
-        sourceThoughtTags: thought?.tags,
+        sourceRecordId: thought?.id,
       });
       if (!opened) setBusy(false);
     } catch (error) {

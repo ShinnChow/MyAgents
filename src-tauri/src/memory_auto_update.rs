@@ -472,7 +472,7 @@ pub async fn configure_memory_auto_update_task(
                 runtime_config: None,
                 mcp_enabled_servers: None,
                 managed_kind: Some(crate::task::MANAGED_KIND_MEMORY_AUTO_UPDATE_BATCH.to_string()),
-                source_thought_id: None,
+                source_record_id: None,
                 tags: vec!["system".to_string(), "memory".to_string()],
                 notification: Some(crate::task::NotificationConfig {
                     desktop: false,

@@ -1,0 +1,177 @@
+{
+  "schemaVersion": 1,
+  "corpusVersion": "myagents-speech-quality-v1",
+  "preparedManifestSha256": "b0817942aad1c8cb847bf1b259fbd782e1fd8e553ef49a8e851b2080c208cc42",
+  "tools": {
+    "python": "3.12",
+    "pyarrow": "21.0.0",
+    "praatio": "6.2.0",
+    "jiwer": "4.0.0",
+    "meeteval": "0.4.3",
+    "wetext": "0.1.6",
+    "ffmpeg": "8.0.1"
+  },
+  "liveLatencyBenchmark": {
+    "sampleRate": 16000,
+    "frameSamples": 320,
+    "warmRepeats": 5,
+    "trailingSilenceSeconds": 3,
+    "vadParameters": {
+      "threshold": 0.25,
+      "minSilenceSeconds": 0.5,
+      "minSpeechSeconds": 0.25,
+      "maxSpeechSeconds": 30,
+      "windowSamples": 512
+    }
+  },
+  "sources": {
+    "aishell1Audio": {
+      "cacheName": "aishell1-S0002.tar.gz",
+      "url": "https://huggingface.co/datasets/AISHELL/AISHELL-1/resolve/bbe295d530192a4cd41644b711c9aecd087df653/data_aishell/wav/S0002.tar.gz?download=true",
+      "size": 36455331,
+      "sha256": "5700ffa081f42c5a1be701147e680490fa494db959ca3c10ae205c3658af159f",
+      "upstreamRevision": "AISHELL/AISHELL-1@bbe295d530192a4cd41644b711c9aecd087df653",
+      "license": "Apache-2.0",
+      "licenseUrl": "https://www.openslr.org/33/"
+    },
+    "aishell1Transcript": {
+      "cacheName": "aishell-transcript-v0.8.txt",
+      "url": "https://huggingface.co/datasets/AISHELL/AISHELL-1/resolve/bbe295d530192a4cd41644b711c9aecd087df653/data_aishell/transcript/aishell_transcript_v0.8.txt?download=true",
+      "size": 10091431,
+      "sha256": "b5f33b9e0b47548e20a5ea4e504297f80df41d559133924c4e5b7b544c15b5c4",
+      "upstreamRevision": "AISHELL/AISHELL-1@bbe295d530192a4cd41644b711c9aecd087df653",
+      "license": "Apache-2.0",
+      "licenseUrl": "https://www.openslr.org/33/"
+    },
+    "aishell4Audio": {
+      "cacheName": "aishell4-S_R003S01C01.flac",
+      "url": "https://huggingface.co/datasets/AISHELL/AISHELL-4/resolve/aada72727856313b19d4a030383c426364931dbf/test/wav/S_R003S01C01.flac?download=true",
+      "size": 255177109,
+      "sha256": "e4a8a76315b7dabe63f43e2364486d9dee989ddcf111d73dc3eae47d86838cd0",
+      "upstreamRevision": "AISHELL/AISHELL-4@aada72727856313b19d4a030383c426364931dbf",
+      "license": "CC-BY-SA-4.0",
+      "licenseUrl": "https://www.openslr.org/111/"
+    },
+    "aishell4TextGrid": {
+      "cacheName": "aishell4-S_R003S01C01.TextGrid",
+      "url": "https://huggingface.co/datasets/AISHELL/AISHELL-4/resolve/aada72727856313b19d4a030383c426364931dbf/test/TextGrid/S_R003S01C01.TextGrid?download=true",
+      "size": 198779,
+      "sha256": "fe1ac420affae1e377e1a254c72c992b560ea02d3a5d3c7e22b89f5faacf283b",
+      "upstreamRevision": "AISHELL/AISHELL-4@aada72727856313b19d4a030383c426364931dbf",
+      "license": "CC-BY-SA-4.0",
+      "licenseUrl": "https://www.openslr.org/111/"
+    },
+    "aishell4Rttm": {
+      "cacheName": "aishell4-S_R003S01C01.rttm",
+      "url": "https://huggingface.co/datasets/AISHELL/AISHELL-4/resolve/aada72727856313b19d4a030383c426364931dbf/test/TextGrid/S_R003S01C01.rttm?download=true",
+      "size": 46995,
+      "sha256": "1fe23bd4aef6575bfe61f0bc4875bc54fb39044ec013c6383546217ccf3e56e5",
+      "upstreamRevision": "AISHELL/AISHELL-4@aada72727856313b19d4a030383c426364931dbf",
+      "license": "CC-BY-SA-4.0",
+      "licenseUrl": "https://www.openslr.org/111/"
+    },
+    "ascendTest": {
+      "cacheName": "ascend-test.parquet",
+      "url": "https://huggingface.co/datasets/CAiRE/ASCEND/resolve/737e9800ae31be9932ba8464c80366559bd28424/main/test-00000-of-00001.parquet?download=true",
+      "size": 105756434,
+      "sha256": "a4c81d2b5ed6124f052089a695972808c16e0ce0c365ec9773c5d1a8fcf043a7",
+      "upstreamRevision": "CAiRE/ASCEND@737e9800ae31be9932ba8464c80366559bd28424",
+      "license": "CC-BY-SA-4.0",
+      "licenseUrl": "https://huggingface.co/datasets/CAiRE/ASCEND/blob/737e9800ae31be9932ba8464c80366559bd28424/README.md"
+    },
+    "amiAudio": {
+      "cacheName": "ami-ES2002a.Mix-Headset.wav",
+      "url": "https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus/ES2002a/audio/ES2002a.Mix-Headset.wav",
+      "size": 40724524,
+      "sha256": "9c76866990fcc8b84006dc32d273ad99df439090b748ebe72103bb78c3216ee7",
+      "upstreamRevision": "AMI-ES2002a-Mix-Headset",
+      "license": "CC-BY-4.0",
+      "licenseUrl": "https://groups.inf.ed.ac.uk/ami/download/"
+    },
+    "amiAnnotations": {
+      "cacheName": "ami-public-manual-1.6.2.zip",
+      "url": "https://groups.inf.ed.ac.uk/ami/AMICorpusAnnotations/ami_public_manual_1.6.2.zip",
+      "size": 22887865,
+      "sha256": "b56e5babb2496b8795deeeda7e71178d7fbc9963f94276cf2a3f4b56ebbc9f9d",
+      "upstreamRevision": "AMI-public-manual-1.6.2",
+      "license": "CC-BY-4.0",
+      "licenseUrl": "https://groups.inf.ed.ac.uk/ami/download/"
+    }
+  },
+  "selections": {
+    "aishell1Utterances": [
+      "BAC009S0002W0122",
+      "BAC009S0002W0124",
+      "BAC009S0002W0127",
+      "BAC009S0002W0129",
+      "BAC009S0002W0133",
+      "BAC009S0002W0134",
+      "BAC009S0002W0136",
+      "BAC009S0002W0137",
+      "BAC009S0002W0140",
+      "BAC009S0002W0145",
+      "BAC009S0002W0148",
+      "BAC009S0002W0151",
+      "BAC009S0002W0156",
+      "BAC009S0002W0159",
+      "BAC009S0002W0160",
+      "BAC009S0002W0161"
+    ],
+    "aishell4AsrWindow": {
+      "startSeconds": 1000,
+      "durationSeconds": 300
+    },
+    "aishell4DiarizationWindow": {
+      "startSeconds": 1690,
+      "durationSeconds": 120,
+      "collarSeconds": 0.25
+    },
+    "ascendUtterances": [
+      "00151",
+      "00208",
+      "00214",
+      "00233",
+      "00243",
+      "00297",
+      "00312",
+      "00342"
+    ],
+    "amiAsrWindow": {
+      "meeting": "ES2002a",
+      "startSeconds": 55,
+      "durationSeconds": 120
+    },
+    "amiDiarizationWindow": {
+      "meeting": "ES2002a",
+      "startSeconds": 55,
+      "durationSeconds": 120,
+      "collarSeconds": 0.25
+    },
+    "amiLiveLatencyWindows": [
+      {
+        "id": "ami-live-d002",
+        "meeting": "ES2002a",
+        "speaker": "D",
+        "firstWordSeconds": 82.08,
+        "lastWordEndSeconds": 84.46,
+        "leadingContextSeconds": 0.25
+      },
+      {
+        "id": "ami-live-c000",
+        "meeting": "ES2002a",
+        "speaker": "C",
+        "firstWordSeconds": 85.99,
+        "lastWordEndSeconds": 88.71,
+        "leadingContextSeconds": 0.25
+      },
+      {
+        "id": "ami-live-b005",
+        "meeting": "ES2002a",
+        "speaker": "B",
+        "firstWordSeconds": 104.89,
+        "lastWordEndSeconds": 106.58,
+        "leadingContextSeconds": 0.25
+      }
+    ]
+  }
+}

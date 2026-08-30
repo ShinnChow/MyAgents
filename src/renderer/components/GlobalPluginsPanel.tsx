@@ -449,9 +449,8 @@ function PluginDetailView({
         )}
       </div>
 
-      {/* Action buttons — DESIGN.md §6.1: pill-shaped (rounded-full) using
-       *  button tokens. Toggle uses secondary, open-dir is ghost, uninstall
-       *  uses danger semantic (var(--error)) per §6.1 危险按钮 spec. */}
+      {/* Component-specific pill action row. Colors follow DESIGN.md §5.1:
+       * toggle/open-dir use secondary semantics and uninstall uses danger. */}
       <div className="flex flex-wrap gap-2">
         <button
           type="button"
@@ -479,10 +478,8 @@ function PluginDetailView({
         </button>
       </div>
 
-      {/* Metadata card — bordered "主卡片" (DESIGN.md §6.2): paper-elevated
-       *  + 1px line border + p-5. Compact (no-border) cards are reserved
-       *  for clickable list items; static content blocks like these need
-       *  the border to visually contain themselves. */}
+      {/* Static metadata uses the DESIGN.md §5.3 main-card surface. The
+       * component-specific padding keeps its definition list readable. */}
       <section>
         <h3 className="mb-3 text-sm font-semibold tracking-[0.04em] text-[var(--ink-muted)]">
           {t('plugins.detail.metadata')}

@@ -46,6 +46,8 @@ replacement id.
 - `history_click`
 - `new_chat_button`
 - `task_center`
+- `record_detail`
+- `speech_tool_card`
 - `bug_report`
 - `agent_setup`
 - `cmd_k`
@@ -230,7 +232,55 @@ Task center:
 Launcher and thoughts:
 
 - `launcher_mode_switch`
-- `thought_create`
+
+Record, recording, and local speech:
+
+- `record_create`
+- `recording_start_result`
+- `recording_finish`
+- `recording_recovery`
+- `speech_processing_finish`
+- `record_use`
+- `speech_resource_mutation`
+- `speech_attachment_job`
+
+These events use `event_schema_version=1`. RecordStore, RecordingManager,
+SpeechRecognitionManager, and the speech resource owner produce typed local
+receipts only after their authoritative mutation or terminal commit. A single
+App-shell listener explicitly maps the receipt allowlist into the existing
+`track()` queue; it does not add a network endpoint, persistent analytics
+outbox, retry owner, or business-state replay.
+
+The local bridge may receive a random Record/job identity, but must replace it
+with the existing locally peppered, domain-separated `record_hash` or
+`job_hash` before calling `track()`. Raw Record/job IDs, title, tag,
+transcript, note, Speaker name, source/output paths, media bytes, and raw error
+messages are forbidden. `error_code` accepts normalized uppercase codes only.
+Media duration, file bytes, count, coverage, and segment-final latency use the
+fixed buckets in PRD 0.4.12; model resource bytes and technical operation
+duration may remain exact because they contain no user media facts.
+
+`record_use` reports an accepted Record operation, never a hover or an
+uncommitted click. Renderer owns only `open` after Record Tab navigation
+succeeds and `play` after the media element actually enters a new playback
+session; pause/resume/seek do not emit another event. Rust-owned export,
+archive, delete, and Speaker correction operations emit only after their
+authoritative operation succeeds. Stable fields are `record_hash`,
+`record_kind`, the fixed `operation`, `source`, and `surface`.
+
+`recording_start_result` records one new start admission result, not an
+idempotent replay or focus of an already-active slot. `recording_finish` is
+emitted after archive/final manifest settlement and contains only fixed
+finish/outcome enums and aggregate buckets. `recording_recovery` is buffered
+in process until the App-shell listener confirms registration so startup
+recovery receipts are not lost; the buffer is bounded and non-persistent.
+
+`speech_processing_finish` covers terminal Record backfill and diarization.
+`speech_attachment_job` covers accepted submit and terminal finish/cancel for
+Session-scoped Agent jobs. `speech_resource_mutation` covers explicit
+download/update/retry/remove results. All three reuse the same Rust owners and
+existing Renderer analytics transport; Worker stdout, UI buttons, and CLI
+formatting never infer success.
 
 Floating ball:
 

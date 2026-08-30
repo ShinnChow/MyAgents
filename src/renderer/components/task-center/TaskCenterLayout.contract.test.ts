@@ -11,9 +11,13 @@ function source(relativePath: string): string {
 describe('Task Center layout contract', () => {
   it('keeps the thought panel fixed while allowing the task panel to shrink', () => {
     const taskCenter = source('src/renderer/pages/TaskCenter.tsx');
+    const thoughtPanel = source('src/renderer/components/task-center/ThoughtPanel.tsx');
 
-    expect(taskCenter).toContain('w-[480px] shrink-0');
     expect(taskCenter).toContain('flex min-w-0 flex-1 flex-col overflow-hidden');
+    expect(taskCenter).toContain('w-[480px] min-w-0 max-w-full shrink-0');
+    expect(thoughtPanel).toContain(
+      'box-border w-full min-w-0 max-w-full px-4 pb-3',
+    );
   });
 
   it('compacts the task toolbar without allowing its title to break', () => {
@@ -63,6 +67,9 @@ describe('Task Center layout contract', () => {
     expect(compactVariant).toContain("textareaClass: 'text-sm leading-relaxed'");
     expect(launcherVariant).toContain('pxPerLine: 26');
     expect(launcherVariant).toContain("textareaClass: 'text-base leading-relaxed'");
+    expect(input).toContain(
+      "variant === 'launcher' ? 'h-8 px-2.5' : 'h-7 px-2'",
+    );
     expect(card).toContain(
       'bg-transparent text-sm leading-relaxed text-[var(--ink)]',
     );
@@ -72,5 +79,19 @@ describe('Task Center layout contract', () => {
     expect(card).toContain(
       'bg-[var(--accent-warm-subtle)] px-1 text-xs text-[var(--accent-warm)]',
     );
+  });
+
+  it('keeps Task Center as the idea surface and starts recording through App', () => {
+    const taskCenter = source('src/renderer/pages/TaskCenter.tsx');
+    const thoughtPanel = source('src/renderer/components/task-center/ThoughtPanel.tsx');
+    const app = source('src/renderer/App.tsx');
+
+    expect(thoughtPanel).toContain("t('thoughts.centerTitle')");
+    expect(thoughtPanel).toContain("t('thoughts.centerInputPlaceholder')");
+    expect(taskCenter).toContain(
+      'onStartRecording ? handleRequestRecording : undefined',
+    );
+    expect(app).toContain("tab.id === tabId && tab.view === 'taskcenter'");
+    expect(app).toContain('openInNewTab,');
   });
 });

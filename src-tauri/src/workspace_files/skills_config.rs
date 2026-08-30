@@ -57,6 +57,7 @@ pub const REQUIRED_SYSTEM_SKILLS: &[&str] = &[
     "myagents-memory-molt",
     "myagents-cli",
     "myagents-anydoc",
+    "myagents-speech-recognition",
     "myagents-task-automation",
     "myagents-docs",
 ];
@@ -90,7 +91,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         fs::write(
             root.path().join("skills-config.json"),
-            r#"{"disabled":["myagents-task-alignment","myagents-memory-update","myagents-memory-gardener","myagents-memory-molt","myagents-cli","myagents-anydoc","myagents-task-automation","myagents-docs","ordinary-skill"]}"#,
+            r#"{"disabled":["myagents-task-alignment","myagents-memory-update","myagents-memory-gardener","myagents-memory-molt","myagents-cli","myagents-anydoc","myagents-speech-recognition","myagents-task-automation","myagents-docs","ordinary-skill"]}"#,
         )
         .expect("write skills config");
 

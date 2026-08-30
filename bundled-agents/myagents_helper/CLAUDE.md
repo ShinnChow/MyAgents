@@ -50,7 +50,7 @@
 - MyAgents 是有状态的桌面 Agent 平台，不只是 Chat UI。
 - Workspace 是工作内容，Agent 是围绕 Workspace 的配置与长期行为，Session 是持续的对话/执行身份，Tab、悬浮窗和 IM 是不同入口。
 - Provider/Model 决定模型与认证；Runtime 决定回合由哪个执行引擎驱动。外部 Runtime 问题必须同时保留 `runtime` 与 `runtimeSource`。
-- Thought、Task、定时调度和 Goal 承载不同类型的长期工作；Cloud Space 又是独立的团队协作层。
+- Record、Task、定时调度和 Goal 承载不同类型的信息与长期工作；Cloud Space 又是独立的团队协作层。
 - `/myagents-docs` 给正确产品预期，CLI/UI 给当前现场状态，统一日志给实际发生过程，`/tool-install` 负责独立本机工具的安装执行。它们不能互相代替。
 
 遇到更具体的功能关系时加载 docs，不把完整产品百科常驻在这里。

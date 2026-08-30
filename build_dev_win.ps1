@@ -184,13 +184,13 @@ Write-Host ""
 # Prepare the same target-locked document Worker/OCR/PDFium projection used by
 # release builds. The prepare owner is fingerprinted, so a warm invocation is
 # an offline no-op instead of repeating downloads, extraction, or signing.
-Write-ColorOutput "[准备] 准备离线文档转换资源 (x86_64-pc-windows-msvc)..." "Blue"
-& node "$PROJECT_DIR\scripts\prepare-document-processing.mjs" "x86_64-pc-windows-msvc"
+Write-ColorOutput "[准备] 准备离线文档与语音推理资源 (x86_64-pc-windows-msvc)..." "Blue"
+& node "$PROJECT_DIR\scripts\prepare-native-inference.mjs" "x86_64-pc-windows-msvc"
 if ($LASTEXITCODE -ne 0) {
-    Write-ColorOutput "✗ 文档转换资源准备失败" "Red"
+    Write-ColorOutput "✗ 原生推理资源准备失败" "Red"
     exit 1
 }
-Write-ColorOutput "✓ 文档转换资源 ready" "Green"
+Write-ColorOutput "✓ 原生推理资源 ready" "Green"
 Write-Host ""
 
 # TypeScript 检查
