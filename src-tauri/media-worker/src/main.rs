@@ -12,7 +12,7 @@ use myagents_media_worker::protocol::{
     WorkerStage, WorkloadIdentity, WorkloadInput, WorkloadKind, read_manager_frame,
     write_control_frame,
 };
-use myagents_media_worker::record_opus::{RecordOpusDecoder, RecordOpusError, RecordOpusMixer};
+use myagents_media_worker::record_opus::{RecordOpusError, RecordOpusMixer};
 use std::io::{self, BufReader, BufWriter, StdinLock, StdoutLock, Write};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -485,78 +485,83 @@ fn run_record_backfill(
     let mut revision = 0_u64;
     let mut emitted_segments = 0_u32;
     let mut source_samples = 0_u64;
-    for (index, input) in inputs.iter().enumerate() {
+    let output_track = record_backfill_output_track(inputs)?;
+    let paths = inputs
+        .iter()
+        .map(|input| Path::new(&input.input_path))
+        .collect::<Vec<_>>();
+    let mut decoder = RecordOpusMixer::open(&paths).map_err(map_record_decode_error)?;
+    let mut vad = adapter
+        .create_vad(models)
+        .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+    let mut last_heartbeat_at = Instant::now();
+    while let Some(chunk) = decoder.read_chunk().map_err(map_record_decode_error)? {
         if poll_batch_control(identity, &controls, &checkpoints, writer)? {
             return Ok(());
         }
-        let mut decoder = RecordOpusDecoder::open(Path::new(&input.input_path))
-            .map_err(map_record_decode_error)?;
-        let mut vad = adapter
-            .create_vad(models)
-            .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
-        let mut last_heartbeat_at = Instant::now();
-        while let Some(chunk) = decoder.read_chunk().map_err(map_record_decode_error)? {
-            if poll_batch_control(identity, &controls, &checkpoints, writer)? {
-                return Ok(());
-            }
-            if chunk.start_sample() != checkpoints[index].analysis_sample {
-                return Err("SPEECH_CORRUPT_MEDIA");
-            }
-            vad.accept(chunk.samples())
-                .map_err(|_| "SPEECH_INFERENCE_FAILED")?;
-            checkpoints[index].analysis_sample = checkpoints[index]
-                .analysis_sample
-                .checked_add(chunk.samples().len() as u64)
-                .ok_or("SPEECH_RESOURCE_LIMIT")?;
-            source_samples = source_samples
-                .checked_add(chunk.samples().len() as u64)
-                .ok_or("SPEECH_RESOURCE_LIMIT")?;
-            emitted_segments = emitted_segments.saturating_add(drain_batch_vad(
-                &mut vad,
-                input.track,
-                checkpoints[index].analysis_sample,
-                &mut asr,
-                identity,
-                &mut revision,
-                writer,
-            )?);
-            if last_heartbeat_at.elapsed() >= Duration::from_secs(2) {
-                last_heartbeat_at = Instant::now();
-                write_response(
-                    writer,
-                    WorkerResponse::Heartbeat {
-                        protocol_version: PROTOCOL_VERSION,
-                        identity: identity.clone(),
-                        stage: WorkerStage::Transcribing,
-                        checkpoint: batch_checkpoint(&checkpoints),
-                    },
-                )?;
-            }
-        }
-        let summary = decoder.summary().ok_or("SPEECH_CORRUPT_MEDIA")?;
-        if summary.output_samples_16k != checkpoints[index].analysis_sample {
+        if chunk.start_sample() != source_samples {
             return Err("SPEECH_CORRUPT_MEDIA");
         }
-        vad.flush().map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+        vad.accept(chunk.samples())
+            .map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+        source_samples = source_samples
+            .checked_add(chunk.samples().len() as u64)
+            .ok_or("SPEECH_RESOURCE_LIMIT")?;
+        for (checkpoint, stream_position) in checkpoints.iter_mut().zip(decoder.stream_positions())
+        {
+            checkpoint.analysis_sample = stream_position;
+        }
         emitted_segments = emitted_segments.saturating_add(drain_batch_vad(
             &mut vad,
-            input.track,
-            checkpoints[index].analysis_sample,
+            output_track,
+            source_samples,
             &mut asr,
             identity,
             &mut revision,
             writer,
         )?);
-        write_response(
-            writer,
-            WorkerResponse::Heartbeat {
-                protocol_version: PROTOCOL_VERSION,
-                identity: identity.clone(),
-                stage: WorkerStage::Finalizing,
-                checkpoint: batch_checkpoint(&checkpoints),
-            },
-        )?;
+        if last_heartbeat_at.elapsed() >= Duration::from_secs(2) {
+            last_heartbeat_at = Instant::now();
+            write_response(
+                writer,
+                WorkerResponse::Heartbeat {
+                    protocol_version: PROTOCOL_VERSION,
+                    identity: identity.clone(),
+                    stage: WorkerStage::Transcribing,
+                    checkpoint: batch_checkpoint(&checkpoints),
+                },
+            )?;
+        }
     }
+    let summary = decoder.summary().ok_or("SPEECH_CORRUPT_MEDIA")?;
+    if summary.output_samples_16k != source_samples
+        || summary.track_output_samples_16k.len() != checkpoints.len()
+    {
+        return Err("SPEECH_CORRUPT_MEDIA");
+    }
+    for (checkpoint, stream_samples) in checkpoints.iter_mut().zip(summary.track_output_samples_16k)
+    {
+        checkpoint.analysis_sample = stream_samples;
+    }
+    vad.flush().map_err(|_| "SPEECH_INFERENCE_FAILED")?;
+    emitted_segments = emitted_segments.saturating_add(drain_batch_vad(
+        &mut vad,
+        output_track,
+        source_samples,
+        &mut asr,
+        identity,
+        &mut revision,
+        writer,
+    )?);
+    write_response(
+        writer,
+        WorkerResponse::Heartbeat {
+            protocol_version: PROTOCOL_VERSION,
+            identity: identity.clone(),
+            stage: WorkerStage::Finalizing,
+            checkpoint: batch_checkpoint(&checkpoints),
+        },
+    )?;
     if poll_batch_control(identity, &controls, &checkpoints, writer)? {
         return Ok(());
     }
@@ -574,6 +579,14 @@ fn run_record_backfill(
             },
         },
     )
+}
+
+fn record_backfill_output_track(inputs: &[RecordArtifactInput]) -> Result<TrackKind, &'static str> {
+    match inputs {
+        [input] => Ok(input.track),
+        [_, _] => Ok(TrackKind::Mixed),
+        _ => Err("SPEECH_WORKER_PROTOCOL_ERROR"),
+    }
 }
 
 fn run_attachment_asr(
@@ -1264,4 +1277,31 @@ fn write_response(
         .map_err(|_| "SPEECH_WORKER_IO_ERROR");
     response.zeroize_sensitive();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_input(track: TrackKind) -> RecordArtifactInput {
+        RecordArtifactInput {
+            input_path: format!("/{track:?}.opus"),
+            track,
+        }
+    }
+
+    #[test]
+    fn record_backfill_publishes_one_record_wide_track() {
+        assert_eq!(
+            record_backfill_output_track(&[record_input(TrackKind::Microphone)]),
+            Ok(TrackKind::Microphone)
+        );
+        assert_eq!(
+            record_backfill_output_track(&[
+                record_input(TrackKind::Microphone),
+                record_input(TrackKind::System),
+            ]),
+            Ok(TrackKind::Mixed)
+        );
+    }
 }

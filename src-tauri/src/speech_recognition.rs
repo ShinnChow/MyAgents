@@ -2693,6 +2693,17 @@ impl SpeechRecognitionManager {
                 return;
             }
         };
+        let expected_record_transcript_track = if job.kind == SpeechJobKind::RecordBackfillAsr {
+            match expected_record_backfill_track(&input) {
+                Ok(track) => Some(track),
+                Err(code) => {
+                    self.finish_failed(job, generation, code, false);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let lifecycle_spawn_permit = match crate::sidecar::begin_lifecycle_spawn_permit() {
             Ok(permit) => permit,
             Err(_) => {
@@ -2759,6 +2770,7 @@ impl SpeechRecognitionManager {
             job,
             generation,
             &identity,
+            expected_record_transcript_track,
             stdout,
             &stdin,
             &child,
@@ -2913,6 +2925,7 @@ impl SpeechRecognitionManager {
             job,
             generation,
             &identity,
+            None,
             stdout,
             &stdin,
             &child,
@@ -3437,6 +3450,7 @@ impl SpeechRecognitionManager {
         job: &SpeechJob,
         generation: u64,
         identity: &WorkloadIdentity,
+        expected_record_transcript_track: Option<AudioTrackKind>,
         stdout: ChildStdout,
         stdin: &Arc<Mutex<std::process::ChildStdin>>,
         child: &Arc<Mutex<process_cmd::ChildTree>>,
@@ -3575,10 +3589,12 @@ impl SpeechRecognitionManager {
                         (SpeechJobKind::AgentAttachmentAsr, TrackKind::Attachment) => {
                             AudioTrackKind::Mixed
                         }
-                        (SpeechJobKind::RecordBackfillAsr, track) => match record_track(track) {
-                            Ok(track) => track,
-                            Err(code) => return failed_outcome(code, false),
-                        },
+                        (SpeechJobKind::RecordBackfillAsr, track) => {
+                            match record_backfill_track(track, expected_record_transcript_track) {
+                                Ok(track) => track,
+                                Err(code) => return failed_outcome(code, false),
+                            }
+                        }
                         _ => return failed_outcome("SPEECH_WORKER_PROTOCOL_ERROR", true),
                     };
                     transcripts.0.push(RecordTranscriptSegment {
@@ -4193,7 +4209,7 @@ fn read_live_frame_settlement(
                     return Err(("SPEECH_RESOURCE_LIMIT".to_string(), false));
                 };
                 *next_worker_revision = next_revision;
-                let track = match record_track(track) {
+                let track = match record_source_track(track) {
                     Ok(track) => track,
                     Err(code) => {
                         text.zeroize();
@@ -4335,12 +4351,38 @@ fn protocol_track(track: AudioTrackKind) -> Result<TrackKind, &'static str> {
     }
 }
 
-fn record_track(track: TrackKind) -> Result<AudioTrackKind, &'static str> {
+fn expected_record_backfill_track(input: &WorkloadInput) -> Result<AudioTrackKind, &'static str> {
+    let WorkloadInput::RecordArtifacts { inputs } = input else {
+        return Err("SPEECH_WORKER_PROTOCOL_ERROR");
+    };
+    match inputs.as_slice() {
+        [input] => record_source_track(input.track),
+        [_, _] => Ok(AudioTrackKind::Mixed),
+        _ => Err("SPEECH_WORKER_PROTOCOL_ERROR"),
+    }
+}
+
+fn record_source_track(track: TrackKind) -> Result<AudioTrackKind, &'static str> {
     match track {
         TrackKind::Microphone => Ok(AudioTrackKind::Microphone),
         TrackKind::System => Ok(AudioTrackKind::System),
         TrackKind::Mixed | TrackKind::Attachment => Err("SPEECH_WORKER_PROTOCOL_ERROR"),
     }
+}
+
+fn record_backfill_track(
+    track: TrackKind,
+    expected: Option<AudioTrackKind>,
+) -> Result<AudioTrackKind, &'static str> {
+    let actual = match track {
+        TrackKind::Microphone => Ok(AudioTrackKind::Microphone),
+        TrackKind::System => Ok(AudioTrackKind::System),
+        TrackKind::Mixed => Ok(AudioTrackKind::Mixed),
+        TrackKind::Attachment => Err("SPEECH_WORKER_PROTOCOL_ERROR"),
+    }?;
+    (Some(actual) == expected)
+        .then_some(actual)
+        .ok_or("SPEECH_WORKER_PROTOCOL_ERROR")
 }
 
 fn record_speaker_turn(turn: SpeakerTurn) -> RecordSpeakerTurn {
@@ -5751,6 +5793,38 @@ mod tests {
             false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn record_backfill_accepts_mixed_output_without_widening_live_tracks() {
+        let dual_input = WorkloadInput::RecordArtifacts {
+            inputs: vec![
+                RecordArtifactInput {
+                    input_path: "/record/microphone.opus".into(),
+                    track: TrackKind::Microphone,
+                },
+                RecordArtifactInput {
+                    input_path: "/record/system.opus".into(),
+                    track: TrackKind::System,
+                },
+            ],
+        };
+        assert_eq!(
+            expected_record_backfill_track(&dual_input),
+            Ok(AudioTrackKind::Mixed)
+        );
+        assert_eq!(
+            record_backfill_track(TrackKind::Mixed, Some(AudioTrackKind::Mixed)),
+            Ok(AudioTrackKind::Mixed)
+        );
+        assert_eq!(
+            record_backfill_track(TrackKind::Microphone, Some(AudioTrackKind::Mixed)),
+            Err("SPEECH_WORKER_PROTOCOL_ERROR")
+        );
+        assert_eq!(
+            record_source_track(TrackKind::Mixed),
+            Err("SPEECH_WORKER_PROTOCOL_ERROR")
+        );
     }
 
     #[cfg(unix)]

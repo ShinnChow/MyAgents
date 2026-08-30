@@ -324,8 +324,8 @@ impl BufferedRecordOpusDecoder {
 }
 
 /// Bounded, timeline-preserving mixer for the one or two physical tracks in a
-/// Record. It exists only to feed one Record-wide diarization pass; playback
-/// and permanent artifacts remain physically separated.
+/// Record. It feeds Record-wide inference passes; playback and permanent
+/// artifacts remain physically separated.
 pub struct RecordOpusMixer {
     tracks: Vec<BufferedRecordOpusDecoder>,
     output_samples_16k: u64,

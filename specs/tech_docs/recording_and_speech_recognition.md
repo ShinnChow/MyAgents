@@ -94,7 +94,7 @@ Pause 先停止两个 ring 的 admission，再暂停设备；analysis writer 排
 
 live revision 写入 `transcript/revisions.jsonl`，复用 `DurableRecordJournal`。Worker-local ID 不成为产品 identity；RecordStore 按 `track + start + end` 生成稳定 segment ID，同边界重算只递增 revision。generation 失败时从最后 durable segment end 重放，以重建尚未发布的 VAD pending state；每帧 ACK 仍即时校验，但不能仅从最后 ACK 继续，否则会丢掉已 ACK、尚未形成稳定句段的语音。
 
-Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact；archive 结束时必须编码足以覆盖 source media 与 Opus pre-skip 的最小尾包，异常恢复把最后 checkpoint 收敛到其真实可解码的 EOS granule，不能把尚待后续 packet drain 的 lookahead 发布成媒体时长。只有本次录音在开始时已接纳 live workload，才会用最终 analysis boundary 收敛 live Worker，并自动为永久 Ogg 接纳 recording-final backfill。analysis 失败不把可用音频判坏。异常退出恢复只清理 Record 内两个固定 spool 文件；只对 manifest 表明此前已经接纳 live transcription 的 interrupted Record 恢复 backfill，普通历史录音保持手动“开始转录”。
+Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact；archive 结束时必须编码足以覆盖 source media 与 Opus pre-skip 的最小尾包，异常恢复把最后 checkpoint 收敛到其真实可解码的 EOS granule，不能把尚待后续 packet drain 的 lookahead 发布成媒体时长。只有本次录音在开始时已接纳 live workload，才会用最终 analysis boundary 收敛 live Worker，并自动为永久 Ogg 接纳 recording-final backfill。双物理轨的最终 backfill 复用同一个有界时间线 mixer，只做一次 Record-wide VAD/ASR 并发布 `mixed` segment；不得分别转写 microphone/system 后再拼接或做文本去重。stop 命令返回的终态 snapshot 只是 operation receipt，不再拥有 RecordingManager slot；Renderer 释放该 owner 后由 RecordStore 的 final-transcript `upsert` 重新读取并替换 live projection。analysis 失败不把可用音频判坏。异常退出恢复只清理 Record 内两个固定 spool 文件；只对 manifest 表明此前已经接纳 live transcription 的 interrupted Record 恢复 backfill，普通历史录音保持手动“开始转录”。
 
 ## 用户模型包
 
