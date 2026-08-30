@@ -65,6 +65,7 @@ jobs:
             libxdo-dev \
             libssl-dev \
             libpipewire-0.3-dev \
+            libasound2-dev \
             build-essential \
             file
       - uses: dtolnay/rust-toolchain@1.92.0
