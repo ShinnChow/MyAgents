@@ -824,7 +824,7 @@ export default memo(function GlobalSidebar({
 
   const handleOpenFolder = useCallback(async (project: Project) => {
     try {
-      await openPathExternal({ fullPath: project.path, workspace: null });
+      await openPathExternal({ fullPath: project.path, workspace: project.path });
     } catch (error) {
       console.error('[GlobalSidebar] Failed to open workspace folder:', error);
       toastRef.current.error(tLauncher('toasts.openFolderFailed'));

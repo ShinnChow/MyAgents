@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   forcedRail: true,
   isTauri: false,
   openExternal: vi.fn(async () => undefined),
+  openPathExternal: vi.fn(async () => undefined),
   deleteSession: vi.fn(),
   notificationSnapshot: {
     loadState: 'ready',
@@ -71,7 +72,7 @@ vi.mock('@/hooks/useTaskCenterData', () => ({
 vi.mock('@/hooks/taskCenterStore', () => ({ ensureWorkspaceSessions: vi.fn() }));
 
 vi.mock('@/hooks/useWorkspaceFileService', () => ({
-  useWorkspaceFileService: () => ({ openPathExternal: vi.fn() }),
+  useWorkspaceFileService: () => ({ openPathExternal: mocks.openPathExternal }),
 }));
 
 vi.mock('@/utils/browserMock', () => ({
@@ -523,7 +524,8 @@ describe('GlobalSidebar rail flyout', () => {
   });
 
   it('opens a workspace context menu without allowing right-click text selection', () => {
-    mocks.projects.push({ id: 'project-1', name: 'Project one', path: '/work/project-one' });
+    const workspacePath = 'D:\\work\\project-one';
+    mocks.projects.push({ id: 'project-1', name: 'Project one', path: workspacePath });
     renderSidebar();
     fireEvent.click(screen.getByRole('button', { name: 'Agent 工作区' }));
 
@@ -546,6 +548,14 @@ describe('GlobalSidebar rail flyout', () => {
       String(i18n.t('launcher:workspaceCard.archive')),
       String(i18n.t('launcher:workspaceCard.remove')),
     ]);
+
+    fireEvent.click(within(menu).getByRole('button', {
+      name: String(i18n.t('launcher:workspaceCard.openFolder')),
+    }));
+    expect(mocks.openPathExternal).toHaveBeenCalledWith({
+      fullPath: workspacePath,
+      workspace: workspacePath,
+    });
   });
 
   it('opens a Session context menu without allowing right-click text selection', () => {
@@ -1240,10 +1250,11 @@ describe('GlobalSidebar rail flyout', () => {
   });
 
   it('keeps archived workspaces reachable when there are no active workspaces', () => {
+    const workspacePath = 'E:\\work\\archived';
     mocks.projects.push({
       id: 'archived-1',
       name: 'Archived project',
-      path: '/work/archived',
+      path: workspacePath,
       archivedAt: '2026-07-20T00:00:00.000Z',
     });
     renderSidebar();
@@ -1252,7 +1263,17 @@ describe('GlobalSidebar rail flyout', () => {
     const archived = screen.getByRole('button', { name: /已归档/ });
     expect(archived).toBeInTheDocument();
     fireEvent.click(archived);
-    expect(screen.getByText('Archived project')).toBeInTheDocument();
+    const archivedRow = screen.getByText('Archived project').parentElement!;
+    fireEvent.click(within(archivedRow).getByRole('button', {
+      name: String(i18n.t('launcher:workspaceCard.more')),
+    }));
+    fireEvent.click(screen.getByRole('button', {
+      name: String(i18n.t('launcher:workspaceCard.openFolder')),
+    }));
+    expect(mocks.openPathExternal).toHaveBeenCalledWith({
+      fullPath: workspacePath,
+      workspace: workspacePath,
+    });
   });
 
   it('keeps the flyout alive while a menu-launched confirmation owns focus', () => {
