@@ -58,6 +58,13 @@ echo -e "${BLUE}[2/7] 准备 Rust toolchain / components${NC}"
 "${PROJECT_DIR}/scripts/ensure_rust_toolchain.sh"
 echo ""
 
+# 原生推理 owner 按 host target 和 exact prepared cache 判断是否真的需要
+# CMake/Python/compiler；在任何大下载或依赖安装前给出权威恢复提示。
+echo -e "${BLUE}[2.5/7] 检查原生推理构建依赖${NC}"
+node "${PROJECT_DIR}/scripts/prepare-native-inference.mjs" --check-prerequisites
+echo -e "${GREEN}✓ 原生推理构建依赖检查完成${NC}"
+echo ""
+
 # 下载 Node.js 二进制（Sidecar + MCP Server + 社区工具 统一 runtime）
 echo ""
 echo -e "${BLUE}[3/7] 下载 Node.js 运行时${NC}"

@@ -4,7 +4,7 @@
 # 产出 AppImage + deb 到 src-tauri/target/release/bundle/{appimage,deb}。
 # 所需系统依赖（Ubuntu 22.04+ / Debian 12+）：
 #   sudo apt-get install -y \
-#     build-essential libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
+#     build-essential cmake libssl-dev libgtk-3-dev libayatana-appindicator3-dev \
 #     librsvg2-dev libwebkit2gtk-4.1-dev patchelf
 # (详见 specs/tech_docs/linux_platform_guide.md)
 
@@ -106,6 +106,7 @@ for cmd in node npm rustc cargo rustup; do
     fi
 done
 "${PROJECT_DIR}/scripts/ensure_rust_toolchain.sh" "$TARGET"
+node "${PROJECT_DIR}/scripts/prepare-native-inference.mjs" "$TARGET" --check-prerequisites
 echo -e "${GREEN}✓ Rust / Node 构建依赖就绪${NC}"
 echo ""
 

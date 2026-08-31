@@ -376,6 +376,110 @@ test('CLI bundle staging owns its complete mutable resource inventory', () => {
   assert.doesNotMatch(esbuildBundle, /copyFile|src\/cli\/myagents\.cmd/);
 });
 
+test('native prerequisite preflight runs before expensive or destructive entry-point work', () => {
+  function assertEarlyNativePreflight({
+    source,
+    invocation,
+    toolchain,
+    expensiveBoundary,
+    label,
+  }) {
+    const toolchainAt = source.indexOf(toolchain);
+    const preflightAt = source.indexOf(invocation);
+    const expensiveBoundaryAt = source.indexOf(expensiveBoundary);
+    assert.notEqual(toolchainAt, -1, `${label} must prepare pinned Rust`);
+    assert.notEqual(preflightAt, -1, `${label} must run native preflight`);
+    assert.notEqual(
+      expensiveBoundaryAt,
+      -1,
+      `${label} must retain its expensive-work boundary`,
+    );
+    assert.ok(
+      toolchainAt < preflightAt && preflightAt < expensiveBoundaryAt,
+      `${label} must run native preflight after Rust and before expensive work`,
+    );
+  }
+
+  assertEarlyNativePreflight({
+    source: setupUnix,
+    invocation:
+      'prepare-native-inference.mjs" --check-prerequisites',
+    toolchain: '"${PROJECT_DIR}/scripts/ensure_rust_toolchain.sh"',
+    expensiveBoundary: 'scripts/download_nodejs.sh',
+    label: 'Unix setup',
+  });
+  assertEarlyNativePreflight({
+    source: setupWindows,
+    invocation:
+      'prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites',
+    toolchain:
+      '& "$ProjectDir\\scripts\\ensure_rust_toolchain.ps1" -Targets',
+    expensiveBoundary:
+      'Write-Host "`nStep 2/8: 下载 Node.js 运行时',
+    label: 'Windows setup',
+  });
+  const windowsSetupMainAt = setupWindows.indexOf('# Main');
+  const windowsSetupPreflightAt = setupWindows.indexOf(
+    'prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites',
+    windowsSetupMainAt,
+  );
+  const windowsSetupBeforePreflight = setupWindows.slice(
+    windowsSetupMainAt,
+    windowsSetupPreflightAt,
+  );
+  assert.doesNotMatch(
+    windowsSetupBeforePreflight,
+    /Test-MSVC|winget install --id Microsoft\.VisualStudio\.2022\.BuildTools/,
+    'Windows setup must leave cache-aware MSVC decisions to the native owner',
+  );
+  assertEarlyNativePreflight({
+    source: buildDev,
+    invocation:
+      'prepare-native-inference.mjs" "$DEV_NATIVE_TARGET" --check-prerequisites',
+    toolchain: '"${PROJECT_DIR}/scripts/ensure_rust_toolchain.sh"',
+    expensiveBoundary: 'LOCK_FILE="$HOME/.myagents/app.lock"',
+    label: 'macOS dev build',
+  });
+  assertEarlyNativePreflight({
+    source: buildDevWindows,
+    invocation:
+      'prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites',
+    toolchain:
+      '& "$PROJECT_DIR\\scripts\\ensure_rust_toolchain.ps1" -Targets',
+    expensiveBoundary: '$appProcesses = Get-Process',
+    label: 'Windows dev build',
+  });
+  assertEarlyNativePreflight({
+    source: buildLinux,
+    invocation:
+      'prepare-native-inference.mjs" "$TARGET" --check-prerequisites',
+    toolchain:
+      '"${PROJECT_DIR}/scripts/ensure_rust_toolchain.sh" "$TARGET"',
+    expensiveBoundary: 'npm run typecheck',
+    label: 'Linux release build',
+  });
+  assertEarlyNativePreflight({
+    source: buildWindows,
+    invocation:
+      'prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites',
+    toolchain:
+      '& "$ProjectDir\\scripts\\ensure_rust_toolchain.ps1" -Targets',
+    expensiveBoundary: 'Write-Host "  拉取最新 cuse 二进制',
+    label: 'Windows release build',
+  });
+
+  const windowsMsvcAt = buildWindows.indexOf(
+    'VC\\Auxiliary\\Build\\vcvarsall.bat',
+  );
+  const windowsPreflightAt = buildWindows.indexOf(
+    'prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites',
+  );
+  assert.ok(
+    windowsMsvcAt >= 0 && windowsMsvcAt < windowsPreflightAt,
+    'Windows release preflight must inherit the initialized MSVC environment',
+  );
+});
+
 test('every setup, dev, and release entry point delegates native resources to one prepare owner', () => {
   const macPreflight = buildMacos.indexOf(
     'prepare-native-inference.mjs" "$TARGET" --check-prerequisites',

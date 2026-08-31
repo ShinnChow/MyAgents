@@ -68,6 +68,27 @@ if ($PKG_VERSION -ne $TAURI_VERSION -or $PKG_VERSION -ne $CARGO_VERSION) {
     }
 }
 
+# Establish the pinned Rust identity, then ask the native owner for the exact
+# target/cache-aware prerequisites before stopping processes or cleaning output.
+Write-ColorOutput "[准备] 准备 Rust toolchain / components / Windows target..." "Blue"
+try {
+    & "$PROJECT_DIR\scripts\ensure_rust_toolchain.ps1" -Targets @("x86_64-pc-windows-msvc")
+} catch {
+    Write-ColorOutput "✗ Rust toolchain 准备失败: $_" "Red"
+    exit 1
+}
+Write-ColorOutput "✓ Rust toolchain ready" "Green"
+Write-Host ""
+
+Write-ColorOutput "[准备] 检查原生推理构建依赖 (x86_64-pc-windows-msvc)..." "Blue"
+& node "$PROJECT_DIR\scripts\prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites
+if ($LASTEXITCODE -ne 0) {
+    Write-ColorOutput "✗ 原生推理构建依赖不完整，请按上方提示安装后重试" "Red"
+    exit 1
+}
+Write-ColorOutput "✓ 原生推理构建依赖检查完成" "Green"
+Write-Host ""
+
 # 杀死残留进程（避免"旧代码"问题）
 Write-ColorOutput "[准备] 杀死残留进程..." "Blue"
 
@@ -168,17 +189,6 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-ColorOutput "✓ Node.js 项目依赖已就绪" "Green"
-Write-Host ""
-
-# Rust toolchain/components/target 与 rust-toolchain.toml、CI 和 release build 保持一致。
-Write-ColorOutput "[准备] 准备 Rust toolchain / components / Windows target..." "Blue"
-try {
-    & "$PROJECT_DIR\scripts\ensure_rust_toolchain.ps1" -Targets @("x86_64-pc-windows-msvc")
-} catch {
-    Write-ColorOutput "✗ Rust toolchain 准备失败: $_" "Red"
-    exit 1
-}
-Write-ColorOutput "✓ Rust toolchain ready" "Green"
 Write-Host ""
 
 # Prepare the same target-locked document Worker/OCR/PDFium projection used by

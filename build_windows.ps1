@@ -219,6 +219,54 @@ try {
         throw "请先安装缺失的依赖"
     }
 
+    # ========================================
+    # 初始化 MSVC 编译环境 (link.exe / cl.exe)
+    # ========================================
+    if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
+        Write-Host "[准备] 初始化 MSVC 编译环境..." -ForegroundColor Blue
+        $vcFound = $false
+
+        # Find vcvarsall.bat via vswhere
+        $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
+        $vsWhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path $vsWhere) {
+            $vsPath = & $vsWhere -latest -products * -property installationPath 2>$null
+            if ($vsPath) {
+                $vcvarsall = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
+                if (Test-Path $vcvarsall) {
+                    Write-Host "  找到: $vcvarsall" -ForegroundColor Cyan
+                    # Import environment variables from vcvarsall into PowerShell
+                    $tempFile = [System.IO.Path]::GetTempFileName()
+                    cmd /c "`"$vcvarsall`" x64 > nul 2>&1 && set > `"$tempFile`""
+                    Get-Content $tempFile | ForEach-Object {
+                        if ($_ -match '^([^=]+)=(.*)$') {
+                            [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+                        }
+                    }
+                    Remove-Item $tempFile -ErrorAction SilentlyContinue
+                    $vcFound = $true
+                    Write-Host "  OK - MSVC x64 环境已加载" -ForegroundColor Green
+                }
+            }
+        }
+
+        if (-not $vcFound) {
+            Write-Host "  未找到 vcvarsall.bat，Rust 编译可能失败" -ForegroundColor Yellow
+            Write-Host "  建议从 Developer PowerShell for VS 运行此脚本" -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+
+    # The prepare owner is the only source of target/cache-specific native
+    # prerequisites. Check before downloads, npm install, cleanup, or builds.
+    Write-Host "  检查原生推理构建依赖..." -ForegroundColor Cyan
+    & node "$ProjectDir\scripts\prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites
+    if ($LASTEXITCODE -ne 0) {
+        throw "原生推理构建依赖不完整，请按上方提示安装后重试"
+    }
+    Write-Host "  OK - 原生推理构建依赖检查完成" -ForegroundColor Green
+    Write-Host ""
+
     # 每次构建都拉取最新 cuse release — 从 Cloudflare R2 拉取（公网公开），
     # 不再依赖 gh CLI / 私有仓库访问权限。cuse 维护者负责在 GH Release 之后跑
     # MyAgents-Cuse/publish_r2.sh 镜像产物到 R2（`download.myagents.io/cuse/...`）。
@@ -457,44 +505,6 @@ try {
         Write-Host "  OK - CSP 配置完整 (包含 Windows IPC 支持)" -ForegroundColor Green
     }
     Write-Host ""
-
-    # ========================================
-    # 初始化 MSVC 编译环境 (link.exe / cl.exe)
-    # ========================================
-    if (-not (Get-Command link.exe -ErrorAction SilentlyContinue)) {
-        Write-Host "[准备] 初始化 MSVC 编译环境..." -ForegroundColor Blue
-        $vcFound = $false
-
-        # Find vcvarsall.bat via vswhere
-        $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
-        $vsWhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
-        if (Test-Path $vsWhere) {
-            $vsPath = & $vsWhere -latest -products * -property installationPath 2>$null
-            if ($vsPath) {
-                $vcvarsall = Join-Path $vsPath "VC\Auxiliary\Build\vcvarsall.bat"
-                if (Test-Path $vcvarsall) {
-                    Write-Host "  找到: $vcvarsall" -ForegroundColor Cyan
-                    # Import environment variables from vcvarsall into PowerShell
-                    $tempFile = [System.IO.Path]::GetTempFileName()
-                    cmd /c "`"$vcvarsall`" x64 > nul 2>&1 && set > `"$tempFile`""
-                    Get-Content $tempFile | ForEach-Object {
-                        if ($_ -match '^([^=]+)=(.*)$') {
-                            [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
-                        }
-                    }
-                    Remove-Item $tempFile -ErrorAction SilentlyContinue
-                    $vcFound = $true
-                    Write-Host "  OK - MSVC x64 环境已加载" -ForegroundColor Green
-                }
-            }
-        }
-
-        if (-not $vcFound) {
-            Write-Host "  未找到 vcvarsall.bat，Rust 编译可能失败" -ForegroundColor Yellow
-            Write-Host "  建议从 Developer PowerShell for VS 运行此脚本" -ForegroundColor Yellow
-        }
-        Write-Host ""
-    }
 
     # ========================================
     # 清理旧构建（包括缓存的 resources）
