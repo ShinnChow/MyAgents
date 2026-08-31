@@ -153,7 +153,7 @@ MyAgents 是一个桌面端 AI Agent 产品，不是单纯的前端项目。改�
 - Node.js `>=22.0.0`，推荐 Node.js 24。
 - npm，仓库当前声明 `npm@11.13.0`。
 - Rust 通过 [rustup](https://rustup.rs) 安装，实际 toolchain 由 [rust-toolchain.toml](rust-toolchain.toml) 固定。
-- 原生推理资源冷构建需要 CMake 3.28+ 和平台 C/C++ 工具链；macOS 还需要 Git、Python 3.8+ 与 Apple Clang。
+- 原生推理资源冷构建需要 CMake 3.28+ 和平台 C/C++ 工具链；macOS 还需要 Git、Python 3.10+ 与 Apple Clang。
 - macOS 13+ / Windows 10+ / Linux Ubuntu 22.04+ 或 Debian 12+。
 
 ### 本地开发
@@ -429,7 +429,7 @@ Developers:
 - Node.js `>=22.0.0`, Node.js 24 recommended.
 - npm. The repository currently declares `npm@11.13.0`.
 - Rust installed through [rustup](https://rustup.rs). The actual toolchain is pinned by [rust-toolchain.toml](rust-toolchain.toml).
-- Cold native-inference resource builds require CMake 3.28+ and the platform C/C++ toolchain. macOS additionally requires Git, Python 3.8+, and Apple Clang.
+- Cold native-inference resource builds require CMake 3.28+ and the platform C/C++ toolchain. macOS additionally requires Git, Python 3.10+, and Apple Clang.
 - macOS 13+ / Windows 10+ / Linux Ubuntu 22.04+ or Debian 12+.
 
 ### Local Development
