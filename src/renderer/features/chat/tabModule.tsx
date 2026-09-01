@@ -41,6 +41,7 @@ export interface ChatRenderBinding {
     title: string,
     historyEntrySource?: HistoryEntrySource,
   ) => Promise<void>;
+  onOpenHistoryTag?: (tag: string) => void;
   onNewSession: (tabId: string) => Promise<boolean>;
   onLaunchRuntimeBackedProviderSession: (
     project: Project,
@@ -116,6 +117,7 @@ const ChatTabRenderer = memo(function ChatTabRenderer({
               binding.onForkSession(tab.id, sessionId, agentDir, title, initialMessage)
             }
             sessionNotificationBadgeCounts={binding.sessionNotificationBadgeCounts}
+            onOpenHistoryTag={binding.onOpenHistoryTag}
           />
         </Suspense>
       )}

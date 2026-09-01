@@ -23,6 +23,7 @@ import MessageList from '@/components/MessageList';
 import SessionHistoryDropdown from '@/components/SessionHistoryDropdown';
 import SessionSurfaceTags from '@/components/SessionSurfaceTags';
 import SessionMenuButton, { type BotChannelCandidate } from '@/components/SessionMenuButton';
+import UserTagPills from '@/components/session-tags/UserTagPills';
 import { FileActionProvider } from '@/context/FileActionContext';
 import SimpleChatInput, { type ImageAttachment, type SimpleChatInputHandle } from '@/components/SimpleChatInput';
 import type { SlashCommand as InputSlashCommand } from '@/components/SlashCommandMenu';
@@ -55,7 +56,9 @@ import { useChatScrollModel } from '@/hooks/useChatScrollModel';
 import { useAgentStatuses } from '@/hooks/useAgentStatuses';
 import { useProjectCapabilities } from '@/hooks/useProjectCapabilities';
 import { useSessionSurfaces, type ChannelSurface } from '@/hooks/useSessionSurfaces';
-import { resolveFloatingBallBoundSession } from '@/hooks/taskCenterStore';
+import { actions as taskCenterActions, resolveFloatingBallBoundSession } from '@/hooks/taskCenterStore';
+import { usePassiveSessionMetadata } from '@/hooks/useTaskCenterData';
+import { sameSessionUserTags } from '../../shared/session-user-tags';
 import { useConfig } from '@/hooks/useConfig';
 import { useFileDropZone } from '@/hooks/useFileDropZone';
 import { useTauriFileDrop } from '@/hooks/useTauriFileDrop';
@@ -490,13 +493,15 @@ interface ChatProps {
   pendingFilePreview?: FilePreviewIntent;
   onFilePreviewIntentConsumed?: (intentId: string) => void;
   sessionNotificationBadgeCounts?: ReadonlyMap<string, number>;
+  /** Open App Shell history with a clean, single-Tag aggregation intent. */
+  onOpenHistoryTag?: (tag: string) => void;
 }
 
 function isCurrentSessionGoal(goal: SessionGoal | null | undefined): goal is SessionGoal {
   return Boolean(goal);
 }
 
-export default function Chat({ windowPresentation, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
+export default function Chat({ windowPresentation, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts, onOpenHistoryTag }: ChatProps) {
   // Get state from TabContext (required - Chat must be inside TabProvider)
   const {
     tabId,
@@ -552,6 +557,16 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     forceExecuteQueuedMessage,
     isConnected,
   } = useTabState();
+  const projectedSessionMeta = usePassiveSessionMetadata(agentDir, sessionId);
+
+  useEffect(() => {
+    if (!projectedSessionMeta) return;
+    setSessionMeta((current) => {
+      if (!current || current.id !== projectedSessionMeta.id) return current;
+      if (sameSessionUserTags(current.userTags, projectedSessionMeta.userTags)) return current;
+      return { ...current, userTags: projectedSessionMeta.userTags };
+    });
+  }, [projectedSessionMeta, setSessionMeta]);
   const isActive = useTabActive();
   const toast = useToast();
   const { t } = useTranslation('chat');
@@ -5162,6 +5177,11 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                 />
               </>
             )}
+            <UserTagPills
+              tags={sessionMeta?.userTags}
+              onTagClick={(name) => onOpenHistoryTag?.(name)}
+              className="max-w-56"
+            />
             {/* Surface tags (channel/cron/floating-ball pill) — display-only since the menu owns actions */}
             <SessionSurfaceTags
               channel={surfaces.channel}
@@ -5178,6 +5198,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                 availableChannels={availableHandoverChannels}
                 deleteProtected={sessionDeleteProtected}
                 favorite={!!sessionMeta?.favorite}
+                userTags={sessionMeta?.userTags}
                 // The inline editor only mounts once a session has a real
                 // title (see the `sessionTitle && sessionTitle !== 'New Tab' …`
                 // gate above). Mirror that condition here so the menu's
@@ -5189,6 +5210,13 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                 onShowContext={isExternalRuntime ? undefined : () => { void handleSendMessageRef.current('/context'); }}
                 onOpenRename={() => titleEditorRef.current?.openRename()}
                 onFavoriteChanged={(_, updated) => { if (updated) setSessionMeta(updated); }}
+                onSessionMetadataMutationStart={taskCenterActions.beginSessionMetadataMutation}
+                onSessionMetadataChanged={(updated, mutationSequence) => {
+                  const accepted = taskCenterActions.applySessionMetadata(updated, mutationSequence);
+                  if (accepted) setSessionMeta(updated);
+                  return accepted;
+                }}
+                onGlobalTagChange={() => taskCenterActions.refreshSessions()}
               />
             )}
           </div>

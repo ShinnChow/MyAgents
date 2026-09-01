@@ -12,6 +12,7 @@ import type { Project } from '@/config/types';
 import WorkspaceIcon from '@/components/launcher/WorkspaceIcon';
 import SearchHighlight from './SearchHighlight';
 import { getFolderName, formatTime } from '@/utils/taskCenterUtils';
+import UserTagPills from '@/components/session-tags/UserTagPills';
 
 interface SessionSearchItemProps {
     hit: SessionSearchHit;
@@ -22,6 +23,7 @@ interface SessionSearchItemProps {
     onContextMenu: (e: React.MouseEvent<HTMLDivElement>) => void;
     onShowStats: (e: React.MouseEvent) => void;
     onDelete: (e: React.MouseEvent) => void;
+    onTagClick?: (name: string) => void;
 }
 
 export default memo(function SessionSearchItem({
@@ -33,6 +35,7 @@ export default memo(function SessionSearchItem({
     onContextMenu,
     onShowStats,
     onDelete,
+    onTagClick,
 }: SessionSearchItemProps) {
     const { t } = useTranslation('app');
     // If we don't have project info, fallback to showing just the agentDir
@@ -73,6 +76,7 @@ export default memo(function SessionSearchItem({
                             {turnCountStr}
                         </span>
                     )}
+                    <UserTagPills tags={session?.userTags} onTagClick={onTagClick ?? (() => undefined)} className="ml-1.5" />
                 </div>
 
                 {/* Second row: Content Snippet (Only show if there's a snippet and it's a content match) */}

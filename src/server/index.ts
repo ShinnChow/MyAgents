@@ -496,9 +496,13 @@ import {
   getSessionMetadata,
   getSessionsByAgentDir,
   isHistoryVisibleSession,
+  listSessionUserTags,
+  mutateGlobalSessionUserTag,
+  mutateSessionUserTag,
   updateSessionMetadata,
   getAttachmentPath,
 } from './SessionStore';
+import { sessionUserTagFailureStatus } from './session-user-tag-http';
 import { findProjectAgentByWorkspacePath, loadConfig, resolveImProviderRouting, resolveProviderEnv, resolveWorkspaceConfig } from './utils/admin-config';
 import {
   projectCapabilitySnapshotForWire,
@@ -2636,6 +2640,82 @@ async function main() {
       }
 
       // ============= SESSION API =============
+
+      // Global Session user Tag projection + intent mutations.
+      if (pathname === '/api/session-tags' && request.method === 'GET') {
+        return jsonResponse({ success: true, tags: listSessionUserTags() });
+      }
+
+      if (pathname === '/api/session-tags/assign' && request.method === 'POST') {
+        let payload: { sessionId?: unknown; operation?: unknown; name?: unknown };
+        try {
+          payload = await request.json() as typeof payload;
+        } catch {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid JSON payload.' }, 400);
+        }
+        if (typeof payload.sessionId !== 'string' || !/^[A-Za-z0-9-]{1,99}$/.test(payload.sessionId)) {
+          return jsonResponse({ success: false, reason: 'session-not-found', error: 'Invalid Session ID.' }, 400);
+        }
+        if ((payload.operation !== 'add' && payload.operation !== 'remove') || typeof payload.name !== 'string') {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid Tag assignment operation.' }, 400);
+        }
+        const result = await mutateSessionUserTag(payload.sessionId, {
+          kind: payload.operation,
+          name: payload.name,
+        });
+        if (!result.ok) {
+          const status = sessionUserTagFailureStatus(result.reason);
+          return jsonResponse({ success: false, ...result }, status);
+        }
+        if (!result.session) {
+          return jsonResponse({ success: false, reason: 'io-error', error: 'Tag mutation returned no Session.' }, 500);
+        }
+        return jsonResponse({
+          success: true,
+          ...result,
+          session: toClientSessionMetadata(result.session),
+        });
+      }
+
+      if (pathname === '/api/session-tags/manage' && request.method === 'POST') {
+        let payload: {
+          operation?: unknown;
+          name?: unknown;
+          newName?: unknown;
+          merge?: unknown;
+          focusSessionId?: unknown;
+        };
+        try {
+          payload = await request.json() as typeof payload;
+        } catch {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid JSON payload.' }, 400);
+        }
+        if ((payload.operation !== 'rename' && payload.operation !== 'delete') || typeof payload.name !== 'string') {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid global Tag operation.' }, 400);
+        }
+        if (payload.operation === 'rename' && typeof payload.newName !== 'string') {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'A new Tag name is required.' }, 400);
+        }
+        if (payload.focusSessionId !== undefined
+          && (typeof payload.focusSessionId !== 'string' || !/^[A-Za-z0-9-]{1,99}$/.test(payload.focusSessionId))) {
+          return jsonResponse({ success: false, reason: 'session-not-found', error: 'Invalid focus Session ID.' }, 400);
+        }
+        const result = await mutateGlobalSessionUserTag(
+          payload.operation === 'rename'
+            ? { kind: 'rename', name: payload.name, newName: payload.newName as string, merge: payload.merge === true }
+            : { kind: 'delete', name: payload.name },
+          payload.focusSessionId as string | undefined,
+        );
+        if (!result.ok) {
+          const status = sessionUserTagFailureStatus(result.reason);
+          return jsonResponse({ success: false, ...result }, status);
+        }
+        return jsonResponse({
+          success: true,
+          ...result,
+          ...(result.session ? { session: toClientSessionMetadata(result.session) } : {}),
+        });
+      }
 
       // GET /sessions - List all sessions or filter by agentDir
       if (pathname === '/sessions' && request.method === 'GET') {

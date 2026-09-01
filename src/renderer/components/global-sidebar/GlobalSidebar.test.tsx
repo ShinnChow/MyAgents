@@ -1202,6 +1202,21 @@ describe('GlobalSidebar rail flyout', () => {
     expect(document.querySelector('[data-history-search-overlay-panel]')).toBe(coldPanel);
   });
 
+  it('consumes a Tag navigation intent when the search surface closes before content handles it', async () => {
+    mocks.isTauri = true;
+    const onHistoryTagIntentConsumed = vi.fn();
+    renderSidebar({
+      historyTagIntent: { id: 41, tag: 'Alpha' },
+      onHistoryTagIntentConsumed,
+    });
+
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Close search test overlay' }));
+    expect(onHistoryTagIntentConsumed).toHaveBeenCalledWith(41);
+  });
+
   it('hides the Team Space navigation entry when the feature is unavailable', () => {
     const onOpenSpace = vi.fn();
     renderSidebar({ teamSpaceAvailable: false, onOpenSpace });

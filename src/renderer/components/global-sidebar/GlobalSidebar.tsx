@@ -167,6 +167,8 @@ interface GlobalSidebarProps {
     entryIntent?: 'open_workspace' | 'workspace_init',
   ) => Promise<boolean>;
   onOpenSession: (session: SessionMetadata, project: Project) => Promise<boolean>;
+  historyTagIntent?: { id: number; tag: string } | null;
+  onHistoryTagIntentConsumed?: (id: number) => void;
 }
 
 function useForcedRail(): boolean {
@@ -353,6 +355,8 @@ export default memo(function GlobalSidebar({
   onOpenBugReport,
   onOpenWorkspace,
   onOpenSession,
+  historyTagIntent,
+  onHistoryTagIntentConsumed,
 }: GlobalSidebarProps) {
   const { t } = useTranslation('app');
   const { t: tLauncher } = useTranslation('launcher');
@@ -928,7 +932,18 @@ export default memo(function GlobalSidebar({
   const handleSearchClose = useCallback(() => {
     resourceSurfaceInteractionGenerationRef.current += 1;
     setSearchOpen(false);
-  }, []);
+    if (historyTagIntent) onHistoryTagIntentConsumed?.(historyTagIntent.id);
+  }, [historyTagIntent, onHistoryTagIntentConsumed]);
+
+  useEffect(() => {
+    if (!historyTagIntent || !isTauriEnvironment()) return;
+    void loadHistorySearchOverlayContent();
+    closeFlyout();
+    closeNotificationCenter();
+    setShowFeedback(false);
+    resourceSurfaceInteractionGenerationRef.current += 1;
+    setSearchOpen(true);
+  }, [closeFlyout, closeNotificationCenter, historyTagIntent]);
 
   const activeView = activeTab?.view;
   const isWindows = typeof navigator !== 'undefined'
@@ -1405,6 +1420,8 @@ export default memo(function GlobalSidebar({
               taskCenterData={taskCenterData}
               onClose={handleSearchClose}
               onOpenSession={(session, project) => { void handleOpenSession(session, project); }}
+              tagIntent={historyTagIntent}
+              onTagIntentConsumed={onHistoryTagIntentConsumed}
             />
           </Suspense>
         </HistorySearchOverlayFrame>
@@ -1790,6 +1807,9 @@ function WorkspaceTree({
                               onCopySessionId={() => onCopySessionId(session)}
                               onShowStats={(origin) => onShowStats(session, origin)}
                               onDelete={(origin) => onDeleteSession(session, origin)}
+                              onSessionMutationStart={taskCenterData.actions.beginSessionMetadataMutation}
+                              onSessionUpdated={taskCenterData.actions.applySessionMetadata}
+                              onGlobalTagChange={taskCenterData.actions.refreshSessions}
                               onMenuOpenChange={(open) => onNestedInteractionChange(`session:${session.id}`, open)}
                             />
                           ))}
@@ -1999,6 +2019,9 @@ interface SessionRowProps {
   onCopySessionId: () => void;
   onShowStats: (origin?: HTMLElement | null) => void;
   onDelete: (origin?: HTMLElement | null) => void;
+  onSessionMutationStart: (sessionId: string, scope?: 'session' | 'global') => number;
+  onSessionUpdated: (session: SessionMetadata, mutationSequence: number) => boolean;
+  onGlobalTagChange: () => void;
   onMenuOpenChange: (open: boolean) => void;
 }
 
@@ -2014,6 +2037,9 @@ function SessionRow({
   onCopySessionId,
   onShowStats,
   onDelete,
+  onSessionMutationStart,
+  onSessionUpdated,
+  onGlobalTagChange,
   onMenuOpenChange,
 }: SessionRowProps) {
   const { t: tLauncher, i18n } = useTranslation('launcher');
@@ -2112,6 +2138,9 @@ function SessionRow({
         onToggleFavorite={onToggleFavorite}
         onShowStats={onShowStats}
         onDelete={onDelete}
+        onSessionMutationStart={onSessionMutationStart}
+        onSessionUpdated={onSessionUpdated}
+        onGlobalTagChange={onGlobalTagChange}
       />
     </div>
   );

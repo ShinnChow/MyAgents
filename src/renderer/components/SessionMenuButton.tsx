@@ -49,6 +49,7 @@ import Tip from './Tip';
 import { useToast } from './Toast';
 import { MenuItem } from './ui/MenuItem';
 import { Popover } from './ui/Popover';
+import SessionTagMenuItem, { type GlobalUserTagChange } from './session-tags/SessionTagMenuItem';
 
 export interface BotChannelCandidate {
     agentId: string;
@@ -79,6 +80,7 @@ export interface SessionMenuButtonProps {
     deleteProtected: boolean;
     /** Current favorite state from sessionMeta. */
     favorite: boolean;
+    userTags?: string[];
     /** False when the title editor isn't mounted (placeholder titles like
      *  "New Tab" / "New Chat") — disables the 重命名 row to avoid a silent
      *  no-op on a click that promised to open the editor. */
@@ -96,6 +98,9 @@ export interface SessionMenuButtonProps {
     onShowContext?: () => void;
     /** Caller persists the change and updates sessionMeta optimistically. */
     onFavoriteChanged?: (next: boolean, updated: SessionMetadata | null) => void;
+    onSessionMetadataMutationStart: (sessionId: string, scope?: 'session' | 'global') => number;
+    onSessionMetadataChanged?: (updated: SessionMetadata, mutationSequence: number) => boolean;
+    onGlobalTagChange?: (change: GlobalUserTagChange) => void;
 }
 
 export default function SessionMenuButton({
@@ -106,10 +111,14 @@ export default function SessionMenuButton({
     availableChannels,
     deleteProtected,
     favorite,
+    userTags,
     canRename,
     onOpenRename,
     onShowContext,
     onFavoriteChanged,
+    onSessionMetadataMutationStart,
+    onSessionMetadataChanged,
+    onGlobalTagChange,
 }: SessionMenuButtonProps) {
     const { t } = useTranslation('chat');
     const toast = useToast();
@@ -118,6 +127,7 @@ export default function SessionMenuButton({
     const botMenuItemRef = useRef<HTMLButtonElement | null>(null);
     const [open, setOpen] = useState(false);
     const [submenuOpen, setSubmenuOpen] = useState(false);
+    const [tagLayerOpen, setTagLayerOpen] = useState(false);
     // Snapshot the session id+title at modal-open time so the stats view
     // doesn't silently switch to a different session if the parent tab
     // rotates `sessionId` (e.g. a "+新对话" elsewhere) while the modal is up.
@@ -139,6 +149,7 @@ export default function SessionMenuButton({
     const closeAll = useCallback(() => {
         setOpen(false);
         setSubmenuOpen(false);
+        setTagLayerOpen(false);
     }, []);
 
     // ─── Actions ──────────────────────────────────────────────────────────
@@ -318,6 +329,8 @@ export default function SessionMenuButton({
                 placement="bottom-start"
                 offset={6}
                 className="w-56 py-1"
+                closeOnOutsideClick={!submenuOpen && !tagLayerOpen}
+                closeOnEscape={!submenuOpen && !tagLayerOpen}
             >
                 <div className="border-b border-[var(--line-subtle)] px-3 py-2">
                     <div className="flex min-w-0 items-center gap-2 text-xs">
@@ -351,6 +364,15 @@ export default function SessionMenuButton({
                     label={favorite ? t('shell.sessionMenu.unfavorite') : t('shell.sessionMenu.favorite')}
                     onClick={() => { void handleToggleFavorite(); }}
                     disabled={favoriteInFlight}
+                />
+                <SessionTagMenuItem
+                    session={{ id: sessionId, userTags }}
+                    onMutationStart={onSessionMetadataMutationStart}
+                    onSessionUpdated={(updated, mutationSequence) => (
+                        onSessionMetadataChanged?.(updated, mutationSequence) ?? true
+                    )}
+                    onGlobalTagChange={onGlobalTagChange}
+                    onSubmenuOpenChange={setTagLayerOpen}
                 />
                 <MenuItem
                     icon={exporting

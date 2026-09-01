@@ -47,6 +47,8 @@ export interface SessionMetadata {
      *  identical semantics, so the on-disk size cost is zero for the common
      *  case. */
     favorite?: boolean;
+    /** User-managed global names used to organize Session history. */
+    userTags?: string[];
     /** Preview of the last user message (truncated, for Task Center display) */
     lastMessagePreview?: string;
     /** How the title was set: default (first message truncation), auto (AI-generated), user (manually renamed) */

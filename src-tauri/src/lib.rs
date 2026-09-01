@@ -56,6 +56,7 @@ pub mod runtime_launch_guard;
 pub mod search;
 pub mod session_goal;
 pub mod session_metadata;
+pub mod session_tags;
 pub mod session_visibility;
 mod sidecar;
 pub mod space_cloud;

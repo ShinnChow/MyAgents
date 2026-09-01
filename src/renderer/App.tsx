@@ -453,6 +453,14 @@ export default function App() {
   const [externalNotificationBadges, setExternalNotificationBadges] = useState<
     NotificationBadgeItem[]
   >([]);
+  const historyTagIntentSequenceRef = useRef(0);
+  const [historyTagIntent, setHistoryTagIntent] = useState<{ id: number; tag: string } | null>(null);
+  const handleOpenHistoryTag = useCallback((tag: string) => {
+    setHistoryTagIntent({ id: ++historyTagIntentSequenceRef.current, tag });
+  }, []);
+  const handleHistoryTagIntentConsumed = useCallback((id: number) => {
+    setHistoryTagIntent((current) => current?.id === id ? null : current);
+  }, []);
   const pendingSpaceRouteRef = useRef<PendingAppRoute | null>(null);
   const appRouteGenerationRef = useRef(0);
   const spaceRouteTabIdRef = useRef<string | null>(null);
@@ -4621,6 +4629,7 @@ export default function App() {
     () => ({
       windowPresentation,
       onOpenHistorySession: handleOpenChatHistorySession,
+      onOpenHistoryTag: handleOpenHistoryTag,
       onNewSession: handleNewSession,
       onLaunchRuntimeBackedProviderSession:
         handleLaunchRuntimeBackedProviderSession,
@@ -4644,6 +4653,7 @@ export default function App() {
       handleLaunchRuntimeBackedProviderSession,
       handleNewSession,
       handleOpenChatHistorySession,
+      handleOpenHistoryTag,
       handleRenameSession,
       markSidecarConfigAdopted,
       sessionNotificationBadgeCounts,
@@ -4766,6 +4776,8 @@ export default function App() {
             onOpenBugReport={handleOpenBugReport}
             onOpenWorkspace={handleOpenWorkspaceFromSidebar}
             onOpenSession={handleOpenSidebarSession}
+            historyTagIntent={historyTagIntent}
+            onHistoryTagIntentConsumed={handleHistoryTagIntentConsumed}
           />
           <div className="flex min-w-0 flex-1 flex-col" data-tab-workspace>
             {/* Chrome-style titlebar with tabs */}

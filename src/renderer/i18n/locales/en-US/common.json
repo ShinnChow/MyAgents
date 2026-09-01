@@ -9,5 +9,45 @@
     "system": "System",
     "zhCN": "Simplified Chinese",
     "enUS": "English"
+  },
+  "sessionTags": {
+    "addTag": "Add Tag",
+    "allTags": "All Tags",
+    "close": "Close Tag manager",
+    "createTag": "Create “{{name}}”",
+    "filterLabel": "Filter by Tag",
+    "limitHint": "Up to {{count}} Tags per Session",
+    "manageTags": "Manage Tags",
+    "noTags": "No matching Tags",
+    "remainingTags": "Remaining Tags",
+    "searchTags": "Search Tags",
+    "sessionCount": "{{count}} Session(s)",
+    "showMore": "Show {{count}} more Tags",
+    "errors": {
+      "conflict": "Tags changed. Please try again.",
+      "invalidName": "Tag names must be at most 32 characters and contain no line breaks.",
+      "ioError": "Failed to save Tags. Please try again.",
+      "limitReached": "Each Session can have up to 5 Tags.",
+      "loadFailed": "Failed to load Tags. Please try again.",
+      "protectedSession": "Tags cannot be edited on system maintenance Sessions.",
+      "sessionNotFound": "This Session no longer exists.",
+      "tagNotFound": "This Tag no longer exists. Refresh and try again."
+    },
+    "manager": {
+      "cancel": "Cancel",
+      "delete": "Delete {{name}}",
+      "deleteConfirm": "Delete",
+      "deleteMessage": "Delete “{{name}}”? It will be removed from {{count}} Session(s).",
+      "deleteTitle": "Delete Tag",
+      "description": "Rename, merge, or delete global Session Tags",
+      "empty": "No Tags to manage",
+      "mergeConfirm": "Merge",
+      "mergeMessage": "“{{source}}” matches “{{target}}”. Merge them?",
+      "mergeTitle": "Merge Tags",
+      "rename": "Rename {{name}}",
+      "renameInput": "Rename {{name}}",
+      "save": "Save",
+      "title": "Manage Tags"
+    }
   }
 }

@@ -203,8 +203,15 @@ impl SearchEngine {
         &self,
         query: &str,
         limit: usize,
+        tag: Option<String>,
     ) -> Result<SessionSearchResult, String> {
-        self.session_index.search(query, limit)
+        let session_index = Arc::clone(&self.session_index);
+        let query = query.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            session_index.search_with_tag(&query, limit, tag.as_deref())
+        })
+        .await
+        .map_err(|error| format!("Session search task failed: {}", error))?
     }
 
     pub async fn search_records(
@@ -531,6 +538,7 @@ pub async fn cmd_search_sessions(
     state: tauri::State<'_, Arc<SearchEngine>>,
     query: String,
     limit: Option<usize>,
+    tag: Option<String>,
 ) -> Result<SessionSearchResult, String> {
     let query = query.trim();
     if query.is_empty() {
@@ -540,7 +548,7 @@ pub async fn cmd_search_sessions(
             query_time_ms: 0.0,
         });
     }
-    state.search_sessions(query, limit.unwrap_or(50)).await
+    state.search_sessions(query, limit.unwrap_or(50), tag).await
 }
 
 #[tauri::command]

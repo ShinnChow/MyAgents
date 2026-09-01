@@ -41,12 +41,22 @@ import type { Project } from '@/config/types';
 import SessionSearchItem from '@/components/search/SessionSearchItem';
 import { parseSessionIdQuery } from '@/utils/parseSessionIdQuery';
 import { copyPlainText } from '@/utils/clipboard';
+import UserTagPills from '@/components/session-tags/UserTagPills';
+import UserTagFilter from '@/components/session-tags/UserTagFilter';
+import type { GlobalUserTagChange } from '@/components/session-tags/SessionTagMenuItem';
+import {
+    deriveSessionUserTagSummaries,
+    sanitizeSessionUserTags,
+    sessionHasUserTag,
+} from '../../shared/session-user-tags';
 
 interface HistorySearchOverlayContentProps {
     projects: Project[];
     onOpenSession: (session: SessionMetadata, project: Project) => void;
     onClose: () => void;
     taskCenterData: TaskCenterData;
+    tagIntent?: { id: number; tag: string } | null;
+    onTagIntentConsumed?: (id: number) => void;
 }
 
 type BrowseFilter = 'all' | 'favorite';
@@ -66,6 +76,7 @@ interface HistorySessionRowProps {
     onToggleFavorite: (event: React.MouseEvent) => void;
     onShowStats: (event: React.MouseEvent) => void;
     onDelete: (event: React.MouseEvent) => void;
+    onTagClick: (name: string) => void;
 }
 
 const HistorySessionRow = memo(function HistorySessionRow({
@@ -78,6 +89,7 @@ const HistorySessionRow = memo(function HistorySessionRow({
     onToggleFavorite,
     onShowStats,
     onDelete,
+    onTagClick,
 }: HistorySessionRowProps) {
     const { t } = useTranslation('app');
     const displayText = getSessionDisplayText(session);
@@ -102,6 +114,7 @@ const HistorySessionRow = memo(function HistorySessionRow({
                 {tags.map((tag, index) => (
                     <SessionTagBadge key={`${tag.type}-${index}`} tag={tag} />
                 ))}
+                <UserTagPills tags={session.userTags} onTagClick={onTagClick} />
                 <span className="min-w-0 flex-1 truncate text-sm text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
                     {displayText}
                     {turnCount && (
@@ -166,10 +179,19 @@ export default memo(function HistorySearchOverlayContent({
     onOpenSession,
     onClose,
     taskCenterData,
+    tagIntent,
+    onTagIntentConsumed,
 }: HistorySearchOverlayContentProps) {
     const { t } = useTranslation('app');
     const { t: tLauncher } = useTranslation('launcher');
-    const { sessions, deleteProtectedSessionIds, sessionTagsMap, isSessionsLoading, actions } = taskCenterData;
+    const {
+        sessions,
+        deleteProtectedSessionIds,
+        sessionTagsMap,
+        isSessionsLoading,
+        sessionsError,
+        actions,
+    } = taskCenterData;
     const deleteSession = useSessionDeletion();
     const toast = useToast();
 
@@ -178,15 +200,29 @@ export default memo(function HistorySearchOverlayContent({
     const [searchQuery, setSearchQuery] = useState('');
     const [isSearching, setIsSearching] = useState(false);
     const [searchResults, setSearchResults] = useState<SessionSearchHit[]>([]);
+    const [searchError, setSearchError] = useState(false);
     const searchInputRef = useRef<HTMLInputElement>(null);
     const compactSearchRef = useRef<HTMLButtonElement>(null);
 
     const [browseFilter, setBrowseFilter] = useState<BrowseFilter>('all');
     const [workspaceFilter, setWorkspaceFilter] = useState<string>('all');
+    const [selectedUserTag, setSelectedUserTag] = useState<string | null>(() => tagIntent?.tag ?? null);
     const [pendingDeleteSession, setPendingDeleteSession] = useState<{ id: string; title: string } | null>(null);
     const [statsSession, setStatsSession] = useState<{ id: string; title: string } | null>(null);
     const [contextMenu, setContextMenu] = useState<{ session: SessionMetadata; x: number; y: number } | null>(null);
     const contextMenuAnchorRef = useRef<HTMLSpanElement>(null);
+
+    useEffect(() => {
+        if (!tagIntent) return;
+        setIsSearchMode(false);
+        setSearchQuery('');
+        setSearchResults([]);
+        setSearchError(false);
+        setBrowseFilter('all');
+        setWorkspaceFilter('all');
+        setSelectedUserTag(tagIntent.tag);
+        onTagIntentConsumed?.(tagIntent.id);
+    }, [onTagIntentConsumed, tagIntent]);
 
     // Keep keyboard focus inside the overlay and on the same search affordance
     // as it morphs between compact and expanded states.
@@ -207,6 +243,7 @@ export default memo(function HistorySearchOverlayContent({
         setSearchQuery('');
         setSearchResults([]);
         setIsSearching(false);
+        setSearchError(false);
     }, []);
 
     const projectsByWorkspace = useMemo(() => {
@@ -227,6 +264,44 @@ export default memo(function HistorySearchOverlayContent({
             projectsByWorkspace.get(normalizeWorkspacePathIdentity(session.agentDir)),
         [projectsByWorkspace],
     );
+
+    const userTagSummaries = useMemo(
+        () => deriveSessionUserTagSummaries(sessions.filter((session) => !!getProjectForSession(session))),
+        [getProjectForSession, sessions],
+    );
+    const tagEligibilityRevision = useMemo(
+        () => sessions.map((session) => `${session.id}:${sanitizeSessionUserTags(session.userTags).join('\u0001')}`).join('\u0002'),
+        [sessions],
+    );
+
+    useEffect(() => {
+        if (!selectedUserTag || isSessionsLoading) return;
+        const exists = userTagSummaries.some((tag) => tag.name.toLowerCase() === selectedUserTag.toLowerCase());
+        if (!exists) setSelectedUserTag(null);
+    }, [isSessionsLoading, selectedUserTag, userTagSummaries]);
+
+    const openTagAggregation = useCallback((name: string) => {
+        setIsSearchMode(false);
+        setSearchQuery('');
+        setSearchResults([]);
+        setSearchError(false);
+        setBrowseFilter('all');
+        setWorkspaceFilter('all');
+        setSelectedUserTag(name);
+    }, []);
+
+    const handleTagFilterChange = useCallback((name: string | null) => {
+        setSelectedUserTag(name);
+        setSearchError(false);
+    }, []);
+
+    const handleGlobalTagChange = useCallback((change: GlobalUserTagChange) => {
+        setSelectedUserTag((current) => {
+            if (!current || current.toLowerCase() !== change.name.toLowerCase()) return current;
+            return change.kind === 'rename' ? (change.newName ?? null) : null;
+        });
+        actions.refreshSessions();
+    }, [actions]);
 
     // Unique workspace entries for dropdown (name + icon)
     const workspaceOptions = useMemo(() => {
@@ -257,6 +332,7 @@ export default memo(function HistorySearchOverlayContent({
     const filteredSessions = useMemo(() => {
         return sessions.filter(session => {
             if (browseFilter === 'favorite' && !session.favorite) return false;
+            if (selectedUserTag && !sessionHasUserTag(session.userTags, selectedUserTag)) return false;
 
             // Workspace filter
             if (workspaceFilter !== 'all') {
@@ -266,7 +342,7 @@ export default memo(function HistorySearchOverlayContent({
 
             return true;
         });
-    }, [sessions, browseFilter, workspaceFilter, getProjectForSession]);
+    }, [sessions, browseFilter, selectedUserTag, workspaceFilter, getProjectForSession]);
 
     const browseRows = useMemo(() => filteredSessions.flatMap((session) => {
         const project = getProjectForSession(session);
@@ -289,13 +365,17 @@ export default memo(function HistorySearchOverlayContent({
 
             setIsSearching(true);
             try {
-                const result = await searchSessions(searchQuery);
+                const result = await searchSessions(searchQuery, 50, selectedUserTag);
                 if (!isStale) {
                     setSearchResults(result.hits);
+                    setSearchError(false);
                 }
             } catch (err) {
                 console.error('[HistorySearchOverlayContent] Session search failed:', err);
-                if (!isStale) setSearchResults([]);
+                if (!isStale) {
+                    setSearchResults([]);
+                    setSearchError(true);
+                }
             } finally {
                 if (!isStale) setIsSearching(false);
             }
@@ -305,7 +385,7 @@ export default memo(function HistorySearchOverlayContent({
             isStale = true;
             clearTimeout(timeout);
         };
-    }, [searchQuery, isSearchMode]);
+    }, [searchQuery, isSearchMode, selectedUserTag, tagEligibilityRevision]);
 
     // Paste-to-jump (Issue #260): if the query is a pasted session id (bare or
     // the `SessionID: <uuid>` copy-button format), resolve it directly against
@@ -316,11 +396,14 @@ export default memo(function HistorySearchOverlayContent({
     const directSessionMatch = useMemo(() => {
         const sessionId = parseSessionIdQuery(searchQuery);
         if (!sessionId) return null;
-        const session = sessions.find(s => s.id.toLowerCase() === sessionId);
+        const session = sessions.find(s => (
+            s.id.toLowerCase() === sessionId
+            && (!selectedUserTag || sessionHasUserTag(s.userTags, selectedUserTag))
+        ));
         const project = session ? getProjectForSession(session) : undefined;
         if (session && project) return { kind: 'found' as const, session, project };
         return { kind: 'notFound' as const };
-    }, [searchQuery, sessions, getProjectForSession]);
+    }, [searchQuery, selectedUserTag, sessions, getProjectForSession]);
 
     // Open the direct-match session (used by Enter in the search box).
     const openDirectMatch = useCallback(() => {
@@ -428,11 +511,17 @@ export default memo(function HistorySearchOverlayContent({
                         {/* Browse controls stay visible until the compact search field is
                             activated. The animated surface uses transform/opacity only,
                             so opening search does not force layout on the long list below. */}
-                        <div
-                            className="relative mb-3 h-8"
-                            data-history-search-bar
-                            data-state={isSearchMode ? 'expanded' : 'compact'}
-                        >
+                        <div className="mb-3 flex h-8 items-center gap-2">
+                            <UserTagFilter
+                                tags={userTagSummaries}
+                                value={selectedUserTag}
+                                onChange={handleTagFilterChange}
+                            />
+                            <div
+                                className="relative h-8 min-w-0 flex-1"
+                                data-history-search-bar
+                                data-state={isSearchMode ? 'expanded' : 'compact'}
+                            >
                             <div
                                 className={`flex h-full items-center gap-2 transition-[opacity,transform] duration-150 ease-out motion-reduce:transition-none ${
                                     isSearchMode
@@ -548,6 +637,20 @@ export default memo(function HistorySearchOverlayContent({
                                 </div>
                             </div>
                         </div>
+                        </div>
+
+                        {sessionsError && (
+                            <div role="alert" className="mb-3 flex items-center justify-between gap-3 rounded-md border border-[var(--error)]/20 bg-[var(--error-bg)] px-3 py-2 text-xs text-[var(--error)]">
+                                <span>{t('historyOverlay.metadataFailed')}</span>
+                                <button
+                                    type="button"
+                                    onClick={actions.refreshSessions}
+                                    className="shrink-0 rounded px-2 py-1 font-medium hover:bg-[var(--paper-elevated)]"
+                                >
+                                    {t('historyOverlay.retry')}
+                                </button>
+                            </div>
+                        )}
 
                         {/* Session list — empty-query history is virtualized so opening
                             the overlay never mounts the entire archive in one commit. */}
@@ -572,6 +675,7 @@ export default memo(function HistorySearchOverlayContent({
                                                 <Clock className="h-2.5 w-2.5" />
                                                 <span>{formatTime(directSessionMatch.session.lastActiveAt)}</span>
                                             </div>
+                                            <UserTagPills tags={directSessionMatch.session.userTags} onTagClick={openTagAggregation} />
                                             <span className="min-w-0 flex-1 truncate text-sm text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
                                                 {getSessionDisplayText(directSessionMatch.session)}
                                             </span>
@@ -591,7 +695,11 @@ export default memo(function HistorySearchOverlayContent({
                             </div>
                         ) : isSearchMode && searchQuery.trim() !== '' ? (
                             <div className="flex-1 overflow-y-auto overscroll-contain" style={{ scrollbarGutter: 'stable' }}>
-                                {searchResults.length === 0 && !isSearching ? (
+                                {searchError && !isSearching ? (
+                                    <div role="alert" className="py-8 text-center text-sm text-[var(--error)]">
+                                        {t('historyOverlay.searchFailed')}
+                                    </div>
+                                ) : searchResults.length === 0 && !isSearching ? (
                                     <div className="py-8 text-center text-sm text-[var(--ink-muted)]/60">
                                         {t('historyOverlay.noResults')}
                                     </div>
@@ -613,6 +721,7 @@ export default memo(function HistorySearchOverlayContent({
                                                     onContextMenu={(event) => openContextMenu(event, session)}
                                                     onShowStats={(event) => handleShowStats(event, session)}
                                                     onDelete={(event) => handleDeleteClick(event, session)}
+                                                    onTagClick={openTagAggregation}
                                                 />
                                             );
                                         })}
@@ -646,6 +755,7 @@ export default memo(function HistorySearchOverlayContent({
                                         onToggleFavorite={(event) => handleToggleFavorite(event, row.session)}
                                         onShowStats={(event) => handleShowStats(event, row.session)}
                                         onDelete={(event) => handleDeleteClick(event, row.session)}
+                                        onTagClick={openTagAggregation}
                                     />
                                 )}
                             />
@@ -674,6 +784,9 @@ export default memo(function HistorySearchOverlayContent({
                     onToggleFavorite={() => toggleFavorite(contextMenu.session)}
                     onShowStats={() => showStats(contextMenu.session)}
                     onDelete={() => requestDelete(contextMenu.session)}
+                    onSessionMutationStart={actions.beginSessionMetadataMutation}
+                    onSessionUpdated={actions.applySessionMetadata}
+                    onGlobalTagChange={handleGlobalTagChange}
                 />
             )}
 

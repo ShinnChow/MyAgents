@@ -1,10 +1,11 @@
 import { BarChart2, Copy, Star, Trash2 } from 'lucide-react';
-import type { RefObject } from 'react';
+import { useState, type RefObject } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { SessionMetadata } from '@/api/sessionClient';
 import { MenuItem } from '@/components/ui/MenuItem';
 import { Popover, type PopoverPlacement } from '@/components/ui/Popover';
+import SessionTagMenuItem, { type GlobalUserTagChange } from '@/components/session-tags/SessionTagMenuItem';
 
 interface SessionContextMenuProps {
     open: boolean;
@@ -17,6 +18,9 @@ interface SessionContextMenuProps {
     onToggleFavorite: () => void | Promise<void>;
     onShowStats: (origin?: HTMLElement | null) => void;
     onDelete: (origin?: HTMLElement | null) => void;
+    onSessionMutationStart: (sessionId: string, scope?: 'session' | 'global') => number;
+    onSessionUpdated?: (session: SessionMetadata, mutationSequence: number) => boolean;
+    onGlobalTagChange?: (change: GlobalUserTagChange) => void;
 }
 
 /**
@@ -35,8 +39,12 @@ export default function SessionContextMenu({
     onToggleFavorite,
     onShowStats,
     onDelete,
+    onSessionMutationStart,
+    onSessionUpdated,
+    onGlobalTagChange,
 }: SessionContextMenuProps) {
     const { t } = useTranslation('launcher');
+    const [tagLayerOpen, setTagLayerOpen] = useState(false);
 
     return (
         <Popover
@@ -46,6 +54,8 @@ export default function SessionContextMenu({
             placement={placement}
             offset={placement === 'bottom-start' ? 0 : undefined}
             className="session-context-menu global-sidebar-nested-layer w-44 py-1"
+            closeOnOutsideClick={!tagLayerOpen}
+            closeOnEscape={!tagLayerOpen}
         >
             <MenuItem
                 icon={<Copy className="h-3.5 w-3.5" />}
@@ -62,6 +72,13 @@ export default function SessionContextMenu({
                     onClose();
                     void onToggleFavorite();
                 }}
+            />
+            <SessionTagMenuItem
+                session={session}
+                onMutationStart={onSessionMutationStart}
+                onSessionUpdated={onSessionUpdated ?? (() => true)}
+                onGlobalTagChange={onGlobalTagChange}
+                onSubmenuOpenChange={setTagLayerOpen}
             />
             <MenuItem
                 icon={<BarChart2 className="h-3.5 w-3.5" />}
