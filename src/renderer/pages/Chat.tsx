@@ -1,5 +1,5 @@
 import { AlertTriangle, Bot, Globe, History, Loader2, MessageSquarePlus, PanelRight, RotateCcw, TerminalSquare, X } from 'lucide-react';
-import { forwardRef, lazy, Suspense, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, lazy, Suspense, useCallback, useEffect, useImperativeHandle, useMemo, useReducer, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 
@@ -160,8 +160,10 @@ import {
   shouldUseExternalRuntimeInputControls,
 } from '@/utils/runtimeUiProjection';
 import {
+  createWorkspacePanelDisclosureState,
   DEFAULT_WORKSPACE_LAYOUT_METRICS,
   nextSplitViewAfterBrowserClose,
+  reduceWorkspacePanelDisclosure,
   resolveWorkspacePanelMode,
   shouldPresentBrowserFullscreen,
 } from '@/utils/chatWorkspaceLayout';
@@ -689,9 +691,16 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   const isNarrowLayout = workspaceLayoutMetrics.viewportWidthPx < workspaceLayoutMetrics.contentMinWidthPx;
   // If workspace would render as an overlay at startup, keep it hidden so it
   // does not block the chat before the user explicitly opens it.
-  const [showWorkspace, setShowWorkspace] = useState(shouldShowWorkspaceByDefault);
-  const [workspacePanelMounted, setWorkspacePanelMounted] = useState(shouldShowWorkspaceByDefault);
-  const [workspacePanelMotion, setWorkspacePanelMotion] = useState<'expand' | 'collapse' | null>(null);
+  const [workspacePanelDisclosure, dispatchWorkspacePanelDisclosure] = useReducer(
+    reduceWorkspacePanelDisclosure,
+    undefined,
+    () => createWorkspacePanelDisclosureState(shouldShowWorkspaceByDefault()),
+  );
+  const {
+    visible: showWorkspace,
+    mounted: workspacePanelMounted,
+    motion: workspacePanelMotion,
+  } = workspacePanelDisclosure;
   const workspacePanelUnmountTimerRef = useRef<number | null>(null);
   const clearWorkspacePanelUnmountTimer = useCallback(() => {
     if (workspacePanelUnmountTimerRef.current === null) return;
@@ -700,16 +709,13 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   }, []);
   const handleExpandWorkspace = useCallback(() => {
     clearWorkspacePanelUnmountTimer();
-    setWorkspacePanelMounted(true);
-    setWorkspacePanelMotion('expand');
-    setShowWorkspace(true);
+    dispatchWorkspacePanelDisclosure({ type: 'open' });
   }, [clearWorkspacePanelUnmountTimer]);
   const handleCollapseWorkspace = useCallback(() => {
     clearWorkspacePanelUnmountTimer();
-    setWorkspacePanelMotion('collapse');
-    setShowWorkspace(false);
+    dispatchWorkspacePanelDisclosure({ type: 'close' });
     workspacePanelUnmountTimerRef.current = window.setTimeout(() => {
-      setWorkspacePanelMounted(false);
+      dispatchWorkspacePanelDisclosure({ type: 'settle-close' });
       workspacePanelUnmountTimerRef.current = null;
     }, WORKSPACE_PANEL_TRANSITION_MS);
   }, [clearWorkspacePanelUnmountTimer]);
@@ -1240,6 +1246,8 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   const [treeExternalReveal, setTreeExternalReveal] = useState<{ id: number; path: string } | null>(null);
   const treeExternalRevealIdRef = useRef(0);
   const handleRevealInTree = useCallback((path: string) => {
+    // Opening is idempotent: a reveal into an already-visible tree must not
+    // manufacture another panel/conversation entrance animation.
     handleExpandWorkspace();
     setTreeExternalReveal({ id: ++treeExternalRevealIdRef.current, path });
   }, [handleExpandWorkspace]);

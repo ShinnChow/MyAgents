@@ -1,5 +1,50 @@
 export type WorkspacePanelMode = 'inline' | 'overlay';
 
+export type WorkspacePanelMotion = 'expand' | 'collapse' | null;
+
+export interface WorkspacePanelDisclosureState {
+  visible: boolean;
+  mounted: boolean;
+  motion: WorkspacePanelMotion;
+}
+
+export type WorkspacePanelDisclosureAction =
+  | { type: 'open' }
+  | { type: 'close' }
+  | { type: 'settle-close' };
+
+export function createWorkspacePanelDisclosureState(
+  visible: boolean,
+): WorkspacePanelDisclosureState {
+  return {
+    visible,
+    mounted: visible,
+    motion: null,
+  };
+}
+
+/**
+ * Owns the workspace panel's visibility and paint-only transition as one state
+ * machine. `open` is intentionally idempotent: navigation can require an
+ * already-visible tree without inventing another expand lifecycle edge.
+ */
+export function reduceWorkspacePanelDisclosure(
+  state: WorkspacePanelDisclosureState,
+  action: WorkspacePanelDisclosureAction,
+): WorkspacePanelDisclosureState {
+  switch (action.type) {
+    case 'open':
+      if (state.visible) return state;
+      return { visible: true, mounted: true, motion: 'expand' };
+    case 'close':
+      if (!state.visible) return state;
+      return { visible: false, mounted: true, motion: 'collapse' };
+    case 'settle-close':
+      if (state.visible || state.motion !== 'collapse' || !state.mounted) return state;
+      return { ...state, mounted: false };
+  }
+}
+
 export const DEFAULT_WORKSPACE_LAYOUT_METRICS = {
   contentMinWidthPx: 640,
   sidebarMinWidthPx: 320,

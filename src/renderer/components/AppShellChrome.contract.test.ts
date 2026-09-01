@@ -258,7 +258,7 @@ describe('App Shell chrome contract', () => {
     expect(styles).toContain('--global-sidebar-brand-icon-left: 22px;');
   });
 
-  it('mirrors the compositor choreography across Chat and its right workspace panel', () => {
+  it('mirrors real Chat workspace disclosure edges without replaying them for reveal navigation', () => {
     const chat = source('src/renderer/pages/Chat.tsx');
     const styles = source('src/renderer/index.css');
     const workspaceStylesStart = styles.indexOf(
@@ -274,8 +274,16 @@ describe('App Shell chrome contract', () => {
     );
 
     expect(chat).toContain(
-      'const [workspacePanelMounted, setWorkspacePanelMounted]',
+      'const [workspacePanelDisclosure, dispatchWorkspacePanelDisclosure] = useReducer(',
     );
+    expect(chat).toContain('reduceWorkspacePanelDisclosure,');
+    expect(chat).toContain(
+      '() => createWorkspacePanelDisclosureState(shouldShowWorkspaceByDefault()),',
+    );
+    expect(chat).toContain("dispatchWorkspacePanelDisclosure({ type: 'open' });");
+    expect(chat).toContain("dispatchWorkspacePanelDisclosure({ type: 'close' });");
+    expect(chat).toContain("dispatchWorkspacePanelDisclosure({ type: 'settle-close' });");
+    expect(chat).not.toContain("setWorkspacePanelMotion('expand')");
     expect(chat).toContain('clearWorkspacePanelUnmountTimer();');
     expect(chat).toContain('{workspacePanelMounted && (');
     expect(chat).toContain('data-chat-workspace-motion=');
