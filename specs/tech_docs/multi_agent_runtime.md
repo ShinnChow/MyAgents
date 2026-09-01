@@ -641,8 +641,10 @@ MyAgents session 身份下，造成历史会话和新会话串写。
 | `turn` | busy 时进入 turn-boundary queue | busy 时进入 MyAgents turn-boundary queue，当前 turn 完成后再 `turn/start` | turn-boundary queue |
 
 实现边界：
-- `AgentRuntime.steerMessage?()` 是可选能力；只有 Codex adapter 实现。`external-session` 只看 capability，不硬编码 runtime 名。
-- `turn/steer` 必须带 `expectedTurnId`（来自 Codex 当前 active turn）和 MyAgents user message id 作为 `clientUserMessageId`。
+- `AgentRuntime.steerMessage?()` 是静态协议能力，`canSteerMessage(process)` 是当前 generation 的动态 native authority；只有两者同时成立才能走 realtime。`external-session` 只看 capability，不硬编码 runtime 名。
+- Codex 保留最近 root turn id 做 turn-local correlation，但 root `turn/completed` 到达时立即撤销 active steer target；等待 child tail 而暂存 product `turn_complete` 不得让已完成 root 继续表现为可 steer。
+- `turn/steer` 必须带 `expectedTurnId`（来自 Codex 当前 active steer target）和 MyAgents user message id 作为 `clientUserMessageId`。若 eligibility 检查后 Codex 明确返回 `no active turn to steer`，adapter 投影为 runtime-neutral 的“确定未接收”结果；external operation owner 按首次 admission 顺序把同一 `queueId` / user message / config snapshot 降级到既有 turn-boundary FIFO，不撤回、不复制，原 dispatch acceptance 继续等待队列 guard / dispatch 的最终裁决。更早的 direct admission 未落定前，drain 不得预留后续排队项；用户显式“立即发送”仍可覆盖普通 FIFO。timeout / process-exit 等交付不确定错误不得借这条路径自动重放。
+- realtime pending pill 只有在 native user-message echo 到达，或 `turn/steer` RPC 已确认且 root terminal 触发兼容 fallback 后，才能写入 transcript；不能把尚未落定、随后可能返回 `no active turn` 的 RPC 当成已接收。后者的兼容 append 仍属于该次 direct admission，完成前不能释放发送尾链让下一条排队消息读取旧 cursor。
 - same-turn steering 不应用新的 model / permission / reasoning effort snapshot；这些仍是下一 turn 边界生效，和 builtin busy 时“配置锁定当前 turn”的语义一致。
 - response mode 与 same-turn steering 只作用于桌面 `sendDesktopMessage`。IM 始终保持 turn
   级语义：idle 时等待既有 adapter admission 结果，busy 或已有普通 direct send 占位时由同一个

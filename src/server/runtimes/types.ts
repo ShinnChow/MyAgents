@@ -129,6 +129,30 @@ export interface RuntimeProcess {
   waitForExit(): Promise<number>;
 }
 
+/**
+ * A same-turn input was definitively not accepted because the runtime no
+ * longer has an active steer target. Session orchestration may safely retain
+ * the same user operation for the next turn; transport failures must not use
+ * this error because their delivery outcome is unknown.
+ */
+export class RuntimeSteerUnavailableError extends Error {
+  readonly code = 'runtime_steer_unavailable';
+
+  constructor(message = 'Runtime has no active turn to steer') {
+    super(message);
+    this.name = 'RuntimeSteerUnavailableError';
+  }
+}
+
+export function isRuntimeSteerUnavailableError(error: unknown): error is RuntimeSteerUnavailableError {
+  return error instanceof RuntimeSteerUnavailableError
+    || (
+      typeof error === 'object'
+      && error !== null
+      && (error as { code?: unknown }).code === 'runtime_steer_unavailable'
+    );
+}
+
 export type RuntimeConfigApplyMode =
   | 'next_turn_state'
   | 'live_session_rpc'
@@ -436,6 +460,8 @@ export interface AgentRuntime {
    * new turn. Only runtimes whose protocol exposes same-turn steering should
    * implement this; others fall back to MyAgents' turn-boundary queue.
    */
+  canSteerMessage?(process: RuntimeProcess): boolean;
+
   steerMessage?(
     process: RuntimeProcess,
     message: string,

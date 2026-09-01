@@ -28,7 +28,11 @@ import type {
   ImagePayload,
   ResolvedImagePayload,
 } from './types';
-import { RuntimeConversationBranchError, StaleRuntimeSessionError } from './types';
+import {
+  isRuntimeSteerUnavailableError,
+  RuntimeConversationBranchError,
+  StaleRuntimeSessionError,
+} from './types';
 import { awaitInFlightSaves, rebuildAttachmentRegistryFromBlocks, trackInFlightSave } from './tool-attachments';
 import { messageAttachmentsFromImagePayloads, resolveImagePayloads } from './image-payload';
 import { maybeSpill } from '../utils/large-value-store';
@@ -204,6 +208,7 @@ import {
   consumeLeadingExternalConfigOps,
   createExternalMessageOperation,
   enqueueExternalConfigOperation,
+  enqueueExistingExternalMessageOperation,
   enqueueExternalMessageOperation,
   getExternalOperationGeneration,
   getExternalOperationQueueLength,
@@ -678,6 +683,7 @@ interface PendingRealtimeSteeredUserMessage {
   activityFacts: SessionActivityTurnFacts;
   channelDelivery: TurnChannelDelivery;
   userChannelProjection: ExternalUserChannelProjection;
+  steerAcknowledged: boolean;
 }
 
 const pendingRealtimeSteeredUserMessages: PendingRealtimeSteeredUserMessage[] = [];
@@ -842,6 +848,15 @@ function forgetPendingRealtimeSteeredUserMessage(userMessageId: string): void {
   if (index !== -1) pendingRealtimeSteeredUserMessages.splice(index, 1);
 }
 
+function acknowledgePendingRealtimeSteeredUserMessage(userMessageId: string): boolean {
+  const entry = pendingRealtimeSteeredUserMessages.find(
+    pending => pending.operation.userProjection.message.id === userMessageId,
+  );
+  if (!entry) return false;
+  entry.steerAcknowledged = true;
+  return true;
+}
+
 function takePendingRealtimeSteeredUserMessage(clientUserMessageId?: string): PendingRealtimeSteeredUserMessage | undefined {
   if (clientUserMessageId) {
     const index = pendingRealtimeSteeredUserMessages.findIndex(
@@ -856,7 +871,7 @@ function takePendingRealtimeSteeredUserMessage(clientUserMessageId?: string): Pe
   return pendingRealtimeSteeredUserMessages.shift();
 }
 
-function surfaceRealtimeSteeredUserMessage(entry: PendingRealtimeSteeredUserMessage): void {
+function surfaceRealtimeSteeredUserMessage(entry: PendingRealtimeSteeredUserMessage): Promise<boolean> {
   const userMsg = entry.operation.userProjection.message;
   setExternalTurnActivityFacts(entry.activityFacts);
   const admissionActivityAt = shouldRecordAdmissionActivity(entry.activityFacts)
@@ -901,18 +916,26 @@ function surfaceRealtimeSteeredUserMessage(entry: PendingRealtimeSteeredUserMess
       attachments: userMsg.attachments,
     },
   });
+  return persistence;
 }
 
-function surfaceAcceptedRealtimeSteeredUserMessage(clientUserMessageId?: string): void {
+function surfaceAcceptedRealtimeSteeredUserMessage(
+  clientUserMessageId?: string,
+): Promise<boolean> | null {
   const entry = takePendingRealtimeSteeredUserMessage(clientUserMessageId);
-  if (!entry) return;
-  surfaceRealtimeSteeredUserMessage(entry);
+  if (!entry) return null;
+  return surfaceRealtimeSteeredUserMessage(entry);
 }
 
-function surfaceAllPendingRealtimeSteeredUserMessages(): void {
-  while (pendingRealtimeSteeredUserMessages.length > 0) {
-    const entry = pendingRealtimeSteeredUserMessages.shift();
-    if (entry) surfaceRealtimeSteeredUserMessage(entry);
+function surfaceAcknowledgedPendingRealtimeSteeredUserMessages(): void {
+  for (let index = 0; index < pendingRealtimeSteeredUserMessages.length;) {
+    const entry = pendingRealtimeSteeredUserMessages[index];
+    if (!entry.steerAcknowledged) {
+      index += 1;
+      continue;
+    }
+    pendingRealtimeSteeredUserMessages.splice(index, 1);
+    void surfaceRealtimeSteeredUserMessage(entry);
   }
 }
 
@@ -1015,6 +1038,7 @@ function broadcastManagedCodexExtensionDiagnostics(emitExtensionLog = false): vo
 type ExternalActivePair = NonNullable<ReturnType<typeof getExternalActivePair>>;
 type SteerCapableActivePair = {
   runtime: ExternalActivePair['runtime'] & {
+    canSteerMessage: NonNullable<ExternalActivePair['runtime']['canSteerMessage']>;
     steerMessage: NonNullable<ExternalActivePair['runtime']['steerMessage']>;
   };
   process: ExternalActivePair['process'];
@@ -1022,7 +1046,12 @@ type SteerCapableActivePair = {
 
 function getExternalActiveSteerPair(): SteerCapableActivePair | null {
   const active = getExternalActivePair();
-  if (!active || active.process.exited || !active.runtime.steerMessage) return null;
+  if (
+    !active
+    || active.process.exited
+    || !active.runtime.steerMessage
+    || !active.runtime.canSteerMessage?.(active.process)
+  ) return null;
   if (getExternalLifecycleState() !== 'running') return null;
   if (isExternalTurnCompleted() || getExternalTurnStartTime() === 0) return null;
   return active as SteerCapableActivePair;
@@ -4237,38 +4266,23 @@ async function dispatchExternalMessageOperation(
   }
 }
 
+type ExternalRealtimeSteerDispatch = {
+  result: ExternalSendResult;
+  deferredDispatchAcceptance?: Promise<ExternalSendResult>;
+};
+
 async function steerExternalMessageForDesktop(input: {
   queueId: string;
   text: string;
   images?: ImagePayload[];
   context: ExternalSendContext;
   operation: ExternalMessageOperation;
-}): Promise<{ queued: boolean; error?: string }> {
+  generation: number;
+}): Promise<ExternalRealtimeSteerDispatch> {
   const userMsg = input.operation.userProjection.message;
   const active = getExternalActiveSteerPair();
   if (!active) {
-    return runExternalMessageOperation(
-      input.text,
-      input.images,
-      input.context.permissionMode,
-      input.context.model,
-      input.context,
-      input.operation,
-      () => {
-        setExternalSessionState('running');
-        broadcast('queue:started', {
-          queueId: input.queueId,
-          sessionId: input.context.sessionId,
-          userMessage: {
-            id: userMsg.id,
-            role: userMsg.role,
-            content: input.text,
-            timestamp: userMsg.timestamp,
-            attachments: userMsg.attachments,
-          },
-        });
-      },
-    );
+    return deferRealtimeOperationToTurnBoundary(input);
   }
 
   let resolvedImages: ResolvedImagePayload[] | undefined;
@@ -4278,13 +4292,13 @@ async function steerExternalMessageForDesktop(input: {
     const message = err instanceof Error ? err.message : String(err);
     console.error('[external-session] failed to resolve realtime steer image attachments:', err);
     broadcast('queue:cancelled', { queueId: input.queueId });
-    return { queued: false, error: message };
+    return { result: { queued: false, error: message } };
   }
 
   const guarded = await evaluateExternalDispatchGuard(input.context.beforeDispatch);
   if (!guarded.accepted) {
     broadcast('queue:cancelled', { queueId: input.queueId });
-    return { queued: false, error: guarded.error };
+    return { result: { queued: false, error: guarded.error } };
   }
 
   const steerOrigin = input.context.analyticsOrigin ?? originFromTurnAttribution({
@@ -4311,6 +4325,7 @@ async function steerExternalMessageForDesktop(input: {
       input.text,
       resolvedImages,
     ),
+    steerAcknowledged: false,
   });
   try {
     await active.runtime.steerMessage(
@@ -4319,15 +4334,47 @@ async function steerExternalMessageForDesktop(input: {
       resolvedImages && resolvedImages.length > 0 ? resolvedImages : undefined,
       { clientUserMessageId: userMsg.id },
     );
-    return { queued: true };
+    if (
+      acknowledgePendingRealtimeSteeredUserMessage(userMsg.id)
+      && isExternalTurnCompleted()
+    ) {
+      await waitExternalTurnFinalization(60_000);
+      await surfaceAcceptedRealtimeSteeredUserMessage(userMsg.id);
+    }
+    return { result: { queued: true } };
   } catch (err) {
+    if (isRuntimeSteerUnavailableError(err)) {
+      forgetPendingRealtimeSteeredUserMessage(userMsg.id);
+      return deferRealtimeOperationToTurnBoundary(input);
+    }
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`[external-session] realtime steer failed, retracting user message ${userMsg.id}: ${message}`);
     forgetPendingRealtimeSteeredUserMessage(userMsg.id);
     markExternalUserMessageRetracted(input.operation);
     broadcast('queue:cancelled', { queueId: input.queueId });
-    return { queued: false, error: message };
+    return { result: { queued: false, error: message } };
   }
+}
+
+function deferRealtimeOperationToTurnBoundary(input: {
+  queueId: string;
+  text: string;
+  operation: ExternalMessageOperation;
+  generation: number;
+}): ExternalRealtimeSteerDispatch {
+  const queued = enqueueExistingExternalMessageOperation(input.operation, input.generation);
+  broadcast('queue:added', {
+    queueId: input.queueId,
+    messageText: input.text.slice(0, 100),
+    isInFlight: false,
+    deliveryMode: 'turn',
+    canCancel: true,
+    canForceExecute: true,
+  });
+  return {
+    result: { queued: true },
+    deferredDispatchAcceptance: queued.dispatchAcceptance,
+  };
 }
 
 /**
@@ -4435,18 +4482,25 @@ export function enqueueExternalSendForDesktop(
   const queueResponseMode = context.turnBoundaryOnly
     ? 'turn'
     : resolveChatQueueResponseMode(loadAdminConfig().chatQueueResponseMode, true);
+  const lifecycleState = getExternalLifecycleState();
   const canSteerActiveTurn = getExternalActiveSteerPair() !== null;
   // Mid-turn defer: turn-level external runtimes hold this as a queue pill
   // instead of starting a 2nd turn. Codex app-server can append to the active
   // turn via turn/steer, but only in realtime mode and only when no earlier
-  // queued work would be jumped.
+  // queued work would be jumped. An idle lifecycle does not override an older
+  // direct admission that is still resolving; later Desktop input queues just
+  // like IM so it cannot overtake that owner.
   // Return the queueId SYNCHRONOUSLY so /chat/send can hand it back to the renderer, which
   // reconciles its optimistic `opt-` pill with this real queueId (exactly like the builtin
   // path) — without it the optimistic pill would orphan + a stray bubble would appear.
-  if (externalSessionMutationInFlight || shouldQueueExternalOperation(getExternalLifecycleState(), {
-    responseMode: queueResponseMode,
-    canSteerActiveTurn,
-  })) {
+  if (
+    externalSessionMutationInFlight
+    || (lifecycleState === 'idle' && hasExternalSendInFlight())
+    || shouldQueueExternalOperation(lifecycleState, {
+      responseMode: queueResponseMode,
+      canSteerActiveTurn,
+    })
+  ) {
     const queued = enqueueExternalTurnBoundaryOperation(
       text,
       images,
@@ -4494,8 +4548,18 @@ export function enqueueExternalSendForDesktop(
         images,
         context: sendContext,
         operation,
+        generation,
       }),
       generation,
+    ).then(
+      ({ result, deferredDispatchAcceptance }) => {
+        scheduleExternalQueueDrainAfterDirectAdmission();
+        return deferredDispatchAcceptance ?? result;
+      },
+      (error) => {
+        scheduleExternalQueueDrainAfterDirectAdmission();
+        throw error;
+      },
     ).catch((err) => {
       markExternalUserMessageRetracted(operation);
       if (isExternalQueueGenerationStaleError(err)) {
@@ -6858,7 +6922,7 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
     }
 
     case 'user_message_accepted': {
-      surfaceAcceptedRealtimeSteeredUserMessage(event.clientUserMessageId);
+      void surfaceAcceptedRealtimeSteeredUserMessage(event.clientUserMessageId);
       break;
     }
 
@@ -6873,9 +6937,11 @@ function handleUnifiedEvent(event: UnifiedEvent): void {
       // Mark turn complete — session_complete will follow for CC -p mode
       clearWatchdog();
       // Defensive fallback: Codex should emit item/started userMessage for
-      // accepted turn/steer input. If an older app-server does not, promote the
-      // pending pill at the turn boundary rather than leaving it orphaned.
-      surfaceAllPendingRealtimeSteeredUserMessages();
+      // accepted turn/steer input. If an older app-server does not, promote an
+      // RPC-acknowledged pill at the turn boundary. An unresolved RPC is not
+      // acceptance: it may still return the exact no-active rejection and must
+      // remain available for turn-boundary demotion without transcript writes.
+      surfaceAcknowledgedPendingRealtimeSteeredUserMessages();
       finalizeExternalSubagentLifecycleProjection(
         getExternalUserRequestedStop() ? 'interrupted' : 'failed',
       );

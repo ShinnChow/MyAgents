@@ -19,6 +19,7 @@ import type {
 const externalOperationQueue: ExternalTurnOperation[] = [];
 const externalInFlightMessageOperations: ExternalMessageOperation[] = [];
 let externalReservedDrainOperation: ExternalTurnOperation | null = null;
+let externalAdmissionSeq = 0;
 let externalQueueSeq = 0;
 let externalConfigSeq = 0;
 let externalOperationDrainInFlight = false;
@@ -93,7 +94,9 @@ export function shouldQueueExternalOperation(
 }
 
 export function canDrainExternalOperations(state: ExternalSessionState): boolean {
-  return canDrainExternalQueue(state, externalOperationQueue.length) && !externalOperationDrainInFlight;
+  return canDrainExternalQueue(state, externalOperationQueue.length)
+    && !externalOperationDrainInFlight
+    && externalSendTail === null;
 }
 
 export function nextExternalUserMessageId(): string {
@@ -116,6 +119,7 @@ export function createExternalMessageOperation(input: {
   const queueId = input.queueId ?? input.context.queueId ?? nextExternalQueueId();
   return {
     kind: 'message',
+    admissionOrder: externalAdmissionSeq++,
     queueId,
     text: input.text,
     images: input.images,
@@ -189,16 +193,40 @@ export function enqueueExternalMessageOperation(input: {
     return { queued: false, error: '排队消息已达上限，请稍后再发' };
   }
   const operation = createExternalMessageOperation(input);
+  return enqueueExistingExternalMessageOperation(operation);
+}
+
+/** Queue an already-admitted user intent without minting or rejecting it again. */
+export function enqueueExistingExternalMessageOperation(
+  operation: ExternalMessageOperation,
+  generation = externalOperationGeneration,
+): {
+  queued: true;
+  queueId: string;
+  dispatchAcceptance: Promise<ExternalSendResult>;
+} {
+  if (!isCurrentExternalOperationGeneration(generation)) {
+    throw new ExternalQueueGenerationStaleError();
+  }
   const queueId = operation.queueId;
   let settleDispatchAcceptance!: (result: ExternalSendResult) => void;
   const dispatchAcceptance = new Promise<ExternalSendResult>((resolve) => {
     settleDispatchAcceptance = resolve;
   });
-  externalOperationQueue.push({
-    ...operation,
+  const queuedOperation = Object.assign(operation, {
     dispatchAcceptance,
     settleDispatchAcceptance,
   });
+  const insertionIndex = externalOperationQueue.findIndex(
+    item => !(
+      item.kind === 'message' && item.forcePriority
+    ) && item.admissionOrder > queuedOperation.admissionOrder,
+  );
+  if (insertionIndex === -1) {
+    externalOperationQueue.push(queuedOperation);
+  } else {
+    externalOperationQueue.splice(insertionIndex, 0, queuedOperation);
+  }
   return { queued: true, queueId, dispatchAcceptance };
 }
 
@@ -214,6 +242,7 @@ export function enqueueExternalConfigOperation(
   }
   externalOperationQueue.push({
     kind: 'config',
+    admissionOrder: externalAdmissionSeq++,
     opId: `xcfg-${Date.now()}-${externalConfigSeq++}`,
     patch,
     source,
@@ -316,8 +345,10 @@ export function unshiftExternalOperation(item: ExternalTurnOperation): void {
 export function moveExternalQueuedMessageToFront(queueId: string): boolean {
   const idx = externalOperationQueue.findIndex(q => q.kind === 'message' && q.queueId === queueId);
   if (idx < 0) return false;
+  const item = externalOperationQueue[idx] as ExternalQueuedMessageOperation;
+  item.forcePriority = true;
   if (idx > 0) {
-    const [item] = externalOperationQueue.splice(idx, 1);
+    externalOperationQueue.splice(idx, 1);
     externalOperationQueue.unshift(item);
   }
   return true;

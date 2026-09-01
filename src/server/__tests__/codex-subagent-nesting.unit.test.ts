@@ -250,6 +250,7 @@ describe('applyCodexSubAgentActivity (Codex 0.144.1 multi-agent v2)', () => {
       ...state(),
       threadId: 'main',
       currentTurnId: 'root-turn',
+      activeSteerTurnId: 'root-turn',
       deferredSubAgentEvents: new Map<string, UnifiedEvent[]>(),
       collabControlToolParents: new Map<string, string[]>(),
       activeSubAgentTurns: new Map<string, string | null>(),
@@ -479,12 +480,15 @@ describe('applyCodexSubAgentActivity (Codex 0.144.1 multi-agent v2)', () => {
       turn: { id: 'child-turn' },
     }, () => {})).toBeNull();
     expect(correlation.activeSubAgentTurns).toEqual(new Map([['child', 'child-turn']]));
+    expect(runtime.canSteerMessage?.(correlation as never)).toBe(true);
 
     expect(parseNotification(correlation, 'turn/completed', {
       threadId: 'main',
       turn: { id: 'root-turn', status: 'completed' },
     }, () => {})).toBeNull();
     expect(correlation.pendingMainTurnCompletion?.[0]).toMatchObject({ kind: 'turn_complete' });
+    expect(correlation.currentTurnId).toBe('root-turn');
+    expect(runtime.canSteerMessage?.(correlation as never)).toBe(false);
     expect(computeCodexItemEventRoute(
       'child',
       'main',
