@@ -103,7 +103,7 @@ const MemoChild = memo(function Child(props) { ... }, (prev, next) => {
 
 **关键约束**：
 - 自定义 comparator 跳过回调检查的前提是 **所有回调 props 确实稳定**（`[]` 依赖）。若某个回调依赖了不稳定值（如来自 hook 的函数），必须用 ref 包一层
-- `setTabs(prev => prev.map(...))` 会保留未变更 item 的对象引用，使 `prev.data === next.data` 生效
+- 对仍由组件直接拥有的普通列表，`setItems(prev => prev.map(...))` 应保留未变更 item 的对象引用，使 `prev.data === next.data` 生效；Tab workspace 必须经 `useTabWorkspaceController` transition 保持同一性质，不能绕过 controller 直接调用 setter
 - 仅影响特定子组件类型的 prop，用条件表达式限制传递范围
 
 ## 扩展模式
