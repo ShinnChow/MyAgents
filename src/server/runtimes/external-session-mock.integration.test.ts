@@ -611,11 +611,12 @@ async function createHarness(
     };
   });
 
-  const [{ getSessionEngine }, externalSession, sessionStore] = await Promise.all([
-    import('../session-engine'),
-    import('./external-session'),
-    import('../SessionStore'),
-  ]);
+  // Load the overlapping module graph in dependency order. Importing these in
+  // parallel can race Vitest's dynamic SSE mock and leave SessionEngine bound
+  // to the real broadcaster while this harness observes the mocked one.
+  const externalSession = await import('./external-session');
+  const { getSessionEngine } = await import('../session-engine');
+  const sessionStore = await import('../SessionStore');
   externalSession.__resetExternalSessionForTests();
   if (options.conversationRewindCommitFailure) {
     const reason = options.conversationRewindCommitFailure;
