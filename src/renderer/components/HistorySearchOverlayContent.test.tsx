@@ -66,6 +66,9 @@ function taskCenterData(overrides: Partial<TaskCenterData> = {}): TaskCenterData
         actions: {
             deleteSession: vi.fn(async () => ({ deleted: true as const })),
             setSessionFavorite: vi.fn(async () => true),
+            beginSessionMetadataMutation: vi.fn(() => 1),
+            applySessionMetadata: vi.fn(() => true),
+            refreshSessions: vi.fn(),
         },
         ...overrides,
     } as TaskCenterData;
@@ -78,6 +81,7 @@ function renderOverlay() {
             taskCenterData={taskCenterData()}
             onClose={vi.fn()}
             onOpenSession={vi.fn()}
+            onRenameSession={vi.fn(async () => null)}
         />,
     );
 }
@@ -94,6 +98,7 @@ function expectSharedSessionMenu() {
     const menu = document.querySelector<HTMLElement>('.session-context-menu');
     expect(menu).not.toBeNull();
     expect(within(menu!).getAllByRole('button').map(button => button.textContent)).toEqual([
+        i18n.t('launcher:rightRail.rename'),
         i18n.t('launcher:rightRail.copySessionId'),
         i18n.t('launcher:rightRail.favorite'),
         i18n.t('common:sessionTags.addTag'),
@@ -294,6 +299,7 @@ describe('HistorySearchOverlayContent', () => {
                 taskCenterData={taskCenterData({ sessions: [taggedSession, otherSession] })}
                 onClose={vi.fn()}
                 onOpenSession={vi.fn()}
+                onRenameSession={vi.fn(async () => null)}
             />,
         );
 
@@ -315,6 +321,7 @@ describe('HistorySearchOverlayContent', () => {
                 taskCenterData={taskCenterData({ sessions: [{ ...session, userTags: ['Alpha'] }] })}
                 onClose={vi.fn()}
                 onOpenSession={vi.fn()}
+                onRenameSession={vi.fn(async () => null)}
                 tagIntent={{ id: 7, tag: 'Alpha' }}
                 onTagIntentConsumed={onConsumed}
             />,
@@ -339,6 +346,7 @@ describe('HistorySearchOverlayContent', () => {
                 })}
                 onClose={vi.fn()}
                 onOpenSession={vi.fn()}
+                onRenameSession={vi.fn(async () => null)}
             />,
         );
 

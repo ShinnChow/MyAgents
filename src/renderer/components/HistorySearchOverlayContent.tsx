@@ -53,6 +53,7 @@ import {
 interface HistorySearchOverlayContentProps {
     projects: Project[];
     onOpenSession: (session: SessionMetadata, project: Project) => void;
+    onRenameSession: (sessionId: string, title: string) => Promise<SessionMetadata | null>;
     onClose: () => void;
     taskCenterData: TaskCenterData;
     tagIntent?: { id: number; tag: string } | null;
@@ -177,6 +178,7 @@ const HistorySessionRow = memo(function HistorySessionRow({
 export default memo(function HistorySearchOverlayContent({
     projects,
     onOpenSession,
+    onRenameSession,
     onClose,
     taskCenterData,
     tagIntent,
@@ -782,6 +784,7 @@ export default memo(function HistorySearchOverlayContent({
                     deleteProtected={protectedSessionIds.has(contextMenu.session.id)}
                     onCopySessionId={() => handleCopySessionId(contextMenu.session)}
                     onToggleFavorite={() => toggleFavorite(contextMenu.session)}
+                    onRenameSession={onRenameSession}
                     onShowStats={() => showStats(contextMenu.session)}
                     onDelete={() => requestDelete(contextMenu.session)}
                     onSessionMutationStart={actions.beginSessionMetadataMutation}

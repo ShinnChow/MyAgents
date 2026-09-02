@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { CODEX_SUBSCRIPTION_PROVIDER_ID } from '../shared/config-types';
 import { CUSTOM_EVENTS } from '../shared/constants';
+import type { SessionMetadata } from '@/api/sessionClient';
 import { SessionDeletionContext } from '@/context/SessionDeletionContext';
 import { useTabStateOptional } from '@/context/TabContext';
 
@@ -59,6 +60,10 @@ const mocks = vi.hoisted(() => {
       lastActiveAt: '2026-06-27T00:00:00.000Z',
     })),
     deleteSession: vi.fn(async () => ({ deleted: true as const })),
+    updateSession: vi.fn<(
+      sessionId: string,
+      updates: { title?: string; titleSource?: 'user' | 'auto' },
+    ) => Promise<SessionMetadata | undefined>>(async () => undefined),
     deleteTargetSessionId: null as string | null,
     deleteResults: [] as Array<{ deleted: boolean; reason?: string }>,
     startGlobalSidecar: vi.fn(async () => undefined),
@@ -249,7 +254,7 @@ vi.mock('@/api/sessionClient', () => ({
   createSession: mocks.createSession,
   deleteSession: mocks.deleteSession,
   getSessions: vi.fn(async () => []),
-  updateSession: vi.fn(async () => undefined),
+  updateSession: mocks.updateSession,
 }));
 
 vi.mock('@/api/taskCenter', () => ({
@@ -558,6 +563,8 @@ describe('App helper launch', () => {
     mocks.upgradeSessionId.mockResolvedValue(true);
     mocks.getSessionActivation.mockResolvedValue(null);
     mocks.updateSessionTab.mockResolvedValue(undefined);
+    mocks.updateSession.mockReset();
+    mocks.updateSession.mockResolvedValue(undefined);
     mocks.cancelBackgroundCompletion.mockResolvedValue(undefined);
     mocks.querySessionHasPersistentOwners.mockResolvedValue(false);
     mocks.canRestoreSession.mockResolvedValue(true);
@@ -656,6 +663,7 @@ describe('App helper launch', () => {
         entryIntent?: 'open_workspace' | 'workspace_init',
       ) => Promise<boolean>;
       onOpenSession: (session: { id: string; agentDir: string; title: string }, project: typeof mocks.project) => Promise<boolean>;
+      onRenameSession: (sessionId: string, newTitle: string) => Promise<SessionMetadata | null>;
     };
   }
 
@@ -1003,6 +1011,47 @@ describe('App helper launch', () => {
         entry_source: 'global_sidebar',
       }));
     });
+  });
+
+  it('does not let an older sidebar rename response overwrite the latest Tab title', async () => {
+    const session: SessionMetadata = {
+      id: 'rename-race-session',
+      agentDir: mocks.project.path,
+      title: 'Original title',
+      createdAt: '2026-07-20T00:00:00.000Z',
+      lastActiveAt: '2026-07-20T00:00:00.000Z',
+    };
+    let resolveOlder!: (session: SessionMetadata) => void;
+    let resolveNewer!: (session: SessionMetadata) => void;
+    mocks.updateSession
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOlder = resolve; }))
+      .mockReturnValueOnce(new Promise((resolve) => { resolveNewer = resolve; }));
+
+    render(<App />);
+    await act(async () => {
+      await latestSidebarProps().onOpenSession(session, mocks.project);
+    });
+
+    let olderRename!: Promise<SessionMetadata | null>;
+    let newerRename!: Promise<SessionMetadata | null>;
+    act(() => {
+      olderRename = latestSidebarProps().onRenameSession(session.id, 'Older response');
+      newerRename = latestSidebarProps().onRenameSession(session.id, 'Newest title');
+    });
+
+    await act(async () => {
+      resolveNewer({ ...session, title: 'Newest title', titleSource: 'user' });
+      await newerRename;
+    });
+    expect(latestTabbarProps().tabs.find((tab) => tab.sessionId === session.id)?.title)
+      .toBe('Newest title');
+
+    await act(async () => {
+      resolveOlder({ ...session, title: 'Older response', titleSource: 'user' });
+      await olderRename;
+    });
+    expect(latestTabbarProps().tabs.find((tab) => tab.sessionId === session.id)?.title)
+      .toBe('Newest title');
   });
 
   it('releases an owner acquired after the existing target Tab closes during reconcile', async () => {

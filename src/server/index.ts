@@ -80,6 +80,7 @@ import {
   buildSessionDetailedUsageStats,
 } from './utils/usage-stats';
 import { toClientSessionMetadata } from './utils/session-metadata-wire';
+import { shouldBumpSessionRecency } from './session-core/session-metadata-patch-policy';
 // adm-zip lazy-loaded at its one call site below (/api/skill/upload with zip
 // content) — saves ~30ms of module-init cost when users never upload skills.
 import {
@@ -3021,6 +3022,8 @@ async function main() {
            *  freshly toggled-off session matches "never favorited" exactly
            *  on disk. */
           favorite?: boolean;
+          /** Pin/unpin inside the owning workspace's sidebar Session list. */
+          pinned?: boolean;
           model?: string | null;
           /** #324 — reasoning effort snapshot ('default' | level); null clears. */
           reasoningEffort?: string | null;
@@ -3045,29 +3048,26 @@ async function main() {
             && typeof payload.permissionMode !== 'string') {
           return jsonResponse({ success: false, error: 'permissionMode must be a string or null.' }, 400);
         }
+        if (payload.title !== undefined) {
+          if (typeof payload.title !== 'string') {
+            return jsonResponse({ success: false, error: 'title must be a string.' }, 400);
+          }
+          payload.title = payload.title.trim();
+          if (!payload.title) {
+            return jsonResponse({ success: false, error: 'title must not be empty.' }, 400);
+          }
+        }
+        if (payload.pinned !== undefined && typeof payload.pinned !== 'boolean') {
+          return jsonResponse({ success: false, error: 'pinned must be a boolean.' }, 400);
+        }
 
         // `lastActiveAt` is the recency signal that drives history sort
         // order. Bumping it on EVERY PATCH means a pure-UI flag change
         // (favorite toggle) makes an old session jump to the top of the
         // dropdown — confusing UX (Codex round-4 caught). Only the fields
-        // that genuinely represent "session was used" should refresh it.
-        const RECENCY_BUMP_FIELDS = new Set([
-          'title',           // user-edited title implies engagement
-          'titleSource',
-          'model',
-          'reasoningEffort',
-          'permissionMode',
-          'mcpEnabledServers',
-          'enabledPluginIds',
-          'enabledOfficialToolIds',
-          'providerId',
-          'providerRoute',
-          'providerExecutionIdentity',
-          'providerEnvJson',
-        ]);
-        const touchedRecencyField = (Object.keys(payload) as Array<keyof PatchPayload>)
-          .filter((k) => payload[k] !== undefined)
-          .some((k) => RECENCY_BUMP_FIELDS.has(k));
+        // that genuinely represent "session was used" should refresh it. Title
+        // edits and pinning are organizational actions, so neither affects recency.
+        const touchedRecencyField = shouldBumpSessionRecency(payload);
 
         let updated: SessionMetadata | null = null;
         let sawExistingSession = false;
@@ -3090,13 +3090,14 @@ async function main() {
           const updates: Record<string, unknown> = touchedRecencyField
             ? { lastActiveAt: nowIso }
             : {};
-          if (payload.title !== undefined) updates.title = String(payload.title).slice(0, 100);
+          if (payload.title !== undefined) updates.title = payload.title.slice(0, 100);
           if (payload.titleSource !== undefined) updates.titleSource = payload.titleSource;
           if (payload.favorite !== undefined) {
             // Convert false → undefined so the on-disk shape stays minimal
             // (the JSON serializer drops undefined keys).
             updates.favorite = payload.favorite === true ? true : undefined;
           }
+          if (payload.pinned !== undefined) updates.pinned = payload.pinned;
           if (payload.origin !== undefined) {
             if (payload.origin === null) {
               updates.origin = undefined;

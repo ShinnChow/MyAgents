@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
     actions: {
       deleteSession: vi.fn(async () => ({ deleted: true as const })),
       setSessionFavorite: vi.fn(async () => true),
+      beginSessionMetadataMutation: vi.fn(() => 1),
+      applySessionMetadata: vi.fn(() => true),
+      refreshSessions: vi.fn(),
     },
   },
   addProject: vi.fn(),
@@ -29,6 +32,7 @@ const mocks = vi.hoisted(() => ({
   openExternal: vi.fn(async () => undefined),
   openPathExternal: vi.fn(async () => undefined),
   deleteSession: vi.fn(),
+  updateSession: vi.fn(),
   notificationSnapshot: {
     loadState: 'ready',
     authState: 'signed_out',
@@ -130,10 +134,15 @@ vi.mock('@/context/SessionDeletionContext', () => ({
   useSessionDeletion: () => mocks.deleteSession,
 }));
 
+vi.mock('@/api/sessionClient', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/sessionClient')>();
+  return { ...actual, updateSession: mocks.updateSession };
+});
+
 import { i18n } from '@/i18n';
 import type { Tab } from '@/types/tab';
 import { GLOBAL_SIDEBAR_PREFERENCE_KEY } from '@/utils/globalSidebarPreference';
-import GlobalSidebar, { isPointerWithinBounds } from './GlobalSidebar';
+import GlobalSidebar, { isPointerWithinBounds, sortWorkspaceSessions } from './GlobalSidebar';
 
 const launcherTab: Tab = {
   id: 'launcher-tab',
@@ -159,6 +168,7 @@ function sidebar(overrides: Partial<SidebarProps> = {}) {
       onOpenBugReport={vi.fn()}
       onOpenWorkspace={vi.fn(async () => true)}
       onOpenSession={vi.fn(async () => true)}
+      onRenameSession={vi.fn(async () => null)}
       {...overrides}
     />
   );
@@ -179,6 +189,7 @@ describe('GlobalSidebar rail flyout', () => {
     mocks.taskData.workspaceSessionStates.clear();
     mocks.taskData.deleteProtectedSessionIds.clear();
     mocks.deleteSession.mockResolvedValue({ deleted: true });
+    mocks.updateSession.mockReset();
     mocks.config.defaultWorkspacePath = null;
     mocks.configError = null;
     mocks.forcedRail = true;
@@ -588,7 +599,112 @@ describe('GlobalSidebar rail flyout', () => {
     const contextMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 });
     fireEvent(sessionRow, contextMenu);
     expect(contextMenu.defaultPrevented).toBe(true);
+    expect(screen.getByRole('button', { name: String(i18n.t('launcher:rightRail.rename')) })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: String(i18n.t('launcher:rightRail.pin')) })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: String(i18n.t('launcher:rightRail.copySessionId')) })).toBeInTheDocument();
+  });
+
+  it('renames a sidebar Session through the shared dialog with the current title prefilled', async () => {
+    const current = {
+      id: 'session-rename',
+      agentDir: '/work/project-one',
+      title: 'Before rename',
+      createdAt: '2026-07-20T00:00:00.000Z',
+      lastActiveAt: '2026-07-20T00:00:00.000Z',
+    };
+    const onRenameSession = vi.fn(async (_sessionId: string, title: string) => ({ ...current, title }));
+    mocks.projects.push({ id: 'project-1', name: 'Project one', path: '/work/project-one' });
+    mocks.taskData.sessions.push(current);
+    window.localStorage.setItem(GLOBAL_SIDEBAR_PREFERENCE_KEY, JSON.stringify({
+      version: 1,
+      preferredMode: 'rail',
+      expandedWorkspaceKeys: ['/work/project-one'],
+      hasSeededDefaultExpansion: true,
+      showAutomationSessions: true,
+      sessionView: 'all',
+    }));
+    renderSidebar({ onRenameSession });
+    fireEvent.click(screen.getByRole('button', { name: 'Agent 工作区' }));
+
+    const row = screen.getByText('Before rename').closest<HTMLElement>('[data-global-sidebar-session-row]')!;
+    fireEvent.contextMenu(row);
+    fireEvent.click(screen.getByRole('button', { name: String(i18n.t('launcher:rightRail.rename')) }));
+    const input = screen.getByLabelText(String(i18n.t('launcher:rightRail.renameDialogLabel')));
+    expect(input).toHaveValue('Before rename');
+    fireEvent.change(input, { target: { value: 'After rename' } });
+    fireEvent.click(screen.getByRole('button', { name: String(i18n.t('common:actions.save')) }));
+
+    await vi.waitFor(() => expect(onRenameSession).toHaveBeenCalledWith('session-rename', 'After rename'));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('keeps pinned Sessions ahead of recency and orders later pins first', () => {
+    const ordered = sortWorkspaceSessions([
+      { id: 'recent', agentDir: '/work', title: 'Recent', createdAt: '', lastActiveAt: '2026-09-02T12:00:00.000Z' },
+      { id: 'pin-old', agentDir: '/work', title: 'Old pin', createdAt: '', lastActiveAt: '2026-01-01T00:00:00.000Z', pinnedAt: '2026-09-02T08:00:00.000Z' },
+      { id: 'pin-new', agentDir: '/work', title: 'New pin', createdAt: '', lastActiveAt: '2025-01-01T00:00:00.000Z', pinnedAt: '2026-09-02T09:00:00.000Z' },
+      { id: 'older', agentDir: '/work', title: 'Older', createdAt: '', lastActiveAt: '2026-09-01T12:00:00.000Z' },
+    ]);
+
+    expect(ordered.map((session) => session.id)).toEqual(['pin-new', 'pin-old', 'recent', 'older']);
+  });
+
+  it('keeps pinned favorites first without leaking non-favorites into the favorites view', () => {
+    mocks.projects.push({ id: 'project-1', name: 'Project one', path: '/work/project-one' });
+    mocks.taskData.sessions.push(
+      { id: 'favorite-recent', agentDir: '/work/project-one', title: 'Favorite recent', createdAt: '', lastActiveAt: '2026-09-02T12:00:00.000Z', favorite: true },
+      { id: 'favorite-pin-old', agentDir: '/work/project-one', title: 'Favorite pin old', createdAt: '', lastActiveAt: '2026-01-01T00:00:00.000Z', favorite: true, pinnedAt: '2026-09-02T08:00:00.000Z' },
+      { id: 'favorite-pin-new', agentDir: '/work/project-one', title: 'Favorite pin new', createdAt: '', lastActiveAt: '2025-01-01T00:00:00.000Z', favorite: true, pinnedAt: '2026-09-02T09:00:00.000Z' },
+      { id: 'non-favorite-pin', agentDir: '/work/project-one', title: 'Non favorite pin', createdAt: '', lastActiveAt: '2026-09-02T13:00:00.000Z', pinnedAt: '2026-09-02T10:00:00.000Z' },
+    );
+    window.localStorage.setItem(GLOBAL_SIDEBAR_PREFERENCE_KEY, JSON.stringify({
+      version: 1,
+      preferredMode: 'rail',
+      expandedWorkspaceKeys: ['/work/project-one'],
+      hasSeededDefaultExpansion: true,
+      showAutomationSessions: true,
+      sessionView: 'favorites',
+    }));
+    renderSidebar();
+    fireEvent.click(screen.getByRole('button', { name: 'Agent 工作区' }));
+
+    const titles = Array.from(document.querySelectorAll('[data-global-sidebar-session-title]'))
+      .map((element) => element.textContent);
+    expect(titles).toEqual(['Favorite pin new', 'Favorite pin old', 'Favorite recent']);
+    expect(screen.queryByText('Non favorite pin')).not.toBeInTheDocument();
+    expect(screen.getAllByRole('img', { name: String(i18n.t('launcher:rightRail.pinned')) })).toHaveLength(2);
+  });
+
+  it('persists a sidebar pin intent and publishes the canonical Session response', async () => {
+    const current = {
+      id: 'session-pin',
+      agentDir: '/work/project-one',
+      title: 'Pin me',
+      createdAt: '2026-07-20T00:00:00.000Z',
+      lastActiveAt: '2026-07-20T00:00:00.000Z',
+    };
+    const updated = { ...current, pinnedAt: '2026-09-02T08:00:00.000Z' };
+    mocks.projects.push({ id: 'project-1', name: 'Project one', path: '/work/project-one' });
+    mocks.taskData.sessions.push(current);
+    mocks.updateSession.mockResolvedValue(updated);
+    window.localStorage.setItem(GLOBAL_SIDEBAR_PREFERENCE_KEY, JSON.stringify({
+      version: 1,
+      preferredMode: 'rail',
+      expandedWorkspaceKeys: ['/work/project-one'],
+      hasSeededDefaultExpansion: true,
+      showAutomationSessions: true,
+      sessionView: 'all',
+    }));
+    renderSidebar();
+    fireEvent.click(screen.getByRole('button', { name: 'Agent 工作区' }));
+
+    const row = screen.getByText('Pin me').closest<HTMLElement>('[data-global-sidebar-session-row]')!;
+    fireEvent.contextMenu(row);
+    fireEvent.click(screen.getByRole('button', { name: String(i18n.t('launcher:rightRail.pin')) }));
+
+    await vi.waitFor(() => expect(mocks.updateSession).toHaveBeenCalledWith('session-pin', { pinned: true }));
+    expect(mocks.taskData.actions.beginSessionMetadataMutation).toHaveBeenCalledWith('session-pin');
+    expect(mocks.taskData.actions.applySessionMetadata).toHaveBeenCalledWith(updated, 1);
   });
 
   it('shows a truncated Session title only after a one-second hover', () => {
@@ -695,7 +811,7 @@ describe('GlobalSidebar rail flyout', () => {
     expect(mocks.toast.warning).toHaveBeenCalledWith(String(i18n.t('launcher:rightRail.deleteBlockedByOwner')));
   });
 
-  it('copies the Session ID from the first row of the history menu', async () => {
+  it('copies the Session ID from the Session resource menu', async () => {
     const sessionId = '642ea003-5219-4af7-a812-a9812d6e79de';
     mocks.projects.push({ id: 'project-1', name: 'Project one', path: '/work/project-one' });
     mocks.taskData.sessions.push({
@@ -720,7 +836,7 @@ describe('GlobalSidebar rail flyout', () => {
     fireEvent.click(within(sessionRow).getByRole('button', { name: String(i18n.t('launcher:rightRail.more')) }));
     const copyButton = screen.getByRole('button', { name: String(i18n.t('launcher:rightRail.copySessionId')) });
     const menu = copyButton.closest<HTMLElement>('.global-sidebar-nested-layer')!;
-    expect(within(menu).getAllByRole('button')[0]).toBe(copyButton);
+    expect(within(menu).getAllByRole('button')[1]).toBe(copyButton);
 
     await act(async () => {
       fireEvent.click(copyButton);

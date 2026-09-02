@@ -49,7 +49,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 
 import { track } from '@/analytics';
 import myAgentsLogo from '@/assets/runtime-icons/myagents.png';
-import type { SessionMetadata } from '@/api/sessionClient';
+import { updateSession, type SessionMetadata } from '@/api/sessionClient';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import FeedbackPopover from '@/components/FeedbackPopover';
 import { APP_SHELL_POPOVER_CHROME } from '@/components/global-sidebar/appShellPopoverChrome';
@@ -145,6 +145,25 @@ export function isPointerWithinBounds(
     && clientY < bounds.bottom;
 }
 
+function sessionTime(value: string | undefined): number {
+  const parsed = value ? Date.parse(value) : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** Sidebar-only order: pins first, then each partition's own canonical time. */
+export function sortWorkspaceSessions(sessions: readonly SessionMetadata[]): SessionMetadata[] {
+  return [...sessions].sort((a, b) => {
+    const aPinned = Boolean(a.pinnedAt);
+    const bPinned = Boolean(b.pinnedAt);
+    if (aPinned !== bPinned) return bPinned ? 1 : -1;
+    const primary = aPinned
+      ? sessionTime(b.pinnedAt) - sessionTime(a.pinnedAt)
+      : sessionTime(b.lastActiveAt) - sessionTime(a.lastActiveAt);
+    if (primary !== 0) return primary;
+    return a.id.localeCompare(b.id);
+  });
+}
+
 export type CapabilitySection = 'skills' | 'plugins' | 'mcp';
 
 interface GlobalSidebarProps {
@@ -167,6 +186,7 @@ interface GlobalSidebarProps {
     entryIntent?: 'open_workspace' | 'workspace_init',
   ) => Promise<boolean>;
   onOpenSession: (session: SessionMetadata, project: Project) => Promise<boolean>;
+  onRenameSession: (sessionId: string, title: string) => Promise<SessionMetadata | null>;
   historyTagIntent?: { id: number; tag: string } | null;
   onHistoryTagIntentConsumed?: (id: number) => void;
 }
@@ -355,6 +375,7 @@ export default memo(function GlobalSidebar({
   onOpenBugReport,
   onOpenWorkspace,
   onOpenSession,
+  onRenameSession,
   historyTagIntent,
   onHistoryTagIntentConsumed,
 }: GlobalSidebarProps) {
@@ -910,6 +931,18 @@ export default memo(function GlobalSidebar({
     if (!success) toastRef.current.error(tLauncher('rightRail.favoriteFailedRetry'));
   }, [tLauncher, taskCenterData.actions]);
 
+  const handleToggleSessionPin = useCallback(async (session: SessionMetadata) => {
+    const mutationSequence = taskCenterData.actions.beginSessionMetadataMutation(session.id);
+    try {
+      const updated = await updateSession(session.id, { pinned: !session.pinnedAt });
+      if (!updated) throw new Error('Session no longer exists.');
+      taskCenterData.actions.applySessionMetadata(updated, mutationSequence);
+    } catch (error) {
+      console.error('[GlobalSidebar] Failed to update Session pinned state:', error);
+      toastRef.current.error(tLauncher('rightRail.sessionPinFailedRetry'));
+    }
+  }, [tLauncher, taskCenterData.actions]);
+
   const handleCopySessionId = useCallback(async (session: SessionMetadata) => {
     try {
       await copyPlainText(`SessionID: ${session.id}`);
@@ -994,6 +1027,8 @@ export default memo(function GlobalSidebar({
         setProjectToRemove(project);
       }}
       onToggleFavorite={handleToggleFavorite}
+      onToggleSessionPin={(session) => { void handleToggleSessionPin(session); }}
+      onRenameSession={onRenameSession}
       onCopySessionId={(session) => { void handleCopySessionId(session); }}
       onShowStats={(session, origin) => {
         rememberChildLayerOrigin(origin);
@@ -1420,6 +1455,7 @@ export default memo(function GlobalSidebar({
               taskCenterData={taskCenterData}
               onClose={handleSearchClose}
               onOpenSession={(session, project) => { void handleOpenSession(session, project); }}
+              onRenameSession={onRenameSession}
               tagIntent={historyTagIntent}
               onTagIntentConsumed={onHistoryTagIntentConsumed}
             />
@@ -1463,6 +1499,8 @@ interface WorkspaceTreeProps {
   onOpenFolder: (project: Project) => void;
   onRemove: (project: Project, origin?: HTMLElement | null) => void;
   onToggleFavorite: (session: SessionMetadata) => void;
+  onToggleSessionPin: (session: SessionMetadata) => void;
+  onRenameSession: (sessionId: string, title: string) => Promise<SessionMetadata | null>;
   onCopySessionId: (session: SessionMetadata) => void;
   onShowStats: (session: SessionMetadata, origin?: HTMLElement | null) => void;
   onDeleteSession: (session: SessionMetadata, origin?: HTMLElement | null) => void;
@@ -1570,6 +1608,8 @@ function WorkspaceTree({
   onOpenFolder,
   onRemove,
   onToggleFavorite,
+  onToggleSessionPin,
+  onRenameSession,
   onCopySessionId,
   onShowStats,
   onDeleteSession,
@@ -1595,8 +1635,8 @@ function WorkspaceTree({
       list.push(session);
       map.set(key, list);
     }
-    for (const list of map.values()) {
-      list.sort((a, b) => new Date(b.lastActiveAt).getTime() - new Date(a.lastActiveAt).getTime());
+    for (const [key, list] of map) {
+      map.set(key, sortWorkspaceSessions(list));
     }
     return map;
   }, [sessionView, showAutomationSessions, taskCenterData.sessions]);
@@ -1804,6 +1844,8 @@ function WorkspaceTree({
                               deleteProtected={taskCenterData.deleteProtectedSessionIds.has(session.id)}
                               onOpen={() => onOpenSession(session, project)}
                               onToggleFavorite={() => onToggleFavorite(session)}
+                              onTogglePin={() => onToggleSessionPin(session)}
+                              onRenameSession={onRenameSession}
                               onCopySessionId={() => onCopySessionId(session)}
                               onShowStats={(origin) => onShowStats(session, origin)}
                               onDelete={(origin) => onDeleteSession(session, origin)}
@@ -2016,6 +2058,8 @@ interface SessionRowProps {
   deleteProtected: boolean;
   onOpen: () => void;
   onToggleFavorite: () => void;
+  onTogglePin: () => void;
+  onRenameSession: (sessionId: string, title: string) => Promise<SessionMetadata | null>;
   onCopySessionId: () => void;
   onShowStats: (origin?: HTMLElement | null) => void;
   onDelete: (origin?: HTMLElement | null) => void;
@@ -2034,6 +2078,8 @@ function SessionRow({
   deleteProtected,
   onOpen,
   onToggleFavorite,
+  onTogglePin,
+  onRenameSession,
   onCopySessionId,
   onShowStats,
   onDelete,
@@ -2091,6 +2137,14 @@ function SessionRow({
           data-global-sidebar-session-title
         />
         {session.favorite && <Star className="h-3 w-3 shrink-0 text-[var(--accent)]" fill="currentColor" />}
+        {session.pinnedAt && (
+          <Pin
+            role="img"
+            aria-label={tLauncher('rightRail.pinned')}
+            className="h-3 w-3 shrink-0 text-[var(--ink-muted)]"
+            data-global-sidebar-session-pinned
+          />
+        )}
         {tags.map((tag, index) => <SessionTagBadge key={`${tag.type}-${index}`} tag={tag} />)}
         <UnreadNotificationIndicator
           count={unreadNotificationCount}
@@ -2136,6 +2190,8 @@ function SessionRow({
         deleteProtected={deleteProtected}
         onCopySessionId={onCopySessionId}
         onToggleFavorite={onToggleFavorite}
+        onTogglePin={onTogglePin}
+        onRenameSession={onRenameSession}
         onShowStats={onShowStats}
         onDelete={onDelete}
         onSessionMutationStart={onSessionMutationStart}

@@ -71,6 +71,8 @@ export interface SessionMetadata {
     /** User-pinned to the 收藏 filter view. Only `true` is persisted; absent
      *  has identical meaning to false. */
     favorite?: boolean;
+    /** Server-owned ordering timestamp for the workspace sidebar. */
+    pinnedAt?: string;
     /** User-managed global names used to organize Session history. */
     userTags?: string[];
     /** Preview of the last user message (truncated, for Task Center display) */
@@ -281,6 +283,8 @@ export async function updateSession(
          *  so toggling off shrinks the on-disk metadata back to the absent
          *  baseline. */
         favorite?: boolean;
+        /** true pins to the workspace sidebar; false removes the canonical timestamp. */
+        pinned?: boolean;
         // v0.1.69 snapshot fields — null clears, undefined leaves unchanged.
         // Server auto-stamps configSnapshotAt when any snapshot field is touched
         // and redacts providerEnvJson to '[redacted]' in the response (zero-trust).

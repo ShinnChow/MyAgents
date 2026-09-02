@@ -41,6 +41,8 @@ export default memo(function SessionSearchItem({
     // If we don't have project info, fallback to showing just the agentDir
     const projectName = project ? getFolderName(project.path) : getFolderName(hit.agentDir);
     const displayLastActiveAt = session?.lastActiveAt ?? hit.lastActiveAt;
+    const displayTitle = session?.title ?? hit.title;
+    const titleHighlights = displayTitle === hit.title ? hit.titleHighlights : [];
     const turnCountStr = hit.turnCount !== null && hit.turnCount > 0
         ? t('historyOverlay.turnCount', { count: hit.turnCount })
         : '';
@@ -67,8 +69,8 @@ export default memo(function SessionSearchItem({
                 {/* First row: Title */}
                 <div className="flex items-center text-sm text-[var(--ink-secondary)] transition-colors group-hover:text-[var(--ink)]">
                     <SearchHighlight
-                        text={hit.title}
-                        highlights={hit.titleHighlights}
+                        text={displayTitle}
+                        highlights={titleHighlights}
                         className="truncate flex-1 min-w-0"
                     />
                     {turnCountStr && (

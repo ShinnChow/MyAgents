@@ -2100,7 +2100,10 @@ export async function updateSessionMetadata(
         | 'materializationState'
         | 'materializationSourceSessionId'
         | 'pendingContinueAfterAbort'
-    >>,
+    >> & {
+        /** Pin intent. SessionStore owns the canonical ordering timestamp. */
+        pinned?: boolean;
+    },
     /**
      * Optional compare-and-set guard evaluated INSIDE the lock against the
      * freshly-read current metadata. When it returns false the write is skipped
@@ -2137,7 +2140,21 @@ export async function updateSessionMetadata(
             return;
         }
         const current = all[idx];
-        const patch = { ...updates };
+        const { pinned, ...updatesWithoutPinIntent } = updates;
+        const patch: Partial<SessionMetadata> = { ...updatesWithoutPinIntent };
+        if (pinned !== undefined) {
+            if (!pinned) {
+                patch.pinnedAt = undefined;
+            } else {
+                const latestPinnedAtMs = all.reduce((latest, session) => {
+                    const candidate = session.pinnedAt ? Date.parse(session.pinnedAt) : Number.NaN;
+                    return Number.isFinite(candidate) ? Math.max(latest, candidate) : latest;
+                }, 0);
+                // A user can issue two pin intents inside one wall-clock millisecond. Allocate
+                // under the sessions lock so the later committed intent still sorts first.
+                patch.pinnedAt = new Date(Math.max(Date.now(), latestPinnedAtMs + 1)).toISOString();
+            }
+        }
         if (patch.lastActiveAt !== undefined) {
             patch.lastActiveAt = monotonicLastActiveAt(current.lastActiveAt, patch.lastActiveAt);
         }

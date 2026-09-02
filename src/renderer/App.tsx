@@ -2311,26 +2311,49 @@ export default function App() {
     [tabWorkspaceController],
   );
 
-  // Rename session: update tab title + persist to backend + notify listeners
+  // Persist one canonical Product Session title, then converge every renderer
+  // projection that App owns. Resource surfaces share this path with Chat so a
+  // sidebar rename cannot leave an already-open tab showing an older title.
+  const renamePersistedSession = useCallback(
+    async (sessionId: string, newTitle: string) => {
+      const mutationSequence = taskCenterActions.beginSessionMetadataMutation(sessionId);
+      const updated = await updateSession(sessionId, {
+        title: newTitle,
+        titleSource: 'user',
+      });
+      if (!updated) return null;
+
+      const applied = taskCenterActions.applySessionMetadata(updated, mutationSequence);
+      if (!applied) return updated;
+
+      for (const tab of tabWorkspaceController.getSnapshot().tabs) {
+        if (tab.view === 'chat' && tab.sessionId === sessionId && tab.title !== updated.title) {
+          tabWorkspaceController.update(tab.id, 'chat', (current) => ({
+            ...current,
+            title: updated.title,
+          }));
+        }
+      }
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SESSION_TITLE_CHANGED));
+      return updated;
+    },
+    [tabWorkspaceController],
+  );
+
   const handleRenameSession = useCallback(
     (tabId: string, newTitle: string) => {
-      updateTabTitle(tabId, newTitle);
       const tab = tabWorkspaceController
         .getSnapshot()
-        .tabs.find((t) => t.id === tabId);
-      if (tab?.view === 'chat' && tab.sessionId) {
-        updateSession(tab.sessionId, { title: newTitle, titleSource: 'user' })
-          .then(() =>
-            window.dispatchEvent(
-              new CustomEvent(CUSTOM_EVENTS.SESSION_TITLE_CHANGED),
-            ),
-          )
-          .catch((err) =>
-            console.error('[App] Failed to persist renamed title:', err),
-          );
+        .tabs.find((candidate) => candidate.id === tabId);
+      if (tab?.view !== 'chat' || !tab.sessionId || tab.sessionId.startsWith('pending-')) {
+        updateTabTitle(tabId, newTitle);
+        return;
       }
+      void renamePersistedSession(tab.sessionId, newTitle).catch((err) =>
+        console.error('[App] Failed to persist renamed title:', err),
+      );
     },
-    [tabWorkspaceController, updateTabTitle],
+    [renamePersistedSession, tabWorkspaceController, updateTabTitle],
   );
 
   /**
@@ -4776,6 +4799,7 @@ export default function App() {
             onOpenBugReport={handleOpenBugReport}
             onOpenWorkspace={handleOpenWorkspaceFromSidebar}
             onOpenSession={handleOpenSidebarSession}
+            onRenameSession={renamePersistedSession}
             historyTagIntent={historyTagIntent}
             onHistoryTagIntentConsumed={handleHistoryTagIntentConsumed}
           />
