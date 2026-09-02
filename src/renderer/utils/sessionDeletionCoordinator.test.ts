@@ -111,9 +111,11 @@ describe('deleteSessionThroughAppOwner', () => {
         const terminateTabsForSession = vi.fn((sessionId: string) => {
             events.push('tabs-reset');
             tabOwners.terminateTabsForSession(sessionId);
-            expect(tabsRef.current[0]).toMatchObject({ id: 'active-tab', view: 'launcher', sessionId: null });
+            expect(tabsRef.current[0]).toMatchObject({ id: 'active-tab', view: 'launcher' });
+            expect(tabsRef.current[0]).not.toHaveProperty('sessionId');
             expect(tabsRef.current[1]).toBe(originalOtherTab);
-            expect(tabsRef.current[2]).toMatchObject({ id: 'duplicate-tab', view: 'launcher', sessionId: null });
+            expect(tabsRef.current[2]).toMatchObject({ id: 'duplicate-tab', view: 'launcher' });
+            expect(tabsRef.current[2]).not.toHaveProperty('sessionId');
         });
         const stopSseProxy = vi.fn(async (tabId: string) => {
             events.push(`sse:${tabId}`);
@@ -180,7 +182,8 @@ describe('deleteSessionThroughAppOwner', () => {
 
         await expect(deletion).resolves.toEqual({ deleted: true });
         expect(tabsRef.current).toHaveLength(2);
-        expect(tabsRef.current[0]).toMatchObject({ id: 'target-tab', view: 'launcher', sessionId: null });
+        expect(tabsRef.current[0]).toMatchObject({ id: 'target-tab', view: 'launcher' });
+        expect(tabsRef.current[0]).not.toHaveProperty('sessionId');
         expect(tabsRef.current[1]).toMatchObject({ id: 'new-other-tab', sessionId: 'new-other-session' });
     });
 

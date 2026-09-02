@@ -34,6 +34,8 @@ interface BrowserPanelProps {
   isDraggingSplit: boolean;
   isSplitTransitioning?: boolean;
   browserAlive: boolean;
+  /** Parent-owned reload intent; BrowserPanel applies it to its exact generation. */
+  reloadSignal?: number;
   /** When previewing a local file, stores its metadata for editor toggle */
   sourceFile?: { name: string; content: string; size: number; path: string } | null;
   /**
@@ -64,6 +66,7 @@ export default function BrowserPanel({
   isDraggingSplit,
   isSplitTransitioning = false,
   browserAlive,
+  reloadSignal = 0,
   sourceFile,
   workspace,
   onBrowserCreated,
@@ -77,7 +80,8 @@ export default function BrowserPanel({
   const containerRef = useRef<HTMLDivElement>(null);
   const [currentUrl, setCurrentUrl] = useState(url ?? '');
   const [isLoading, setIsLoading] = useState(false);
-  const creatingRef = useRef(false);
+  const lifecycleTokenRef = useRef<string | null>(null);
+  const creatingTokenRef = useRef<string | null>(null);
 
   // Toast accessed via ref so the create effect doesn't list it as a dep
   // (project convention — see CLAUDE.md react_stability_rules). Ref is
@@ -96,8 +100,7 @@ export default function BrowserPanel({
   // the close→reopen race where an unmounted instance's create promise still
   // resolves and would otherwise mutate parent state for the new instance's
   // tabId. Must be declared BEFORE any effect that depends on it.
-  const isMountedRef = useRef(true);
-  useEffect(() => () => { isMountedRef.current = false; }, []);
+  const isMountedRef = useRef(false);
 
   // Whether this webview has ever navigated to a real (non-blank) URL. Once
   // true, subsequent visits to the blank page (e.g. via browser back-button)
@@ -123,7 +126,33 @@ export default function BrowserPanel({
   // settles — two in-flight resizes have no ordering guarantee on the Rust
   // side, and the older one landing last would park the webview on stale
   // bounds that the ref-bookkeeping believes are current.
-  const resizeInFlightRef = useRef(false);
+  const resizeInFlightTokenRef = useRef<string | null>(null);
+  const createIssuedTokenRef = useRef<string | null>(null);
+
+  // One token per effect lifetime, not per tab. React's setup-cleanup-setup
+  // probe and a real close→reopen may reuse the same tabId, but neither may
+  // address the other's native child WebView generation.
+  useEffect(() => {
+    const lifecycleToken = crypto.randomUUID();
+    lifecycleTokenRef.current = lifecycleToken;
+    isMountedRef.current = true;
+    lastRequestedUrlRef.current = null;
+    lastSyncedBoundsRef.current = null;
+    resizeInFlightTokenRef.current = null;
+    createIssuedTokenRef.current = null;
+
+    return () => {
+      const createWasIssued = createIssuedTokenRef.current === lifecycleToken;
+      if (lifecycleTokenRef.current === lifecycleToken) {
+        lifecycleTokenRef.current = null;
+        isMountedRef.current = false;
+        createIssuedTokenRef.current = null;
+      }
+      if (createWasIssued) {
+        invoke('cmd_browser_close', { tabId, lifecycleToken }).catch(() => {});
+      }
+    };
+  }, [tabId]);
 
   const readUsableBounds = useCallback((): BrowserBounds | null => {
     const el = containerRef.current;
@@ -133,7 +162,8 @@ export default function BrowserPanel({
 
   // ── Create or navigate webview when url prop changes ──
   useEffect(() => {
-    if (!url) return;
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (!url || !lifecycleToken) return;
     // While the split panel is in its Windows transition-suspension window,
     // the native webview is hidden specifically because the DOM rect is still
     // moving. If no webview exists yet, wait instead of seeding Rust's SHOW
@@ -144,14 +174,14 @@ export default function BrowserPanel({
     let rafId = 0;
 
     const createWithBounds = (bounds: BrowserBounds) => {
-      creatingRef.current = true;
+      createIssuedTokenRef.current = lifecycleToken;
+      creatingTokenRef.current = lifecycleToken;
       lastRequestedUrlRef.current = url;
       lastSyncedBoundsRef.current = bounds;
 
       invoke('cmd_browser_create', {
-        tabId, url,
-        x: bounds.x, y: bounds.y,
-        width: bounds.width, height: bounds.height,
+        tabId, lifecycleToken, url,
+        bounds,
       })
         .then(() => {
           // Cross-instance race: this resolution may belong to an unmounted
@@ -159,7 +189,7 @@ export default function BrowserPanel({
           // (close → reopen). Calling cmd_browser_close here would kill the
           // new instance's webview. The unmount-cleanup effect already handles
           // teardown for unmounted instances; bail without touching state.
-          if (!isMountedRef.current) return;
+          if (!isMountedRef.current || lifecycleTokenRef.current !== lifecycleToken) return;
           if (cancelled) {
             // Same instance, but deps changed mid-create (e.g. url updated).
             // Sync browserAlive=true so the navigate branch on the next effect
@@ -170,7 +200,13 @@ export default function BrowserPanel({
           onBrowserCreated();
         })
         .catch((err) => {
-          if (!isMountedRef.current) return;
+          if (!isMountedRef.current || lifecycleTokenRef.current !== lifecycleToken) return;
+          // Rust has definitively settled this birth as failed and removed its
+          // reservation. Do not let a later React cleanup manufacture a
+          // close-before-admit tombstone for a create that cannot arrive.
+          if (createIssuedTokenRef.current === lifecycleToken) {
+            createIssuedTokenRef.current = null;
+          }
           console.error('[browser] Create failed:', err);
           if (!cancelled) {
             const msg = typeof err === 'string' ? err : (err?.message ?? String(err));
@@ -178,11 +214,13 @@ export default function BrowserPanel({
             onCreateFailed();
           }
         })
-        .finally(() => { creatingRef.current = false; });
+        .finally(() => {
+          if (creatingTokenRef.current === lifecycleToken) creatingTokenRef.current = null;
+        });
     };
 
     const waitForUsableBounds = () => {
-      if (cancelled || creatingRef.current) return;
+      if (cancelled || creatingTokenRef.current === lifecycleToken) return;
       const bounds = readUsableBounds();
       if (bounds) {
         createWithBounds(bounds);
@@ -191,7 +229,7 @@ export default function BrowserPanel({
       rafId = requestAnimationFrame(waitForUsableBounds);
     };
 
-    if (!browserAlive && !creatingRef.current && isVisible) {
+    if (!browserAlive && creatingTokenRef.current !== lifecycleToken && isVisible) {
       // Create at the first usable rect after any known split-transition
       // suspension (#290 degenerate-bounds floor). The previous "wait for the
       // rect to hold still across N frames" dance (a8cd4f47) is still gone: a
@@ -201,7 +239,7 @@ export default function BrowserPanel({
       waitForUsableBounds();
     } else if (browserAlive && url !== lastRequestedUrlRef.current) {
       lastRequestedUrlRef.current = url;
-      invoke('cmd_browser_navigate', { tabId, url }).catch(() => {});
+      invoke('cmd_browser_navigate', { tabId, lifecycleToken, url }).catch(() => {});
     }
 
     return () => {
@@ -212,10 +250,11 @@ export default function BrowserPanel({
 
   // ── Listen for URL/loading events from Rust ──
   useEffect(() => {
-    if (!browserAlive) return;
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (!browserAlive || !lifecycleToken) return;
     const ac = new AbortController();
 
-    void listenWithCleanup<string>(`browser:url-changed:${tabId}`, (event) => {
+    void listenWithCleanup<string>(`browser:url-changed:${tabId}:${lifecycleToken}`, (event) => {
       const next = event.payload;
       setCurrentUrl(next);
       // Latch hasNavigated on first real navigation — lets the React empty
@@ -230,7 +269,7 @@ export default function BrowserPanel({
       onUrlChangeRef.current?.(next);
     }, ac.signal);
 
-    void listenWithCleanup<boolean>(`browser:loading:${tabId}`, (event) => {
+    void listenWithCleanup<boolean>(`browser:loading:${tabId}:${lifecycleToken}`, (event) => {
       setIsLoading(event.payload);
     }, ac.signal);
 
@@ -260,21 +299,24 @@ export default function BrowserPanel({
   // cmd_browser_resize updates Rust's cached geometry on hidden webviews, so
   // the next SHOW restores the current rect, not a stale one.
   useEffect(() => {
-    if (!browserAlive || !isVisible) return;
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (!browserAlive || !isVisible || !lifecycleToken) return;
     let rafId = 0;
     let disposed = false;
     const tick = () => {
       if (disposed) return;
       const bounds = readUsableBounds();
-      if (shouldSyncBrowserBounds(lastSyncedBoundsRef.current, bounds, resizeInFlightRef.current)) {
-        resizeInFlightRef.current = true;
+      if (shouldSyncBrowserBounds(
+        lastSyncedBoundsRef.current,
+        bounds,
+        resizeInFlightTokenRef.current === lifecycleToken,
+      )) {
+        resizeInFlightTokenRef.current = lifecycleToken;
         lastSyncedBoundsRef.current = bounds;
         invoke('cmd_browser_resize', {
           tabId,
-          x: bounds.x,
-          y: bounds.y,
-          width: bounds.width,
-          height: bounds.height,
+          lifecycleToken,
+          bounds,
         })
           .catch(() => {
             // Failed delivery must not be remembered as synced — clear so the
@@ -284,7 +326,9 @@ export default function BrowserPanel({
             lastSyncedBoundsRef.current = null;
           })
           .finally(() => {
-            resizeInFlightRef.current = false;
+            if (resizeInFlightTokenRef.current === lifecycleToken) {
+              resizeInFlightTokenRef.current = null;
+            }
           });
       }
       rafId = requestAnimationFrame(tick);
@@ -314,36 +358,42 @@ export default function BrowserPanel({
 
   // ── Consolidated show/hide ──
   useEffect(() => {
-    if (!browserAlive) return;
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (!browserAlive || !lifecycleToken) return;
     const nativeViewSuspended = isDraggingSplit || isSplitTransitioning;
     const shouldShow = isVisible && !nativeViewSuspended && !overlayDetected && !isBlankPage;
     if (shouldShow) {
       // SHOW restores Rust's cached geometry; the reconciler keeps that cache
       // current (it syncs even while hidden), and corrects any residue within
       // a frame — no force-sync needed here.
-      invoke('cmd_browser_show', { tabId }).catch(() => {});
+      invoke('cmd_browser_show', { tabId, lifecycleToken }).catch(() => {});
     } else {
-      invoke('cmd_browser_hide', { tabId }).catch(() => {});
+      invoke('cmd_browser_hide', { tabId, lifecycleToken }).catch(() => {});
     }
   }, [isVisible, isDraggingSplit, isSplitTransitioning, overlayDetected, browserAlive, isBlankPage, tabId]);
 
-  // ── Cleanup on unmount ──
+  // Parent reload intents stay generation-local; Chat never owns the native
+  // token and therefore cannot accidentally reload a reopened BrowserPanel.
   useEffect(() => {
-    const tid = tabId;
-    return () => { invoke('cmd_browser_close', { tabId: tid }).catch(() => {}); };
-  }, [tabId]);
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (!browserAlive || reloadSignal <= 0 || !lifecycleToken) return;
+    invoke('cmd_browser_reload', { tabId, lifecycleToken }).catch(() => {});
+  }, [browserAlive, reloadSignal, tabId]);
 
   // ── Navigation handlers ──
   const handleGoBack = useCallback(() => {
-    invoke('cmd_browser_go_back', { tabId }).catch(() => {});
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (lifecycleToken) invoke('cmd_browser_go_back', { tabId, lifecycleToken }).catch(() => {});
   }, [tabId]);
 
   const handleGoForward = useCallback(() => {
-    invoke('cmd_browser_go_forward', { tabId }).catch(() => {});
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (lifecycleToken) invoke('cmd_browser_go_forward', { tabId, lifecycleToken }).catch(() => {});
   }, [tabId]);
 
   const handleReload = useCallback(() => {
-    invoke('cmd_browser_reload', { tabId }).catch(() => {});
+    const lifecycleToken = lifecycleTokenRef.current;
+    if (lifecycleToken) invoke('cmd_browser_reload', { tabId, lifecycleToken }).catch(() => {});
   }, [tabId]);
 
   const handleOpenExternal = useCallback(() => {
@@ -374,7 +424,9 @@ export default function BrowserPanel({
       trimmed = 'https://' + trimmed;
     }
     if (trimmed !== currentUrl) {
-      invoke('cmd_browser_navigate', { tabId, url: trimmed }).catch(() => {});
+      const lifecycleToken = lifecycleTokenRef.current;
+      if (!lifecycleToken) return;
+      invoke('cmd_browser_navigate', { tabId, lifecycleToken, url: trimmed }).catch(() => {});
       lastRequestedUrlRef.current = trimmed;
     }
   }, [urlDraft, currentUrl, tabId]);

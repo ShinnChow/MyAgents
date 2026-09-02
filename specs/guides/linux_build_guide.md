@@ -22,6 +22,7 @@ MyAgents 在 Linux 上通过 AppImage（便携）+ deb（apt 源）分发。
 sudo apt-get update
 sudo apt-get install -y \
     build-essential \
+    cmake \
     curl \
     wget \
     file \
@@ -35,6 +36,7 @@ sudo apt-get install -y \
 ```
 
 **说明**：
+- `cmake` — speech native adapter 要求 3.28+；若发行版仓库版本较旧，需从 CMake 官方渠道安装满足要求的版本
 - `libwebkit2gtk-4.1-dev` — Tauri WebView 后端（Linux 用 WebKit2GTK；不像 macOS 的 WKWebView 或 Windows 的 WebView2）
 - `libayatana-appindicator3-dev` — 系统托盘图标库
 - `patchelf` — AppImage 打包要求的 RPATH 补丁工具
@@ -47,10 +49,11 @@ sudo apt-get install -y \
 
 `setup.sh` 在 Linux 上的行为：
 - 检查 Node.js / npm / Rust / Cargo / rustup，并按 `rust-toolchain.toml` 准备固定 toolchain 与 `rustfmt` / `clippy`
+- 根据当前 target 和 exact prepared cache 提前检查 CMake 3.28+/C++ 等原生推理构建工具；缺失时在下载或安装项目依赖前给出修复命令，不自动安装原生构建工具
 - `scripts/download_nodejs.sh` 下载 Node.js v24 Linux x64/arm64 tarball（按 `uname -m` 自动选择）
 - `npm install` 拉取依赖（包括 SDK platform optional dep `@anthropic-ai/claude-agent-sdk-linux-<arch>`）
 - Rust `cargo fetch`
-- 准备当前架构的离线文档 Worker、OCR、ONNX Runtime 与 PDFium；资源缓存跨 `npm run clean` 复用
+- 准备当前架构的离线文档 Worker、media Worker、OCR、speech native、ONNX Runtime 与 PDFium；资源缓存跨 `npm run clean` 复用
 
 Mino 默认工作区模板已提交在 `bundled-workspaces/mino/`，setup 和构建不再下载外部模板仓库。
 

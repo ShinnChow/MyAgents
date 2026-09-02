@@ -23,6 +23,97 @@
 // other desktop targets compile a stub that reports `supported: false`.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+const FLOATING_BALL_COMPANION_OWNER_ID: &str = "floating-ball";
+static COMPANION_OWNER_ADMITTED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static NATIVE_LIFECYCLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn lock_native_lifecycle() -> std::sync::MutexGuard<'static, ()> {
+    NATIVE_LIFECYCLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn sidecar_owner_admitted(owner: &crate::sidecar::SidecarOwner) -> bool {
+    !is_floating_ball_companion_owner(owner) || COMPANION_OWNER_ADMITTED.load(Ordering::SeqCst)
+}
+
+fn is_floating_ball_companion_owner(owner: &crate::sidecar::SidecarOwner) -> bool {
+    matches!(
+        owner,
+        crate::sidecar::SidecarOwner::Companion(owner_id)
+            if owner_id == FLOATING_BALL_COMPANION_OWNER_ID
+    )
+}
+
+fn lifecycle_generation_is_current(current: u64, captured: u64) -> bool {
+    current == captured
+}
+
+fn startup_enable_is_authorized(admitted: bool, dev_gate: bool, enabled: bool) -> bool {
+    admitted && dev_gate && enabled
+}
+
+fn set_companion_owner_admitted(admitted: bool) {
+    COMPANION_OWNER_ADMITTED.store(admitted, Ordering::SeqCst);
+}
+
+fn floating_ball_companion_owner() -> crate::sidecar::SidecarOwner {
+    crate::sidecar::SidecarOwner::Companion(FLOATING_BALL_COMPANION_OWNER_ID.to_string())
+}
+
+#[cfg(any(target_os = "macos", test))]
+const MACOS_SURFACE_LABELS: &[&str] = &["fb-companion", "fb-shield", "fb-ball"];
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_SURFACE_LABELS: &[&str] = &["fb-companion", "fb-ball"];
+
+#[cfg(test)]
+mod lifecycle_policy_tests {
+    use super::{
+        is_floating_ball_companion_owner, lifecycle_generation_is_current,
+        startup_enable_is_authorized, MACOS_SURFACE_LABELS, WINDOWS_SURFACE_LABELS,
+    };
+    use crate::sidecar::SidecarOwner;
+
+    #[test]
+    fn native_teardown_covers_the_complete_platform_surface_set() {
+        assert_eq!(
+            MACOS_SURFACE_LABELS,
+            &["fb-companion", "fb-shield", "fb-ball"]
+        );
+        assert_eq!(WINDOWS_SURFACE_LABELS, &["fb-companion", "fb-ball"]);
+    }
+
+    #[test]
+    fn only_the_exact_desktop_pet_companion_owner_uses_feature_admission() {
+        assert!(is_floating_ball_companion_owner(&SidecarOwner::Companion(
+            "floating-ball".to_string()
+        )));
+        assert!(!is_floating_ball_companion_owner(&SidecarOwner::Companion(
+            "other".to_string()
+        )));
+        assert!(!is_floating_ball_companion_owner(&SidecarOwner::Tab(
+            "floating-ball".to_string()
+        )));
+    }
+
+    #[test]
+    fn retired_poller_generation_cannot_act_on_recreated_surface_labels() {
+        assert!(lifecycle_generation_is_current(7, 7));
+        assert!(!lifecycle_generation_is_current(8, 7));
+    }
+
+    #[test]
+    fn newer_disable_cancels_delayed_startup_enable_even_before_config_commit() {
+        assert!(startup_enable_is_authorized(true, true, true));
+        assert!(!startup_enable_is_authorized(false, true, true));
+        assert!(!startup_enable_is_authorized(true, false, true));
+        assert!(!startup_enable_is_authorized(true, true, false));
+    }
+}
 
 /// Renderer-facing snapshot of what this build can do.
 #[derive(Debug, Clone, Serialize)]
@@ -128,7 +219,7 @@ mod imp {
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex,
     };
     use tauri::{
@@ -298,8 +389,8 @@ mod imp {
     // the panel subclass — user-verified dead end. NSEvent.mouseLocation is a
     // permission-free class-property query (NOT an event tap / NOT Input
     // Monitoring), and an 8Hz main-thread peek is unmeasurable CPU-wise.
-    static HOVER_POLLER_RUNNING: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static HOVER_POLLER_GENERATION: AtomicU64 = AtomicU64::new(0);
+    static FLOATING_ACTIVE: AtomicBool = AtomicBool::new(false);
     static COMPANION_PINNED: AtomicBool = AtomicBool::new(false);
 
     #[derive(Debug, Clone, Copy)]
@@ -500,10 +591,7 @@ mod imp {
     }
 
     fn start_hover_poller(app: &AppHandle) {
-        use std::sync::atomic::Ordering;
-        if HOVER_POLLER_RUNNING.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let generation = HOVER_POLLER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let mut ball_inside = false;
@@ -511,13 +599,29 @@ mod imp {
             let mut ball_raw_inside = false;
             let mut comp_raw_inside = false;
             loop {
-                if !HOVER_POLLER_RUNNING.load(Ordering::SeqCst) {
+                if !super::lifecycle_generation_is_current(
+                    HOVER_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
                     break;
                 }
                 // 60ms ≈ 16Hz：hover 响应的第一段延迟就是这个间隔，120ms 在
                 // 体感上"卡"（用户验收反馈）；16Hz 的 mouseLocation 查询 CPU
                 // 仍不可测量。
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                if !super::lifecycle_generation_is_current(
+                    HOVER_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
+                    break;
+                }
+                let _lifecycle_guard = super::lock_native_lifecycle();
+                if !super::lifecycle_generation_is_current(
+                    HOVER_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
+                    break;
+                }
                 let app2 = app.clone();
                 let (tx, rx) = std::sync::mpsc::channel::<HoverProbe>();
                 let dispatched = app
@@ -650,7 +754,7 @@ mod imp {
     }
 
     fn stop_hover_poller() {
-        HOVER_POLLER_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        HOVER_POLLER_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
 
     fn placement_path() -> Option<PathBuf> {
@@ -799,6 +903,73 @@ mod imp {
         (x, y)
     }
 
+    fn ensure_ball_panel(app: &AppHandle, win: &tauri::WebviewWindow) -> Result<(), String> {
+        if app.get_webview_panel(BALL_LABEL).is_ok() {
+            return Ok(());
+        }
+        let panel = win
+            .to_panel::<FbBallPanel>()
+            .map_err(|e| format!("[fb] ball to_panel: {e}"))?;
+        panel.set_level(PanelLevel::Floating.value());
+        panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
+        panel.set_collection_behavior(
+            CollectionBehavior::new()
+                .full_screen_auxiliary()
+                .can_join_all_spaces()
+                .stationary()
+                .ignores_cycle()
+                .into(),
+        );
+        panel.set_hides_on_deactivate(false);
+        panel.set_released_when_closed(false);
+        Ok(())
+    }
+
+    fn ensure_shield_panel(app: &AppHandle, win: &tauri::WebviewWindow) -> Result<(), String> {
+        if app.get_webview_panel(SHIELD_LABEL).is_ok() {
+            return Ok(());
+        }
+        let panel = win
+            .to_panel::<FbShieldPanel>()
+            .map_err(|e| format!("[fb] shield to_panel: {e}"))?;
+        panel.set_level(PanelLevel::Floating.value().saturating_sub(1));
+        panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
+        panel.set_collection_behavior(
+            CollectionBehavior::new()
+                .full_screen_auxiliary()
+                .can_join_all_spaces()
+                .stationary()
+                .ignores_cycle()
+                .into(),
+        );
+        panel.set_hides_on_deactivate(false);
+        panel.set_released_when_closed(false);
+        Ok(())
+    }
+
+    fn ensure_companion_panel(app: &AppHandle, win: &tauri::WebviewWindow) -> Result<(), String> {
+        if app.get_webview_panel(COMPANION_LABEL).is_ok() {
+            return Ok(());
+        }
+        let panel = win
+            .to_panel::<FbCompanionPanel>()
+            .map_err(|e| format!("[fb] companion to_panel: {e}"))?;
+        panel.set_level(PanelLevel::Floating.value());
+        panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
+        panel.set_collection_behavior(
+            CollectionBehavior::new()
+                .full_screen_auxiliary()
+                .can_join_all_spaces()
+                .stationary()
+                .ignores_cycle()
+                .into(),
+        );
+        panel.set_hides_on_deactivate(false);
+        panel.set_released_when_closed(false);
+        panel.set_works_when_modal(true);
+        Ok(())
+    }
+
     fn ensure_windows(app: &AppHandle) -> Result<(), String> {
         if app.get_webview_window(BALL_LABEL).is_none() {
             let win = WebviewWindowBuilder::new(app, BALL_LABEL, WebviewUrl::default())
@@ -821,23 +992,7 @@ mod imp {
                 .build()
                 .map_err(|e| format!("[fb] create ball window: {e}"))?;
 
-            let panel = win
-                .to_panel::<FbBallPanel>()
-                .map_err(|e| format!("[fb] ball to_panel: {e}"))?;
-            panel.set_level(PanelLevel::Floating.value());
-            panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
-            panel.set_collection_behavior(
-                CollectionBehavior::new()
-                    .full_screen_auxiliary()
-                    .can_join_all_spaces()
-                    .stationary()
-                    .ignores_cycle()
-                    .into(),
-            );
-            panel.set_hides_on_deactivate(false);
-            // NSPanel double-release crash guard: Tauri also keeps a reference
-            // to the NSWindow; never let AppKit free it on close.
-            panel.set_released_when_closed(false);
+            ensure_ball_panel(app, &win)?;
 
             let placement = load_placement();
             let (x, y) = ball_xy_for_placement(app, &placement);
@@ -860,21 +1015,7 @@ mod imp {
                 .map_err(|e| format!("[fb] create shield window: {e}"))?;
 
             position_click_shield(app, &win);
-            let panel = win
-                .to_panel::<FbShieldPanel>()
-                .map_err(|e| format!("[fb] shield to_panel: {e}"))?;
-            panel.set_level(PanelLevel::Floating.value().saturating_sub(1));
-            panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
-            panel.set_collection_behavior(
-                CollectionBehavior::new()
-                    .full_screen_auxiliary()
-                    .can_join_all_spaces()
-                    .stationary()
-                    .ignores_cycle()
-                    .into(),
-            );
-            panel.set_hides_on_deactivate(false);
-            panel.set_released_when_closed(false);
+            ensure_shield_panel(app, &win)?;
         }
 
         if app.get_webview_window(COMPANION_LABEL).is_none() {
@@ -907,28 +1048,27 @@ mod imp {
             // warm paper, so hover and click felt like two different panels.
             // Keep Rust responsible only for window/focus/position lifecycle.
 
-            let panel = win
-                .to_panel::<FbCompanionPanel>()
-                .map_err(|e| format!("[fb] companion to_panel: {e}"))?;
-            panel.set_level(PanelLevel::Floating.value());
-            panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
-            panel.set_collection_behavior(
-                CollectionBehavior::new()
-                    .full_screen_auxiliary()
-                    .can_join_all_spaces()
-                    .stationary()
-                    .ignores_cycle()
-                    .into(),
-            );
-            panel.set_hides_on_deactivate(false);
-            panel.set_released_when_closed(false);
-            panel.set_works_when_modal(true);
+            ensure_companion_panel(app, &win)?;
+        }
+
+        // A failed destroy may leave a regular Tauri window after the panel
+        // registry was correctly detached. Compensation re-enables by
+        // restoring the exact platform panel class before showing anything.
+        if let Some(win) = app.get_webview_window(BALL_LABEL) {
+            ensure_ball_panel(app, &win)?;
+        }
+        if let Some(win) = app.get_webview_window(SHIELD_LABEL) {
+            ensure_shield_panel(app, &win)?;
+        }
+        if let Some(win) = app.get_webview_window(COMPANION_LABEL) {
+            ensure_companion_panel(app, &win)?;
         }
         Ok(())
     }
 
     pub fn enable(app: &AppHandle) -> Result<(), String> {
         use tauri::Emitter;
+        FLOATING_ACTIVE.store(false, Ordering::SeqCst);
         ensure_windows(app)?;
         ulog_info!(
             "[fb] enable begin mouse={} app_active={} main=[{}] ball=[{}] companion=[{}]",
@@ -942,6 +1082,7 @@ mod imp {
             panel.order_front_regardless();
             panel.show();
         }
+        FLOATING_ACTIVE.store(true, Ordering::SeqCst);
         ulog_info!(
             "[fb] enable after ball show app_active={} main=[{}] ball=[{}]",
             current_app_active(),
@@ -961,8 +1102,24 @@ mod imp {
         Ok(())
     }
 
-    pub fn disable(app: &AppHandle) {
-        use tauri::Emitter;
+    fn destroy_surface(app: &AppHandle, label: &str) -> Result<(), String> {
+        if let Ok(panel) = app.get_webview_panel(label) {
+            panel.hide();
+            let window = panel
+                .to_window()
+                .ok_or_else(|| format!("stage=panel-detach label={label}"))?;
+            window
+                .destroy()
+                .map_err(|error| format!("stage=window-destroy label={label} error={error}"))?;
+        } else if let Some(window) = app.get_webview_window(label) {
+            window
+                .destroy()
+                .map_err(|error| format!("stage=window-destroy label={label} error={error}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn disable(app: &AppHandle) -> Result<(), String> {
         ulog_info!(
             "[fb] disable begin app_active={} main=[{}] ball=[{}] companion=[{}]",
             current_app_active(),
@@ -970,9 +1127,16 @@ mod imp {
             window_debug_frame_by_label(app, BALL_LABEL),
             window_debug_frame_by_label(app, COMPANION_LABEL)
         );
+        FLOATING_ACTIVE.store(false, Ordering::SeqCst);
         // 作废 in-flight 渐变 task（否则它会在已隐藏的窗口上继续步进 alpha）。
         let _ = next_companion_gen();
         COMPANION_PINNED.store(false, Ordering::SeqCst);
+        if let Ok(mut drag) = BALL_DRAG.lock() {
+            *drag = None;
+        }
+        if let Ok(mut drag) = COMPANION_DRAG.lock() {
+            *drag = None;
+        }
         hide_click_shield(app);
         if let Ok(panel) = app.get_webview_panel(COMPANION_LABEL) {
             let should_restore = companion_is_key_window(app);
@@ -984,17 +1148,19 @@ mod imp {
         if let Ok(panel) = app.get_webview_panel(BALL_LABEL) {
             panel.hide();
         }
-        // Feature off ⇒ release resources: the companion disconnects SSE and
-        // releases its sidecar owner (the Mino sidecar then stops unless other
-        // owners hold it). Review fix C2 — hide-only left the sidecar running
-        // for the rest of the app lifetime.
-        let _ = app.emit_to(
-            COMPANION_LABEL,
-            "fb:lifecycle",
-            serde_json::json!({ "active": false }),
-        );
         stop_hover_poller();
-        ulog_info!("[fb] floating ball disabled");
+        let mut errors = Vec::new();
+        for label in super::MACOS_SURFACE_LABELS {
+            if let Err(error) = destroy_surface(app, label) {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            ulog_info!("[fb] floating ball disabled and surfaces destroyed");
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub fn capabilities(app: &AppHandle) -> FbCapabilities {
@@ -1148,6 +1314,9 @@ mod imp {
     /// Position the companion next to the ball (dock-aware) and show it.
     /// mode = "peek" (no keyboard focus) | "pin" (becomes key window).
     pub fn show_companion(app: &AppHandle, mode: &str) -> Result<(), String> {
+        if !FLOATING_ACTIVE.load(Ordering::SeqCst) {
+            return Err("[fb] floating ball is disabled".to_string());
+        }
         ensure_windows(app)?;
         ulog_info!(
             "[fb] show_companion begin mode={} mouse={} app_active={} main=[{}] ball=[{}] companion=[{}]",
@@ -1233,6 +1402,9 @@ mod imp {
 
     /// Promote an already-visible peek to pinned (keyboard focus).
     pub fn pin_companion(app: &AppHandle) -> Result<(), String> {
+        if !FLOATING_ACTIVE.load(Ordering::SeqCst) {
+            return Err("[fb] floating ball is disabled".to_string());
+        }
         let panel = app
             .get_webview_panel(COMPANION_LABEL)
             .map_err(|_| "[fb] companion panel missing".to_string())?;
@@ -1682,8 +1854,8 @@ mod imp {
     const COMPANION_H: f64 = 660.0;
     const COMPANION_GAP: f64 = 10.0;
 
-    static HOVER_POLLER_RUNNING: AtomicBool = AtomicBool::new(false);
-    static FOREGROUND_POLLER_STARTED: AtomicBool = AtomicBool::new(false);
+    static HOVER_POLLER_GENERATION: AtomicU64 = AtomicU64::new(0);
+    static FOREGROUND_POLLER_GENERATION: AtomicU64 = AtomicU64::new(0);
     static FLOATING_ACTIVE: AtomicBool = AtomicBool::new(false);
     static COMPANION_PINNED: AtomicBool = AtomicBool::new(false);
     static COMPANION_PINNED_AT_MS: AtomicU64 = AtomicU64::new(0);
@@ -1764,6 +1936,35 @@ mod imp {
             }
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, fb_window_proc as usize as isize);
             map.insert(key, original);
+        }
+        Ok(())
+    }
+
+    fn restore_window_proc(hwnd: HWND, label: &str) -> Result<(), String> {
+        if hwnd.is_null() {
+            return Ok(());
+        }
+        let original = original_procs()
+            .lock()
+            .map_err(|_| format!("stage=wndproc-map label={label} error=poisoned"))?
+            .remove(&(hwnd as usize));
+        let Some(original) = original else {
+            return Ok(());
+        };
+        if unsafe { IsWindow(hwnd) } == 0 {
+            return Ok(());
+        }
+        let replaced = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, original) };
+        if replaced == 0 {
+            // Keep the original pointer available while the custom proc is
+            // still installed. A failed destroy followed by compensation can
+            // then retry restoration without recording our own proc as the
+            // "original" and recursing through CallWindowProcW.
+            original_procs()
+                .lock()
+                .map_err(|_| format!("stage=wndproc-map label={label} error=poisoned"))?
+                .insert(hwnd as usize, original);
+            return Err(format!("stage=wndproc-restore label={label}"));
         }
         Ok(())
     }
@@ -1984,6 +2185,21 @@ mod imp {
             apply_tool_window_styles(&win, true)?;
             position_companion_near_ball(app, &win);
         }
+        // A partial destroy can leave a valid Tauri window after its cached
+        // HWND/WndProc state was already retired. Re-enable always rebuilds
+        // those native records from the current window objects.
+        let ball = app
+            .get_webview_window(BALL_LABEL)
+            .ok_or("[fb] ball window missing after ensure")?;
+        let ball_hwnd = hwnd_for(&ball)?;
+        BALL_HWND.store(ball_hwnd as usize, Ordering::SeqCst);
+        apply_tool_window_styles(&ball, true)?;
+        let companion = app
+            .get_webview_window(COMPANION_LABEL)
+            .ok_or("[fb] companion window missing after ensure")?;
+        let companion_hwnd = hwnd_for(&companion)?;
+        COMPANION_HWND.store(companion_hwnd as usize, Ordering::SeqCst);
+        apply_tool_window_styles(&companion, true)?;
         Ok(())
     }
 
@@ -2007,25 +2223,55 @@ mod imp {
         Ok(())
     }
 
-    pub fn disable(app: &AppHandle) {
+    fn destroy_surface(
+        app: &AppHandle,
+        label: &str,
+        cached_hwnd: &AtomicUsize,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let hwnd = cached_hwnd.swap(0, Ordering::SeqCst) as HWND;
+        if let Err(error) = restore_window_proc(hwnd, label) {
+            errors.push(error);
+        }
+        if let Some(window) = app.get_webview_window(label) {
+            hide_window_strict(&window);
+            if let Err(error) = window.destroy() {
+                errors.push(format!("stage=window-destroy label={label} error={error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    pub fn disable(app: &AppHandle) -> Result<(), String> {
         FLOATING_ACTIVE.store(false, Ordering::SeqCst);
         COMPANION_PINNED.store(false, Ordering::SeqCst);
         COMPANION_PINNED_AT_MS.store(0, Ordering::SeqCst);
         LAST_FOREGROUND_HWND.store(0, Ordering::SeqCst);
         clear_drag_sessions();
         stop_hover_poller();
-        if let Some(companion) = app.get_webview_window(COMPANION_LABEL) {
-            hide_window_strict(&companion);
+        stop_foreground_poller();
+        let mut errors = Vec::new();
+        for label in super::WINDOWS_SURFACE_LABELS {
+            let cached_hwnd = if *label == COMPANION_LABEL {
+                &COMPANION_HWND
+            } else {
+                &BALL_HWND
+            };
+            if let Err(error) = destroy_surface(app, label, cached_hwnd) {
+                errors.push(error);
+            }
         }
-        if let Some(ball) = app.get_webview_window(BALL_LABEL) {
-            hide_window_strict(&ball);
+        LAST_FOREGROUND_HWND.store(0, Ordering::SeqCst);
+        if errors.is_empty() {
+            ulog_info!("[fb] floating ball disabled and surfaces destroyed on Windows");
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
-        let _ = app.emit_to(
-            COMPANION_LABEL,
-            "fb:lifecycle",
-            serde_json::json!({ "active": false }),
-        );
-        ulog_info!("[fb] floating ball disabled on Windows");
     }
 
     pub fn capabilities(app: &AppHandle) -> FbCapabilities {
@@ -2065,18 +2311,32 @@ mod imp {
     }
 
     fn start_hover_poller(app: &AppHandle) {
-        if HOVER_POLLER_RUNNING.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let generation = HOVER_POLLER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let mut ball_inside = false;
             let mut comp_inside = false;
             loop {
-                if !HOVER_POLLER_RUNNING.load(Ordering::SeqCst) {
+                if !super::lifecycle_generation_is_current(
+                    HOVER_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                if !super::lifecycle_generation_is_current(
+                    HOVER_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
+                    break;
+                }
+                let _lifecycle_guard = super::lock_native_lifecycle();
+                if !super::lifecycle_generation_is_current(
+                    HOVER_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
+                    break;
+                }
                 let mouse = mouse_location();
                 let ball = app
                     .get_webview_window(BALL_LABEL)
@@ -2119,7 +2379,7 @@ mod imp {
     }
 
     fn stop_hover_poller() {
-        HOVER_POLLER_RUNNING.store(false, Ordering::SeqCst);
+        HOVER_POLLER_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
 
     fn now_millis() -> u64 {
@@ -2130,13 +2390,27 @@ mod imp {
     }
 
     fn start_foreground_poller(app: &AppHandle) {
-        if FOREGROUND_POLLER_STARTED.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let generation = FOREGROUND_POLLER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             loop {
+                if !super::lifecycle_generation_is_current(
+                    FOREGROUND_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                if !super::lifecycle_generation_is_current(
+                    FOREGROUND_POLLER_GENERATION.load(Ordering::SeqCst),
+                    generation,
+                ) {
+                    break;
+                }
+                let _lifecycle_guard = super::lock_native_lifecycle();
+                if FOREGROUND_POLLER_GENERATION.load(Ordering::SeqCst) != generation {
+                    break;
+                }
                 if !COMPANION_PINNED.load(Ordering::SeqCst) {
                     continue;
                 }
@@ -2164,6 +2438,10 @@ mod imp {
             }
         });
         ulog_info!("[fb] windows foreground poller started");
+    }
+
+    fn stop_foreground_poller() {
+        FOREGROUND_POLLER_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
 
     fn window_origin(win: &WebviewWindow) -> Result<(f64, f64), String> {
@@ -2806,7 +3084,7 @@ try {{
 mod commands {
     use super::imp;
     use super::{FbCapabilities, FbContext, FbScreenshot};
-    use tauri::AppHandle;
+    use tauri::{AppHandle, State};
 
     #[cfg(target_os = "macos")]
     fn run_native_window_op<T, F>(
@@ -2818,6 +3096,7 @@ mod commands {
         T: Send + 'static,
         F: FnOnce(&AppHandle) -> Result<T, String> + Send + 'static,
     {
+        let _lifecycle_guard = super::lock_native_lifecycle();
         let (tx, rx) = std::sync::mpsc::channel();
         app.clone()
             .run_on_main_thread(move || {
@@ -2838,22 +3117,67 @@ mod commands {
         T: Send + 'static,
         F: FnOnce(&AppHandle) -> Result<T, String> + Send + 'static,
     {
+        let _lifecycle_guard = super::lock_native_lifecycle();
         f(&app)
     }
 
     #[tauri::command]
-    pub async fn cmd_fb_enable(app: AppHandle) -> Result<(), String> {
+    pub async fn cmd_fb_enable(
+        app: AppHandle,
+        sidecars: State<'_, crate::sidecar::ManagedSidecarManager>,
+    ) -> Result<(), String> {
         crate::ulog_info!("[fb] cmd_fb_enable requested");
-        run_native_window_op(app, "enable", imp::enable)
+        super::set_companion_owner_admitted(true);
+        let native_result = run_native_window_op(app.clone(), "enable", imp::enable);
+        if let Err(native_error) = native_result {
+            super::set_companion_owner_admitted(false);
+            let cleanup_result = run_native_window_op(app, "failed enable cleanup", imp::disable);
+            let owner_result = crate::sidecar::release_session_owner_everywhere(
+                sidecars.inner(),
+                &super::floating_ball_companion_owner(),
+            )
+            .await;
+            let error = format!(
+                "stage=enable error={native_error}; cleanup={}; ownerRelease={}",
+                cleanup_result.err().unwrap_or_else(|| "ok".to_string()),
+                owner_result.err().unwrap_or_else(|| "ok".to_string())
+            );
+            crate::ulog_error!("[fb] {error}");
+            return Err(error);
+        }
+        Ok(())
     }
 
     #[tauri::command]
-    pub async fn cmd_fb_disable(app: AppHandle) -> Result<(), String> {
+    pub async fn cmd_fb_disable(
+        app: AppHandle,
+        sidecars: State<'_, crate::sidecar::ManagedSidecarManager>,
+    ) -> Result<(), String> {
         crate::ulog_info!("[fb] cmd_fb_disable requested");
-        run_native_window_op(app, "disable", |app| {
-            imp::disable(app);
-            Ok(())
-        })
+        super::set_companion_owner_admitted(false);
+        let owner_result = crate::sidecar::release_session_owner_everywhere(
+            sidecars.inner(),
+            &super::floating_ball_companion_owner(),
+        )
+        .await;
+        let native_result = run_native_window_op(app.clone(), "disable", imp::disable);
+        if owner_result.is_ok() && native_result.is_ok() {
+            return Ok(());
+        }
+
+        // Durable config is still enabled until this command succeeds. Restore
+        // effective state inside the same toggle transaction and report every
+        // failed phase so Renderer can keep the switch on.
+        super::set_companion_owner_admitted(true);
+        let restore_result = run_native_window_op(app, "disable compensation", imp::enable);
+        let error = format!(
+            "stage=disable ownerRelease={} native={} compensation={}",
+            owner_result.err().unwrap_or_else(|| "ok".to_string()),
+            native_result.err().unwrap_or_else(|| "ok".to_string()),
+            restore_result.err().unwrap_or_else(|| "ok".to_string())
+        );
+        crate::ulog_error!("[fb] {error}");
+        Err(error)
     }
 
     #[tauri::command]
@@ -3241,6 +3565,8 @@ pub fn setup_on_startup(app: &tauri::AppHandle) {
     if !(cfg.dev_gate && cfg.enabled) {
         return;
     }
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    set_companion_owner_admitted(true);
     #[cfg(target_os = "macos")]
     {
         let app = app.clone();
@@ -3268,5 +3594,27 @@ pub fn setup_on_startup(app: &tauri::AppHandle) {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn platform_enable(app: &tauri::AppHandle) -> Result<(), String> {
-    imp::enable(app)
+    let _lifecycle_guard = lock_native_lifecycle();
+    // A user disable can overtake the detached startup task. Admission is
+    // closed synchronously at command entry, so the late task must not revive
+    // surfaces from the still-not-yet-persisted startup config snapshot.
+    let cfg = load_fb_config();
+    if !startup_enable_is_authorized(
+        COMPANION_OWNER_ADMITTED.load(Ordering::SeqCst),
+        cfg.dev_gate,
+        cfg.enabled,
+    ) {
+        // Do not write admission from a rejected startup snapshot: a newer
+        // explicit enable may already own `true` while waiting for this lock.
+        // Startup is allowed to consume its own old intent, never to overwrite
+        // a later command decision.
+        crate::ulog_info!("[fb] startup enable cancelled by newer lifecycle decision");
+        return Ok(());
+    }
+    if let Err(error) = imp::enable(app) {
+        set_companion_owner_admitted(false);
+        let cleanup = imp::disable(app).err().unwrap_or_else(|| "ok".to_string());
+        return Err(format!("{error}; cleanup={cleanup}"));
+    }
+    Ok(())
 }

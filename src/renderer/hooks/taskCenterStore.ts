@@ -74,6 +74,8 @@ export interface TaskCenterData {
     isLoading: boolean;
     isSessionsLoading: boolean;
     error: string | null;
+    /** Failure of the authoritative global Session metadata projection. */
+    sessionsError: string | null;
     workspaceSessionStates: ReadonlyMap<string, WorkspaceSessionLoadState>;
     refresh: (scope?: TaskCenterRefreshScope, options?: TaskCenterRefreshOptions) => void;
     actions: TaskCenterActions;
@@ -99,6 +101,10 @@ export interface TaskCenterActions {
         releasableTabIds?: readonly string[],
     ) => ReturnType<typeof deleteSessionApi>;
     setSessionFavorite: (sessionId: string, favorite: boolean) => Promise<boolean>;
+    /** Allocate a latest-wins token before issuing a Session metadata mutation. */
+    beginSessionMetadataMutation: (sessionId: string, scope?: 'session' | 'global') => number;
+    /** Apply a canonical mutation/readback only when its mutation token is current. */
+    applySessionMetadata: (session: SessionMetadata, mutationSequence?: number) => boolean;
     refreshSessions: () => void;
     refreshCronTasks: () => void;
 }
@@ -205,6 +211,7 @@ interface StoreState {
     isLoading: boolean;
     isSessionsLoading: boolean;
     error: string | null;
+    sessionsError: string | null;
     workspaceSessionStates: ReadonlyMap<string, WorkspaceSessionLoadState>;
 }
 
@@ -219,6 +226,7 @@ let state: StoreState = {
     isLoading: true,
     isSessionsLoading: true,
     error: null,
+    sessionsError: null,
     workspaceSessionStates: new Map(),
 };
 
@@ -229,9 +237,14 @@ const loadedWorkspaceSessionKeys = new Set<string>();
 const workspaceSessionRequests = new Map<string, Promise<void>>();
 const workspaceForceAfterRequest = new Set<string>();
 const demandedWorkspaceDirs = new Map<string, string>();
+const sidebarWorkspaceDirs = new Map<string, string>();
+const passiveWorkspaceDemand = new Map<string, { agentDir: string; count: number }>();
 let sessionDecorationRequest: Promise<void> | null = null;
 let onDemandGeneration = 0;
 let fullSessionAuthoritySeq: number | null = null;
+let sessionMetadataMutationSeq = 0;
+let latestGlobalSessionMetadataMutation = 0;
+const latestSessionMetadataMutationById = new Map<string, number>();
 
 interface FavoriteMutation {
     desired: boolean;
@@ -316,6 +329,7 @@ function buildSnapshot(): TaskCenterData {
         isLoading: state.isLoading,
         isSessionsLoading: state.isSessionsLoading,
         error: state.error,
+        sessionsError: state.sessionsError,
         workspaceSessionStates: state.workspaceSessionStates,
         refresh,
         actions,
@@ -335,6 +349,44 @@ function patchSessionFavorite(sessionId: string, favorite: boolean): void {
             session.id === sessionId ? { ...session, favorite } : session,
         ),
     });
+}
+
+function beginSessionMetadataMutation(sessionId: string, scope: 'session' | 'global' = 'session'): number {
+    const mutationSequence = ++sessionMetadataMutationSeq;
+    latestSessionMetadataMutationById.set(sessionId, mutationSequence);
+    if (scope === 'global') latestGlobalSessionMetadataMutation = mutationSequence;
+    return mutationSequence;
+}
+
+function applyCanonicalSessionMetadata(
+    session: SessionMetadata,
+    mutationSequence?: number,
+): boolean {
+    if (mutationSequence !== undefined) {
+        if (latestSessionMetadataMutationById.get(session.id) !== mutationSequence) return false;
+        // A global rename/delete changes every Session assignment. Responses
+        // from Session-local intents issued before it cannot be re-published.
+        if (mutationSequence < latestGlobalSessionMetadataMutation) return false;
+    }
+    // A mutation response is newer than every request that started before it.
+    // Fence both global and workspace readers before publishing that response
+    // so a late projection cannot briefly roll the Tag state back.
+    startRequest('sessions');
+    onDemandGeneration++;
+    workspaceSessionRequests.clear();
+    workspaceForceAfterRequest.clear();
+    loadedWorkspaceSessionKeys.add(normalizeWorkspacePathIdentity(session.agentDir));
+    setState({
+        sessions: sortSessionsByLastActive([
+            ...state.sessions.filter((candidate) => candidate.id !== session.id),
+            session,
+        ]),
+    });
+    // Advancing the shared generation invalidates every in-flight workspace
+    // reader, not only the mutated Session's workspace. Re-arm all live
+    // demands so unrelated slices cannot remain loading or absent forever.
+    resumeDemandedWorkspaceSessions(true);
+    return true;
 }
 
 function patchWorkspaceSessionState(key: string, patch: Partial<WorkspaceSessionLoadState>): void {
@@ -444,6 +496,7 @@ async function fetchData(retryCount = 0, silent = false): Promise<void> {
             setState({
                 sessions: sortSessionsByLastActive(filterTombstoned(sessionsData, deletedSessionIds)),
                 isSessionsLoading: false,
+                sessionsError: null,
             });
             // Session availability should not wait for slower cron/config/tag
             // decoration slices. Empty-but-loaded workspaces are complete too.
@@ -483,7 +536,10 @@ async function fetchData(retryCount = 0, silent = false): Promise<void> {
         // this full request) — otherwise an older full fetch would clobber it.
         const patch: Partial<StoreState> = {};
         if (isLatest('sessions', requestSeq)) patch.sessions = sortSessionsByLastActive(filterTombstoned(sessionsData, deletedSessionIds));
-        if (isLatest('sessions', requestSeq)) patch.isSessionsLoading = false;
+        if (isLatest('sessions', requestSeq)) {
+            patch.isSessionsLoading = false;
+            patch.sessionsError = null;
+        }
         if (ok.cron && isLatest('cronTasks', requestSeq)) patch.cronTasks = filterManagedCronTasks(cronData);
         if (ok.lifecycle && isLatest('cronTasks', requestSeq)) {
             patch.deleteProtectedSessionIds = schedulerLifecycle.deleteProtectedSessionIds;
@@ -511,9 +567,14 @@ async function fetchData(retryCount = 0, silent = false): Promise<void> {
                 isLoading: false,
                 isSessionsLoading: false,
                 error: taskText('tasks.loadFailedRetry'),
+                sessionsError: taskText('tasks.loadFailedRetry'),
             });
         } else {
-            setState({ isLoading: false, isSessionsLoading: false });
+            setState({
+                isLoading: false,
+                isSessionsLoading: false,
+                sessionsError: taskText('tasks.loadFailedRetry'),
+            });
         }
     } finally {
         if (fullSessionAuthoritySeq === requestSeq && !retryScheduled) {
@@ -531,10 +592,18 @@ function refreshSessionsNow(): void {
     getSessions().then((data) => {
         if (gen !== lifecycleGen || fullSessionAuthoritySeq !== s) return;
         if (!isLatest('sessions', s)) return;
-        setState({ sessions: sortSessionsByLastActive(filterTombstoned(data, deletedSessionIds)) });
+        setState({
+            sessions: sortSessionsByLastActive(filterTombstoned(data, deletedSessionIds)),
+            sessionsError: null,
+        });
         adoptFullSessionIndexForDemand();
         succeeded = true;
-    }).catch((err) => console.warn('[taskCenterStore] refresh sessions failed:', err))
+    }).catch((err) => {
+        console.warn('[taskCenterStore] refresh sessions failed:', err);
+        if (gen === lifecycleGen && fullSessionAuthoritySeq === s && isLatest('sessions', s)) {
+            setState({ sessionsError: taskText('tasks.loadFailedRetry') });
+        }
+    })
         .finally(() => {
             if (fullSessionAuthoritySeq !== s) return;
             fullSessionAuthoritySeq = null;
@@ -627,7 +696,6 @@ export function ensureWorkspaceSessions(agentDirs: readonly string[], force = fa
     }
     if (unique.size === 0) return;
 
-    for (const [key, agentDir] of unique) demandedWorkspaceDirs.set(key, agentDir);
     if (started || fullSessionAuthoritySeq !== null) return;
 
     void refreshSessionDecorationsOnDemand();
@@ -658,11 +726,23 @@ export function ensureWorkspaceSessions(agentDirs: readonly string[], force = fa
                 if (generation !== onDemandGeneration) return;
                 workspaceSessionRequests.delete(key);
                 if (workspaceForceAfterRequest.delete(key)) {
-                    const demandedDir = demandedWorkspaceDirs.get(key);
-                    if (demandedDir) ensureWorkspaceSessions([demandedDir], true);
+                    // A caller that explicitly queued a forced refresh owns
+                    // that one follow-up even when it is not a long-lived
+                    // sidebar/Chat demand.
+                    ensureWorkspaceSessions([demandedWorkspaceDirs.get(key) ?? agentDir], true);
                 }
             });
         workspaceSessionRequests.set(key, request);
+    }
+}
+
+function rebuildDemandedWorkspaceDirs(): void {
+    demandedWorkspaceDirs.clear();
+    for (const [key, agentDir] of sidebarWorkspaceDirs) {
+        demandedWorkspaceDirs.set(key, agentDir);
+    }
+    for (const [key, demand] of passiveWorkspaceDemand) {
+        demandedWorkspaceDirs.set(key, demand.agentDir);
     }
 }
 
@@ -673,9 +753,34 @@ export function setSidebarWorkspaceSessionDemand(agentDirs: readonly string[]): 
         const key = normalizeWorkspacePathIdentity(agentDir);
         if (key) next.set(key, agentDir);
     }
-    demandedWorkspaceDirs.clear();
-    for (const [key, agentDir] of next) demandedWorkspaceDirs.set(key, agentDir);
+    sidebarWorkspaceDirs.clear();
+    for (const [key, agentDir] of next) sidebarWorkspaceDirs.set(key, agentDir);
+    rebuildDemandedWorkspaceDirs();
     ensureWorkspaceSessions(agentDirs);
+}
+
+/**
+ * Ref-count a narrow Session projection for non-sidebar consumers such as an
+ * open Chat header. This shares the one metadata watcher and never starts the
+ * Task Center polling lifecycle.
+ */
+export function registerPassiveWorkspaceSessionDemand(agentDir: string): () => void {
+    const key = normalizeWorkspacePathIdentity(agentDir);
+    if (!key) return () => undefined;
+    const current = passiveWorkspaceDemand.get(key);
+    passiveWorkspaceDemand.set(key, {
+        agentDir,
+        count: (current?.count ?? 0) + 1,
+    });
+    rebuildDemandedWorkspaceDirs();
+    ensureWorkspaceSessions([agentDir]);
+    return () => {
+        const active = passiveWorkspaceDemand.get(key);
+        if (!active) return;
+        if (active.count <= 1) passiveWorkspaceDemand.delete(key);
+        else passiveWorkspaceDemand.set(key, { ...active, count: active.count - 1 });
+        rebuildDemandedWorkspaceDirs();
+    };
 }
 
 interface SessionMetadataChangedPayload {
@@ -807,6 +912,8 @@ export const actions: TaskCenterActions = {
         mutation.promise = runFavoriteMutation(sessionId, previous, mutation);
         return mutation.promise;
     },
+    beginSessionMetadataMutation,
+    applySessionMetadata: applyCanonicalSessionMetadata,
     refreshSessions: () => refresh('sessions', { force: true, silent: true }),
     refreshCronTasks: () => refresh('cronTasks', { force: true, silent: true }),
 };
@@ -918,7 +1025,7 @@ export function getSnapshot(): TaskCenterData {
 export function __resetTaskCenterStoreForTest(): void {
     onDemandGeneration++;
     lifecycleGen++;
-    state = { sessions: [], cronTasks: [], deleteProtectedSessionIds: [], backgroundSessionIds: [], agentStatuses: {}, agents: [], floatingBallSessionId: null, isLoading: true, isSessionsLoading: true, error: null, workspaceSessionStates: new Map() };
+    state = { sessions: [], cronTasks: [], deleteProtectedSessionIds: [], backgroundSessionIds: [], agentStatuses: {}, agents: [], floatingBallSessionId: null, isLoading: true, isSessionsLoading: true, error: null, sessionsError: null, workspaceSessionStates: new Map() };
     listeners.clear();
     passiveListeners.clear();
     deletedSessionIds.clear();
@@ -926,9 +1033,14 @@ export function __resetTaskCenterStoreForTest(): void {
     workspaceSessionRequests.clear();
     workspaceForceAfterRequest.clear();
     demandedWorkspaceDirs.clear();
+    sidebarWorkspaceDirs.clear();
+    passiveWorkspaceDemand.clear();
     sessionDecorationRequest = null;
     fullSessionAuthoritySeq = null;
     favoriteMutations.clear();
+    latestSessionMetadataMutationById.clear();
+    sessionMetadataMutationSeq = 0;
+    latestGlobalSessionMetadataMutation = 0;
     mapsCache = null;
     snapshot = buildSnapshot();
     started = false;

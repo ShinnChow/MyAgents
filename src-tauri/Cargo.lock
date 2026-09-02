@@ -3966,7 +3966,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "myagents"
-version = "0.4.12"
+version = "0.4.13"
 dependencies = [
  "active-win-pos-rs 0.11.0",
  "axum",
@@ -4040,6 +4040,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "trash",
+ "unicode-normalization",
  "url",
  "uuid",
  "which 8.0.2",
@@ -8254,6 +8255,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-segmentation"

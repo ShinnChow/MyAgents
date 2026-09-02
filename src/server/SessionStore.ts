@@ -24,6 +24,15 @@ import { CODEX_SUBSCRIPTION_PROVIDER_ID } from '../shared/config-types';
 import { isPendingSessionId } from '../shared/constants';
 import { isSystemMaintenanceSession } from '../shared/managedScheduledJob';
 import {
+    deriveSessionUserTagSummaries,
+    MAX_SESSION_USER_TAGS,
+    normalizeSessionUserTag,
+    sanitizeSessionUserTags,
+    type GlobalSessionUserTagMutation,
+    type SessionUserTagMutation,
+    type SessionUserTagSummary,
+} from '../shared/session-user-tags';
+import {
     normalizeSessionOrigin,
     type RegisteredAgentSessionOrigin,
     type SessionOrigin,
@@ -682,6 +691,235 @@ export function getAllSessionMetadata(): SessionMetadata[] {
         }
         console.error('[SessionStore] Failed to read sessions.json:', error);
         return [];
+    }
+}
+
+export type SessionUserTagMutationFailureReason =
+    | 'invalid-name'
+    | 'session-not-found'
+    | 'protected-session'
+    | 'limit-reached'
+    | 'tag-not-found'
+    | 'merge-required'
+    | 'conflict'
+    | 'io-error';
+
+export type SessionUserTagMutationResult =
+    | {
+        ok: true;
+        session?: SessionMetadata;
+        tags: SessionUserTagSummary[];
+        affectedSessionCount: number;
+        action: 'updated' | 'noop';
+    }
+    | {
+        ok: false;
+        reason: SessionUserTagMutationFailureReason;
+        targetName?: string;
+        error: string;
+    };
+
+function storedUserTagsEqual(input: unknown, expected: readonly string[]): boolean {
+    if (expected.length === 0) return input === undefined || (Array.isArray(input) && input.length === 0);
+    return Array.isArray(input)
+        && input.length === expected.length
+        && input.every((value, index) => value === expected[index]);
+}
+
+function replaceSessionUserTags(session: SessionMetadata, tags: readonly string[]): SessionMetadata {
+    const { userTags: _userTags, ...rest } = session;
+    return tags.length > 0 ? { ...rest, userTags: [...tags] } : rest;
+}
+
+function sessionUserTagSummaries(sessions: readonly SessionMetadata[]): SessionUserTagSummary[] {
+    return deriveSessionUserTagSummaries(sessions.filter(isHistoryVisibleSession));
+}
+
+/** Read-only global catalog projection. Assignments remain the sole authority. */
+export function listSessionUserTags(): SessionUserTagSummary[] {
+    return sessionUserTagSummaries(getAllSessionMetadata());
+}
+
+/**
+ * Apply one idempotent assignment intent against a fresh sessions.json
+ * snapshot. The Renderer never submits a replacement userTags array.
+ */
+export async function mutateSessionUserTag(
+    sessionId: string,
+    mutation: SessionUserTagMutation,
+): Promise<SessionUserTagMutationResult> {
+    const requested = normalizeSessionUserTag(mutation.name);
+    if (!requested.ok) {
+        return { ok: false, reason: 'invalid-name', error: `Invalid Tag name (${requested.reason}).` };
+    }
+
+    ensureStorageDir();
+    try {
+        return await withSessionsLock(async () => {
+            const all = readSessionsIndexForWrite();
+            const index = all.findIndex((session) => session.id === sessionId);
+            if (index < 0) {
+                return { ok: false, reason: 'session-not-found', error: 'Session not found.' };
+            }
+            const current = all[index];
+            if (isSystemMaintenanceSession(current)) {
+                return { ok: false, reason: 'protected-session', error: 'System maintenance session is not user-editable.' };
+            }
+
+            const currentTags = sanitizeSessionUserTags(current.userTags);
+            const currentIdentities = new Set(currentTags.map((name) => name.toLowerCase()));
+            let nextTags: string[];
+
+            if (mutation.kind === 'add') {
+                if (currentIdentities.has(requested.tag.identity)) {
+                    nextTags = currentTags;
+                } else {
+                    if (currentTags.length >= MAX_SESSION_USER_TAGS) {
+                        return { ok: false, reason: 'limit-reached', error: `A Session can have at most ${MAX_SESSION_USER_TAGS} Tags.` };
+                    }
+                    const canonical = sessionUserTagSummaries(all)
+                        .find((summary) => normalizeSessionUserTag(summary.name).ok
+                            && summary.name.toLowerCase() === requested.tag.identity)
+                        ?.name ?? requested.tag.name;
+                    nextTags = [...currentTags, canonical];
+                }
+            } else {
+                nextTags = currentTags.filter((name) => name.toLowerCase() !== requested.tag.identity);
+            }
+
+            const changed = !storedUserTagsEqual(current.userTags, nextTags);
+            const updated = replaceSessionUserTags(current, nextTags);
+            if (changed) {
+                all[index] = updated;
+                atomicWriteSessionsFile(JSON.stringify(all, null, 2));
+            }
+            return {
+                ok: true,
+                session: updated,
+                tags: sessionUserTagSummaries(all),
+                affectedSessionCount: changed ? 1 : 0,
+                action: changed ? 'updated' : 'noop',
+            };
+        });
+    } catch (error) {
+        return {
+            ok: false,
+            reason: 'io-error',
+            error: error instanceof Error ? error.message : String(error),
+        };
+    }
+}
+
+/** Rename/merge/delete one global name in a single sessions.json commit. */
+export async function mutateGlobalSessionUserTag(
+    mutation: GlobalSessionUserTagMutation,
+    focusSessionId?: string,
+): Promise<SessionUserTagMutationResult> {
+    const source = normalizeSessionUserTag(mutation.name);
+    if (!source.ok) {
+        return { ok: false, reason: 'invalid-name', error: `Invalid Tag name (${source.reason}).` };
+    }
+    const requestedTarget = mutation.kind === 'rename'
+        ? normalizeSessionUserTag(mutation.newName)
+        : null;
+    if (requestedTarget && !requestedTarget.ok) {
+        return { ok: false, reason: 'invalid-name', error: `Invalid Tag name (${requestedTarget.reason}).` };
+    }
+
+    ensureStorageDir();
+    try {
+        return await withSessionsLock(async () => {
+            const all = readSessionsIndexForWrite();
+            const summaries = sessionUserTagSummaries(all);
+            const canonicalSource = summaries.find((summary) => summary.name.toLowerCase() === source.tag.identity);
+            if (!canonicalSource) {
+                return { ok: false, reason: 'tag-not-found', error: 'Tag no longer exists.' };
+            }
+
+            if (mutation.kind === 'rename'
+                && requestedTarget?.ok
+                && requestedTarget.tag.name === canonicalSource.name) {
+                const focusSession = focusSessionId
+                    ? all.find((session) => session.id === focusSessionId)
+                    : undefined;
+                return {
+                    ok: true,
+                    ...(focusSession ? { session: focusSession } : {}),
+                    tags: summaries,
+                    affectedSessionCount: 0,
+                    action: 'noop',
+                };
+            }
+
+            let replacementName: string | null = null;
+            if (mutation.kind === 'rename' && requestedTarget?.ok) {
+                const existingTarget = summaries.find((summary) => (
+                    summary.name.toLowerCase() === requestedTarget.tag.identity
+                    && summary.name.toLowerCase() !== source.tag.identity
+                ));
+                if (existingTarget && !mutation.merge) {
+                    return {
+                        ok: false,
+                        reason: 'merge-required',
+                        targetName: existingTarget.name,
+                        error: 'The target Tag already exists and requires merge confirmation.',
+                    };
+                }
+                if (!existingTarget
+                    && mutation.merge
+                    && requestedTarget.tag.identity !== source.tag.identity) {
+                    return {
+                        ok: false,
+                        reason: 'conflict',
+                        error: 'The merge target changed before the operation committed.',
+                    };
+                }
+                replacementName = existingTarget?.name ?? requestedTarget.tag.name;
+            }
+
+            let affectedSessionCount = 0;
+            const nextAll = all.map((session) => {
+                if (isSystemMaintenanceSession(session)) return session;
+                const tags = sanitizeSessionUserTags(session.userTags);
+                if (!tags.some((name) => name.toLowerCase() === source.tag.identity)) return session;
+
+                const nextTags: string[] = [];
+                const seen = new Set<string>();
+                for (const name of tags) {
+                    const identity = name.toLowerCase();
+                    const nextName = identity === source.tag.identity ? replacementName : name;
+                    if (!nextName) continue;
+                    const nextIdentity = nextName.toLowerCase();
+                    if (seen.has(nextIdentity)) continue;
+                    seen.add(nextIdentity);
+                    nextTags.push(nextName);
+                }
+                if (storedUserTagsEqual(session.userTags, nextTags)) return session;
+                affectedSessionCount += 1;
+                return replaceSessionUserTags(session, nextTags);
+            });
+
+            if (affectedSessionCount === 0) {
+                return { ok: false, reason: 'conflict', error: 'Tag assignments changed before the operation committed.' };
+            }
+            atomicWriteSessionsFile(JSON.stringify(nextAll, null, 2));
+            const focusSession = focusSessionId
+                ? nextAll.find((session) => session.id === focusSessionId)
+                : undefined;
+            return {
+                ok: true,
+                ...(focusSession ? { session: focusSession } : {}),
+                tags: sessionUserTagSummaries(nextAll),
+                affectedSessionCount,
+                action: 'updated',
+            };
+        });
+    } catch (error) {
+        return {
+            ok: false,
+            reason: 'io-error',
+            error: error instanceof Error ? error.message : String(error),
+        };
     }
 }
 
@@ -1862,7 +2100,10 @@ export async function updateSessionMetadata(
         | 'materializationState'
         | 'materializationSourceSessionId'
         | 'pendingContinueAfterAbort'
-    >>,
+    >> & {
+        /** Pin intent. SessionStore owns the canonical ordering timestamp. */
+        pinned?: boolean;
+    },
     /**
      * Optional compare-and-set guard evaluated INSIDE the lock against the
      * freshly-read current metadata. When it returns false the write is skipped
@@ -1899,7 +2140,21 @@ export async function updateSessionMetadata(
             return;
         }
         const current = all[idx];
-        const patch = { ...updates };
+        const { pinned, ...updatesWithoutPinIntent } = updates;
+        const patch: Partial<SessionMetadata> = { ...updatesWithoutPinIntent };
+        if (pinned !== undefined) {
+            if (!pinned) {
+                patch.pinnedAt = undefined;
+            } else {
+                const latestPinnedAtMs = all.reduce((latest, session) => {
+                    const candidate = session.pinnedAt ? Date.parse(session.pinnedAt) : Number.NaN;
+                    return Number.isFinite(candidate) ? Math.max(latest, candidate) : latest;
+                }, 0);
+                // A user can issue two pin intents inside one wall-clock millisecond. Allocate
+                // under the sessions lock so the later committed intent still sorts first.
+                patch.pinnedAt = new Date(Math.max(Date.now(), latestPinnedAtMs + 1)).toISOString();
+            }
+        }
         if (patch.lastActiveAt !== undefined) {
             patch.lastActiveAt = monotonicLastActiveAt(current.lastActiveAt, patch.lastActiveAt);
         }

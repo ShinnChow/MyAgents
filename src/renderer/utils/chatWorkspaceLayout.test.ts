@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  createWorkspacePanelDisclosureState,
   DEFAULT_WORKSPACE_LAYOUT_METRICS,
   nextSplitViewAfterBrowserClose,
+  reduceWorkspacePanelDisclosure,
   resolveWorkspacePanelMode,
   shouldPresentBrowserFullscreen,
 } from './chatWorkspaceLayout';
@@ -12,6 +14,39 @@ const baseInput = {
   splitPanelVisible: false,
   splitRatio: 0.5,
 };
+
+describe('workspace panel disclosure', () => {
+  it('keeps an already-visible panel stable when reveal only needs it to stay open', () => {
+    const visible = createWorkspacePanelDisclosureState(true);
+
+    expect(reduceWorkspacePanelDisclosure(visible, { type: 'open' })).toBe(visible);
+  });
+
+  it('animates only real visibility edges and ignores a stale collapse settlement after reopen', () => {
+    const hidden = createWorkspacePanelDisclosureState(false);
+    const opened = reduceWorkspacePanelDisclosure(hidden, { type: 'open' });
+    const closing = reduceWorkspacePanelDisclosure(opened, { type: 'close' });
+    const reopened = reduceWorkspacePanelDisclosure(closing, { type: 'open' });
+
+    expect(opened).toEqual({ visible: true, mounted: true, motion: 'expand' });
+    expect(closing).toEqual({ visible: false, mounted: true, motion: 'collapse' });
+    expect(reopened).toEqual({ visible: true, mounted: true, motion: 'expand' });
+    expect(reduceWorkspacePanelDisclosure(reopened, { type: 'settle-close' })).toBe(reopened);
+  });
+
+  it('unmounts only after a still-current close transition settles', () => {
+    const closing = reduceWorkspacePanelDisclosure(
+      createWorkspacePanelDisclosureState(true),
+      { type: 'close' },
+    );
+
+    expect(reduceWorkspacePanelDisclosure(closing, { type: 'settle-close' })).toEqual({
+      visible: false,
+      mounted: false,
+      motion: 'collapse',
+    });
+  });
+});
 
 describe('resolveWorkspacePanelMode', () => {
   it('keeps the workspace tree inline when the remaining chat width reaches the content threshold', () => {

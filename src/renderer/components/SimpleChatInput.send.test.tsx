@@ -8,6 +8,7 @@ import type { Provider } from '@/config/types';
 import { i18n } from '@/i18n';
 import { CUSTOM_EVENTS } from '../../shared/constants';
 import { MANAGED_BROWSER_MCP_ID } from '../../shared/browserTools';
+import { OFFICIAL_TOOLS } from '../../shared/official-tools';
 import {
   CC_PERMISSION_MODES,
   CODEX_PERMISSION_MODES,
@@ -27,6 +28,22 @@ const workspaceMocks = vi.hoisted(() => ({
     listSlashCommands: vi.fn(),
   },
 }));
+
+const textOnlyImageFallbackProvider = {
+  id: 'xiaomi-mimo',
+  name: 'Xiaomi MiMo',
+  vendor: 'Xiaomi',
+  cloudProvider: '模型官方',
+  type: 'api',
+  primaryModel: 'mimo-v2.5-pro',
+  isBuiltin: true,
+  config: {},
+  models: [{
+    model: 'mimo-v2.5-pro',
+    modelName: 'MiMo V2.5 Pro',
+    inputModalities: ['text'],
+  }],
+} as Provider;
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -999,6 +1016,125 @@ describe('SimpleChatInput send paths', () => {
       files: [{ name: 'pasted.txt', content: expect.any(String) }],
       targetDir: 'myagents_files',
     });
+  });
+
+  it('warns when a text-only model converts an image without ready image understanding', async () => {
+    await i18n.changeLanguage('zh-CN');
+    renderInput({
+      runtime: 'builtin',
+      provider: textOnlyImageFallbackProvider,
+      selectedModel: 'mimo-v2.5-pro',
+      workspacePath: '/workspace',
+      officialTools: OFFICIAL_TOOLS,
+      officialToolNeedsConfig: { 'image-understanding': true },
+    });
+    const textarea = screen.getByRole('textbox');
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [{ kind: 'file', getAsFile: () => new File(['png'], 'clip.png', { type: 'image/png' }) }],
+      },
+    });
+
+    await waitFor(() => expect(textarea).toHaveValue('@myagents_files/pasted.txt '));
+    expect(screen.getByText(/图片理解未就绪/)).toHaveTextContent(
+      '当前模型不支持图片，图片已作为工作区文件添加；图片理解未就绪，Agent 可能无法读取。请启用并配置图片理解，或切换支持图片的模型。',
+    );
+  });
+
+  it('stays silent when a text-only model converts an image with ready image understanding', async () => {
+    await i18n.changeLanguage('zh-CN');
+    renderInput({
+      runtime: 'builtin',
+      provider: textOnlyImageFallbackProvider,
+      selectedModel: 'mimo-v2.5-pro',
+      workspacePath: '/workspace',
+      officialTools: OFFICIAL_TOOLS,
+      globalOfficialToolEnabled: ['image-understanding'],
+      workspaceOfficialToolEnabled: ['image-understanding'],
+      officialToolNeedsConfig: { 'image-understanding': false },
+    });
+    const textarea = screen.getByRole('textbox');
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [{ kind: 'file', getAsFile: () => new File(['png'], 'clip.png', { type: 'image/png' }) }],
+      },
+    });
+
+    await waitFor(() => expect(textarea).toHaveValue('@myagents_files/pasted.txt '));
+    expect(screen.queryByText(/当前模型不支持图片/)).not.toBeInTheDocument();
+  });
+
+  it('uses the same not-ready warning for a native image path fallback', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const ref = createRef<SimpleChatInputHandle>();
+    workspaceMocks.service.copyPaths.mockResolvedValueOnce({
+      success: true,
+      copiedFiles: [{ targetPath: 'myagents_files/screenshot.png' }],
+    });
+    renderInput({
+      ref,
+      runtime: 'builtin',
+      provider: textOnlyImageFallbackProvider,
+      selectedModel: 'mimo-v2.5-pro',
+      workspacePath: '/workspace',
+      officialTools: OFFICIAL_TOOLS,
+      officialToolNeedsConfig: { 'image-understanding': true },
+    });
+
+    await act(async () => {
+      const processDroppedFilePaths = ref.current?.processDroppedFilePaths;
+      if (!processDroppedFilePaths) throw new Error('SimpleChatInput ref was not mounted');
+      await processDroppedFilePaths(['/tmp/screenshot.png']);
+    });
+
+    expect(screen.getByRole('textbox')).toHaveValue('@myagents_files/screenshot.png ');
+    expect(screen.getByText(/图片理解未就绪/)).toBeInTheDocument();
+  });
+
+  it('warns on send after an attached image is switched to a text-only model', async () => {
+    await i18n.changeLanguage('zh-CN');
+    const onSend = vi.fn();
+    const provider = {
+      ...textOnlyImageFallbackProvider,
+      primaryModel: 'mimo-v2.5',
+      models: [
+        { model: 'mimo-v2.5', modelName: 'MiMo V2.5', inputModalities: ['text', 'image'] },
+        ...textOnlyImageFallbackProvider.models,
+      ],
+    } as Provider;
+    const tree = (selectedModel: string) => (
+      <ToastProvider>
+        <ImagePreviewProvider>
+          <SimpleChatInput
+            runtime="builtin"
+            isLoading={false}
+            onSend={onSend}
+            provider={provider}
+            providerAvailable
+            selectedModel={selectedModel}
+            officialTools={OFFICIAL_TOOLS}
+            officialToolNeedsConfig={{ 'image-understanding': true }}
+          />
+        </ImagePreviewProvider>
+      </ToastProvider>
+    );
+    const view = render(tree('mimo-v2.5'));
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        items: [{ kind: 'file', getAsFile: () => new File(['png'], 'clip.png', { type: 'image/png' }) }],
+      },
+    });
+    await screen.findByRole('button', { name: 'clip.png' });
+
+    view.rerender(tree('mimo-v2.5-pro'));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: '看一下这张图' } });
+    fireEvent.click(screen.getByTitle(/发送/));
+
+    expect(onSend).toHaveBeenCalledOnce();
+    expect(screen.getByText(/图片理解未就绪/)).toBeInTheDocument();
   });
 
   it('preserves text typed while a pasted file import is still pending', async () => {

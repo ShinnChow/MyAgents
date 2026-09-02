@@ -24,6 +24,7 @@ import {
 } from '@/floating-ball/defaultPetPack';
 import {
     describeNativeFloatingBallError,
+    runFloatingBallToggleTransaction,
     setNativeFloatingBallEnabled,
 } from '@/floating-ball/nativeFloatingBall';
 import {
@@ -36,6 +37,7 @@ import {
     type PetImportSummary,
 } from '@/floating-ball/petPackLibrary';
 import { PetSprite } from '@/floating-ball/PetSprite';
+import { derivePetPreviewPlayback } from '@/floating-ball/petPlayback';
 import type { PetPack } from '@/floating-ball/petAtlas';
 import '@/floating-ball/fb.css';
 
@@ -61,7 +63,7 @@ function formatImportToast(summary: PetImportSummary, t: TFunction<'settings'>):
     return t('floatingBallPet.importToast.imported', { imported: summary.imported });
 }
 
-function PetStyleCard({
+export function PetStyleCard({
     pack,
     active,
     deleting = false,
@@ -78,6 +80,9 @@ function PetStyleCard({
 }) {
     const { t } = useTranslation('settings');
     const description = pack.description?.trim();
+    const [previewHovered, setPreviewHovered] = useState(false);
+    const [previewFocused, setPreviewFocused] = useState(false);
+    const previewActive = previewHovered || previewFocused;
 
     return (
         <div
@@ -90,13 +95,22 @@ function PetStyleCard({
             <button
                 type="button"
                 onClick={onSelect}
+                onMouseEnter={() => setPreviewHovered(true)}
+                onMouseLeave={() => setPreviewHovered(false)}
+                onFocus={() => setPreviewFocused(true)}
+                onBlur={() => setPreviewFocused(false)}
                 disabled={deleting}
                 className={`flex min-h-28 w-full items-center gap-4 rounded-xl p-4 text-left transition-opacity disabled:cursor-wait disabled:opacity-70 ${
                     removable ? 'pr-12' : ''
                 }`}
             >
                 <div className="flex h-20 w-20 shrink-0 items-center justify-center">
-                    <PetSprite pack={pack} animation="idle" title={pack.displayName} />
+                    <PetSprite
+                        pack={pack}
+                        animation="idle"
+                        playback={derivePetPreviewPlayback(previewActive)}
+                        title={pack.displayName}
+                    />
                 </div>
                 <div className="min-w-0 flex-1">
                     <div className="flex min-w-0 items-center gap-2">
@@ -379,8 +393,12 @@ export default function FloatingBallPetSettings() {
     const setEnabled = useCallback(
         async (enabled: boolean) => {
             try {
-                await setNativeFloatingBallEnabled(enabled, {
-                    unsupported: tRef.current('floatingBallPet.toasts.unsupportedSystem'),
+                await runFloatingBallToggleTransaction({
+                    enabled,
+                    persistDesiredState: next => updateConfig({ floatingBallEnabled: next }),
+                    applyNativeState: next => setNativeFloatingBallEnabled(next, {
+                        unsupported: tRef.current('floatingBallPet.toasts.unsupportedSystem'),
+                    }),
                 });
             } catch (err) {
                 toast.error(tRef.current('floatingBallPet.toasts.toggleFailed', {
@@ -391,8 +409,6 @@ export default function FloatingBallPetSettings() {
                 }));
                 return;
             }
-
-            await updateConfig({ floatingBallEnabled: enabled });
             track('floating_ball_toggle', { gate: false, enabled });
             toast.success(enabled
                 ? tRef.current('floatingBallPet.toasts.enabled')

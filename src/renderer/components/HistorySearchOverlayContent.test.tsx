@@ -66,6 +66,9 @@ function taskCenterData(overrides: Partial<TaskCenterData> = {}): TaskCenterData
         actions: {
             deleteSession: vi.fn(async () => ({ deleted: true as const })),
             setSessionFavorite: vi.fn(async () => true),
+            beginSessionMetadataMutation: vi.fn(() => 1),
+            applySessionMetadata: vi.fn(() => true),
+            refreshSessions: vi.fn(),
         },
         ...overrides,
     } as TaskCenterData;
@@ -78,6 +81,7 @@ function renderOverlay() {
             taskCenterData={taskCenterData()}
             onClose={vi.fn()}
             onOpenSession={vi.fn()}
+            onRenameSession={vi.fn(async () => null)}
         />,
     );
 }
@@ -95,7 +99,9 @@ function expectSharedSessionMenu() {
     expect(menu).not.toBeNull();
     expect(within(menu!).getAllByRole('button').map(button => button.textContent)).toEqual([
         i18n.t('launcher:rightRail.copySessionId'),
+        i18n.t('launcher:rightRail.rename'),
         i18n.t('launcher:rightRail.favorite'),
+        i18n.t('common:sessionTags.addTag'),
         i18n.t('launcher:rightRail.viewStats'),
         i18n.t('launcher:rightRail.delete'),
     ]);
@@ -281,5 +287,72 @@ describe('HistorySearchOverlayContent', () => {
         fireEvent.contextMenu(row, { clientX: 180, clientY: 130 });
 
         expectSharedSessionMenu();
+    });
+
+    it('uses a single Tag filter for both browse metadata and pre-limit full-text search', async () => {
+        const taggedSession = { ...session, id: 'session-alpha', userTags: ['Alpha'] };
+        const otherSession = { ...session, id: 'session-beta', title: 'Other session', userTags: ['Beta'] };
+        mocks.searchSessions.mockResolvedValue({ hits: [], totalCount: 0, queryTimeMs: 1 });
+        render(
+            <HistorySearchOverlayContent
+                projects={[project]}
+                taskCenterData={taskCenterData({ sessions: [taggedSession, otherSession] })}
+                onClose={vi.fn()}
+                onOpenSession={vi.fn()}
+                onRenameSession={vi.fn(async () => null)}
+            />,
+        );
+
+        fireEvent.click(screen.getByRole('button', { name: i18n.t('common:sessionTags.allTags') }));
+        fireEvent.click(screen.getByRole('option', { name: /Alpha/ }));
+        expect(document.querySelectorAll('[data-history-session-row]')).toHaveLength(1);
+        expect(screen.getByText(taggedSession.title)).toBeInTheDocument();
+        expect(screen.queryByText(otherSession.title)).not.toBeInTheDocument();
+
+        fireEvent.change(enterSearchMode(), { target: { value: 'needle' } });
+        await waitFor(() => expect(mocks.searchSessions).toHaveBeenCalledWith('needle', 50, 'Alpha'));
+    });
+
+    it('applies a clicked Tag intent as a clean aggregation and acknowledges it once', () => {
+        const onConsumed = vi.fn();
+        render(
+            <HistorySearchOverlayContent
+                projects={[project]}
+                taskCenterData={taskCenterData({ sessions: [{ ...session, userTags: ['Alpha'] }] })}
+                onClose={vi.fn()}
+                onOpenSession={vi.fn()}
+                onRenameSession={vi.fn(async () => null)}
+                tagIntent={{ id: 7, tag: 'Alpha' }}
+                onTagIntentConsumed={onConsumed}
+            />,
+        );
+
+        expect(document.querySelector('button[aria-haspopup="listbox"]')).toHaveTextContent('Alpha');
+        expect(onConsumed).toHaveBeenCalledOnce();
+        expect(onConsumed).toHaveBeenCalledWith(7);
+    });
+
+    it('keeps stale history rows visible and offers retry when metadata refresh fails', () => {
+        const refreshSessions = vi.fn();
+        render(
+            <HistorySearchOverlayContent
+                projects={[project]}
+                taskCenterData={taskCenterData({
+                    sessionsError: 'failed',
+                    actions: {
+                        ...taskCenterData().actions,
+                        refreshSessions,
+                    } as TaskCenterData['actions'],
+                })}
+                onClose={vi.fn()}
+                onOpenSession={vi.fn()}
+                onRenameSession={vi.fn(async () => null)}
+            />,
+        );
+
+        expect(screen.getByRole('alert')).toHaveTextContent(i18n.t('app:historyOverlay.metadataFailed'));
+        expect(screen.getByText(session.title)).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', { name: i18n.t('app:historyOverlay.retry') }));
+        expect(refreshSessions).toHaveBeenCalledOnce();
     });
 });

@@ -251,7 +251,7 @@ Global control request
 用于 Rust 与 Renderer 之间的控制请求、命令和事件：
 - Session / Global 普通 HTTP 控制请求（相对路径 + 逻辑 owner，由 Rust 解析当前 generation）
 - 内嵌终端事件（`terminal:data:{id}`）
-- 内嵌浏览器事件（`browser:url-changed:{tabId}`）
+- 内嵌浏览器事件（`browser:url-changed:{tabId}:{lifecycleToken}` / `browser:loading:{tabId}:{lifecycleToken}`）
 - 任务状态变更（`task:status-changed`）
 - 工作区文件变更（`workspace:files-changed:{eventKey}`，`eventKey` 由 `watch_start` 返回）
 - 工作区文件操作（`cmd_workspace_*`，所有 `src-tauri/src/workspace_files/` 命令）
@@ -296,7 +296,7 @@ Rust 为 Global 与 Session 两类 Sidecar 都在 spawn 前分配 process-global
 受管工具只把 JS 控制代码与 App 一起发布：`@playwright/mcp`、`playwright`、`playwright-core` 保持上游 package-local CommonJS / data-file 布局进入 `Resources/node_modules`，不折叠进 ESM `server-dist.js`。Chromium、Chromium Headless Shell 与 FFmpeg 不进入 App bundle、installer 或 updater。`src/shared/managed-browser-runtime.json` 是随 App 签名发布的 required runtime set 与各平台官方 artifact 计划：它锁定 Playwright 官方来源解析出的最终 Chrome for Testing / Playwright CDN URL、archive size、SHA-256、归档根和 executable path。Rust App owner 从未安装时只在用户点击“安装资源”后直连该锁定官方 artifact，完成摘要校验、安全解压与原子安装；读取状态不访问网络。首次成功形成 install authorization，后续 App revision 变化自动维护且最多重试两次；没有用户卸载入口。Browser Host 只能消费 Rust 投影的精确 executable path，不回退系统 Chrome、用户 Playwright cache、`npx playwright install` 或 App resources。
 
 - 一个 App Browser generation 共享一个 Chromium Browser process；每个 Product Session 一个隔离 `BrowserContext` 和原生窗口，同一 Context 的 Pages 是 Tabs。不存在 persistent/user-data-dir/Profile lease 模式。
-- Context 从 Rust-owned Browser Identity revision 初始化，Host 仅通过 `addCookies()` / `cookies()` 恢复和保存 Cookie，并在成功工具调用后防抖保存、在 close/teardown/shutdown 前强制保存；禁止对 headed Context 使用 Playwright `storageState()`，因为它会用用户可见的临时页面遍历历史 Web Storage origin。并发 checkpoint 通过 revision + key-level CAS 合并；旧版本留下的 localStorage / IndexedDB origin 只作兼容读取并在后续 checkpoint 清理，不再恢复。
+- Context 从 Rust-owned Browser Identity revision 初始化，Host 仅通过 `addCookies()` / `cookies()` 恢复和保存 Cookie，并在成功工具调用后防抖保存、在 close/teardown/shutdown 前强制保存；禁止对 headed Context 使用 Playwright `storageState()`，因为它会用用户可见的临时页面遍历历史 Web Storage origin。并发 checkpoint 通过 revision + key-level CAS 合并；旧版本留下的 localStorage / IndexedDB origin 只作兼容读取并在后续 checkpoint 清理，不再恢复。Browser Identity 只拥有持久化结果，不拥有 Context 生杀权：destructive close 前的 checkpoint 保持有界重试和结构化诊断，但 checkpoint-only failure 不得阻止 exact Context 退休；只有真实 Context close failure 才保留 entry 并触发既有精确 release retry。
 - Runtime/transport replacement 在有界 reattach 窗口内仍以 Product Session identity 找回原 Context；Host generation 改变会关闭旧 generation 的新准入并使迟到回调失效。Renderer 只读 Runtime-neutral effective MCP snapshot，不从配置勾选数推断已连接工具。
 - `config.mcpEnabledServers` 只表达全局可用性，因此两个固定内置 ID 可以同时启用。真正形成执行工具集的 Session、Agent 默认、Launcher 与 Task override 选择入口才互斥：选择一个会移除另一个，取消选择不改变对方；最终 Session 工具集仍取全局可用集与该执行选择集的交集。自定义 MCP 不参与该规则。
 
@@ -376,6 +376,12 @@ Tab 内 MUST 用 `useTabState()` 的 `apiGet` / `apiPost`，禁止全局 `apiPos
 
 `GlobalSidebar` 挂在 `App` 的 Tab Workspace 之外，是应用级导航和资源投影，不是新的页面容器或 Session owner。顶部 Tab 仍是所有主内容页面的唯一 authority：active、关闭、恢复、拖拽、Sidecar owner token 与 pending-session birth 都继续由现有 Tab 状态机管理。
 
+`Tab` 是以 `view` 判别的闭合联合：generic shell 的 `TabBase` 留在 `tab-workspace/contracts.ts`，每个 feature 的准确 variant/intent 留在自己的 public `tabContract.ts`，builtin `types/tab.ts` 只聚合这些 variant 并闭合当前 edition。内置 Launcher、Chat、Settings、Capabilities、Task Center、Space、Record 只在 `src/renderer/tab-workspace/builtinComposition.ts` 这一处组成 immutable edition registry；同一 boundary 还从 module map 推导 render-binding map、配对 lifecycle composition，并注入 Launcher fallback/protection 等 edition policy。feature 的 module definition 只声明纯 shell 事实：准确 payload、renderer/lazy boundary、chrome、初始 mount、structural identity/open-reopen policy 与可选 persistence codec。`BuiltinTabSlot` 和 `TabBar` 都查询这份 registry，不再维护 page-kind fallback 或第二份标题分发表。这里是源码级 composition，不存在运行时 `registerTab()`、import side effect、远程 module 或前端插件 ABI。
+
+App 内的 `useTabWorkspaceController` 是 `tabs + activeTabId + deferredMountTabIds` 的唯一 mutation boundary，并在一次 transition 中维持非空、Tab id 唯一、active 必须存在和 deferred 必须为 live Tab 子集。feature 只持有 typed open/focus/reopen/update/replace/remove/detach command 与结构化结果，不能直接写同步 state cell；controller 仍是 App-owned React state 的边界，不是独立 store。Session terminal/delete/reconcile 与 Space gate 等 authority-driven replace/remove 也经过该 controller，但不冒充用户 close，也不运行用户 close cleanup。
+
+Live 页面依赖通过 feature-specific、reference-stable render binding 注入；Chat/Record 的副作用关闭编排则分别留在 feature lifecycle adapter。统一关闭顺序是 capture exact typed Tab → `prepareClose` → 原子 detach → `afterDetach`，adapter 只委托既有 TabProvider/Sidecar/Recording authority，不获得底层状态写权限。`tabPersistence.ts` 继续拥有 v1 wire、外部输入校验、去重、容量与 restore planning；只有显式 opt-in 的 Chat/Record module 提供纯 codec，async Session/Record validation 仍由原 feature restore admission 负责。
+
 App Shell 同时也是 Task 创建 overlay 与 typed AppRoute 的唯一 UI owner。侧边栏、Task Center 和 Record 只提交创建/讨论意图，不各自挂第二个 modal；普通 Task 详情选择属于 Task Center 内部状态，`task.comment` typed route 则由 App 打开或聚焦 Task Center，再交给同一个详情 Drawer 消费。
 
 Record detail 也是普通顶部 Tab，但不是 Chat Tab：同一 `recordId` 只打开一个实例，持久 Tab snapshot 只保存 `{ id, view:'record', recordId, title }`。恢复时必须先经 `RecordStore.get` 验证；Record 已删除则保留同一 Tab identity 并退回统一 Record 列表。Record Tab 不创建 Session、Sidecar、owner token，也不持久化录音 snapshot、播放进度或活动电平。
@@ -386,7 +392,7 @@ Record detail 也是普通顶部 Tab，但不是 Chat Tab：同一 `recordId` �
 - 侧栏与顶部 Title/Tab chrome 是同一 App Shell material surface：三者只读取完整 Theme 必需的 `--global-sidebar-bg`，该 Token 由每套 Theme 的 light/dark package 拥有；页面内容与卡片/弹层继续使用既有 `--paper / --paper-elevated / --paper-inset` 语义。App Shell chrome 不再依赖与内容区的分割线，常规 leading inset 为 8px，手动 rail 的 52px 预留同时容纳固定 toggle 与其后 8px 留白；Tab active/hover 复用全局 `--hover-bg`。不能为制造分区而翻转通用 Paper 层级、在组件内混色或为 Tab Chrome 复制一套局部 palette。
 - 侧栏展开/rail 切换的布局槽一次提交最终宽度，不能给 `width` / `flex-basis` 加逐帧 transition 让 Chat、Browser、Terminal 等 resize-sensitive surface 连续重排。可见边界由固定展开宽度的独立 paint-only 材质层通过 `clip-path` 横向揭示/收回；右侧 Tab 标题栏与内容用一次布局后的 compositor transform 保持旧视觉中心，再与边界同节奏归位。Chat 右侧工作区复用镜像模式：面板材质横移，对话区在最终 flex 布局上从旧中心归位；内容只做 opacity/translate/clip 编排，且必须提供 `prefers-reduced-motion` 立即切换路径。
 - App Shell 使用 Task Center store 的 passive projection：只按需读取已展开工作区的 Session，每个规范化工作区 key 独立持有 loading/error/retry；只有用户打开全局搜索时才触发一次完整索引加载。passive 与完整 Task Center 读取共享 generation/latest-wins 交接，完整读取开始时使旧 passive 写入失效，完整 owner 卸载时显式把当前展开需求交还 passive。任务列表、轮询与 Tauri 监听仍由真正挂载的 Task Center 生命周期拥有，不能因侧栏常驻而前移到 App mount。
-- 点击已有 Session 必须回到 `App` 的统一 open-target-session planner：优先聚焦已打开 Tab，否则按既有恢复/创建路径 materialize；并发点击复用同一 in-flight guard。新建既有 Session Tab 时用 `flushSync` 把 `sidecarConfigDisposition:'pending'` 的 Tab 加入并激活，立即挂载 Chat owner 子树并由其既有 `ChatBootOverlay` 承担加载反馈，再异步 ensure/activate；`setTabs` 必须保持 functional composition，不能把 `tabsRef` 提升为第二个可写 authority。ensure 的锁内 `isNew` 仍是 `push/adopt` 唯一裁决。失败时只撤销该临时 Tab 并恢复仍存在的前一 active Tab，成功后不得把加载期间主动切走的用户强制拉回。
+- 点击已有 Session 必须回到 `App` 的统一 open-target-session planner：优先聚焦已打开 Tab，否则按既有恢复/创建路径 materialize；并发点击复用同一 in-flight guard。新建既有 Session Tab 时用 `flushSync` 经 workspace controller 把 `sidecarConfigDisposition:'pending'` 的 Tab 加入并激活，立即挂载 Chat owner 子树并由其既有 `ChatBootOverlay` 承担加载反馈，再异步 ensure/activate；业务 handler 不得直接写 controller 的同步 state cell。ensure 的锁内 `isNew` 仍是 `push/adopt` 唯一裁决。失败时只撤销该临时 Tab 并恢复仍存在的前一 active Tab，成功后不得把加载期间主动切走的用户强制拉回。
 - 删除 Session 必须回到 `App` 的统一 deletion capability，因为只有 App 拥有全部 mounted Tab：同一 App-owned admission map 先互斥目标 Session 的 open/switch、fork attach、pending→real identity adoption、TabProvider recovery、mounted Tab turn submission 与 delete，实时非 Tab owner 预检通过后，再由 Rust 将运行中 turn 接管为 `BackgroundCompletion` 或权威确认 idle；只有明确 idle 才把全部匹配 Chat Tab ids 交给 Rust，由 Rust 在同一 lifecycle fence 内以 `SessionEngine.isBusy()` 复核已接纳队列、完成最终 owner 裁决、存储删除与这些 Tab owner 的释放，成功后 App 才清退 UI 与 SSE。任何拒绝都必须原样保留 mounted Tab，不建立 renderer rollback。Floating companion 使用独立 `Companion` owner；headless Inbox 的 healthy reuse 与 dead resume 都在同一 fence 内用 transient `Agent` owner 覆盖投递到 `BackgroundCompletion` 接管，不能伪装成 App 可释放的 Tab。删除专用 strict handoff 不吞 transport / activity-check 错误；运行中或状态查询不可用都保留 mounted Tab 与 transcript，并返回结构化拒绝，不能拿 renderer `isGenerating` 投影当删除许可。GlobalSidebar、搜索覆盖层、Chat 菜单和历史下拉只消费这项 capability；不得各自猜当前 Tab、直接删存储或把 UI 快照当最终 authority。
 - `session start --agent` 的 fresh headless birth 复用现有 lifecycle：source 只提交已解析的 Agent/workspace 与 prompt，Rust 生成 Session/request identity 并持 transient `Agent` owner ensure 目标 workspace Sidecar；target 在写 metadata 前重新解析 Agent/Project lifecycle，并核对当前 Sidecar 的 Session/workspace。通过后按目标侧当前配置与实际 Runtime 创建 owned `prepared` snapshot，在 `SessionEngine` 的既有 dispatch guard 提交可见。明确拒绝按 request identity 回滚；dispatch ACK 后的 runtime 错误仍是已接纳 terminal，ACK 不明保留 ID 且不自动重试。Rust 只复用既有 `BackgroundCompletion` handoff，不为 fresh start 新增 durable token、恢复状态机、配置 fingerprint 或跨文件事务。成功 receipt 只证明 admission，不证明 terminal。
 - 点击工作区始终新建 Launcher Tab，再通过 Launcher 既有选择路径写入该 Tab 的待创建工作区；不得在侧栏提前创建 Session 或 Sidecar。
@@ -718,6 +724,7 @@ Chat / Tab 自己持有的 URL 预览器（Tauri Multi-Webview）。AI Markdown 
 - **链接动作 owner**：Markdown、`ExternalLink`、WebSearch / WebFetch 与文件工具不各自解释点击。HTTP(S) 统一走 `useOpenWebLink()`：Chat 普通点击进入当前 Tab 的 `BrowserPanel`，Cmd/Ctrl 点击或 Chat 外 surface 才交给系统浏览器；反引号 HTTP(S) 仅做标准 URL 格式校验，不探测网络可达性。文件链接、inline path 与工具 path 统一走 `FileActionContext`：显式 Markdown file link 保留作者声明的链接样式并在动作时复核；系统推断的 inline/tool path 只有 Rust existence + safety check 为 `exists:true` 时才获得下划线和左右键动作。只有当前挂载的 inferred target 才订阅校验，按 target 去重并以最多 200 条分批；工作区 watcher 使 workspace cache 失效，workspace 外 local target 使用 30 秒临时验证租约。workspace identity / generation fence 与单 target request sequence 共同拒绝跨工作区、跨代次和乱序迟到结果，左右键动作均再次复核。目标在动作前失效时撤销资格并明确反馈，不能静默交给 OS。
 - **Overlay 协调**：原生 Webview 浮于 React DOM 之上，Overlay 出现时通过 `closeLayer.hasOverlayLayer()` 自动 hide
 - **呈现与关闭 owner**：全屏条件只由“Browser 是当前 active split view”派生，不能由残留 `browserUrl` 单独决定；分屏、全屏、工具栏和 Tab × 共用同一个资源清理与剩余 view handoff callback
+- **代际 owner**：`tabId` 只表示 Chat Tab 产品 scope；每次 `BrowserPanel` effect lifetime 生成 required lifecycle token。Rust `BrowserManager` 必须在 native `add_child()` 前登记该 generation 的 birth intent，create / navigate / history / reload / resize / show / hide / close 与 URL/loading event 全部携带同一 token；迟到 birth、command、callback 或旧 close 只能作用于其 exact generation，不能覆盖或销毁复用同一 `tabId` 的新 WebView。普通 App/update shutdown 继续复用全局 lifecycle spawn gate，等待已准入 birth settlement 后统一 drain，不建立第二套退出状态机。
 - **Cookie 持久化**：同 App 所有 Webview 共享，默认持久化磁盘
 - **关闭即销毁**，不后台保活
 
@@ -732,6 +739,16 @@ Cmd+W 层级关闭：Overlay → 分屏面板 → Tab，高 z-index 优先。
 - 浏览器联动：`hasOverlayLayer()` 当有 z-index > 0 注册层时自动隐藏原生 Webview
 
 新增 overlay/可关闭面板 MUST 调用 `useCloseLayer`，否则 Cmd+W 会跳过该面板直接关 Tab。
+
+### 13.1 桌面宠物 (`src-tauri/src/floating_ball.rs` + `src/renderer/floating-ball/`)
+
+`config.json.floatingBallEnabled` 是跨启动 desired state；Rust `floating_ball` 是 native surface lifecycle owner；`SidecarManager` 是 `Companion("floating-ball")` owner set authority；Renderer 只拥有 live WebView 内的派生视觉与调度。focus、visibility 和 companion collapse 不改写 enabled state：普通收起继续保留预热 WebView、SSE 与 Companion owner，只停止 hidden surface 的视觉调度。
+
+**功能关闭事务：** Rust 首先关闭 exact Companion owner admission，使已在途 ensure 在 settlement 后自行释放，然后在 `SidecarManager` 同一把锁下从当前所有 Session key 移除该 exact owner（覆盖 session rotate 的短暂双持有），最后由平台 owner 销毁全部 surface。macOS 依次将 companion / shield / ball 通过 locked `tauri-nspanel` 的 `Panel::to_window()` 摘除 registry 再 `destroy()`；Windows 停止 hover / foreground poller，恢复 exact WndProc，清理 HWND / proc record，再销毁 companion / ball。所有阶段尽力执行并聚合 `stage + label` 错误；任一失败时 admission 重开且 native owner best-effort 恢复完整启用集合。
+
+Renderer 只在上述 Rust 事务成功后才把 durable config 提交为 `false`；若写盘失败，同一 toggle 立即 best-effort 重新 enable native state。启用时反向先提交 desired `true`、再创建 surface，native 失败回滚 config。这些补偿不形成后台 retry / watchdog 或第二份状态 owner。
+
+**渲染契约：** `PetSprite` 以显式 playback policy 将 semantic animation 与调度权分离；idle 为静态首帧，running / dragging 只在持续状态内 loop，blocked / done / error 单周期后固定末帧，settings preview 只在 hover / focus 时 loop。orb CSS 使用同一 policy class，hidden companion 禁用后代 CSS animation 并停止 activity interval；`prefers-reduced-motion` 可将任何动态 policy 降级为静态帧。
 
 ### 14. 全文搜索引擎 (`src-tauri/src/search/`)
 
@@ -1009,13 +1026,14 @@ Space 与其它 renderer CSS surface 一样直接继承 `<html>` 上当前 Theme
 | Goal Pause/终态 | 先提交 SessionGoal 状态，再精确 stop queue Turn；确认后才清 authority / 释放 Goal owner并广播 `goal:changed`，不确定时保留 |
 | IM 消息到达 | `ensureSessionSidecar(sessionId, workspace, 'agent', sessionKey)` |
 | IM Session 空闲超时 | `releaseSessionSidecar(sessionId, 'agent', sessionKey)` |
+| 桌面宠物关闭 | Rust 关闭 `Companion("floating-ball")` 准入 → `SidecarManager` 全 Session exact-owner sweep → macOS / Windows 完整 native teardown → Renderer 提交 config `false` |
 | 桌面录音开始 | `RecordingManager.start` 取得 App-global 唯一采集槽并创建 audio Record；不创建 Sidecar |
 | 桌面录音 pause/resume/stop | 同一 Manager 串行控制 exact recording generation；stop 先提交 archive，再收敛 live Worker/backfill |
 | Agent attachment 转录 | 当前 Session Sidecar → Admin API → Management API → `SpeechRecognitionManager`；scope 由进程身份注入，不新增 Sidecar owner |
 | 终端打开 | `cmd_terminal_create(workspace, rows, cols, port, id)` |
 | 终端关闭 / Tab 关闭 | `cmd_terminal_close(terminalId)` |
-| 浏览器打开 | `cmd_browser_create(tabId, url, x, y, width, height)` |
-| 浏览器关闭 / Tab 关闭 | `cmd_browser_close(tabId)` |
+| 浏览器打开 | `cmd_browser_create(tabId, lifecycleToken, url, bounds)`；Rust 在 native birth 前登记 exact generation |
+| 浏览器关闭 / Tab 关闭 | `cmd_browser_close(tabId, lifecycleToken)`；迟到 close 只退休匹配 generation |
 | 任务立即执行 / 重新派发 | `TaskApplication::run*` / `cron run-now` → 直接触发 Task execution use case；不创建 CronTask |
 | Task 软删除 | `TaskApplication::delete_ordinary` → `TaskStore` 写 `→ deleted` 伪状态 + 联动清理来源 Record |
 | 应用退出 / 普通重启 | Rust `RunEvent::ExitRequested` 统一关闭资源创建入口，等待在途创建完成登记或释放，再通过现有进程树句柄停止 Sidecar / Plugin Bridge 并清理 IM、终端和浏览器；普通重启通过 `request_restart()` 进入同一路径 |

@@ -47,6 +47,7 @@ function renderMenu(overrides: Partial<ComponentProps<typeof SessionMenuButton>>
         canRename
         onOpenRename={vi.fn()}
         onFavoriteChanged={vi.fn()}
+        onSessionMetadataMutationStart={vi.fn().mockReturnValue(1)}
         {...overrides}
       />
     </ToastProvider>,

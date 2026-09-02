@@ -80,6 +80,7 @@ import {
   buildSessionDetailedUsageStats,
 } from './utils/usage-stats';
 import { toClientSessionMetadata } from './utils/session-metadata-wire';
+import { shouldBumpSessionRecency } from './session-core/session-metadata-patch-policy';
 // adm-zip lazy-loaded at its one call site below (/api/skill/upload with zip
 // content) — saves ~30ms of module-init cost when users never upload skills.
 import {
@@ -496,9 +497,13 @@ import {
   getSessionMetadata,
   getSessionsByAgentDir,
   isHistoryVisibleSession,
+  listSessionUserTags,
+  mutateGlobalSessionUserTag,
+  mutateSessionUserTag,
   updateSessionMetadata,
   getAttachmentPath,
 } from './SessionStore';
+import { sessionUserTagFailureStatus } from './session-user-tag-http';
 import { findProjectAgentByWorkspacePath, loadConfig, resolveImProviderRouting, resolveProviderEnv, resolveWorkspaceConfig } from './utils/admin-config';
 import {
   projectCapabilitySnapshotForWire,
@@ -2637,6 +2642,82 @@ async function main() {
 
       // ============= SESSION API =============
 
+      // Global Session user Tag projection + intent mutations.
+      if (pathname === '/api/session-tags' && request.method === 'GET') {
+        return jsonResponse({ success: true, tags: listSessionUserTags() });
+      }
+
+      if (pathname === '/api/session-tags/assign' && request.method === 'POST') {
+        let payload: { sessionId?: unknown; operation?: unknown; name?: unknown };
+        try {
+          payload = await request.json() as typeof payload;
+        } catch {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid JSON payload.' }, 400);
+        }
+        if (typeof payload.sessionId !== 'string' || !/^[A-Za-z0-9-]{1,99}$/.test(payload.sessionId)) {
+          return jsonResponse({ success: false, reason: 'session-not-found', error: 'Invalid Session ID.' }, 400);
+        }
+        if ((payload.operation !== 'add' && payload.operation !== 'remove') || typeof payload.name !== 'string') {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid Tag assignment operation.' }, 400);
+        }
+        const result = await mutateSessionUserTag(payload.sessionId, {
+          kind: payload.operation,
+          name: payload.name,
+        });
+        if (!result.ok) {
+          const status = sessionUserTagFailureStatus(result.reason);
+          return jsonResponse({ success: false, ...result }, status);
+        }
+        if (!result.session) {
+          return jsonResponse({ success: false, reason: 'io-error', error: 'Tag mutation returned no Session.' }, 500);
+        }
+        return jsonResponse({
+          success: true,
+          ...result,
+          session: toClientSessionMetadata(result.session),
+        });
+      }
+
+      if (pathname === '/api/session-tags/manage' && request.method === 'POST') {
+        let payload: {
+          operation?: unknown;
+          name?: unknown;
+          newName?: unknown;
+          merge?: unknown;
+          focusSessionId?: unknown;
+        };
+        try {
+          payload = await request.json() as typeof payload;
+        } catch {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid JSON payload.' }, 400);
+        }
+        if ((payload.operation !== 'rename' && payload.operation !== 'delete') || typeof payload.name !== 'string') {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'Invalid global Tag operation.' }, 400);
+        }
+        if (payload.operation === 'rename' && typeof payload.newName !== 'string') {
+          return jsonResponse({ success: false, reason: 'invalid-name', error: 'A new Tag name is required.' }, 400);
+        }
+        if (payload.focusSessionId !== undefined
+          && (typeof payload.focusSessionId !== 'string' || !/^[A-Za-z0-9-]{1,99}$/.test(payload.focusSessionId))) {
+          return jsonResponse({ success: false, reason: 'session-not-found', error: 'Invalid focus Session ID.' }, 400);
+        }
+        const result = await mutateGlobalSessionUserTag(
+          payload.operation === 'rename'
+            ? { kind: 'rename', name: payload.name, newName: payload.newName as string, merge: payload.merge === true }
+            : { kind: 'delete', name: payload.name },
+          payload.focusSessionId as string | undefined,
+        );
+        if (!result.ok) {
+          const status = sessionUserTagFailureStatus(result.reason);
+          return jsonResponse({ success: false, ...result }, status);
+        }
+        return jsonResponse({
+          success: true,
+          ...result,
+          ...(result.session ? { session: toClientSessionMetadata(result.session) } : {}),
+        });
+      }
+
       // GET /sessions - List all sessions or filter by agentDir
       if (pathname === '/sessions' && request.method === 'GET') {
         try {
@@ -2941,6 +3022,8 @@ async function main() {
            *  freshly toggled-off session matches "never favorited" exactly
            *  on disk. */
           favorite?: boolean;
+          /** Pin/unpin inside the owning workspace's sidebar Session list. */
+          pinned?: boolean;
           model?: string | null;
           /** #324 — reasoning effort snapshot ('default' | level); null clears. */
           reasoningEffort?: string | null;
@@ -2965,29 +3048,26 @@ async function main() {
             && typeof payload.permissionMode !== 'string') {
           return jsonResponse({ success: false, error: 'permissionMode must be a string or null.' }, 400);
         }
+        if (payload.title !== undefined) {
+          if (typeof payload.title !== 'string') {
+            return jsonResponse({ success: false, error: 'title must be a string.' }, 400);
+          }
+          payload.title = payload.title.trim();
+          if (!payload.title) {
+            return jsonResponse({ success: false, error: 'title must not be empty.' }, 400);
+          }
+        }
+        if (payload.pinned !== undefined && typeof payload.pinned !== 'boolean') {
+          return jsonResponse({ success: false, error: 'pinned must be a boolean.' }, 400);
+        }
 
         // `lastActiveAt` is the recency signal that drives history sort
         // order. Bumping it on EVERY PATCH means a pure-UI flag change
         // (favorite toggle) makes an old session jump to the top of the
         // dropdown — confusing UX (Codex round-4 caught). Only the fields
-        // that genuinely represent "session was used" should refresh it.
-        const RECENCY_BUMP_FIELDS = new Set([
-          'title',           // user-edited title implies engagement
-          'titleSource',
-          'model',
-          'reasoningEffort',
-          'permissionMode',
-          'mcpEnabledServers',
-          'enabledPluginIds',
-          'enabledOfficialToolIds',
-          'providerId',
-          'providerRoute',
-          'providerExecutionIdentity',
-          'providerEnvJson',
-        ]);
-        const touchedRecencyField = (Object.keys(payload) as Array<keyof PatchPayload>)
-          .filter((k) => payload[k] !== undefined)
-          .some((k) => RECENCY_BUMP_FIELDS.has(k));
+        // that genuinely represent "session was used" should refresh it. Title
+        // edits and pinning are organizational actions, so neither affects recency.
+        const touchedRecencyField = shouldBumpSessionRecency(payload);
 
         let updated: SessionMetadata | null = null;
         let sawExistingSession = false;
@@ -3010,13 +3090,14 @@ async function main() {
           const updates: Record<string, unknown> = touchedRecencyField
             ? { lastActiveAt: nowIso }
             : {};
-          if (payload.title !== undefined) updates.title = String(payload.title).slice(0, 100);
+          if (payload.title !== undefined) updates.title = payload.title.slice(0, 100);
           if (payload.titleSource !== undefined) updates.titleSource = payload.titleSource;
           if (payload.favorite !== undefined) {
             // Convert false → undefined so the on-disk shape stays minimal
             // (the JSON serializer drops undefined keys).
             updates.favorite = payload.favorite === true ? true : undefined;
           }
+          if (payload.pinned !== undefined) updates.pinned = payload.pinned;
           if (payload.origin !== undefined) {
             if (payload.origin === null) {
               updates.origin = undefined;

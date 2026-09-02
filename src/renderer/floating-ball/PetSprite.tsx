@@ -2,18 +2,22 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 
 import { getPetAnimationSpec, type CodexPetAnimationName, type PetPack } from './petAtlas';
+import {
+    resolvePetPlaybackForReducedMotion,
+    type PetPlaybackMode,
+} from './petPlayback';
 
 const PET_DISPLAY_W = 76;
 const PET_DISPLAY_H = 82;
 
 function usePrefersReducedMotion(): boolean {
     const [reduced, setReduced] = useState(() => {
-        if (typeof window === 'undefined' || !('matchMedia' in window)) return false;
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
         return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     });
 
     useEffect(() => {
-        if (typeof window === 'undefined' || !('matchMedia' in window)) return;
+        if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
         const query = window.matchMedia('(prefers-reduced-motion: reduce)');
         const onChange = () => setReduced(query.matches);
         onChange();
@@ -29,13 +33,22 @@ export interface PetSpriteProps {
     animation: CodexPetAnimationName;
     className?: string;
     title?: string;
+    playback?: PetPlaybackMode;
     onLoadError?: () => void;
 }
 
-export function PetSprite({ pack, animation, className, title, onLoadError }: PetSpriteProps) {
+export function PetSprite({
+    pack,
+    animation,
+    className,
+    title,
+    playback = 'static-first',
+    onLoadError,
+}: PetSpriteProps) {
     const spriteRef = useRef<HTMLDivElement | null>(null);
     const reduceMotion = usePrefersReducedMotion();
     const spec = getPetAnimationSpec(pack.atlas, animation);
+    const effectivePlayback = resolvePetPlaybackForReducedMotion(playback, reduceMotion);
     const backgroundSize = `${pack.atlas.columns * PET_DISPLAY_W}px ${pack.atlas.rows * PET_DISPLAY_H}px`;
     const initialBackgroundPosition = `0px -${spec.row * PET_DISPLAY_H}px`;
     const style = useMemo<CSSProperties>(
@@ -63,14 +76,19 @@ export function PetSprite({ pack, animation, className, title, onLoadError }: Pe
 
         let cancelled = false;
         let timer: number | null = null;
-        let frame = 0;
+        let frame = effectivePlayback === 'static-final' ? spec.frames - 1 : 0;
 
         const renderFrame = () => {
             if (cancelled) return;
             el.style.backgroundPosition = `-${frame * PET_DISPLAY_W}px -${spec.row * PET_DISPLAY_H}px`;
-            if (reduceMotion || spec.frames <= 1) return;
+            if (
+                spec.frames <= 1
+                || effectivePlayback === 'static-first'
+                || effectivePlayback === 'static-final'
+            ) return;
             const delay = spec.frameDurations[frame] ?? 160;
-            frame = (frame + 1) % spec.frames;
+            if (effectivePlayback === 'once-final' && frame >= spec.frames - 1) return;
+            frame = effectivePlayback === 'loop' ? (frame + 1) % spec.frames : frame + 1;
             timer = window.setTimeout(renderFrame, delay);
         };
 
@@ -79,7 +97,7 @@ export function PetSprite({ pack, animation, className, title, onLoadError }: Pe
             cancelled = true;
             if (timer !== null) window.clearTimeout(timer);
         };
-    }, [animation, reduceMotion, spec]);
+    }, [animation, effectivePlayback, spec]);
 
     return (
         <div
@@ -87,6 +105,7 @@ export function PetSprite({ pack, animation, className, title, onLoadError }: Pe
             className={`fbw-pet-sprite${className ? ` ${className}` : ''}`}
             role="img"
             aria-label={title ?? pack.displayName}
+            data-pet-playback={effectivePlayback}
             style={style}
         />
     );

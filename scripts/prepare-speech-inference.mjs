@@ -97,6 +97,24 @@ const buildJobs = String(
     ),
   ),
 );
+const speechAdapterCmake = readFileSync(
+  join(mediaWorkerRoot, 'native', 'CMakeLists.txt'),
+  'utf8',
+);
+const speechAdapterCmakeMinimum =
+  /^cmake_minimum_required\(VERSION\s+(\d+)\.(\d+)(?:\.(\d+))?\)/m.exec(
+    speechAdapterCmake,
+  );
+if (!speechAdapterCmakeMinimum) {
+  throw new Error('Speech native adapter CMake minimum version is missing');
+}
+const MINIMUM_SPEECH_CMAKE_VERSION_PARTS = [
+  Number(speechAdapterCmakeMinimum[1]),
+  Number(speechAdapterCmakeMinimum[2]),
+  Number(speechAdapterCmakeMinimum[3] ?? 0),
+];
+export const MINIMUM_SPEECH_CMAKE_VERSION =
+  MINIMUM_SPEECH_CMAKE_VERSION_PARTS.join('.');
 
 function probeCommand(command, commandArgs) {
   try {
@@ -109,30 +127,70 @@ function probeCommand(command, commandArgs) {
   }
 }
 
-function prerequisiteFailures() {
-  const failures = [];
-  if (!probeCommand('cmake', ['--version'])) {
-    failures.push('CMake >= 3.28 (install from https://cmake.org/download/)');
+function parseCmakeVersion(output) {
+  const match = /\bcmake version\s+(\d+)\.(\d+)(?:\.(\d+))?/i.exec(
+    output ?? '',
+  );
+  if (!match) return null;
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
+}
+
+function versionAtLeast(actual, minimum) {
+  for (let index = 0; index < minimum.length; index += 1) {
+    if (actual[index] > minimum[index]) return true;
+    if (actual[index] < minimum[index]) return false;
   }
-  if (!probeCommand('cargo', ['--version'])) {
+  return true;
+}
+
+export function speechBuildPrerequisiteFailures(tools, platform) {
+  const failures = [];
+  const cmakeVersion = parseCmakeVersion(tools.cmakeVersion);
+  if (!tools.cmakeVersion) {
+    failures.push(
+      `CMake >= ${MINIMUM_SPEECH_CMAKE_VERSION} (install from https://cmake.org/download/)`,
+    );
+  } else if (!cmakeVersion) {
+    failures.push(
+      `CMake >= ${MINIMUM_SPEECH_CMAKE_VERSION} (could not parse: ${tools.cmakeVersion.split('\n')[0]}; upgrade from https://cmake.org/download/)`,
+    );
+  } else if (
+    !versionAtLeast(cmakeVersion, MINIMUM_SPEECH_CMAKE_VERSION_PARTS)
+  ) {
+    failures.push(
+      `CMake >= ${MINIMUM_SPEECH_CMAKE_VERSION} (found ${cmakeVersion.join('.')}; upgrade from https://cmake.org/download/)`,
+    );
+  }
+  if (!tools.cargoVersion) {
     failures.push('Cargo (install with the repository Rust toolchain)');
   }
+  if (!tools.compiler) {
+    failures.push(
+      platform === 'macos'
+        ? 'Apple Clang (install Xcode Command Line Tools)'
+        : platform === 'windows'
+          ? 'MSVC C++ Build Tools (run from a Developer PowerShell)'
+          : 'a C++20 compiler (install the platform build-essential package)',
+    );
+  }
+  return failures;
+}
+
+function prerequisiteFailures() {
   const compiler =
     targetLock.platform === 'macos'
       ? probeCommand('xcrun', ['--find', 'clang++'])
       : targetLock.platform === 'windows'
         ? probeCommand('where.exe', ['cl.exe'])
         : probeCommand('sh', ['-c', 'command -v c++ || command -v g++']);
-  if (!compiler) {
-    failures.push(
-      targetLock.platform === 'macos'
-        ? 'Apple Clang (install Xcode Command Line Tools)'
-        : targetLock.platform === 'windows'
-          ? 'MSVC C++ Build Tools (run from a Developer PowerShell)'
-          : 'a C++20 compiler (install the platform build-essential package)',
-    );
-  }
-  return failures;
+  return speechBuildPrerequisiteFailures(
+    {
+      cmakeVersion: probeCommand('cmake', ['--version']),
+      cargoVersion: probeCommand('cargo', ['--version']),
+      compiler,
+    },
+    targetLock.platform,
+  );
 }
 
 function assertPrerequisites() {

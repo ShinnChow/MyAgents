@@ -16,6 +16,7 @@ import type {
   SessionStartOptions,
   UnifiedEventCallback,
 } from './types';
+import { RuntimeSteerUnavailableError } from './types';
 
 const broadcastEvents: Array<{ event: string; data: unknown }> = [];
 
@@ -67,6 +68,7 @@ class FakeRuntime implements AgentRuntime {
   readonly conversationBranches: Array<{ kind: 'through-turn' | 'before-turn'; runtimeTurnId: string }> = [];
   compactCalls = 0;
   readonly permissionResponses: Array<{ requestId: string; decision: string; reason?: string }> = [];
+  canSteerMessage?: AgentRuntime['canSteerMessage'];
   steerMessage?: AgentRuntime['steerMessage'];
   branchConversation?: AgentRuntime['branchConversation'];
   private callback: UnifiedEventCallback | null = null;
@@ -77,6 +79,8 @@ class FakeRuntime implements AgentRuntime {
   private releaseRejectedSendGate: (() => void) | null = null;
   private stopGate: Promise<void> | null = null;
   private releaseStopGate: (() => void) | null = null;
+  private steerUnavailableGate: Promise<void> | null = null;
+  private releaseSteerUnavailableGate: (() => void) | null = null;
   private stopAwaitingRelease = false;
   private readonly deferStopBeforeResult: boolean;
   private rejectDispatchAck: boolean;
@@ -86,11 +90,15 @@ class FakeRuntime implements AgentRuntime {
   private readonly emitSessionCompleteOnStop: boolean;
   private nextTurnNumber = 1;
   private nextThreadNumber = 1;
+  private steerAvailable = true;
   private readonly omittedLoadedSkillNames: ReadonlySet<string>;
 
   constructor(private readonly scripts: TurnScript[], options: {
     realtimeSteering?: boolean;
     rejectSteer?: boolean;
+    rejectSteerUnavailable?: boolean;
+    deferSteerUnavailable?: boolean;
+    deferSteerSuccess?: boolean;
     deferStart?: boolean;
     rejectDispatchAck?: boolean;
     rejectStop?: boolean;
@@ -122,8 +130,21 @@ class FakeRuntime implements AgentRuntime {
       });
     }
     if (options.realtimeSteering) {
+      if (options.deferSteerUnavailable || options.deferSteerSuccess) {
+        this.steerUnavailableGate = new Promise<void>((resolve) => {
+          this.releaseSteerUnavailableGate = resolve;
+        });
+      }
+      this.canSteerMessage = () => this.steerAvailable;
       this.steerMessage = async (_process, message, _images, steerOptions) => {
         this.steeredMessages.push({ message, clientUserMessageId: steerOptions?.clientUserMessageId });
+        if (options.rejectSteerUnavailable) {
+          this.steerAvailable = false;
+        }
+        if (this.steerUnavailableGate) await this.steerUnavailableGate;
+        if (options.rejectSteerUnavailable) {
+          throw new RuntimeSteerUnavailableError('fake runtime has no active turn to steer');
+        }
         if (options.rejectSteer) {
           throw new Error('fake steer rejected');
         }
@@ -164,6 +185,19 @@ class FakeRuntime implements AgentRuntime {
   releaseStop(): void {
     this.releaseStopGate?.();
     this.releaseStopGate = null;
+  }
+
+  setSteerAvailable(value: boolean): void {
+    this.steerAvailable = value;
+  }
+
+  releaseSteerUnavailable(): void {
+    this.releaseSteerUnavailableGate?.();
+    this.releaseSteerUnavailableGate = null;
+  }
+
+  releaseSteerSuccess(): void {
+    this.releaseSteerUnavailable();
   }
 
   allowStop(): void {
@@ -287,6 +321,7 @@ class FakeRuntime implements AgentRuntime {
   clearTimers(): void {
     this.releaseStart();
     this.releaseRejectedSend();
+    this.releaseSteerUnavailable();
     this.releaseStop();
     for (const timer of this.timers) clearTimeout(timer);
     this.timers.clear();
@@ -405,6 +440,9 @@ async function createHarness(
   options: {
     realtimeSteering?: boolean;
     rejectSteer?: boolean;
+    rejectSteerUnavailable?: boolean;
+    deferSteerUnavailable?: boolean;
+    deferSteerSuccess?: boolean;
     deferStart?: boolean;
     unconfirmedDispatchStop?: boolean;
     unconfirmedStop?: boolean;
@@ -479,6 +517,9 @@ async function createHarness(
   const runtime = new FakeRuntime(scripts, {
     realtimeSteering: options.realtimeSteering,
     rejectSteer: options.rejectSteer,
+    rejectSteerUnavailable: options.rejectSteerUnavailable,
+    deferSteerUnavailable: options.deferSteerUnavailable,
+    deferSteerSuccess: options.deferSteerSuccess,
     deferStart: options.deferStart,
     rejectDispatchAck: options.unconfirmedDispatchStop,
     rejectStop: options.unconfirmedDispatchStop || options.unconfirmedStop,
@@ -570,11 +611,12 @@ async function createHarness(
     };
   });
 
-  const [{ getSessionEngine }, externalSession, sessionStore] = await Promise.all([
-    import('../session-engine'),
-    import('./external-session'),
-    import('../SessionStore'),
-  ]);
+  // Load the overlapping module graph in dependency order. Importing these in
+  // parallel can race Vitest's dynamic SSE mock and leave SessionEngine bound
+  // to the real broadcaster while this harness observes the mocked one.
+  const externalSession = await import('./external-session');
+  const { getSessionEngine } = await import('../session-engine');
+  const sessionStore = await import('../SessionStore');
   externalSession.__resetExternalSessionForTests();
   if (options.conversationRewindCommitFailure) {
     const reason = options.conversationRewindCommitFailure;
@@ -3462,6 +3504,388 @@ describe('external SessionEngine with fake runtime', () => {
     expect(harness.mirrorCalls.map(({ role, text }) => ({ role, text }))).toEqual([
       { role: 'user', text: 'desktop joins IM turn' },
     ]);
+  });
+
+  it('queues Desktop input when the runtime reports that the root turn is no longer steerable', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 80 },
+      { kind: 'success', text: 'second answer' },
+    ], { realtimeSteering: true });
+    const sessionId = 'session-realtime-steer-unavailable-before-send';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    harness.runtime.setSteerAvailable(false);
+
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+    expect(second).toMatchObject({
+      success: true,
+      queued: true,
+      deliveryMode: 'turn',
+    });
+    expect(harness.runtime.steeredMessages).toEqual([]);
+
+    await waitFor(() => harness.runtime.sentMessages.includes('second'), 'queued second dispatch');
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'second']);
+  });
+
+  it('demotes the same Desktop operation when the active steer turn disappears during dispatch', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 80 },
+      { kind: 'success', text: 'second answer' },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-no-active-race';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+
+    expect(second).toMatchObject({
+      success: true,
+      queued: true,
+      isInFlight: true,
+      deliveryMode: 'realtime',
+    });
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'racing realtime steer');
+    await waitFor(() => harness.runtime.sentMessages.includes('second'), 'demoted second dispatch');
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+
+    const queueEvents = broadcastEvents.filter(
+      (item) => (item.data as { queueId?: string } | null)?.queueId === second.queueId,
+    );
+    expect(queueEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        event: 'queue:added',
+        data: expect.objectContaining({
+          queueId: second.queueId,
+          isInFlight: false,
+          deliveryMode: 'turn',
+        }),
+      }),
+      expect.objectContaining({ event: 'queue:started' }),
+    ]));
+    expect(queueEvents.some((item) => item.event === 'queue:cancelled')).toBe(false);
+    expect(broadcastEvents.some((item) => item.event === 'chat:agent-error')).toBe(false);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'second']);
+    expect(harness.sessionStore.getSessionData(sessionId)?.messages
+      .filter((message) => message.role === 'user')
+      .map((message) => message.content)).toEqual(['first', 'second']);
+  });
+
+  it('keeps concurrent no-active steer fallbacks in Desktop FIFO order', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 80 },
+      { kind: 'success', text: 'second answer' },
+      { kind: 'success', text: 'third answer' },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-no-active-fifo';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const [second, third] = await Promise.all([
+      harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'second')),
+      harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'third')),
+    ]);
+
+    expect(second).toMatchObject({ success: true, queued: true });
+    expect(third).toMatchObject({ success: true, queued: true });
+    await waitFor(() => harness.runtime.sentMessages.length === 3, 'FIFO fallback drain');
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+    expect(harness.runtime.steeredMessages.map(({ message }) => message)).toEqual(['second']);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'second', 'third']);
+  });
+
+  it('keeps an earlier delayed no-active fallback ahead of later turn-boundary admission', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 300 },
+      { kind: 'success', text: 'second answer' },
+      { kind: 'success', text: 'third answer' },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+      deferSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-delayed-fallback-fifo';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'delayed steer request');
+
+    const third = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'third'),
+    );
+    expect(third).toMatchObject({ success: true, queued: true, deliveryMode: 'turn' });
+    expect(harness.engine.getQueueStatus().map((item) => item.messagePreview)).toEqual(['third']);
+
+    harness.runtime.releaseSteerUnavailable();
+    await waitFor(
+      () => harness.engine.getQueueStatus().map((item) => item.messagePreview).join(',') === 'second,third',
+      'fallback insertion before later admission',
+    );
+    await expect(second.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(third.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'second', 'third']);
+    const persistedMessages = harness.sessionStore.getSessionData(sessionId)?.messages;
+    expect(persistedMessages?.map((message) => message.role)).toEqual([
+      'user', 'assistant', 'user', 'assistant', 'user', 'assistant',
+    ]);
+    expect(persistedMessages?.filter((message) => message.role === 'user').map(
+      (message) => message.content,
+    )).toEqual(['first', 'second', 'third']);
+  });
+
+  it('does not resurrect a delayed no-active fallback after Stop resets its queue generation', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 5_000 },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+      deferSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-stale-generation';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'delayed stale steer request');
+
+    await expect(harness.externalSession.stopExternalSession()).resolves.toBe(true);
+    harness.runtime.releaseSteerUnavailable();
+
+    await expect(second.dispatchAcceptance).resolves.toEqual({ accepted: false });
+    expect(harness.engine.getQueueStatus()).toEqual([]);
+    expect(harness.runtime.sentMessages).toEqual(['first']);
+  });
+
+  it('does not reserve a later queued turn while an earlier steer admission is unresolved', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 80 },
+      { kind: 'success', text: 'second answer' },
+      { kind: 'success', text: 'third answer' },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+      deferSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-reservation-fifo';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'unresolved steer admission');
+    const third = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'third'),
+    );
+
+    await waitFor(
+      () => harness.engine.getLatestAssistantResult().latestResult === 'first answer',
+      'first product turn finalization',
+    );
+    expect(harness.engine.getQueueStatus().map((item) => item.messagePreview)).toEqual(['third']);
+    expect(harness.runtime.sentMessages).toEqual(['first']);
+
+    harness.runtime.releaseSteerUnavailable();
+    await expect(second.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(third.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'second', 'third']);
+  });
+
+  it('queues a post-terminal Desktop send behind an earlier unresolved steer admission', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 80 },
+      { kind: 'success', text: 'second answer' },
+      { kind: 'success', text: 'third answer' },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+      deferSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-post-terminal-fifo';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'unresolved steer admission');
+    await waitFor(
+      () => harness.engine.getLatestAssistantResult().latestResult === 'first answer',
+      'first product turn finalization',
+    );
+    await waitFor(
+      () => harness.externalSession.getExternalSessionState() === 'idle',
+      'idle lifecycle after first turn',
+    );
+
+    const third = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'third'),
+    );
+    expect(third).toMatchObject({
+      success: true,
+      queued: true,
+      deliveryMode: 'turn',
+    });
+    expect(harness.runtime.sentMessages).toEqual(['first']);
+
+    harness.runtime.releaseSteerUnavailable();
+    await expect(second.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(third.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'second', 'third']);
+    const persistedMessages = harness.sessionStore.getSessionData(sessionId)?.messages;
+    expect(persistedMessages?.map((message) => message.role)).toEqual([
+      'user', 'assistant', 'user', 'assistant', 'user', 'assistant',
+    ]);
+    expect(persistedMessages?.filter((message) => message.role === 'user').map(
+      (message) => message.content,
+    )).toEqual(['first', 'second', 'third']);
+  });
+
+  it('keeps a late successful steer admission ordered through its slow compatibility append', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 80 },
+      { kind: 'success', text: 'third answer' },
+    ], {
+      realtimeSteering: true,
+      deferSteerSuccess: true,
+      deferMessagePersistOnCall: 2,
+    });
+    const sessionId = 'session-realtime-steer-late-success-persist';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'late successful steer request');
+    await waitFor(
+      () => harness.engine.getLatestAssistantResult().latestResult === 'first answer',
+      'first product turn finalization',
+    );
+    await waitFor(
+      () => harness.externalSession.getExternalSessionState() === 'idle',
+      'idle lifecycle before late steer success',
+    );
+    const third = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'third'),
+    );
+    expect(third).toMatchObject({ deliveryMode: 'turn' });
+
+    harness.runtime.releaseSteerSuccess();
+    await waitFor(() => harness.messagePersistCount() === 2, 'late steer compatibility append');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(harness.runtime.sentMessages).toEqual(['first']);
+    expect(harness.engine.getQueueStatus().map((item) => item.messagePreview)).toEqual(['third']);
+
+    harness.releaseMessagePersist();
+    await expect(second.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(third.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'third']);
+    expect(harness.sessionStore.getSessionData(sessionId)?.messages.filter(
+      (message) => message.role === 'user',
+    ).map((message) => message.content)).toEqual(['first', 'second', 'third']);
+  });
+
+  it('preserves an explicit force-ahead choice when an earlier steer later falls back', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 300 },
+      { kind: 'success', text: 'third answer' },
+      { kind: 'success', text: 'second answer' },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+      deferSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-force-order';
+    const workspacePath = join(harness.home, 'workspace');
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'second'),
+    );
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'unresolved steer before force');
+    const third = await harness.engine.sendDesktopMessage(
+      desktopRequest(sessionId, workspacePath, 'third'),
+    );
+    expect(third.queueId).toBeDefined();
+    await expect(harness.engine.forceQueuedMessage(third.queueId!)).resolves.toBe(true);
+
+    harness.runtime.releaseSteerUnavailable();
+    await waitFor(
+      () => harness.engine.getQueueStatus().map((item) => item.messagePreview).join(',') === 'third,second',
+      'forced item remains ahead of fallback',
+    );
+    await expect(third.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(second.dispatchAcceptance).resolves.toEqual({ accepted: true });
+    await expect(harness.engine.waitIdle(2_000, 10)).resolves.toBe(true);
+    expect(harness.runtime.sentMessages).toEqual(['first', 'third', 'second']);
+  });
+
+  it('settles delayed no-active fallback acceptance from the queued dispatch guard', async () => {
+    const harness = await createHarness([
+      { kind: 'success', text: 'first answer', completeDelayMs: 300 },
+    ], {
+      realtimeSteering: true,
+      rejectSteerUnavailable: true,
+      deferSteerUnavailable: true,
+    });
+    const sessionId = 'session-realtime-steer-fallback-guard';
+    const workspacePath = join(harness.home, 'workspace');
+    const beforeDispatch = vi.fn()
+      .mockResolvedValueOnce({ accepted: true })
+      .mockResolvedValueOnce({ accepted: false, error: 'Goal is terminal' });
+
+    await harness.engine.sendDesktopMessage(desktopRequest(sessionId, workspacePath, 'first'));
+    await waitFor(() => harness.runtime.sentMessages.includes('first'), 'first dispatch');
+    const second = await harness.engine.sendDesktopMessage({
+      ...desktopRequest(sessionId, workspacePath, 'guarded second'),
+      beforeDispatch,
+    });
+    await waitFor(() => harness.runtime.steeredMessages.length === 1, 'guarded delayed steer request');
+
+    let settled = false;
+    void second.dispatchAcceptance?.then(() => { settled = true; });
+    harness.runtime.releaseSteerUnavailable();
+    await waitFor(() => harness.engine.getQueueStatus().length === 1, 'guarded fallback queued');
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await expect(second.dispatchAcceptance).resolves.toEqual({
+      accepted: false,
+      error: 'Goal is terminal',
+    });
+    expect(beforeDispatch).toHaveBeenCalledTimes(2);
+    expect(harness.runtime.sentMessages).toEqual(['first']);
   });
 
   it('does not split the active stream when realtime Codex steering is rejected', async () => {

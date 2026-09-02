@@ -34,7 +34,11 @@ import {
 import { CODEX_PERMISSION_MODES } from '../../shared/types/runtime';
 import { coerceFileChanges, formatFileChangeForResult } from '../../shared/fileChange';
 import type { AgentPlanTodo, AgentRuntime, ConversationBranchBoundary, ConversationBranchResult, RuntimeConfigCapabilities, RuntimeProcess, SessionStartOptions, UnifiedEvent, UnifiedEventCallback, ResolvedImagePayload, SubAgentScope } from './types';
-import { RuntimeConversationBranchError, StaleRuntimeSessionError } from './types';
+import {
+  RuntimeConversationBranchError,
+  RuntimeSteerUnavailableError,
+  StaleRuntimeSessionError,
+} from './types';
 import type { InteractionScenario } from '../system-prompt';
 import { shouldDisallowAskUserQuestion } from '../host-interaction';
 import {
@@ -2301,6 +2305,34 @@ export function codexModelCacheKey(runtimeSource: RuntimeSource, context: CodexC
 
 // ─── JSON-RPC 2.0 Client ───
 
+class JsonRpcResponseError extends Error {
+  constructor(
+    readonly code: number,
+    message: string,
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = 'JsonRpcResponseError';
+  }
+}
+
+type CodexNoActiveTurnSteerRejection = Error & { code: -32600 };
+
+export function isCodexNoActiveTurnSteerRejection(
+  error: unknown,
+): error is CodexNoActiveTurnSteerRejection {
+  const message = typeof error === 'object' && error !== null
+    ? (error as { message?: unknown }).message
+    : undefined;
+  return (
+    typeof error === 'object'
+    && error !== null
+    && (error as { code?: unknown }).code === -32600
+    && typeof message === 'string'
+    && /no active turn to steer/i.test(message)
+  );
+}
+
 /**
  * Lightweight JSON-RPC 2.0 client for Codex app-server.
  *
@@ -2436,7 +2468,11 @@ export class JsonRpcClient {
           // detection (and humans reading logs) see the actionable diagnostic,
           // not just the generic JSON-RPC "Internal error" wrapper.
           const details = typeof err.data?.details === 'string' ? `: ${err.data.details}` : '';
-          handler.reject(new Error(`RPC error ${err.code}: ${err.message}${details}`));
+          handler.reject(new JsonRpcResponseError(
+            err.code,
+            `RPC error ${err.code}: ${err.message}${details}`,
+            err.data,
+          ));
         } else {
           handler.resolve(msg.result);
         }
@@ -2492,13 +2528,17 @@ class CodexProcess implements RuntimeProcess {
   // Codex-specific state
   rpc: JsonRpcClient;
   threadId = '';
+  /** Most recent root/control turn id retained for turn-local correlation. */
   currentTurnId = '';
+  /** Root turn currently eligible for same-turn input; cleared at native terminal. */
+  activeSteerTurnId = '';
   compactControl: CodexCompactControl | null = null;
   version = '';
   activeRootTurnAdmission: {
     clientUserMessageId: string;
     responseTurnId?: string;
     notificationTurnId?: string;
+    nativeTerminalObserved?: boolean;
     deferredTerminalEvents?: UnifiedEvent[];
   } | null = null;
   rootEventHandler: UnifiedEventCallback | null = null;
@@ -4344,20 +4384,38 @@ export class CodexRuntime implements AgentRuntime {
   ): Promise<void> {
     const codexProc = process as CodexProcess;
     if (codexProc.exited) throw new Error('Codex process has exited');
-    if (!codexProc.currentTurnId) {
-      throw new Error('Codex has no active turn to steer');
+    const activeTurnId = codexProc.activeSteerTurnId;
+    if (!activeTurnId) {
+      throw new RuntimeSteerUnavailableError('Codex has no active turn to steer');
     }
 
     const input = buildCodexInput(message, images);
-    const result = await codexProc.rpc.call('turn/steer', buildCodexTurnSteerParams({
-      threadId: codexProc.threadId,
-      input,
-      expectedTurnId: codexProc.currentTurnId,
-      clientUserMessageId: options?.clientUserMessageId,
-    }), 15_000) as { turnId?: string };
-    if (result.turnId && result.turnId !== codexProc.currentTurnId) {
-      codexProc.currentTurnId = result.turnId;
+    let result: { turnId?: string };
+    try {
+      result = await codexProc.rpc.call('turn/steer', buildCodexTurnSteerParams({
+        threadId: codexProc.threadId,
+        input,
+        expectedTurnId: activeTurnId,
+        clientUserMessageId: options?.clientUserMessageId,
+      }), 15_000) as { turnId?: string };
+    } catch (error) {
+      if (isCodexNoActiveTurnSteerRejection(error)) {
+        if (codexProc.activeSteerTurnId === activeTurnId) {
+          codexProc.activeSteerTurnId = '';
+        }
+        throw new RuntimeSteerUnavailableError(error.message);
+      }
+      throw error;
     }
+    if (result.turnId && result.turnId !== activeTurnId) {
+      codexProc.currentTurnId = result.turnId;
+      codexProc.activeSteerTurnId = result.turnId;
+    }
+  }
+
+  canSteerMessage(process: RuntimeProcess): boolean {
+    const codexProc = process as CodexProcess;
+    return !codexProc.exited && Boolean(codexProc.activeSteerTurnId);
   }
 
   /**
@@ -4410,10 +4468,10 @@ export class CodexRuntime implements AgentRuntime {
       await this.interruptActiveSubAgentTurns(codexProc);
       return;
     }
-    if (!codexProc.currentTurnId) return;
+    if (!codexProc.activeSteerTurnId) return;
     await codexProc.rpc.call('turn/interrupt', {
       threadId: codexProc.threadId,
-      turnId: codexProc.currentTurnId,
+      turnId: codexProc.activeSteerTurnId,
     }, 3_000).catch(() => { /* turn may already be ending; the turn/completed event drives idle */ });
   }
 
@@ -4465,6 +4523,9 @@ export class CodexRuntime implements AgentRuntime {
     }
     admission.responseTurnId = runtimeTurnId;
     codexProc.currentTurnId = runtimeTurnId;
+    if (!admission.nativeTerminalObserved) {
+      codexProc.activeSteerTurnId = runtimeTurnId;
+    }
     const admissionEvent = {
       runtimeTurnId,
       clientUserMessageId: admission.clientUserMessageId,
@@ -4894,6 +4955,7 @@ export class CodexRuntime implements AgentRuntime {
             };
           }
           codexProc.currentTurnId = turnId;
+          codexProc.activeSteerTurnId = turnId;
         }
         return [
           { kind: 'turn_started' },
@@ -4919,6 +4981,12 @@ export class CodexRuntime implements AgentRuntime {
             status: 'failed',
             error: 'Codex root turn id changed unexpectedly',
           };
+        }
+        if (codexProc.activeRootTurnAdmission) {
+          codexProc.activeRootTurnAdmission.nativeTerminalObserved = true;
+        }
+        if (completedTurnId && codexProc.activeSteerTurnId === completedTurnId) {
+          codexProc.activeSteerTurnId = '';
         }
         const exactUsage = takeCodexExactTurnUsage(codexProc.exactUsageByTurn, completedTurnId);
         const events: UnifiedEvent[] = [

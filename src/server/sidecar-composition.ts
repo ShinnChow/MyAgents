@@ -116,6 +116,7 @@ const GLOBAL_EXACT_PATHS = new Set([
   '/api/process/graceful-shutdown',
   '/api/proxy/set',
   '/api/session/messages',
+  '/api/session-tags',
   '/api/subscription/status',
   '/api/subscription/verify',
   '/api/subscription/login/start',
@@ -127,7 +128,7 @@ const GLOBAL_EXACT_PATHS = new Set([
   '/mcp/playwright',
 ]);
 
-const GLOBAL_PREFIXES = ['/api/mcp/oauth/'] as const;
+const GLOBAL_PREFIXES = ['/api/mcp/oauth/', '/api/session-tags/'] as const;
 
 const COMMON_EXACT_PATHS = new Set([
   '/api/runtime/models',

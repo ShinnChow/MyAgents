@@ -39,6 +39,7 @@ fn redact_session_metadata(mut session: Value) -> Option<Value> {
             stats.insert("turnCount".to_string(), turn_count);
         }
     }
+    crate::session_tags::project_sanitized_session_user_tags(obj);
     Some(session)
 }
 
@@ -375,6 +376,17 @@ mod tests {
         }));
 
         assert!(value.is_none());
+    }
+
+    #[test]
+    fn projects_only_valid_user_tags() {
+        let value = redact_session_metadata(json!({
+            "id": "session-1",
+            "userTags": [" Alpha ", "alpha", 42, "Beta"]
+        }))
+        .unwrap();
+
+        assert_eq!(value.get("userTags"), Some(&json!(["Alpha", "Beta"])));
     }
 
     #[test]

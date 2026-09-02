@@ -324,9 +324,9 @@ cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 
 ## Resources 缓存问题
 
-### 问题：macOS Intel 构建提示缺少 ONNX Runtime 源码构建工具
+### 问题：macOS 构建提示缺少 ONNX Runtime 源码构建工具
 
-ONNX Runtime 1.28 没有提供 macOS x64 预编译包，因此 `x86_64-apple-darwin` 的冷构建需要 Git、Python 3.8+、CMake 3.28+ 与 Apple Clang。`build_macos.sh` 会在 TypeScript/App 构建和 ONNX Runtime 源码下载前检查；直接运行 prepare 命令也会在 cache miss 后、文档资源网络动作前执行同一检查。固定 Rust toolchain 仍会先由现有 owner 准备，因为它既是 App 构建依赖，也是 prepared fingerprint 的输入。
+ONNX Runtime 1.28 的官方 macOS arm64 archive 最低要求 macOS 14，且没有 macOS x64 binary；为了维持 App 的 macOS 13 deployment target，`aarch64-apple-darwin` 与 `x86_64-apple-darwin` 冷构建都需要 Git、Python 3.10+、CMake 3.28+ 与 Apple Clang。锁定 ORT recipe 的 Python driver 和 CMake 配置都要求 3.10，不能使用 macOS 自带的 Python 3.9。setup、dev build 和 release build 都会在下载依赖、清理产物或开始 App 构建前执行同一 cache-aware 检查。固定 Rust toolchain 仍会先由现有 owner 准备，因为它既是 App 构建依赖，也是 prepared fingerprint 的输入。
 
 常见修复：
 
@@ -335,9 +335,12 @@ xcode-select --install
 brew install cmake python
 cmake --version
 python3 --version
+command -v python3
 ```
 
 构建脚本不会自动安装系统包。已经完整验证的 prepared cache 可以继续离线复用，不要求本机保留源码构建工具；失败前已经下载的 source cache 也会保留，安装缺失工具后直接重跑即可。
+
+Windows 与 Linux 的 speech native 冷构建同样需要 CMake 3.28+、Cargo 和平台 C/C++ 工具链。Windows 应从已安装 “Desktop development with C++” 的 Developer PowerShell 运行，Linux 应安装满足版本要求的 `cmake` 与 `build-essential`；入口脚本会在耗时下载或构建前提示缺项。
 
 ### 问题：每次构建都重新下载或签名本地推理资源
 

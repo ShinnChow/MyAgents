@@ -95,6 +95,117 @@ describe('external operation queue owner', () => {
     await Promise.all([firstRun, secondRun]);
   });
 
+  it('queues an existing message operation without replacing its identity', async () => {
+    const queue = await loadFreshQueueOwner();
+    const operation = queue.createExternalMessageOperation({
+      text: 'defer the same intent',
+      context: context(),
+      runtimeConfig: snapshot(),
+      userMessage: userMessage('defer the same intent'),
+      surfaceMode: 'queue-started',
+      queueId: 'queue-same-operation',
+    });
+
+    const queued = queue.enqueueExistingExternalMessageOperation(operation);
+    expect(queued).toMatchObject({ queued: true, queueId: 'queue-same-operation' });
+    expect(queue.reserveExternalOperationForDrain()).toBe(operation);
+  });
+
+  it('rejects an existing operation after its queue generation was reset', async () => {
+    const queue = await loadFreshQueueOwner();
+    const generation = queue.getExternalOperationGeneration();
+    const operation = queue.createExternalMessageOperation({
+      text: 'stale fallback',
+      context: context(),
+      runtimeConfig: snapshot(),
+      userMessage: userMessage('stale fallback'),
+    });
+
+    queue.clearExternalQueueWithCancellation();
+
+    expect(() => queue.enqueueExistingExternalMessageOperation(operation, generation))
+      .toThrow(queue.ExternalQueueGenerationStaleError);
+    expect(queue.getExternalQueueStatusSnapshot()).toEqual([]);
+  });
+
+  it('inserts an earlier admitted fallback ahead of later queued operations', async () => {
+    const queue = await loadFreshQueueOwner();
+    const earlier = queue.createExternalMessageOperation({
+      text: 'earlier realtime admission',
+      context: context(),
+      runtimeConfig: snapshot(),
+      userMessage: userMessage('earlier realtime admission'),
+    });
+    const later = enqueueMessage(queue, {
+      text: 'later queued admission',
+      context: context(),
+      runtimeConfig: snapshot(),
+    });
+    queue.enqueueExternalConfigOperation({ model: 'model-b' }, 'desktop');
+
+    expect(queue.enqueueExistingExternalMessageOperation(earlier)).toMatchObject({ queued: true });
+    expect(queue.reserveExternalOperationForDrain()).toBe(earlier);
+    if (!later.queued) throw new Error(later.error);
+    expect(queue.reserveExternalOperationForDrain()).toMatchObject({ queueId: later.queueId });
+  });
+
+  it('retains an already admitted fallback when later queued messages fill the cap', async () => {
+    const queue = await loadFreshQueueOwner();
+    const earlier = queue.createExternalMessageOperation({
+      text: 'already admitted realtime message',
+      context: context(),
+      runtimeConfig: snapshot(),
+      userMessage: userMessage('already admitted realtime message'),
+    });
+    for (let index = 0; index < 50; index += 1) {
+      expect(enqueueMessage(queue, {
+        text: `later-${index}`,
+        context: context(),
+        runtimeConfig: snapshot(),
+      })).toMatchObject({ queued: true });
+    }
+
+    expect(queue.enqueueExistingExternalMessageOperation(earlier)).toMatchObject({ queued: true });
+    expect(queue.reserveExternalOperationForDrain()).toBe(earlier);
+  });
+
+  it('keeps an explicitly forced queued message ahead of an earlier fallback', async () => {
+    const queue = await loadFreshQueueOwner();
+    const earlier = queue.createExternalMessageOperation({
+      text: 'earlier realtime admission',
+      context: context(),
+      runtimeConfig: snapshot(),
+      userMessage: userMessage('earlier realtime admission'),
+    });
+    const forced = enqueueMessage(queue, {
+      text: 'later explicitly forced admission',
+      context: context(),
+      runtimeConfig: snapshot(),
+    });
+    if (!forced.queued) throw new Error(forced.error);
+    expect(queue.moveExternalQueuedMessageToFront(forced.queueId)).toBe(true);
+
+    queue.enqueueExistingExternalMessageOperation(earlier);
+    expect(queue.reserveExternalOperationForDrain()).toMatchObject({ queueId: forced.queueId });
+    expect(queue.reserveExternalOperationForDrain()).toBe(earlier);
+  });
+
+  it('does not drain queued work while an earlier direct admission is unresolved', async () => {
+    const queue = await loadFreshQueueOwner();
+    const directGate = deferred();
+    const direct = queue.chainExternalSend(() => directGate.promise);
+    enqueueMessage(queue, {
+      text: 'later queued admission',
+      context: context(),
+      runtimeConfig: snapshot(),
+    });
+
+    expect(queue.canDrainExternalOperations('idle')).toBe(false);
+    directGate.resolve();
+    await direct;
+    await vi.waitFor(() => expect(queue.canDrainExternalOperations('idle')).toBe(true));
+  });
+
   it('claims an idle direct-send slot synchronously and releases it after the tail settles', async () => {
     const queue = await loadFreshQueueOwner();
     const releaseFirst = deferred();

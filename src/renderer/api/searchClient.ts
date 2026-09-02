@@ -87,11 +87,12 @@ export interface FileMatchLine {
 export async function searchSessions(
     query: string,
     limit = 50,
+    tag?: string | null,
 ): Promise<SessionSearchResult> {
     if (!query.trim()) {
         return { hits: [], totalCount: 0, queryTimeMs: 0 };
     }
-    return invoke<SessionSearchResult>('cmd_search_sessions', { query, limit });
+    return invoke<SessionSearchResult>('cmd_search_sessions', { query, limit, tag: tag ?? null });
 }
 
 /** Search canonical Records from the Rust-owned derived index. */

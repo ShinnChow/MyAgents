@@ -48,6 +48,7 @@ myagents-releases/
 |------|------|---------|
 | **Rust** | 编译 Tauri 后端 | https://rustup.rs（必须使用 rustup；仓库 `rust-toolchain.toml` 固定实际 toolchain） |
 | **Node.js / npm** | 前端构建、Node bundle 打包、依赖安装 | https://nodejs.org |
+| **CMake 3.28+** | 构建离线 speech native 依赖 | https://cmake.org/download/ |
 | **Visual Studio Build Tools** | MSVC 编译器 | 见下方说明 |
 | **rclone** | 发布到 R2 (仅发布时需要) | https://rclone.org |
 
@@ -69,8 +70,8 @@ myagents-releases/
 ```
 
 此脚本会：
-1. 检查所有依赖是否已安装
-2. 按 `rust-toolchain.toml` 准备 Rust toolchain、`rustfmt` / `clippy`、`x86_64-pc-windows-msvc` target
+1. 检查基础依赖，并按 `rust-toolchain.toml` 准备 Rust toolchain、`rustfmt` / `clippy`、`x86_64-pc-windows-msvc` target
+2. 根据 exact prepared cache 提前检查 CMake 3.28+/MSVC 等原生推理构建工具；缺失时在下载或安装项目依赖前给出修复命令，不自动安装原生构建工具
 3. 下载 bundled Node.js v24 运行时、cuse、Git 安装包和 VC++ Runtime DLL
 4. 安装前端/后端依赖 (`npm install`)
 5. 下载 Rust crates（`cargo fetch`）
@@ -134,7 +135,7 @@ src-tauri/target/x86_64-pc-windows-msvc/debug/myagents.exe
 **构建流程**（7 步）：
 
 1. **加载环境配置** - 从 `.env` 读取签名密钥
-2. **检查依赖** - 验证 Rust/rustup、npm，并按 `rust-toolchain.toml` 补齐 Rust components 与 Windows target
+2. **检查依赖与原生推理 preflight** - 验证 Rust/rustup、npm，补齐固定 Rust components/Windows target，初始化 MSVC 环境，并在下载、清理或构建前检查 CMake 3.28+/MSVC
 3. **配置生产 CSP** - 更新安全策略
 4. **TypeScript 类型检查** - 确保代码无类型错误
 5. **构建前端和服务端** - 打包服务端代码、复制 SDK 依赖、构建前端

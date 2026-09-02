@@ -43,11 +43,12 @@ import {
 } from '@/components/tabPointerSensor';
 import { Popover } from '@/components/ui/Popover';
 import { useCloseLayer } from '@/hooks/useCloseLayer';
-import { type Tab, MAX_TABS, getFolderName } from '@/types/tab';
-import { getFixedTabChromeTitle } from '@/utils/tabChromeTitle';
+import { type Tab, MAX_TABS } from '@/types/tab';
+import { builtinTabModules } from '@/tab-workspace/builtinComposition';
+import { resolveTabChrome } from '@/tab-workspace/registry';
 
 interface TabBarProps {
-  tabs: Tab[];
+  tabs: readonly Tab[];
   activeTabId: string | null;
   onSelectTab: (tabId: string) => void;
   onCloseTab: (tabId: string) => void;
@@ -64,6 +65,13 @@ export default memo(function TabBar({
   onReorderTabs,
 }: TabBarProps) {
   const { t } = useTranslation('app');
+  const chromeFor = useCallback(
+    (tab: Tab) =>
+      resolveTabChrome(builtinTabModules, tab, {
+        t: (key, options) => t(key, options),
+      }),
+    [t],
+  );
   const canAddTab = tabs.length < MAX_TABS;
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const overflowButtonRef = useRef<HTMLButtonElement>(null);
@@ -268,6 +276,7 @@ export default memo(function TabBar({
                   <SortableTabItem
                     key={tab.id}
                     tab={tab}
+                    chrome={chromeFor(tab)}
                     isActive={tab.id === activeTabId}
                     onSelectTab={onSelectTab}
                     onCloseTab={onCloseTab}
@@ -307,37 +316,13 @@ export default memo(function TabBar({
                 {t('tabs.genericTab')}
               </div>
               {tabs.map((tab) => {
-                const fixedViewTitle = getFixedTabChromeTitle(tab.view, t);
-                const hasSessionTitle =
-                  tab.title &&
-                  tab.title !== 'New Tab' &&
-                  tab.title !== 'New Chat';
-                const displayTitle =
-                  fixedViewTitle ??
-                  (hasSessionTitle
-                    ? tab.title
-                    : tab.agentDir
-                      ? getFolderName(tab.agentDir)
-                      : tab.title);
-                const subtitle = tab.agentDir
-                  ? getFolderName(tab.agentDir)
-                  : tab.view === 'settings'
-                    ? t('tabs.settings')
-                    : tab.view === 'capabilities'
-                      ? t('tabs.capabilities')
-                      : tab.view === 'taskcenter'
-                        ? t('tabs.taskCenter')
-                        : tab.view === 'space'
-                          ? t('tabs.team')
-                          : tab.view === 'record'
-                            ? t('tabs.record')
-                            : t('tabs.launcher');
+                const chrome = chromeFor(tab);
                 const isActive = tab.id === activeTabId;
                 return (
                   <button
                     key={tab.id}
                     type="button"
-                    aria-label={t('tabs.switchTo', { title: displayTitle })}
+                    aria-label={t('tabs.switchTo', { title: chrome.title })}
                     aria-current={isActive ? 'page' : undefined}
                     className={`flex w-full items-center gap-2 px-3 py-2 text-left transition-colors ${
                       isActive
@@ -348,9 +333,9 @@ export default memo(function TabBar({
                   >
                     <span
                       className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${
-                        tab.isGenerating
+                        chrome.isGenerating
                           ? 'bg-[var(--success)]'
-                          : tab.hasUnread
+                          : chrome.hasUnread
                             ? 'bg-[var(--accent-warm)]'
                             : isActive
                               ? 'bg-[var(--accent-warm)]'
@@ -359,10 +344,10 @@ export default memo(function TabBar({
                     />
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium">
-                        {displayTitle}
+                        {chrome.title}
                       </span>
                       <span className="block truncate text-xs text-[var(--ink-muted)]/70">
-                        {subtitle}
+                        {chrome.subtitle}
                       </span>
                     </span>
                   </button>

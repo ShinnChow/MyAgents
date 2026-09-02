@@ -100,4 +100,31 @@ describe('session activity storage invariant', () => {
       favorite: true,
     });
   });
+
+  it('allocates later pin intents above earlier pins without changing recency', async () => {
+    const first = await store.createSession('/tmp/activity-workspace', {
+      title: 'First pin',
+      lastActiveAt: '2026-07-14T12:00:00.000Z',
+    });
+    const second = await store.createSession('/tmp/activity-workspace', {
+      title: 'Second pin',
+      lastActiveAt: '2026-07-14T11:00:00.000Z',
+    });
+    const now = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-09-02T08:00:00.000Z'));
+
+    try {
+      const firstPinned = await store.updateSessionMetadata(first.id, { pinned: true });
+      const secondPinned = await store.updateSessionMetadata(second.id, { pinned: true });
+
+      expect(Date.parse(secondPinned?.pinnedAt ?? '')).toBeGreaterThan(Date.parse(firstPinned?.pinnedAt ?? ''));
+      expect(firstPinned?.lastActiveAt).toBe('2026-07-14T12:00:00.000Z');
+      expect(secondPinned?.lastActiveAt).toBe('2026-07-14T11:00:00.000Z');
+
+      const unpinned = await store.updateSessionMetadata(second.id, { pinned: false });
+      expect(unpinned?.pinnedAt).toBeUndefined();
+      expect(store.getSessionMetadata(second.id)?.pinnedAt).toBeUndefined();
+    } finally {
+      now.mockRestore();
+    }
+  });
 });

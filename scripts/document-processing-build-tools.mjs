@@ -1,5 +1,8 @@
 const MINIMUM_CMAKE_VERSION = [3, 28, 0];
-const MINIMUM_PYTHON_VERSION = [3, 8, 0];
+// The locked ORT shared-library recipe imports match/case syntax and asks
+// CMake for Python 3.10 before configuration. Its build.py still claims 3.8,
+// but that stale check runs only after the 3.10-only module is imported.
+const MINIMUM_PYTHON_VERSION = [3, 10, 0];
 
 export const MINIMUM_MAC_SOURCE_CMAKE_VERSION = MINIMUM_CMAKE_VERSION.join('.');
 export const MINIMUM_MAC_SOURCE_PYTHON_VERSION =
@@ -43,21 +46,21 @@ export function macSourceBuildPrerequisiteFailures(tools) {
       name: `Python >= ${MINIMUM_MAC_SOURCE_PYTHON_VERSION}`,
       reason: 'python3 was not found',
       install: 'brew install python',
-      verify: 'python3 --version',
+      verify: 'python3 --version && command -v python3',
     });
   } else if (!pythonVersion) {
     failures.push({
       name: `Python >= ${MINIMUM_MAC_SOURCE_PYTHON_VERSION}`,
       reason: `could not parse: ${tools.pythonVersion.split('\n')[0]}`,
-      install: 'brew upgrade python',
-      verify: 'python3 --version',
+      install: 'brew install python  # if installed: brew upgrade python',
+      verify: 'python3 --version && command -v python3',
     });
   } else if (!versionAtLeast(pythonVersion, MINIMUM_PYTHON_VERSION)) {
     failures.push({
       name: `Python >= ${MINIMUM_MAC_SOURCE_PYTHON_VERSION}`,
       reason: `found ${pythonVersion.join('.')}`,
-      install: 'brew upgrade python',
-      verify: 'python3 --version',
+      install: 'brew install python  # if installed: brew upgrade python',
+      verify: 'python3 --version && command -v python3',
     });
   }
 

@@ -1,17 +1,6 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useState,
-  useRef,
-  memo,
-  lazy,
-  Suspense,
-} from 'react';
+import { useCallback, useEffect, useMemo, useState, useRef } from 'react';
 import { flushSync } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import ChatBootOverlay from '@/components/ChatBootOverlay';
-import { arrayMove } from '@dnd-kit/sortable';
 import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 
 import {
@@ -61,13 +50,10 @@ import ConfirmDialog from '@/components/ConfirmDialog';
 import BugReportOverlay from '@/components/BugReportOverlay';
 import { DispatchTaskDialog } from '@/components/task-center/DispatchTaskDialog';
 import CustomTitleBar from '@/components/CustomTitleBar';
-import GlobalSidebar, {
-  type CapabilitySection,
-} from '@/components/global-sidebar/GlobalSidebar';
+import GlobalSidebar from '@/components/global-sidebar/GlobalSidebar';
 import LinkContextMenuProvider from '@/components/LinkContextMenuProvider';
 import TabBar from '@/components/TabBar';
 import { SessionDeletionContext } from '@/context/SessionDeletionContext';
-import TabProvider from '@/context/TabProvider';
 import type { AdoptMigratedSessionOptions } from '@/context/TabContext';
 import { useToast } from '@/components/Toast';
 import type { HelperRequestDetail } from '@/utils/dispatchHelperRequest';
@@ -78,32 +64,12 @@ import { useConfig } from '@/hooks/useConfig';
 import { useSpaceBuildCapability } from '@/hooks/useSpaceBuildCapability';
 import { useTabSwipeGesture } from '@/hooks/useTabSwipeGesture';
 import { actions as taskCenterActions } from '@/hooks/taskCenterStore';
-import Launcher from '@/pages/Launcher'; // eager: default first view → no cold-start fallback
-// Route-split (P1): heavy / non-initial pages load on demand. lazy-Chat moves the
-// entire markdown/mermaid/katex/syntax-highlighter chain out of the entry chunk
-// (reachable only via Chat). Launcher stays eager (default first view → no
-// cold-start fallback).
-//
-// NOTE: we deliberately do NOT idle-preload these. A blind idle preload made
-// WKWebView warn "<chunk> was preloaded but not used within a few seconds" for
-// the whole route graph on every startup, AND eagerly pulled Monaco/Markdown
-// (several MB) at boot even when the user never opened those pages. In Tauri the
-// chunks are LOCAL assets, so first-open is fast and just shows the same paper
-// Suspense fallback the deferred-mount placeholder already uses. (If first Chat
-// open ever feels slow, add a targeted preload on launch intent — not a blind
-// idle preload of every route.)
-const Chat = lazy(() => import('@/pages/Chat'));
-const Settings = lazy(() => import('@/pages/Settings'));
-const TaskCenter = lazy(() => import('@/pages/TaskCenter'));
-const Space = lazy(() => import('@/pages/Space'));
-const RecordDetail = lazy(() => import('@/pages/RecordDetail'));
-
-/** Layout-compatible Suspense fallback for a lazy page chunk — same paper fill
- *  as the deferred-mount placeholder, so a chunk-load is never a jarring blank. */
-const PAGE_FALLBACK = <div className="h-full w-full bg-[var(--paper)]" />;
 import { isProjectVisibleToUser, type Project } from '@/config/types';
 import {
   type Tab,
+  type ChatTab,
+  type RecordTab,
+  type CapabilitySection,
   type InitialMessage,
   type LaunchSessionBirthHint,
   type SidecarConfigDisposition,
@@ -111,8 +77,27 @@ import {
   createNewTab,
   getFolderName,
   buildChatFlipPatch,
+  generateTabId,
   MAX_TABS,
 } from '@/types/tab';
+import { BuiltinTabSlot } from '@/tab-workspace/BuiltinTabSlot';
+import {
+  builtinTabModules,
+  builtinTabWorkspacePolicy,
+  composeBuiltinTabBindings,
+  composeBuiltinTabLifecycle,
+  type BuiltinTabBindings,
+} from '@/tab-workspace/builtinComposition';
+import { useTabWorkspaceController } from '@/tab-workspace/useTabWorkspaceController';
+import {
+  isRecordingSnapshotOlder,
+  recordingSnapshotFromTab,
+  recordingTabProjection,
+  sameRecordingTabProjection,
+} from '@/features/record/tabProjection';
+import { createChatTabLifecycle } from '@/features/chat/tabLifecycle';
+import { useRecordTabLifecycle } from '@/features/record/useRecordTabLifecycle';
+import { useTabCloseController } from '@/tab-workspace/useTabCloseController';
 import {
   buildRestoredTabs,
   saveOpenTabs,
@@ -127,8 +112,6 @@ import {
   clearOpenTabsDurable,
 } from '@/utils/tabPersistenceDurable';
 import { consumeCleanExitMarker } from '@/utils/lastExitMarker';
-import { tabContentKind } from '@/utils/tabContentKind';
-import { runAfterNextPaint } from '@/utils/afterPaint';
 import { perfMark } from '@/utils/perfMark';
 import { RENDERER_PERF_PHASE } from '../shared/perfTrace';
 import {
@@ -172,10 +155,7 @@ import {
   type NotificationBadgeItem,
   type NotificationBadgeTarget,
 } from '@/utils/notificationBadgeRegistry';
-import {
-  applyTerminalSessionToTabs,
-  resetTabToLauncher,
-} from '@/utils/sessionTermination';
+import { resetTabToLauncher } from '@/utils/sessionTermination';
 import {
   createSessionResourceTransitionState,
   deleteSessionThroughAppOwner,
@@ -242,7 +222,6 @@ import { resolveGlobalSidebarWorkspace } from '@/utils/globalSidebarProjection';
 import {
   createInitialMainWindowPresentation,
   reduceMainWindowPresentation,
-  type MainWindowPresentation,
 } from '@/utils/mainWindowPresentation';
 import {
   nowForSpaceMetric,
@@ -369,534 +348,6 @@ export interface LaunchProjectAnalyticsContext {
   assistantEntry?: AssistantEntry;
 }
 
-function recordingTabProjection(
-  snapshot: RecordingSnapshot,
-): Pick<
-  Tab,
-  | 'recordingStatus'
-  | 'recordingMediaDurationMs'
-  | 'recordingStartedAtWallTime'
-  | 'recordingPausedWallMs'
-  | 'recordingRevision'
-  | 'recordingGeneration'
-  | 'recordingSources'
-  | 'recordingSourceActivity'
-  | 'recordingWarnings'
-> {
-  return {
-    recordingStatus: snapshot.captureStatus,
-    recordingMediaDurationMs: snapshot.mediaDurationMs,
-    recordingStartedAtWallTime: snapshot.startedAtWallTime,
-    recordingPausedWallMs: snapshot.pausedWallMs,
-    recordingRevision: snapshot.revision,
-    recordingGeneration: snapshot.generation,
-    recordingSources: snapshot.sources,
-    recordingSourceActivity: snapshot.sourceActivity,
-    recordingWarnings: snapshot.warnings,
-  };
-}
-
-function sameRecordingTabProjection(
-  tab: Tab,
-  snapshot: RecordingSnapshot,
-): boolean {
-  const sameSources =
-    (tab.recordingSources?.length ?? 0) === snapshot.sources.length &&
-    (tab.recordingSources ?? []).every((source, index) => {
-      const next = snapshot.sources[index];
-      return (
-        source.track === next?.track &&
-        source.label === next.label &&
-        source.format.channels === next.format.channels &&
-        source.format.sampleRate === next.format.sampleRate
-      );
-    });
-  const sameSourceStates =
-    (tab.recordingSourceActivity?.length ?? 0) ===
-      snapshot.sourceActivity.length &&
-    (tab.recordingSourceActivity ?? []).every((source, index) => {
-      const next = snapshot.sourceActivity[index];
-      return source.track === next?.track && source.enabled === next.enabled;
-    });
-  const sameWarnings =
-    (tab.recordingWarnings?.length ?? 0) === snapshot.warnings.length &&
-    (tab.recordingWarnings ?? []).every(
-      (warning, index) => warning.code === snapshot.warnings[index]?.code,
-    );
-  return (
-    tab.recordingStatus === snapshot.captureStatus &&
-    tab.recordingStartedAtWallTime === snapshot.startedAtWallTime &&
-    tab.recordingPausedWallMs === snapshot.pausedWallMs &&
-    tab.recordingRevision === snapshot.revision &&
-    tab.recordingGeneration === snapshot.generation &&
-    sameSources &&
-    sameSourceStates &&
-    sameWarnings &&
-    tab.recordingMediaDurationMs === snapshot.mediaDurationMs
-  );
-}
-
-function recordingSnapshotFromTab(tab: Tab): RecordingSnapshot | null {
-  if (!tab.recordId || !tab.recordingStatus) return null;
-  return {
-    recordId: tab.recordId,
-    revision: tab.recordingRevision ?? 0,
-    generation: tab.recordingGeneration ?? 0,
-    captureStatus: tab.recordingStatus,
-    startedAtWallTime: tab.recordingStartedAtWallTime ?? 0,
-    mediaDurationMs: tab.recordingMediaDurationMs ?? 0,
-    pausedWallMs: tab.recordingPausedWallMs ?? 0,
-    sources: tab.recordingSources ?? [],
-    sourceActivity: tab.recordingSourceActivity ?? [],
-    warnings: tab.recordingWarnings ?? [],
-  };
-}
-
-function isRecordingSnapshotOlder(
-  current: RecordingSnapshot,
-  next: RecordingSnapshot,
-): boolean {
-  return (
-    next.generation < current.generation ||
-    (next.generation === current.generation &&
-      next.revision < current.revision) ||
-    (next.generation === current.generation &&
-      next.revision === current.revision &&
-      next.mediaDurationMs < current.mediaDurationMs)
-  );
-}
-
-// ============================================================
-// MemoizedTabContent — prevents re-rendering tabs whose props haven't changed.
-// When switching tabs, only the newly active and previously active tabs re-render.
-// ============================================================
-
-interface TabContentProps {
-  tab: Tab;
-  isActive: boolean;
-  windowPresentation: MainWindowPresentation;
-  isLoading: boolean;
-  error: string | null;
-  /**
-   * When true, postpone the heavy view subtree. Non-Chat tabs render a cheap
-   * placeholder; Chat tabs still mount their real TabProvider so Session/SSE/
-   * owner lifecycle is live, but render only ChatBootOverlay until reveal.
-   * Set for a freshly created tab so its full subtree (e.g. the Launcher:
-   * BrandSection + SimpleChatInput + selectors) does NOT mount inside the
-   * synchronous click commit —
-   * that mount is what janked the "+" / Cmd+T action. Active-tab projection clears
-   * the flag right after the placeholder paints (runAfterNextPaint), so React
-   * mounts the real content in a prompt normal-priority commit off the click
-   * frame. (NOT a low-priority transition — that gets starved by background
-   * tabs' SSE/poll updates → 1-2s blank; see openNewTabDeferred.)
-   */
-  isDeferredMount: boolean;
-  onLauncherWorkspaceSelectionChange: (
-    tabId: string,
-    workspacePath: string | null,
-  ) => void;
-  settingsInitialSection: string | undefined;
-  capabilityInitialSection: CapabilitySection;
-  capabilityNavigationNonce: number;
-  capabilityInitialMcpId: string | undefined;
-  capabilityInitialOfficialToolId: OfficialToolId | undefined;
-  capabilityInitialSelect: CapabilityInitialSelect | undefined;
-  // Launcher callbacks
-  onLaunchProject: (
-    project: Project,
-    initialMessage?: InitialMessage,
-    analyticsContext?: LaunchProjectAnalyticsContext,
-    sessionBirthHint?: LaunchSessionBirthHint,
-  ) => Promise<boolean>;
-  onStartRecording: (
-    tabId: string,
-    selection: RecordingSourceSelection,
-  ) => Promise<void>;
-  onRecordingSnapshotChange: (
-    recordId: string,
-    snapshot: RecordingSnapshot | null,
-  ) => void;
-  registerPendingRecordNoteSubmitter?: (
-    recordId: string,
-    submit: () => Promise<boolean>,
-  ) => () => void;
-  onRecordTitleChange: (recordId: string, title: string) => void;
-  onRecordDeleted: (tabId: string) => void;
-  activeRecordingSnapshot?: RecordingSnapshot | null;
-  onOpenRecord: (
-    recordId: string,
-    mediaMs?: number,
-    surface?: Surface,
-    activeRecording?: boolean,
-  ) => void;
-  // Chat callbacks
-  onOpenHistorySession: (
-    tabId: string,
-    sessionId: string,
-    title: string,
-    historyEntrySource?: HistoryEntrySource,
-  ) => Promise<void>;
-  onNewSession: (tabId: string) => Promise<boolean>;
-  onLaunchRuntimeBackedProviderSession: (
-    project: Project,
-    sessionBirthHint: LaunchSessionBirthHint & {
-      providerExecutionIdentity: RuntimeBackedProviderIdentity;
-    },
-    title: string,
-  ) => Promise<string | null>;
-  onUpdateGenerating: (tabId: string, isGenerating: boolean) => void;
-  onUpdateTitle: (tabId: string, title: string) => void;
-  onUpdateUnread: (tabId: string, hasUnread: boolean) => void;
-  onRenameSession: (tabId: string, newTitle: string) => void;
-  onForkSession: (
-    tabId: string,
-    newSessionId: string,
-    agentDir: string,
-    title: string,
-    initialMessage?: string,
-  ) => Promise<boolean>;
-  onUpdateSessionId: (
-    tabId: string,
-    newSessionId: string,
-    options?: AdoptMigratedSessionOptions,
-  ) => Promise<boolean>;
-  claimSessionOpeningTransition: (
-    sessionId: string,
-    ownerId: string,
-  ) => (() => void) | null;
-  onClearInitialMessage: (tabId: string) => void;
-  onSidecarConfigAdopted: (tabId: string) => void;
-  onFilePreviewIntentConsumed?: (tabId: string, intentId: string) => void;
-  onSettingsSectionChange: () => void;
-  updateReady: boolean;
-  updateVersion: string | null;
-  updateChecking: boolean;
-  updateDownloading: boolean;
-  updateInstalling: boolean;
-  updatePreparing: boolean;
-  onCheckForUpdate: () => Promise<'up-to-date' | 'downloading' | 'error'>;
-  onRestartAndUpdate: () => void;
-  sessionNotificationBadgeCounts?: ReadonlyMap<string, number>;
-  // Task Center intent carried by the most recent OPEN_TASK_CENTER event.
-  // Only read by the `taskcenter` tab; other tab views ignore it.
-  taskCenterPendingIntent: { autofocusSearch?: boolean; nonce: number } | null;
-  taskCenterCurrentSessionId?: string | null;
-  taskPendingRoute?: PendingAppRoute | null;
-  onTaskRouteConsumed?: (generation: number) => void;
-  spacePendingRoute?: PendingAppRoute | null;
-  onSpaceRouteConsumed?: (generation: number) => void;
-}
-
-// Exported for focused content-mount behavior tests.
-export const MemoizedTabContent = memo(
-  function TabContent({
-    tab,
-    isActive,
-    windowPresentation,
-    isLoading,
-    error,
-    isDeferredMount,
-    onLaunchProject,
-    onStartRecording,
-    onRecordingSnapshotChange,
-    registerPendingRecordNoteSubmitter,
-    onRecordTitleChange,
-    onRecordDeleted,
-    activeRecordingSnapshot = null,
-    onOpenRecord,
-    onOpenHistorySession,
-    onNewSession,
-    onLaunchRuntimeBackedProviderSession,
-    onUpdateGenerating,
-    onUpdateTitle,
-    onUpdateUnread,
-    onRenameSession,
-    onForkSession,
-    onUpdateSessionId,
-    onClearInitialMessage,
-    claimSessionOpeningTransition,
-    onSidecarConfigAdopted,
-    onFilePreviewIntentConsumed,
-    onLauncherWorkspaceSelectionChange,
-    settingsInitialSection,
-    capabilityInitialSection,
-    capabilityNavigationNonce,
-    capabilityInitialMcpId,
-    capabilityInitialOfficialToolId,
-    capabilityInitialSelect,
-    onSettingsSectionChange,
-    updateReady,
-    updateVersion,
-    updateChecking,
-    updateDownloading,
-    updateInstalling,
-    updatePreparing,
-    onCheckForUpdate,
-    onRestartAndUpdate,
-    sessionNotificationBadgeCounts,
-    taskCenterPendingIntent,
-    taskCenterCurrentSessionId,
-    taskPendingRoute,
-    onTaskRouteConsumed,
-    spacePendingRoute,
-    onSpaceRouteConsumed,
-  }: TabContentProps) {
-    const kind = tabContentKind(tab, isDeferredMount);
-    const handleLauncherWorkspaceChange = useCallback(
-      (workspacePath: string | null) =>
-        onLauncherWorkspaceSelectionChange(tab.id, workspacePath),
-      [onLauncherWorkspaceSelectionChange, tab.id],
-    );
-    const claimTabSessionOpeningTransition = useCallback(
-      (sessionId: string) => claimSessionOpeningTransition(sessionId, tab.id),
-      [claimSessionOpeningTransition, tab.id],
-    );
-    const recordId = tab.recordId;
-    const handleRecordSnapshotChange = useCallback(
-      (next: RecordingSnapshot | null) => {
-        if (recordId) onRecordingSnapshotChange(recordId, next);
-      },
-      [onRecordingSnapshotChange, recordId],
-    );
-    const handleRecordTitleChange = useCallback(
-      (title: string) => {
-        if (recordId) onRecordTitleChange(recordId, title);
-      },
-      [onRecordTitleChange, recordId],
-    );
-    const handleRecordDeleted = useCallback(
-      () => onRecordDeleted(tab.id),
-      [onRecordDeleted, tab.id],
-    );
-    return (
-      <div
-        className={`absolute inset-0 ${isActive ? '' : 'pointer-events-none invisible'}`}
-        style={isActive ? undefined : { contentVisibility: 'hidden' }}
-      >
-        {kind === 'deferred' ? (
-          // One-frame placeholder: paper-colored fill so the just-activated
-          // tab paints instantly with no flash, while the real subtree mounts
-          // on the next normal-priority commit (runAfterNextPaint; see
-          // openNewTabDeferred).
-          <div className="h-full w-full bg-[var(--paper)]" />
-        ) : kind === 'launcher' ? (
-          <Launcher
-            onLaunchProject={onLaunchProject}
-            isStarting={isLoading}
-            startError={error}
-            isActive={isActive}
-            attachmentSessionId={createPendingSessionId(tab.id)}
-            selectedWorkspacePath={tab.launcherWorkspacePath}
-            onWorkspaceSelectionChange={handleLauncherWorkspaceChange}
-            onStartRecording={(selection) =>
-              onStartRecording(tab.id, selection)
-            }
-            onOpenRecord={(recordId) =>
-              onOpenRecord(recordId, undefined, 'launcher_input')
-            }
-            recordingBusy={isLoading}
-          />
-        ) : kind === 'record' && tab.recordId ? (
-          <Suspense fallback={PAGE_FALLBACK}>
-            <RecordDetail
-              recordId={tab.recordId}
-              isActive={isActive}
-              seekMediaMs={tab.recordSeekMediaMs}
-              seekNonce={tab.recordSeekNonce}
-              initialRecordingSnapshot={
-                recordingSnapshotFromTab(tab) ?? undefined
-              }
-              onRecordingSnapshotChange={handleRecordSnapshotChange}
-              registerPendingNoteSubmitter={registerPendingRecordNoteSubmitter}
-              onTitleChange={handleRecordTitleChange}
-              onDeleted={handleRecordDeleted}
-            />
-          </Suspense>
-        ) : kind === 'settings' || kind === 'capabilities' ? (
-          <Suspense fallback={PAGE_FALLBACK}>
-            <Settings
-              mode={kind}
-              initialSection={
-                kind === 'capabilities'
-                  ? capabilityInitialSection
-                  : (settingsInitialSection ?? 'providers')
-              }
-              navigationNonce={
-                kind === 'capabilities' ? capabilityNavigationNonce : undefined
-              }
-              initialMcpId={
-                kind === 'capabilities' ? capabilityInitialMcpId : undefined
-              }
-              initialOfficialToolId={
-                kind === 'capabilities'
-                  ? capabilityInitialOfficialToolId
-                  : undefined
-              }
-              initialSelect={
-                kind === 'capabilities' ? capabilityInitialSelect : undefined
-              }
-              onSectionChange={onSettingsSectionChange}
-              isActive={isActive}
-              updateReady={updateReady}
-              updateVersion={updateVersion}
-              updateChecking={updateChecking}
-              updateDownloading={updateDownloading}
-              updateInstalling={updateInstalling}
-              updatePreparing={updatePreparing}
-              onCheckForUpdate={onCheckForUpdate}
-              onRestartAndUpdate={onRestartAndUpdate}
-            />
-          </Suspense>
-        ) : kind === 'taskcenter' ? (
-          <Suspense fallback={PAGE_FALLBACK}>
-            <TaskCenter
-              isActive={isActive}
-              pendingIntent={taskCenterPendingIntent}
-              currentSessionId={taskCenterCurrentSessionId}
-              pendingRoute={taskPendingRoute ?? null}
-              onRouteConsumed={onTaskRouteConsumed}
-              activeRecordingSnapshot={activeRecordingSnapshot}
-              onStartRecording={(selection) =>
-                onStartRecording(tab.id, selection)
-              }
-              onOpenRecord={(recordId, mediaMs, activeRecording) =>
-                onOpenRecord(recordId, mediaMs, 'task_center', activeRecording)
-              }
-            />
-          </Suspense>
-        ) : kind === 'space' ? (
-          <Suspense fallback={PAGE_FALLBACK}>
-            <Space
-              isActive={isActive}
-              pendingRoute={spacePendingRoute ?? null}
-              onRouteConsumed={onSpaceRouteConsumed}
-            />
-          </Suspense>
-        ) : (
-          <TabProvider
-            tabId={tab.id}
-            agentDir={tab.agentDir ?? ''}
-            sessionId={tab.sessionId}
-            sessionTitle={tab.title}
-            isActive={isActive}
-            onGeneratingChange={(isGenerating) =>
-              onUpdateGenerating(tab.id, isGenerating)
-            }
-            onTitleChange={(title) => onUpdateTitle(tab.id, title)}
-            onUnreadChange={(hasUnread) => onUpdateUnread(tab.id, hasUnread)}
-            onSessionIdChange={(newSessionId, options) =>
-              onUpdateSessionId(tab.id, newSessionId, options)
-            }
-            claimSessionOpeningTransition={claimTabSessionOpeningTransition}
-          >
-            {kind === 'deferred-chat' ? (
-              <ChatBootOverlay />
-            ) : (
-              <Suspense fallback={<ChatBootOverlay />}>
-                <Chat
-                  windowPresentation={windowPresentation}
-                  onOpenSession={(sessionId, title, historyEntrySource) =>
-                    onOpenHistorySession(
-                      tab.id,
-                      sessionId,
-                      title,
-                      historyEntrySource,
-                    )
-                  }
-                  onOpenSessionInNewTab={(sessionId, title) =>
-                    onOpenHistorySession(
-                      tab.id,
-                      sessionId,
-                      title,
-                      'chat_dropdown_new_tab',
-                    )
-                  }
-                  onNewSession={() => onNewSession(tab.id)}
-                  onLaunchRuntimeBackedProviderSession={
-                    onLaunchRuntimeBackedProviderSession
-                  }
-                  initialMessage={tab.initialMessage}
-                  onInitialMessageConsumed={() => onClearInitialMessage(tab.id)}
-                  sidecarConfigDisposition={tab.sidecarConfigDisposition}
-                  onSidecarConfigAdopted={() => onSidecarConfigAdopted(tab.id)}
-                  pendingFilePreview={tab.pendingFilePreview}
-                  onFilePreviewIntentConsumed={(intentId) =>
-                    onFilePreviewIntentConsumed?.(tab.id, intentId)
-                  }
-                  sessionTitle={tab.title}
-                  onRenameSession={(newTitle: string) =>
-                    onRenameSession(tab.id, newTitle)
-                  }
-                  onForkSession={(
-                    newSessionId: string,
-                    agentDir: string,
-                    title: string,
-                    initialMessage?: string,
-                  ) =>
-                    onForkSession(
-                      tab.id,
-                      newSessionId,
-                      agentDir,
-                      title,
-                      initialMessage,
-                    )
-                  }
-                  sessionNotificationBadgeCounts={
-                    sessionNotificationBadgeCounts
-                  }
-                />
-              </Suspense>
-            )}
-          </TabProvider>
-        )}
-      </div>
-    );
-  },
-  (prev, next) => {
-    // Return true = skip re-render
-    // All callbacks are stable (via tabsRef/activeTabIdRef), so we only compare data props
-    return (
-      prev.tab === next.tab &&
-      prev.isActive === next.isActive &&
-      // Native presentation only affects the active Chat's geometry boundary.
-      // Keep inactive heavy Tab subtrees out of minimize/restore renders.
-      (next.tab.view !== 'chat' ||
-        !next.isActive ||
-        prev.windowPresentation === next.windowPresentation) &&
-      prev.isLoading === next.isLoading &&
-      prev.error === next.error &&
-      // Drives the deferred-mount → real-content transition for new tabs.
-      prev.isDeferredMount === next.isDeferredMount &&
-      prev.settingsInitialSection === next.settingsInitialSection &&
-      prev.capabilityInitialSection === next.capabilityInitialSection &&
-      prev.capabilityNavigationNonce === next.capabilityNavigationNonce &&
-      prev.capabilityInitialMcpId === next.capabilityInitialMcpId &&
-      prev.capabilityInitialOfficialToolId ===
-        next.capabilityInitialOfficialToolId &&
-      prev.capabilityInitialSelect === next.capabilityInitialSelect &&
-      prev.updateReady === next.updateReady &&
-      prev.updateVersion === next.updateVersion &&
-      prev.updateChecking === next.updateChecking &&
-      prev.updateDownloading === next.updateDownloading &&
-      prev.updateInstalling === next.updateInstalling &&
-      prev.updatePreparing === next.updatePreparing &&
-      (next.tab.view !== 'taskcenter' ||
-        prev.activeRecordingSnapshot === next.activeRecordingSnapshot) &&
-      prev.sessionNotificationBadgeCounts ===
-        next.sessionNotificationBadgeCounts &&
-      // Reference equality — every App-owned Task Center intent/route
-      // allocates a fresh object (or `null`), so identity comparison is
-      // enough. These data props must stay in the comparator: when the
-      // singleton Task Center is already active, neither the tab nor
-      // `isActive` changes, and omitting one would silently drop navigation.
-      prev.taskCenterPendingIntent === next.taskCenterPendingIntent &&
-      prev.taskCenterCurrentSessionId === next.taskCenterCurrentSessionId &&
-      prev.taskPendingRoute === next.taskPendingRoute &&
-      prev.spacePendingRoute === next.spacePendingRoute
-    );
-  },
-);
-
 export default function App() {
   const { t } = useTranslation('app');
   // Auto-update state (silent background updates)
@@ -956,22 +407,6 @@ export default function App() {
   // Agent) — same path as opening ~/.myagents from the Launcher.
   const helperAgentDefaults = useHelperAgentModelDefaults();
 
-  // Settings initial section state (for deep linking to specific section)
-  const [settingsInitialSection, setSettingsInitialSection] = useState<
-    string | undefined
-  >(undefined);
-  const [capabilityInitialMcpId, setCapabilityInitialMcpId] = useState<
-    string | undefined
-  >(undefined);
-  const [capabilityInitialOfficialToolId, setCapabilityInitialOfficialToolId] =
-    useState<OfficialToolId | undefined>(undefined);
-  const [capabilityInitialSelect, setCapabilityInitialSelect] = useState<
-    CapabilityInitialSelect | undefined
-  >(undefined);
-  const [capabilityInitialSection, setCapabilityInitialSection] =
-    useState<CapabilitySection>('skills');
-  const [capabilityNavigationNonce, setCapabilityNavigationNonce] = useState(0);
-
   // Bug report overlay state (triggered from titlebar feedback button)
   const [showBugReport, setShowBugReport] = useState(false);
   const [appVersion, setAppVersion] = useState('');
@@ -999,17 +434,34 @@ export default function App() {
   // user accepts the pill; the click path validates them before committing the
   // final live Tab projection.
   const [restoreCandidate] = useState(() => buildRestoredTabs());
-  const [tabs, setTabs] = useState<Tab[]>(() => [createNewTab()]);
-  const [activeTabId, setActiveTabIdState] = useState<string | null>(
-    () => tabs[0]?.id ?? null,
-  );
+  const [initialWorkspace] = useState(() => {
+    const tab = createNewTab();
+    return { tabs: [tab] as Tab[], activeTabId: tab.id };
+  });
+  const { state: tabWorkspace, controller: tabWorkspaceController } =
+    useTabWorkspaceController<Tab, typeof builtinTabModules>({
+      modules: builtinTabModules,
+      initialTabs: initialWorkspace.tabs,
+      initialActiveTabId: initialWorkspace.activeTabId,
+      maxTabs: MAX_TABS,
+      createId: generateTabId,
+      isLastTabProtected: builtinTabWorkspacePolicy.isLastTabProtected,
+    });
+  const tabs = tabWorkspace.tabs;
+  const activeTabId = tabWorkspace.activeTabId;
+  const deferredMountTabIds = tabWorkspace.deferredMountTabIds;
   const [externalNotificationBadges, setExternalNotificationBadges] = useState<
     NotificationBadgeItem[]
   >([]);
-  const [spacePendingRoute, setSpacePendingRoute] =
-    useState<PendingAppRoute | null>(null);
-  const [taskPendingRoute, setTaskPendingRoute] =
-    useState<PendingAppRoute | null>(null);
+  const historyTagIntentSequenceRef = useRef(0);
+  const [historyTagIntent, setHistoryTagIntent] = useState<{ id: number; tag: string } | null>(null);
+  const handleOpenHistoryTag = useCallback((tag: string) => {
+    setHistoryTagIntent({ id: ++historyTagIntentSequenceRef.current, tag });
+  }, []);
+  const handleHistoryTagIntentConsumed = useCallback((id: number) => {
+    setHistoryTagIntent((current) => current?.id === id ? null : current);
+  }, []);
+  const pendingSpaceRouteRef = useRef<PendingAppRoute | null>(null);
   const appRouteGenerationRef = useRef(0);
   const spaceRouteTabIdRef = useRef<string | null>(null);
 
@@ -1022,32 +474,21 @@ export default function App() {
   } | null>(null);
   const [restorePillCount, setRestorePillCount] = useState(0);
 
-  // Refs for stable callback access (avoids re-creating callbacks when tabs/activeTabId change)
-  const tabsRef = useRef(tabs);
-  tabsRef.current = tabs;
-
-  const activeTabIdRef = useRef(activeTabId);
-  activeTabIdRef.current = activeTabId;
-
   const handleLauncherWorkspaceSelectionChange = useCallback(
     (tabId: string, workspacePath: string | null) => {
-      setTabs((current) =>
-        current.map((tab) =>
-          tab.id === tabId &&
-          tab.view === 'launcher' &&
-          tab.launcherWorkspacePath !== workspacePath
-            ? { ...tab, launcherWorkspacePath: workspacePath }
-            : tab,
-        ),
+      tabWorkspaceController.update(tabId, 'launcher', (tab) =>
+        tab.launcherWorkspacePath === workspacePath
+          ? tab
+          : { ...tab, launcherWorkspacePath: workspacePath },
       );
     },
-    [],
+    [tabWorkspaceController],
   );
 
   const syncRendererCorrelationForTab = useCallback(
     (
       tabId: string | null | undefined,
-      nextTabs: readonly Tab[] = tabsRef.current,
+      nextTabs: readonly Tab[] = tabWorkspaceController.getSnapshot().tabs,
     ) => {
       const activeTab = tabId
         ? nextTabs.find((t) => t.id === tabId)
@@ -1058,62 +499,32 @@ export default function App() {
       );
       setAppActiveCorrelation({
         tabId,
-        sessionId: activeTab?.sessionId ?? undefined,
-        tabs: nextTabs.map((t) => ({ id: t.id, sessionId: t.sessionId })),
+        sessionId:
+          activeTab?.view === 'chat'
+            ? (activeTab.sessionId ?? undefined)
+            : undefined,
+        tabs: nextTabs.map((tab) => ({
+          id: tab.id,
+          sessionId:
+            tab.view === 'chat' ? (tab.sessionId ?? undefined) : undefined,
+        })),
       });
     },
-    [],
-  );
-
-  // Deferred-view set. Non-Chat tabs in this set render a cheap placeholder;
-  // Chat tabs keep their live TabProvider but postpone the heavy Chat child.
-  // Activation is the single reveal owner: every entry path (mouse, keyboard,
-  // close fallback, history jump) gets the same post-paint behavior.
-  const [deferredMountTabIds, setDeferredMountTabIds] = useState<Set<string>>(
-    () => new Set(),
-  );
-  const revealDeferredActiveTabAfterPaint = useCallback(
-    (tabId: string | null) => {
-      if (!tabId) return;
-      runAfterNextPaint(() => {
-        if (activeTabIdRef.current !== tabId) return;
-        setDeferredMountTabIds((prev) => {
-          if (!prev.has(tabId)) return prev;
-          const next = new Set(prev);
-          next.delete(tabId);
-          return next;
-        });
-      });
-    },
-    [],
+    [tabWorkspaceController],
   );
 
   const setActiveTabId = useCallback(
-    (
-      next: string | null | ((current: string | null) => string | null),
-      nextTabs: readonly Tab[] = tabsRef.current,
-    ) => {
-      if (typeof next === 'function') {
-        setActiveTabIdState((current) => {
-          const resolved = next(current);
-          activeTabIdRef.current = resolved;
-          syncRendererCorrelationForTab(resolved, nextTabs);
-          revealDeferredActiveTabAfterPaint(resolved);
-          return resolved;
-        });
-        return;
-      }
-      activeTabIdRef.current = next;
-      syncRendererCorrelationForTab(next, nextTabs);
-      setActiveTabIdState(next);
-      revealDeferredActiveTabAfterPaint(next);
+    (next: string | null | ((current: string) => string | null)) => {
+      const current = tabWorkspaceController.getSnapshot().activeTabId;
+      const resolved = typeof next === 'function' ? next(current) : next;
+      if (resolved) tabWorkspaceController.focus(resolved);
     },
-    [revealDeferredActiveTabAfterPaint, syncRendererCorrelationForTab],
+    [tabWorkspaceController],
   );
 
   useEffect(() => {
     if (configLoading || spaceBuildCapability.isLoading) return;
-    const currentTabs = tabsRef.current;
+    const currentTabs = tabWorkspaceController.getSnapshot().tabs;
     const routeTabId = spaceRouteTabIdRef.current;
     if (
       routeTabId &&
@@ -1132,22 +543,16 @@ export default function App() {
 
     if (!currentTabs.some((tab) => tab.view === 'space')) return;
 
-    const remainingTabs = currentTabs.filter((tab) => tab.view !== 'space');
-    const nextTabs =
-      remainingTabs.length > 0 ? remainingTabs : [createNewTab()];
-    const currentActiveId = activeTabIdRef.current;
-    const nextActiveId = nextTabs.some((tab) => tab.id === currentActiveId)
-      ? currentActiveId
-      : (nextTabs[nextTabs.length - 1]?.id ?? null);
-
-    setTabs(nextTabs);
-    setActiveTabId(nextActiveId, nextTabs);
+    const plans = currentTabs
+      .filter((tab) => tab.view === 'space')
+      .map((tab) => ({ captured: tabWorkspaceController.capture(tab.id)! }));
+    tabWorkspaceController.removeMany(plans, createNewTab);
   }, [
     configLoading,
     spaceBuildCapability.available,
     spaceBuildCapability.isLoading,
     teamSpaceAvailable,
-    setActiveTabId,
+    tabWorkspaceController,
   ]);
 
   // Persist open Chat / Record tabs after every structural change (Issue #232).
@@ -1165,8 +570,9 @@ export default function App() {
   // where the process exits (update relaunch, Cmd+Q / Dock quit) in the same
   // frame as a structural change, before the post-commit effect above runs.
   const flushOpenTabsNow = useCallback(() => {
-    saveOpenTabs(tabsRef.current, activeTabIdRef.current);
-  }, []);
+    const snapshot = tabWorkspaceController.getSnapshot();
+    saveOpenTabs([...snapshot.tabs], snapshot.activeTabId);
+  }, [tabWorkspaceController]);
 
   // Flush on window hide / pagehide — the Tauri-appropriate quit signal (the
   // analytics tracker uses the same visibilitychange→hidden hook; beforeunload
@@ -1226,69 +632,28 @@ export default function App() {
     restoreCandidateRef.current = null;
   }, []);
 
-  // Single source of truth for opening a NEW tab whose view mounts a large
-  // renderer-only subtree (Launcher / Settings / TaskCenter). It appends and
-  // activates the tab in the urgent commit — so the chip + active highlight
-  // paint instantly with only a cheap placeholder as content — then clears the
-  // deferral once the placeholder has painted, letting React mount the heavy
-  // subtree. This keeps the open action from janking the click frame regardless
-  // of how heavy the view is (e.g. the 5.8k-line Settings tree).
-  //
-  // WHY runAfterNextPaint and NOT startTransition (the "新建 tab 黄屏" fix):
-  // the reveal used to live inside a useTransition, i.e. at LOW priority. Every
-  // still-mounted background Tab keeps firing NORMAL-priority state updates
-  // (SSE token deltas, session-state polling, task notifications); a
-  // low-priority transition gets repeatedly interrupted/restarted by that churn
-  // and could stay pending for 1-2s, leaving the full-screen paper placeholder
-  // on screen the whole time. A normal-priority commit scheduled right after
-  // the placeholder paints is not starvable and reveals the content promptly —
-  // the click already got its feedback from the placeholder, so the one-shot
-  // mount runs off the click frame. See utils/afterPaint.ts for the double-rAF
-  // rationale.
-  //
-  // Normal Chat/session opens are never added to this deferred set: they commit
-  // the Chat owner subtree with its real Session identity immediately. Bulk
-  // restore is the deliberate exception and keeps TabProvider live underneath
-  // the lightweight boot surface.
-  const openNewTabDeferred = useCallback(
-    (newTab: Tab) => {
-      perfMark(RENDERER_PERF_PHASE.newTabReveal, { tabId: newTab.id }); // P0: new-tab timeline anchor
-      const nextTabs = [...tabsRef.current, newTab];
-      setDeferredMountTabIds((prev) => {
-        if (prev.has(newTab.id)) return prev;
-        const next = new Set(prev);
-        next.add(newTab.id);
-        return next;
-      });
-      setTabs((prev) => [...prev, newTab]);
-      setActiveTabId(newTab.id, nextTabs);
-    },
-    [setActiveTabId],
-  );
-
   // Helper-overlay launches must hand `handleLaunchProject` a real, committed
-  // active launcher tab. Mutating activeTabIdRef before React has committed the
-  // tab produces `view=undefined` and can let the new Chat auto-send while hidden.
+  // active launcher tab. Activating before React commits the workspace snapshot
+  // produces `view=undefined` and can let the new Chat auto-send while hidden.
   const openLaunchTabNow = useCallback(
     (newTab: Tab) => {
-      const nextTabs = [...tabsRef.current, newTab];
       flushSync(() => {
-        setTabs((prev) => [...prev, newTab]);
-        setActiveTabId(newTab.id, nextTabs);
+        tabWorkspaceController.append(newTab, { mount: 'immediate' });
       });
     },
-    [setActiveTabId],
+    [tabWorkspaceController],
   );
 
-  const removeUnusedPrecreatedLaunchTab = useCallback((tabId: string) => {
-    setTabs((prev) => {
-      const created = prev.find((t) => t.id === tabId);
-      if (created && !created.sessionId && !created.agentDir) {
-        return prev.filter((t) => t.id !== tabId);
-      }
-      return prev;
-    });
-  }, []);
+  const removeUnusedPrecreatedLaunchTab = useCallback(
+    (tabId: string) => {
+      const snapshot = tabWorkspaceController.getSnapshot();
+      const created = snapshot.tabs.find((tab) => tab.id === tabId);
+      const captured = tabWorkspaceController.capture(tabId);
+      if (created?.view !== 'launcher' || !captured) return;
+      tabWorkspaceController.removeMany([{ captured }], createNewTab);
+    },
+    [tabWorkspaceController],
+  );
 
   // Analytics Active Context — propagate active tab's sessionId/tabId so that
   // downstream track() calls auto-inject these into params (see analytics/tracker.ts).
@@ -1301,7 +666,7 @@ export default function App() {
       return;
     }
     const activeTab = tabs.find((t) => t.id === activeTabId);
-    const sid = activeTab?.sessionId ?? null;
+    const sid = activeTab?.view === 'chat' ? activeTab.sessionId : null;
     setAnalyticsContext({
       tabId: activeTabId,
       sessionId: sid && !isPendingSessionId(sid) ? sid : null,
@@ -1345,7 +710,7 @@ export default function App() {
   configRef.current = config;
 
   const unreadTabCount = tabs.reduce(
-    (count, tab) => count + (tab.hasUnread ? 1 : 0),
+    (count, tab) => count + (tab.view === 'chat' && tab.hasUnread ? 1 : 0),
     0,
   );
   const externalNotificationBadgeCount = countNotificationBadgeItems(
@@ -1453,7 +818,10 @@ export default function App() {
     // open at the click are committed to disk before the process dies; boot
     // consumes the backstop and adopts it only if localStorage came up empty.
     flushOpenTabsNow();
-    await persistOpenTabsDurable(tabsRef.current, activeTabIdRef.current);
+    await persistOpenTabsDurable(
+      tabWorkspaceController.getSnapshot().tabs,
+      tabWorkspaceController.getSnapshot().activeTabId,
+    );
     let outcome:
       | Awaited<ReturnType<typeof restartAndUpdateRef.current>>
       | undefined;
@@ -1480,7 +848,7 @@ export default function App() {
       toastRef.current?.error(t('appChrome.updateInstallFailed'));
     }
     // 'ok' → process is exiting via NSIS/relaunch, no toast needed
-  }, [flushOpenTabsNow, t]);
+  }, [flushOpenTabsNow, t, tabWorkspaceController]);
 
   // Per-tab loading state (keyed by tabId)
   const [loadingTabs, setLoadingTabs] = useState<Record<string, boolean>>({});
@@ -1497,11 +865,6 @@ export default function App() {
     lifecycleUnknown: boolean;
     loading: boolean;
     resolve: (value: boolean) => void;
-  } | null>(null);
-  const [recordCloseConfirmState, setRecordCloseConfirmState] = useState<{
-    tabId: string;
-    snapshot: RecordingSnapshot;
-    loading: boolean;
   } | null>(null);
   const pendingRecordNoteSubmittersRef = useRef(
     new Map<string, () => Promise<boolean>>(),
@@ -1522,6 +885,57 @@ export default function App() {
       pendingRecordNoteSubmittersRef.current.get(recordId)?.() ?? true,
     [],
   );
+
+  const chatTabLifecycle = useMemo(
+    () =>
+      createChatTabLifecycle({
+        startBackgroundCompletion,
+        stopSseProxy,
+        releaseTabSession,
+        stopLegacyTabSidecar: stopTabSidecar,
+        notifyBackgroundContinuation: () =>
+          toastRef.current.info(t('appChrome.backgroundCompletion')),
+        log: (message, error) => console.error(message, error),
+      }),
+    [t],
+  );
+  const { adapter: recordTabLifecycle, dialog: recordCloseDialog } =
+    useRecordTabLifecycle({
+      isAdmissionPending: (tabId) =>
+        recordingAdmissionTabsRef.current.has(tabId),
+      getRecordingSnapshot: recordingSnapshot,
+      stopRecording: recordingStop,
+      flushPendingNote: flushPendingRecordNote,
+      showStatusError: () =>
+        toastRef.current.error(t('appChrome.recordCloseStatusFailed')),
+      showStopError: () =>
+        toastRef.current.error(t('appChrome.recordStopFailed')),
+      labels: {
+        title: t('appChrome.recordCloseTitle'),
+        message: t('appChrome.recordCloseMessage'),
+        confirm: t('appChrome.recordStopSaveClose'),
+        cancel: t('appChrome.cancel'),
+      },
+      log: (message, error) => console.error(message, error),
+    });
+  const tabLifecycle = useMemo(
+    () => composeBuiltinTabLifecycle({ chat: chatTabLifecycle, record: recordTabLifecycle }),
+    [chatTabLifecycle, recordTabLifecycle],
+  );
+  const requestCloseTab = useTabCloseController({
+    workspace: tabWorkspaceController,
+    lifecycle: tabLifecycle,
+    defaultReason: builtinTabWorkspacePolicy.defaultCloseReason,
+    createFallback: builtinTabWorkspacePolicy.createFallback,
+    onBeforeDetach: (tab) => clearPendingSessionBirth(tab.id),
+    onDetached: (result) =>
+      track('tab_close', {
+        view: result.tab.view,
+        tab_count: result.tabCount,
+      }),
+    onCleanupError: (tab, error) =>
+      console.error(`[App] Tab cleanup failed for ${tab.id}`, error),
+  });
 
   // Content container ref for tab swipe gesture
   const contentRef = useRef<HTMLDivElement>(null);
@@ -1686,18 +1100,25 @@ export default function App() {
             `[App] Background session completion finished: session=${sessionId}, sidecarStopped=${sidecarStopped}`,
           );
 
-          setTabs((prev) =>
-            prev.map((tab) =>
-              tab.sessionId === sessionId && tab.isGenerating
-                ? { ...tab, isGenerating: false }
-                : tab,
-            ),
-          );
+          for (const tab of tabWorkspaceController.getSnapshot().tabs) {
+            if (
+              tab.view === 'chat' &&
+              tab.sessionId === sessionId &&
+              tab.isGenerating
+            ) {
+              tabWorkspaceController.update(tab.id, 'chat', (current) => ({
+                ...current,
+                isGenerating: false,
+              }));
+            }
+          }
 
-          const matchingTab = tabsRef.current.find(
-            (tab) => tab.sessionId === sessionId && tab.agentDir,
-          );
-          if (matchingTab?.agentDir) {
+          const matchingTab = tabWorkspaceController
+            .getSnapshot()
+            .tabs.find(
+              (tab) => tab.view === 'chat' && tab.sessionId === sessionId,
+            );
+          if (matchingTab?.view === 'chat') {
             getSessions(matchingTab.agentDir)
               .then((sessions) => {
                 if (!mountedRef.current) return;
@@ -1706,13 +1127,19 @@ export default function App() {
                 );
                 if (!refreshed) return;
                 const refreshedTitle = getSessionDisplayText(refreshed);
-                setTabs((prev) =>
-                  prev.map((tab) =>
-                    tab.sessionId === sessionId && tab.title !== refreshedTitle
-                      ? { ...tab, title: refreshedTitle }
-                      : tab,
-                  ),
-                );
+                for (const tab of tabWorkspaceController.getSnapshot().tabs) {
+                  if (
+                    tab.view === 'chat' &&
+                    tab.sessionId === sessionId &&
+                    tab.title !== refreshedTitle
+                  ) {
+                    tabWorkspaceController.update(
+                      tab.id,
+                      'chat',
+                      (current) => ({ ...current, title: refreshedTitle }),
+                    );
+                  }
+                }
                 window.dispatchEvent(
                   new CustomEvent(CUSTOM_EVENTS.SESSION_TITLE_CHANGED),
                 );
@@ -1824,9 +1251,12 @@ export default function App() {
             createdAt,
           );
           if (!item) return;
-          const activeTab = tabsRef.current.find(
-            (tab) => tab.id === activeTabIdRef.current,
-          );
+          const activeTab = tabWorkspaceController
+            .getSnapshot()
+            .tabs.find(
+              (tab) =>
+                tab.id === tabWorkspaceController.getSnapshot().activeTabId,
+            );
           if (
             isRendererForegrounded() &&
             isNotificationBadgeTargetVisible(item.target, activeTab)
@@ -1925,15 +1355,23 @@ export default function App() {
             // Commit in the same synchronous boundary as the stable revision
             // check so a later opening observes the terminal projection.
             flushSync(() => {
-              setTabs((prev) => {
-                const next = applyTerminalSessionToTabs(prev, sessionId);
-                if (next !== prev) {
-                  console.log(
-                    `[App] Tab.sessionId reset for terminated session ${sessionId}`,
-                  );
-                }
-                return next as typeof prev;
-              });
+              const plans = tabWorkspaceController
+                .getSnapshot()
+                .tabs.filter(
+                  (tab): tab is ChatTab =>
+                    tab.view === 'chat' && tab.sessionId === sessionId,
+                )
+                .map((tab) => ({
+                  captured: tabWorkspaceController.capture(tab.id)!,
+                  replacement: resetTabToLauncher(tab),
+                  mount: 'immediate' as const,
+                }));
+              const replaced = tabWorkspaceController.replaceMany(plans);
+              if (replaced > 0) {
+                console.log(
+                  `[App] Tab.sessionId reset for terminated session ${sessionId}`,
+                );
+              }
             });
             return;
           }
@@ -1952,7 +1390,7 @@ export default function App() {
       //      it as gone if Rust has no sidecar entry for that id. A newer
       //      generation must survive even if its process is temporarily dead
       //      and waiting for health-monitor recovery.
-      //  (2) Candidates are taken from a tabsRef snapshot; new tabs may
+      //  (2) Candidates are taken from a workspace snapshot; new tabs may
       //      appear during our async work. To avoid clearing those, we
       //      apply cleanup tab-by-tab via `applyTerminalSessionToTabs`
       //      against the *current* prev, and only for the exact session
@@ -1965,10 +1403,12 @@ export default function App() {
           while (mountedRef.current) {
             const openingRevision =
               sessionResourceTransitionsRef.current.openingRevision;
-            const candidates = tabsRef.current
-              .filter(
-                (tab) =>
-                  tab.sessionId &&
+            const candidates = tabWorkspaceController
+              .getSnapshot()
+              .tabs.filter(
+                (tab): tab is ChatTab & { sessionId: string } =>
+                  tab.view === 'chat' &&
+                  !!tab.sessionId &&
                   !isPendingSessionId(tab.sessionId) &&
                   !stillLive.has(tab.sessionId) &&
                   !isSessionOpening(
@@ -1976,7 +1416,7 @@ export default function App() {
                     tab.sessionId,
                   ),
               )
-              .map((tab) => tab.sessionId as string);
+              .map((tab) => tab.sessionId);
             const goneIds = (
               await Promise.all(
                 candidates.map(async (sessionId) =>
@@ -2002,21 +1442,26 @@ export default function App() {
             if (stableGoneIds.length === 0) return;
 
             flushSync(() => {
-              setTabs((prev) => {
-                let next = prev;
-                for (const sessionId of stableGoneIds) {
-                  next = applyTerminalSessionToTabs(
-                    next,
-                    sessionId,
-                  ) as typeof prev;
-                }
-                if (next !== prev) {
-                  console.log(
-                    `[App] Reconcile cleared ${stableGoneIds.length} stale binding(s)`,
-                  );
-                }
-                return next;
-              });
+              const stableGone = new Set(stableGoneIds);
+              const plans = tabWorkspaceController
+                .getSnapshot()
+                .tabs.filter(
+                  (tab): tab is ChatTab =>
+                    tab.view === 'chat' &&
+                    !!tab.sessionId &&
+                    stableGone.has(tab.sessionId),
+                )
+                .map((tab) => ({
+                  captured: tabWorkspaceController.capture(tab.id)!,
+                  replacement: resetTabToLauncher(tab),
+                  mount: 'immediate' as const,
+                }));
+              const replaced = tabWorkspaceController.replaceMany(plans);
+              if (replaced > 0) {
+                console.log(
+                  `[App] Reconcile cleared ${replaced} stale binding(s)`,
+                );
+              }
             });
             return;
           }
@@ -2046,39 +1491,45 @@ export default function App() {
       // Rust owns application cleanup on RunEvent::ExitRequested. WebView
       // destruction is window-scoped and must never stop application resources.
     };
-  }, [startGlobalSidecarSilent]);
+  }, [startGlobalSidecarSilent, tabWorkspaceController]);
 
   // Update tab isGenerating state (called from TabProvider via callback)
   const updateTabGenerating = useCallback(
     (tabId: string, isGenerating: boolean) => {
-      setTabs((prev) =>
-        prev.map((t) => (t.id === tabId ? { ...t, isGenerating } : t)),
-      );
+      tabWorkspaceController.update(tabId, 'chat', (tab) => ({
+        ...tab,
+        isGenerating,
+      }));
     },
-    [],
+    [tabWorkspaceController],
   );
 
   // Update tab title (called from TabProvider when auto-title or rename occurs)
-  const updateTabTitle = useCallback((tabId: string, title: string) => {
-    setTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, title } : t)));
-  }, []);
+  const updateTabTitle = useCallback(
+    (tabId: string, title: string) => {
+      tabWorkspaceController.update(tabId, 'chat', (tab) => ({
+        ...tab,
+        title,
+      }));
+    },
+    [tabWorkspaceController],
+  );
 
   // Update tab unread state (called from TabProvider when message completes on non-active tab)
-  const updateTabUnread = useCallback((tabId: string, hasUnread: boolean) => {
-    setTabs((prev) => {
-      const tab = prev.find((t) => t.id === tabId);
-      if (tab && tab.hasUnread !== hasUnread) {
-        return prev.map((t) => (t.id === tabId ? { ...t, hasUnread } : t));
-      }
-      return prev; // no-op: avoid unnecessary re-render
-    });
-  }, []);
+  const updateTabUnread = useCallback(
+    (tabId: string, hasUnread: boolean) => {
+      tabWorkspaceController.update(tabId, 'chat', (tab) =>
+        tab.hasUnread === hasUnread ? tab : { ...tab, hasUnread },
+      );
+    },
+    [tabWorkspaceController],
+  );
 
   const clearActiveTabUnread = useCallback(() => {
-    const activeTabId = activeTabIdRef.current;
+    const activeTabId = tabWorkspaceController.getSnapshot().activeTabId;
     if (!activeTabId) return;
     updateTabUnread(activeTabId, false);
-  }, [updateTabUnread]);
+  }, [tabWorkspaceController, updateTabUnread]);
   const lastUnreadClearedActiveTabIdRef = useRef<string | null>(null);
 
   const acknowledgeNotificationTarget = useCallback(
@@ -2091,14 +1542,16 @@ export default function App() {
   );
 
   const acknowledgeActiveChatSessionNotifications = useCallback(() => {
-    const activeTabId = activeTabIdRef.current;
+    const activeTabId = tabWorkspaceController.getSnapshot().activeTabId;
     if (!activeTabId) return;
-    const activeTab = tabsRef.current.find((tab) => tab.id === activeTabId);
+    const activeTab = tabWorkspaceController
+      .getSnapshot()
+      .tabs.find((tab) => tab.id === activeTabId);
     if (activeTab?.view !== 'chat') return;
     const sessionId = activeTab.sessionId?.trim();
     if (!sessionId || isPendingSessionId(sessionId)) return;
     acknowledgeNotificationTarget({ type: 'session', sessionId });
-  }, [acknowledgeNotificationTarget]);
+  }, [acknowledgeNotificationTarget, tabWorkspaceController]);
 
   const handleWindowFocused = useCallback(() => {
     clearActiveTabUnread();
@@ -2133,8 +1586,10 @@ export default function App() {
         .catch(() => undefined)
         .then(async (): Promise<boolean> => {
           // Find the current tab to get the old sessionId
-          const currentTab = tabsRef.current.find((t) => t.id === tabId);
-          if (!currentTab) {
+          const currentTab = tabWorkspaceController
+            .getSnapshot()
+            .tabs.find((t) => t.id === tabId);
+          if (currentTab?.view !== 'chat') {
             console.error(
               `[App] Refusing to update missing tab ${tabId} sessionId to ${newSessionId}`,
             );
@@ -2146,7 +1601,7 @@ export default function App() {
             }
             return false;
           }
-          const oldSessionId = currentTab?.sessionId;
+          const oldSessionId = currentTab.sessionId;
           const identityChanges = oldSessionId !== newSessionId;
           const releaseTargetTransition = identityChanges
             ? tryClaimSessionResourceTransition(
@@ -2164,9 +1619,15 @@ export default function App() {
             if (options?.sidecarAlreadyMigrated) {
               if (oldSessionId && isPendingSessionId(oldSessionId)) {
                 clearPendingSessionBirth(tabId);
-                setTabs((current) => [
-                  ...applyTerminalSessionToTabs(current, oldSessionId),
-                ]);
+                const captured = tabWorkspaceController.capture(tabId);
+                if (captured) {
+                  tabWorkspaceController.replaceWith(
+                    captured,
+                    'launcher',
+                    {},
+                    { mount: 'immediate' },
+                  );
+                }
               }
               await Promise.allSettled([
                 stopSseProxy(tabId),
@@ -2174,9 +1635,15 @@ export default function App() {
               ]);
             } else if (oldSessionId && isPendingSessionId(oldSessionId)) {
               clearPendingSessionBirth(tabId);
-              setTabs((current) => [
-                ...applyTerminalSessionToTabs(current, oldSessionId),
-              ]);
+              const captured = tabWorkspaceController.capture(tabId);
+              if (captured) {
+                tabWorkspaceController.replaceWith(
+                  captured,
+                  'launcher',
+                  {},
+                  { mount: 'immediate' },
+                );
+              }
               await Promise.allSettled([
                 stopSseProxy(tabId),
                 releaseTabSession(oldSessionId, tabId),
@@ -2228,11 +1695,10 @@ export default function App() {
 
             // Update UI state
             flushSync(() => {
-              setTabs((prev) =>
-                prev.map((t) =>
-                  t.id === tabId ? { ...t, sessionId: newSessionId } : t,
-                ),
-              );
+              tabWorkspaceController.update(tabId, 'chat', (tab) => ({
+                ...tab,
+                sessionId: newSessionId,
+              }));
             });
             return true;
           } finally {
@@ -2251,176 +1717,19 @@ export default function App() {
       });
       return operation;
     },
-    [],
+    [tabWorkspaceController],
   );
 
-  // Perform the actual tab close operation (pure function, no confirmation)
-  // UI updates are immediate; resource cleanup runs in background (non-blocking)
   const performCloseTab = useCallback(
-    (tabId: string) => {
-      const currentTabs = tabsRef.current;
-
-      // Double-check: tab might have been removed
-      const tab = currentTabs.find((t) => t.id === tabId);
-      if (!tab) return;
-
-      // Calculate actual tab_count after close:
-      // - If closing the last tab, a new launcher is created, so count = 1
-      // - Otherwise, count = currentTabs.length - 1
-      const isLastTab = currentTabs.length === 1;
-      const actualTabCount = isLastTab ? 1 : currentTabs.length - 1;
-
-      // Track tab_close event with correct count
-      track('tab_close', { view: tab.view, tab_count: actualTabCount });
-
-      // Drop any leftover pending surface for this tab to avoid leaking it into
-      // a later (unrelated) session_new — the analytics module keeps these
-      // module-level until consumed.
-      clearPendingSessionBirth(tabId);
-      setDeferredMountTabIds((current) => {
-        if (!current.has(tabId)) return current;
-        const next = new Set(current);
-        next.delete(tabId);
-        return next;
-      });
-
-      // ========== IMMEDIATE UI UPDATE (non-blocking) ==========
-      // Update UI state first for instant response
-      if (isLastTab) {
-        // Special case: If this is the last tab, replace with launcher (don't close the app)
-        const newTab = createNewTab();
-        setTabs([newTab]);
-        setActiveTabId(newTab.id);
-      } else {
-        // Normal case: close the tab
-        const newTabs = currentTabs.filter((t) => t.id !== tabId);
-
-        // If closing the active tab, switch to the last remaining tab
-        if (tabId === activeTabIdRef.current && newTabs.length > 0) {
-          setActiveTabId(newTabs[newTabs.length - 1].id);
-        }
-
-        setTabs(newTabs);
-      }
-
-      // ========== BACKGROUND CLEANUP (non-blocking) ==========
-      // Capture tab data before cleanup to avoid stale closure issues
-      const tabSessionId = tab.sessionId;
-      const tabAgentDir = tab.agentDir;
-
-      // Resource cleanup runs asynchronously without blocking UI
-      // CRITICAL: SSE proxy must be stopped BEFORE Sidecar to avoid "unexpected EOF" errors
-      // When Sidecar dies, open HTTP connections break mid-stream causing errors
-      const cleanupResources = async () => {
-        try {
-          // Step 1: Try to start background completion if AI is running
-          // This keeps the Sidecar alive so AI can finish its response
-          if (tabSessionId) {
-            const bgResult = await startBackgroundCompletion(tabSessionId);
-            if (bgResult.started) {
-              console.log(
-                `[App] Tab ${tabId} closing: AI still running, background completion started for session ${tabSessionId}`,
-              );
-            }
-          }
-
-          // Step 2: Stop SSE proxy FIRST to ensure clean disconnection
-          // This prevents "unexpected EOF" errors when Sidecar is stopped
-          await stopSseProxy(tabId);
-
-          // Step 3: Release Tab's ownership of the Session Sidecar
-          // If background completion is active, Sidecar continues running (BG owner keeps it alive)
-          if (tabSessionId) {
-            try {
-              const stopped = await releaseTabSession(tabSessionId, tabId);
-              console.log(
-                `[App] Tab ${tabId} released session ${tabSessionId}, sidecar stopped: ${stopped}`,
-              );
-            } catch (error) {
-              console.error(
-                `[App] Error releasing session sidecar for tab ${tabId}:`,
-                error,
-              );
-              // Fallback to legacy stopTabSidecar
-              void stopTabSidecar(tabId);
-            }
-          } else if (tabAgentDir) {
-            // No sessionId but has agentDir - legacy case, use stopTabSidecar
-            void stopTabSidecar(tabId);
-          }
-        } catch (error) {
-          console.error(
-            `[App] Background cleanup error for tab ${tabId}:`,
-            error,
-          );
-        }
-      };
-
-      // Runs in background — catch ensures no unhandled rejection
-      cleanupResources().catch((err) =>
-        console.error(`[App] Unhandled cleanup error for tab ${tabId}:`, err),
-      );
-    },
-    [setActiveTabId],
+    (tabId: string) => requestCloseTab(tabId, 'user'),
+    [requestCloseTab],
   );
 
-  // Close tab — if AI is generating, close immediately and let it finish in background.
-  // No confirmation dialog: background completion keeps the Sidecar alive.
-  const closeTabWithConfirmation = useCallback(
-    async (tabId: string) => {
-      if (recordingAdmissionTabsRef.current.has(tabId)) return;
-      const tab = tabsRef.current.find((t) => t.id === tabId);
+  const closeTabWithConfirmation = performCloseTab;
 
-      if (tab?.view === 'record' && tab.recordId) {
-        try {
-          const active = await recordingSnapshot();
-          if (active?.recordId === tab.recordId) {
-            setRecordCloseConfirmState({
-              tabId,
-              snapshot: active,
-              loading: false,
-            });
-            return;
-          }
-        } catch (error) {
-          console.error(
-            '[App] Failed to verify recording before closing Record tab:',
-            error,
-          );
-          toastRef.current.error(t('appChrome.recordCloseStatusFailed'));
-          return;
-        }
-      }
-
-      if (tab?.isGenerating && tab.sessionId) {
-        void performCloseTab(tabId);
-        toastRef.current.info(t('appChrome.backgroundCompletion'));
-        return;
-      }
-
-      void performCloseTab(tabId);
-    },
-    [performCloseTab, t],
-  );
-
-  // Close current active tab (for Cmd+W)
   const closeCurrentTab = useCallback(() => {
-    const currentActiveTabId = activeTabIdRef.current;
-    if (!currentActiveTabId) return;
-
-    const currentTabs = tabsRef.current;
-    const activeTab = currentTabs.find((t) => t.id === currentActiveTabId);
-
-    // Special case: If only one launcher tab, do nothing
-    if (currentTabs.length === 1 && activeTab?.view === 'launcher') {
-      return;
-    }
-
-    // Multiple tabs OR last tab is chat/settings: use the unified confirmation logic
-    void closeTabWithConfirmation(currentActiveTabId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- callbacks stabilized via tabsRef
-  }, [setActiveTabId]);
-
+    requestCloseTab(tabWorkspaceController.getSnapshot().activeTabId, 'user');
+  }, [requestCloseTab, tabWorkspaceController]);
   // Application-level keyboard shortcuts (new/close/switch tab, task-center,
   // settings, reload-block). The bindings + matching live in the declarative
   // APP_SHORTCUTS table (utils/appShortcuts.ts) — the same source the Settings
@@ -2432,8 +1741,8 @@ export default function App() {
       const isMac = navigator.platform.toLowerCase().includes('mac');
       if (
         dispatchAppShortcut(e, isMac, {
-          tabs: tabsRef.current,
-          activeTabId: activeTabIdRef.current,
+          tabs: tabWorkspaceController.getSnapshot().tabs,
+          activeTabId: tabWorkspaceController.getSnapshot().activeTabId,
           setActiveTabId,
           newTab: handleNewTab,
           closeCurrentTab,
@@ -2465,7 +1774,7 @@ export default function App() {
     window.addEventListener('keydown', handleKeyDown, { capture: true });
     return () =>
       window.removeEventListener('keydown', handleKeyDown, { capture: true });
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- callbacks stabilized via tabsRef
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- workspace commands and callbacks are stable
   }, [setActiveTabId]);
 
   // Stable capability passed to TabProvider recovery so it shares the same
@@ -2489,7 +1798,7 @@ export default function App() {
       analyticsContext?: LaunchProjectAnalyticsContext,
       sessionBirthHint?: LaunchSessionBirthHint,
     ) => {
-      const activeTabId = activeTabIdRef.current;
+      const activeTabId = tabWorkspaceController.getSnapshot().activeTabId;
       if (!activeTabId) return false;
 
       // Per-tab launch guard: prevent concurrent launches on the same tab
@@ -2557,22 +1866,25 @@ export default function App() {
       let targetTabId = activeTabId;
 
       try {
-        const activeTab = tabsRef.current.find((t) => t.id === activeTabId);
+        const activeTab = tabWorkspaceController
+          .getSnapshot()
+          .tabs.find((t) => t.id === activeTabId);
         perfMark('launch_start', { tabId: activeTabId });
         console.log(
-          `[App][launch] START active=${activeTabId} view=${activeTab?.view} hasSession=${!!activeTab?.sessionId} target-sessionId=NEW`,
+          `[App][launch] START active=${activeTabId} view=${activeTab?.view} hasSession=${activeTab?.view === 'chat' && !!activeTab.sessionId} target-sessionId=NEW`,
         );
 
         // A Session with Task/Goal/background ownership must keep its Tab binding;
         // create the new conversation in a fresh Tab instead of releasing it.
-        const currentSessionHasPersistentOwners = activeTab?.sessionId
-          ? await sessionHasPersistentOwners(activeTab.sessionId)
-          : false;
+        const currentSessionHasPersistentOwners =
+          activeTab?.view === 'chat' && activeTab.sessionId
+            ? await sessionHasPersistentOwners(activeTab.sessionId)
+            : false;
         console.log(
-          `[App][launch] persistent-owner-check ${activeTab?.sessionId ? `present=${currentSessionHasPersistentOwners}` : 'skipped(no-session)'}`,
+          `[App][launch] persistent-owner-check ${activeTab?.view === 'chat' && activeTab.sessionId ? `present=${currentSessionHasPersistentOwners}` : 'skipped(no-session)'}`,
         );
         if (currentSessionHasPersistentOwners) {
-          if (tabsRef.current.length >= MAX_TABS) {
+          if (tabWorkspaceController.getSnapshot().tabs.length >= MAX_TABS) {
             setTabErrors((prev) => ({
               ...prev,
               [activeTabId]: t('appChrome.maxTabsReached'),
@@ -2580,7 +1892,10 @@ export default function App() {
             return false;
           }
           const newTab = createNewTab();
-          setTabs((prev) => [...prev, newTab]);
+          tabWorkspaceController.append(newTab, {
+            activate: false,
+            mount: 'immediate',
+          });
           targetTabId = newTab.id;
           setLoadingTabs((prev) => ({
             ...prev,
@@ -2598,10 +1913,13 @@ export default function App() {
         );
 
         // If current tab has an active session, release it before launching new one
-        const currentTabForLaunch = tabsRef.current.find(
-          (t) => t.id === targetTabId,
-        );
-        const oldSessionForLaunch = currentTabForLaunch?.sessionId;
+        const currentTabForLaunch = tabWorkspaceController
+          .getSnapshot()
+          .tabs.find((t) => t.id === targetTabId);
+        const oldSessionForLaunch =
+          currentTabForLaunch?.view === 'chat'
+            ? currentTabForLaunch.sessionId
+            : null;
         if (oldSessionForLaunch) {
           const bgResult = await startBackgroundCompletion(oldSessionForLaunch);
           if (bgResult.started) {
@@ -2779,19 +2097,26 @@ export default function App() {
         // flushSync is load-bearing: without it React can coalesce this update with
         // the post-ensure updates, delaying the chat shell until after the cold boot.
         flushSync(() => {
-          setTabs((prev) =>
-            prev.map((t) =>
-              t.id === targetTabId
-                ? buildChatFlipPatch(t, {
-                    agentDir: project.path,
-                    sessionId: effectiveSessionId,
-                    title: flipTitle,
-                    initialMessage,
-                    sidecarConfigDisposition: 'push',
-                  })
-                : t,
-            ),
-          );
+          const captured = tabWorkspaceController.capture(targetTabId);
+          const target = tabWorkspaceController
+            .getSnapshot()
+            .tabs.find((tab) => tab.id === targetTabId);
+          if (!captured || !target) {
+            throw new Error(`Launch target tab ${targetTabId} disappeared`);
+          }
+          tabWorkspaceController.replaceMany([
+            {
+              captured,
+              replacement: buildChatFlipPatch(target, {
+                agentDir: project.path,
+                sessionId: effectiveSessionId,
+                title: flipTitle,
+                initialMessage,
+                sidecarConfigDisposition: 'push',
+              }),
+              mount: 'immediate',
+            },
+          ]);
           if (targetTabId !== activeTabId) {
             setActiveTabId(targetTabId);
           }
@@ -2830,13 +2155,10 @@ export default function App() {
           : 'adopt';
         // The shell already owns initialMessage; update only the disposition so it
         // cannot be re-attached and auto-sent twice.
-        setTabs((prev) =>
-          prev.map((t) =>
-            t.id === targetTabId
-              ? { ...t, sidecarConfigDisposition: resolved }
-              : t,
-          ),
-        );
+        tabWorkspaceController.update(targetTabId, 'chat', (tab) => ({
+          ...tab,
+          sidecarConfigDisposition: resolved,
+        }));
         setLoadingTabs((prev) => ({ ...prev, [targetTabId]: false }));
         return true;
       } catch (err) {
@@ -2865,20 +2187,13 @@ export default function App() {
         // In browser dev mode, still allow navigation
         if (isBrowserDevMode()) {
           console.log('[App] Browser mode: continuing despite error');
-          setTabs((prev) =>
-            prev.map((t) =>
-              t.id === errorTabId
-                ? {
-                    ...t,
-                    agentDir: project.path,
-                    view: 'chat',
-                    title: project.displayName || getFolderName(project.path),
-                    // Terminal: ensure failed — never leave a mounted chat 'pending'.
-                    sidecarConfigDisposition: 'push' as const,
-                  }
-                : t,
-            ),
-          );
+          tabWorkspaceController.update(errorTabId, 'chat', (tab) => ({
+            ...tab,
+            agentDir: project.path,
+            title: project.displayName || getFolderName(project.path),
+            // Terminal: ensure failed — never leave a mounted chat 'pending'.
+            sidecarConfigDisposition: 'push',
+          }));
         }
         return false;
       } finally {
@@ -2890,7 +2205,7 @@ export default function App() {
         }));
       }
     },
-    [configProjects, setActiveTabId, t],
+    [configProjects, setActiveTabId, t, tabWorkspaceController],
   );
 
   /**
@@ -2906,7 +2221,7 @@ export default function App() {
       },
       title: string,
     ): Promise<string | null> => {
-      if (tabsRef.current.length >= MAX_TABS) {
+      if (tabWorkspaceController.getSnapshot().tabs.length >= MAX_TABS) {
         toastRef.current.error(t('appChrome.tabLimitReached'));
         return null;
       }
@@ -2925,10 +2240,11 @@ export default function App() {
           return null;
         }
 
-        const launchedTab = tabsRef.current.find(
-          (tab) => tab.id === launchTab.id,
-        );
-        const launchedSessionId = launchedTab?.sessionId;
+        const launchedTab = tabWorkspaceController
+          .getSnapshot()
+          .tabs.find((tab) => tab.id === launchTab.id);
+        const launchedSessionId =
+          launchedTab?.view === 'chat' ? launchedTab.sessionId : null;
         if (!launchedSessionId || isPendingSessionId(launchedSessionId)) {
           console.error(
             '[App] Runtime-backed provider launch completed without a materialized Session id',
@@ -2936,11 +2252,10 @@ export default function App() {
           return null;
         }
 
-        setTabs((current) =>
-          current.map((tab) =>
-            tab.id === launchTab.id ? { ...tab, title } : tab,
-          ),
-        );
+        tabWorkspaceController.update(launchTab.id, 'chat', (tab) => ({
+          ...tab,
+          title,
+        }));
         return launchedSessionId;
       } catch (error) {
         console.error(
@@ -2951,61 +2266,94 @@ export default function App() {
         return null;
       }
     },
-    [handleLaunchProject, openLaunchTabNow, removeUnusedPrecreatedLaunchTab, t],
+    [
+      handleLaunchProject,
+      openLaunchTabNow,
+      removeUnusedPrecreatedLaunchTab,
+      t,
+      tabWorkspaceController,
+    ],
   );
 
   // Clear initialMessage from a tab after it has been consumed by Chat
-  const clearInitialMessage = useCallback((tabId: string) => {
-    setTabs((prev) =>
-      prev.map((t) =>
-        t.id === tabId ? { ...t, initialMessage: undefined } : t,
-      ),
-    );
-  }, []);
+  const clearInitialMessage = useCallback(
+    (tabId: string) => {
+      tabWorkspaceController.update(tabId, 'chat', (tab) => ({
+        ...tab,
+        initialMessage: undefined,
+      }));
+    },
+    [tabWorkspaceController],
+  );
 
   // Called by Chat after it has adopted a joined sidecar's config. Move the tab to
   // 'push' so the user's SUBSEQUENT in-tab edits push to the sidecar normally (the
   // adoption is one-shot). Push effects don't replay on adopt→push because they key
   // on the `configPending` boolean, which stays false across this transition.
-  const markSidecarConfigAdopted = useCallback((tabId: string) => {
-    setTabs((prev) =>
-      prev.map((t) =>
-        t.id === tabId ? { ...t, sidecarConfigDisposition: 'push' } : t,
-      ),
-    );
-  }, []);
+  const markSidecarConfigAdopted = useCallback(
+    (tabId: string) => {
+      tabWorkspaceController.update(tabId, 'chat', (tab) => ({
+        ...tab,
+        sidecarConfigDisposition: 'push',
+      }));
+    },
+    [tabWorkspaceController],
+  );
 
   const handleFilePreviewIntentConsumed = useCallback(
     (tabId: string, intentId: string) => {
-      setTabs((prev) =>
-        prev.map((t) =>
-          t.id === tabId && t.pendingFilePreview?.id === intentId
-            ? { ...t, pendingFilePreview: undefined }
-            : t,
-        ),
+      tabWorkspaceController.update(tabId, 'chat', (tab) =>
+        tab.pendingFilePreview?.id === intentId
+          ? { ...tab, pendingFilePreview: undefined }
+          : tab,
       );
     },
-    [],
+    [tabWorkspaceController],
   );
 
-  // Rename session: update tab title + persist to backend + notify listeners
+  // Persist one canonical Product Session title, then converge every renderer
+  // projection that App owns. Resource surfaces share this path with Chat so a
+  // sidebar rename cannot leave an already-open tab showing an older title.
+  const renamePersistedSession = useCallback(
+    async (sessionId: string, newTitle: string) => {
+      const mutationSequence = taskCenterActions.beginSessionMetadataMutation(sessionId);
+      const updated = await updateSession(sessionId, {
+        title: newTitle,
+        titleSource: 'user',
+      });
+      if (!updated) return null;
+
+      const applied = taskCenterActions.applySessionMetadata(updated, mutationSequence);
+      if (!applied) return updated;
+
+      for (const tab of tabWorkspaceController.getSnapshot().tabs) {
+        if (tab.view === 'chat' && tab.sessionId === sessionId && tab.title !== updated.title) {
+          tabWorkspaceController.update(tab.id, 'chat', (current) => ({
+            ...current,
+            title: updated.title,
+          }));
+        }
+      }
+      window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SESSION_TITLE_CHANGED));
+      return updated;
+    },
+    [tabWorkspaceController],
+  );
+
   const handleRenameSession = useCallback(
     (tabId: string, newTitle: string) => {
-      updateTabTitle(tabId, newTitle);
-      const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (tab?.sessionId) {
-        updateSession(tab.sessionId, { title: newTitle, titleSource: 'user' })
-          .then(() =>
-            window.dispatchEvent(
-              new CustomEvent(CUSTOM_EVENTS.SESSION_TITLE_CHANGED),
-            ),
-          )
-          .catch((err) =>
-            console.error('[App] Failed to persist renamed title:', err),
-          );
+      const tab = tabWorkspaceController
+        .getSnapshot()
+        .tabs.find((candidate) => candidate.id === tabId);
+      if (tab?.view !== 'chat' || !tab.sessionId || tab.sessionId.startsWith('pending-')) {
+        updateTabTitle(tabId, newTitle);
+        return;
       }
+      void renamePersistedSession(tab.sessionId, newTitle).catch((err) =>
+        console.error('[App] Failed to persist renamed title:', err),
+      );
     },
-    [updateTabTitle],
+    [renamePersistedSession, tabWorkspaceController, updateTabTitle],
   );
 
   /**
@@ -3021,7 +2369,7 @@ export default function App() {
       initialMessage?: string,
     ) => {
       // Check tab limit
-      if (tabsRef.current.length >= MAX_TABS) {
+      if (tabWorkspaceController.getSnapshot().tabs.length >= MAX_TABS) {
         toastRef.current.error(t('appChrome.tabLimitReached'));
         return false;
       }
@@ -3045,7 +2393,10 @@ export default function App() {
         ...(initialMessage ? { initialMessage: { text: initialMessage } } : {}),
       };
 
-      setTabs((prev) => [...prev, newTab]);
+      tabWorkspaceController.append(newTab, {
+        activate: false,
+        mount: 'immediate',
+      });
       setLoadingTabs((prev) => ({ ...prev, [newTab.id]: true }));
 
       let ownerAcquired = false;
@@ -3058,7 +2409,11 @@ export default function App() {
         );
         ownerAcquired = true;
         console.log(`[App] Fork tab ${newTab.id} sidecar ensured`);
-        if (!tabsRef.current.some((t) => t.id === newTab.id)) {
+        if (
+          !tabWorkspaceController
+            .getSnapshot()
+            .tabs.some((t) => t.id === newTab.id)
+        ) {
           await releaseTabSession(newSessionId, newTab.id).catch(() => {});
           return false;
         }
@@ -3074,7 +2429,10 @@ export default function App() {
           '[App] Failed to start sidecar for forked session:',
           error,
         );
-        setTabs((prev) => prev.filter((t) => t.id !== newTab.id));
+        const captured = tabWorkspaceController.capture(newTab.id);
+        if (captured) {
+          tabWorkspaceController.removeMany([{ captured }], createNewTab);
+        }
         if (ownerAcquired) {
           await releaseTabSession(newSessionId, newTab.id).catch(() => {});
         }
@@ -3084,7 +2442,7 @@ export default function App() {
         releaseTransition();
       }
     },
-    [setActiveTabId, t],
+    [setActiveTabId, t, tabWorkspaceController],
   );
 
   /**
@@ -3103,9 +2461,14 @@ export default function App() {
       agentDir: string,
     ): Promise<{ isNew: boolean } | null> => {
       const tabStillTargetsSession = () =>
-        tabsRef.current.some(
-          (tab) => tab.id === tabId && tab.sessionId === sessionId,
-        );
+        tabWorkspaceController
+          .getSnapshot()
+          .tabs.some(
+            (tab) =>
+              tab.id === tabId &&
+              tab.view === 'chat' &&
+              tab.sessionId === sessionId,
+          );
       let ownerAcquired = false;
       try {
         const result = await ensureSessionSidecar(
@@ -3145,7 +2508,7 @@ export default function App() {
         throw error;
       }
     },
-    [],
+    [tabWorkspaceController],
   );
 
   /**
@@ -3170,19 +2533,17 @@ export default function App() {
           agentDir,
         );
         if (!result) return false;
-        setTabs((current) =>
-          current.map((tab) =>
-            tab.id === tabId && tab.sessionId === sessionId
-              ? {
-                  ...tab,
-                  sidecarConfigDisposition: result.isNew
-                    ? 'push'
-                    : tab.sidecarConfigDisposition === 'pending'
-                      ? 'adopt'
-                      : tab.sidecarConfigDisposition,
-                }
-              : tab,
-          ),
+        tabWorkspaceController.update(tabId, 'chat', (tab) =>
+          tab.sessionId === sessionId
+            ? {
+                ...tab,
+                sidecarConfigDisposition: result.isNew
+                  ? 'push'
+                  : tab.sidecarConfigDisposition === 'pending'
+                    ? 'adopt'
+                    : tab.sidecarConfigDisposition,
+              }
+            : tab,
         );
         return true;
       } catch (error) {
@@ -3195,7 +2556,7 @@ export default function App() {
         setLoadingTabs((current) => ({ ...current, [tabId]: false }));
       }
     },
-    [reconcileExistingSessionTabOwner],
+    [reconcileExistingSessionTabOwner, tabWorkspaceController],
   );
 
   /**
@@ -3210,12 +2571,12 @@ export default function App() {
       title: string,
       opts?: { pendingFilePreview?: FilePreviewIntent },
     ): Promise<boolean> => {
-      if (tabsRef.current.length >= MAX_TABS) {
+      if (tabWorkspaceController.getSnapshot().tabs.length >= MAX_TABS) {
         toastRef.current.error(t('appChrome.tabLimitReached'));
         return false;
       }
-      const newTab: Tab = {
-        ...createNewTab(),
+      const newTab: ChatTab = {
+        id: generateTabId(),
         agentDir: sessionAgentDir,
         sessionId,
         view: 'chat',
@@ -3227,19 +2588,16 @@ export default function App() {
         // step below resolves push|adopt from result.isNew (no stomp on a join).
         sidecarConfigDisposition: 'pending',
       };
-      const previousActiveTabId = activeTabIdRef.current;
+      const previousActiveTabId =
+        tabWorkspaceController.getSnapshot().activeTabId;
       // Existing-session opens are visually optimistic: mount and activate the
       // pending Tab immediately, then let Chat's existing boot surface cover
       // Sidecar startup. flushSync is load-bearing here: besides guaranteeing
-      // instant visual feedback, it commits tabsRef before a warm Sidecar can
-      // resolve ensure and reach the post-ensure liveness check. Keep setTabs
-      // functional so queued lifecycle mutations still compose; tabsRef remains
-      // a render mirror, never a second writable authority.
+      // instant visual feedback, it commits the workspace snapshot before a
+      // warm Sidecar can resolve ensure and reach the post-ensure liveness check.
+      // The controller serializes lifecycle mutations against that same authority.
       flushSync(() => {
-        setTabs((prev) => [...prev, newTab]);
-      });
-      flushSync(() => {
-        setActiveTabId(newTab.id);
+        tabWorkspaceController.append(newTab, { mount: 'immediate' });
       });
       const materialized = await materializeExistingSessionTab(
         newTab.id,
@@ -3247,21 +2605,19 @@ export default function App() {
         sessionAgentDir,
       );
       if (!materialized) {
-        const remainingTabs = tabsRef.current.filter((t) => t.id !== newTab.id);
-        setTabs((prev) => prev.filter((t) => t.id !== newTab.id));
-        if (activeTabIdRef.current === newTab.id) {
-          const fallbackTabId = remainingTabs.some(
-            (t) => t.id === previousActiveTabId,
-          )
-            ? previousActiveTabId
-            : (remainingTabs.at(-1)?.id ?? null);
-          setActiveTabId(fallbackTabId, remainingTabs);
+        const captured = tabWorkspaceController.capture(newTab.id);
+        if (captured) {
+          tabWorkspaceController.removeMany(
+            [{ captured }],
+            createNewTab,
+            previousActiveTabId,
+          );
         }
         return false;
       }
       return true;
     },
-    [materializeExistingSessionTab, setActiveTabId, t],
+    [materializeExistingSessionTab, t, tabWorkspaceController],
   );
 
   /** Open a history session from any surface using an explicit target workspace. */
@@ -3289,7 +2645,7 @@ export default function App() {
         }
 
         const plan = planSessionOpen({
-          tabs: tabsRef.current,
+          tabs: tabWorkspaceController.getSnapshot().tabs,
           targetSessionId: sessionId,
         });
         if (plan.type === 'jump-to-tab') {
@@ -3297,13 +2653,10 @@ export default function App() {
           // revives a stale binding without a probe/ensure TOCTOU window.
           const targetTabId = plan.tabId;
           if (options?.pendingFilePreview) {
-            setTabs((current) =>
-              current.map((tab) =>
-                tab.id === targetTabId
-                  ? { ...tab, pendingFilePreview: options.pendingFilePreview }
-                  : tab,
-              ),
-            );
+            tabWorkspaceController.update(targetTabId, 'chat', (tab) => ({
+              ...tab,
+              pendingFilePreview: options.pendingFilePreview,
+            }));
           }
           // The existing Tab is already the navigation authority. Activate it
           // synchronously, then reconcile its process owner without yanking focus
@@ -3319,13 +2672,24 @@ export default function App() {
             // revive is in flight, so this path owns rollback for the existing
             // Tab just as the optimistic new/restore paths own theirs.
             flushSync(() => {
-              setTabs((current) =>
-                current.map((tab) =>
-                  tab.id === targetTabId && tab.sessionId === sessionId
-                    ? resetTabToLauncher(tab)
-                    : tab,
-                ),
-              );
+              const captured = tabWorkspaceController.capture(targetTabId);
+              const target = tabWorkspaceController
+                .getSnapshot()
+                .tabs.find(
+                  (tab) =>
+                    tab.id === targetTabId &&
+                    tab.view === 'chat' &&
+                    tab.sessionId === sessionId,
+                );
+              if (captured && target?.view === 'chat') {
+                tabWorkspaceController.replaceMany([
+                  {
+                    captured,
+                    replacement: resetTabToLauncher(target),
+                    mount: 'immediate',
+                  },
+                ]);
+              }
             });
             return false;
           }
@@ -3350,6 +2714,7 @@ export default function App() {
       materializeExistingSessionTab,
       setActiveTabId,
       spawnTabForExistingSession,
+      tabWorkspaceController,
       trackHistorySessionOpenAsync,
     ],
   );
@@ -3368,28 +2733,24 @@ export default function App() {
     type ValidatedRestoreTarget =
       | {
           kind: 'chat';
-          tab: Tab & {
-            view: 'chat';
-            agentDir: string;
-            sessionId: string;
-          };
+          tab: ChatTab & { sessionId: string };
           releaseTransition: () => void;
         }
       | {
           kind: 'record';
-          tab: Tab & { view: 'record'; recordId: string };
+          tab: RecordTab;
           releaseTransition: null;
         }
       | {
           kind: 'record-fallback';
-          tab: Tab & { view: 'taskcenter' };
+          tab: Extract<Tab, { view: 'taskcenter' }>;
           releaseTransition: null;
         };
     const validated = (
       await Promise.all(
         candidate.tabs.map(
           async (tab): Promise<ValidatedRestoreTarget | null> => {
-            if (tab.view === 'record' && tab.recordId) {
+            if (tab.view === 'record') {
               try {
                 const record = await recordGet(tab.recordId);
                 if (record) {
@@ -3417,21 +2778,16 @@ export default function App() {
                 kind: 'record-fallback',
                 tab: {
                   id: tab.id,
-                  agentDir: null,
-                  sessionId: null,
                   view: 'taskcenter',
                   title: t('tabs.taskCenter'),
-                  sidecarConfigDisposition: 'push',
                 },
                 releaseTransition: null,
               };
             }
-            if (!tab.agentDir || !tab.sessionId) return null;
-            const target = tab as Tab & {
-              view: 'chat';
-              agentDir: string;
-              sessionId: string;
-            };
+            if (tab.view !== 'chat' || !tab.agentDir || !tab.sessionId) {
+              return null;
+            }
+            const target = tab as ChatTab & { sessionId: string };
             const releaseTransition = tryClaimSessionResourceTransition(
               sessionResourceTransitionsRef.current,
               target.sessionId,
@@ -3463,51 +2819,37 @@ export default function App() {
     if (validated.some((target) => target.kind === 'record-fallback')) {
       toastRef.current.info(t('appChrome.recordRestoreMissing'));
     }
-    const baseTabs = tabsRef.current;
-    const previousActiveTabId = activeTabIdRef.current;
     const validTabs = validated.map(({ tab }) => tab);
     const validActiveTabId = validTabs.some(
       (tab) => tab.id === candidate.activeTabId,
     )
       ? candidate.activeTabId
       : null;
-    const plan = planRestoreTabs(baseTabs, {
-      tabs: validTabs,
-      activeTabId: validActiveTabId,
+    let restoreResult:
+      | ReturnType<typeof tabWorkspaceController.restoreWithPolicy>
+      | undefined;
+    flushSync(() => {
+      restoreResult = tabWorkspaceController.restoreWithPolicy(
+        { tabs: validTabs, activeTabId: validActiveTabId },
+        (currentTabs, restoreCandidate) =>
+          planRestoreTabs(currentTabs, restoreCandidate),
+      );
     });
-    if (!plan) {
+    const committedRestore = restoreResult;
+    if (!committedRestore || committedRestore.kind === 'no-op') {
       validated.forEach(({ releaseTransition }) => releaseTransition?.());
       return;
     }
 
-    const addedTargets = validated.filter(({ tab }) => plan.tabs.includes(tab));
-    const addedTabSet = new Set(addedTargets.map(({ tab }) => tab));
+    const { addedTabs, previousActiveTabId } = committedRestore;
+    const addedTabIds = new Set(addedTabs.map((tab) => tab.id));
+    const addedTargets = validated.filter(({ tab }) => addedTabIds.has(tab.id));
     validated.forEach(({ tab, releaseTransition }) => {
-      if (!addedTabSet.has(tab)) releaseTransition?.();
+      if (!addedTabIds.has(tab.id)) releaseTransition?.();
     });
     if (addedTargets.length === 0) return;
 
     track('restore_last_session', { count: addedTargets.length });
-    flushSync(() => {
-      setDeferredMountTabIds((current) => {
-        const next = new Set(current);
-        addedTargets.forEach(({ tab }) => next.add(tab.id));
-        return next;
-      });
-      // Compose after any queued field-only updates (for example another
-      // existing Tab settling pending → adopt) instead of replacing them with
-      // the pre-await render mirror captured by the restore plan.
-      setTabs((current) =>
-        plan.tabs.map(
-          (planned) =>
-            current.find(
-              (tab) =>
-                tab.id === planned.id && tab.sessionId === planned.sessionId,
-            ) ?? planned,
-        ),
-      );
-      setActiveTabId(plan.activeTabId, plan.tabs);
-    });
 
     const addedChatTargets = addedTargets.filter(
       (target): target is Extract<ValidatedRestoreTarget, { kind: 'chat' }> =>
@@ -3534,37 +2876,20 @@ export default function App() {
     });
     if (failedTabIds.size === 0) return;
 
-    const remaining = tabsRef.current.filter(
-      (tab) => !failedTabIds.has(tab.id),
-    );
-    const nextTabs = remaining.length > 0 ? remaining : [createNewTab()];
-    const currentActiveTabId = activeTabIdRef.current;
-    const nextActiveTabId =
-      currentActiveTabId &&
-      nextTabs.some((tab) => tab.id === currentActiveTabId)
-        ? currentActiveTabId
-        : previousActiveTabId &&
-            nextTabs.some((tab) => tab.id === previousActiveTabId)
-          ? previousActiveTabId
-          : nextTabs.at(-1)!.id;
     flushSync(() => {
-      setDeferredMountTabIds((current) => {
-        const next = new Set(current);
-        failedTabIds.forEach((tabId) => next.delete(tabId));
-        return next;
-      });
-      // Functional removal composes after each successful target's queued
-      // pending → push/adopt update. A direct `setTabs(nextTabs)` from the
-      // render mirror can overwrite that settlement in React's update queue.
-      setTabs((current) => {
-        const currentRemaining = current.filter(
-          (tab) => !failedTabIds.has(tab.id),
-        );
-        return currentRemaining.length > 0 ? currentRemaining : nextTabs;
-      });
-      setActiveTabId(nextActiveTabId, nextTabs);
+      const removals = [...failedTabIds]
+        .map((tabId) => tabWorkspaceController.capture(tabId))
+        .filter((captured): captured is NonNullable<typeof captured> =>
+          Boolean(captured),
+        )
+        .map((captured) => ({ captured }));
+      tabWorkspaceController.removeMany(
+        removals,
+        createNewTab,
+        previousActiveTabId,
+      );
     });
-  }, [materializeExistingSessionTab, setActiveTabId, t]);
+  }, [materializeExistingSessionTab, t, tabWorkspaceController]);
 
   /** Chat-local adapter: all history selections use the canonical new/jump/revive path. */
   const handleOpenChatHistorySession = useCallback(
@@ -3574,8 +2899,10 @@ export default function App() {
       title: string,
       historyEntrySource: HistoryEntrySource = 'chat_dropdown',
     ) => {
-      const sourceTab = tabsRef.current.find((tab) => tab.id === tabId);
-      if (!sourceTab?.agentDir) {
+      const sourceTab = tabWorkspaceController
+        .getSnapshot()
+        .tabs.find((tab) => tab.id === tabId);
+      if (sourceTab?.view !== 'chat' || !sourceTab.agentDir) {
         console.error(
           '[App] Cannot open history session: source tab has no agentDir',
         );
@@ -3588,7 +2915,7 @@ export default function App() {
         historyEntrySource,
       );
     },
-    [handleOpenTargetSession],
+    [handleOpenTargetSession, tabWorkspaceController],
   );
 
   /**
@@ -3598,8 +2925,14 @@ export default function App() {
    */
   const handleNewSession = useCallback(
     async (tabId: string): Promise<boolean> => {
-      const currentTab = tabsRef.current.find((t) => t.id === tabId);
-      if (!currentTab?.sessionId || !currentTab?.agentDir) {
+      const currentTab = tabWorkspaceController
+        .getSnapshot()
+        .tabs.find((t) => t.id === tabId);
+      if (
+        currentTab?.view !== 'chat' ||
+        !currentTab.sessionId ||
+        !currentTab.agentDir
+      ) {
         return false;
       }
 
@@ -3648,17 +2981,11 @@ export default function App() {
         // Update tab state → TabProvider will detect sessionId change and reconnect
         // Fresh sidecar for the new session → 'push' (overwrites any stale disposition)
         // on the new session (e.g. user clicks "New Session" while still in IM Bot adoption window)
-        setTabs((prev) =>
-          prev.map((t) =>
-            t.id === tabId
-              ? {
-                  ...t,
-                  sessionId: pendingSessionId,
-                  sidecarConfigDisposition: 'push',
-                }
-              : t,
-          ),
-        );
+        tabWorkspaceController.update(tabId, 'chat', (tab) => ({
+          ...tab,
+          sessionId: pendingSessionId,
+          sidecarConfigDisposition: 'push',
+        }));
         const fbResult = await migrateFloatingBallSessionBinding(
           oldSessionId,
           pendingSessionId,
@@ -3677,7 +3004,7 @@ export default function App() {
         return false;
       }
     },
-    [],
+    [tabWorkspaceController],
   );
 
   const handleSelectTab = useCallback(
@@ -3723,45 +3050,47 @@ export default function App() {
   // Trackpad two-finger horizontal swipe to switch tabs (follow-along animation)
   useTabSwipeGesture({
     contentRef,
-    tabsRef,
-    activeTabIdRef,
+    getTabs: () => tabWorkspaceController.getSnapshot().tabs,
+    getActiveTabId: () => tabWorkspaceController.getSnapshot().activeTabId,
     onSwitchTab: handleSelectTab,
   });
 
   const handleCloseTab = useCallback((tabId: string) => {
     // Special case: If only one launcher tab, do nothing
-    const currentTabs = tabsRef.current;
+    const currentTabs = tabWorkspaceController.getSnapshot().tabs;
     const tab = currentTabs.find((t) => t.id === tabId);
     if (currentTabs.length === 1 && tab?.view === 'launcher') {
       return;
     }
 
     void closeTabWithConfirmation(tabId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- callbacks stabilized via tabsRef
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- workspace commands and callbacks are stable
   }, []);
 
   const handleNewTab = useCallback(() => {
-    const currentLength = tabsRef.current.length;
-    if (currentLength >= MAX_TABS) {
+    const currentLength = tabWorkspaceController.getSnapshot().tabs.length;
+    const result = tabWorkspaceController.open('launcher', {
+      reuseExisting: false,
+    });
+    if (result.kind === 'rejected') {
       console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
       return;
     }
-    const newTab = createNewTab();
-    openNewTabDeferred(newTab);
+    perfMark(RENDERER_PERF_PHASE.newTabReveal, { tabId: result.tab.id });
 
     // Track tab_new event
     track('tab_new', { tab_count: currentLength + 1 });
-  }, [openNewTabDeferred]);
+  }, [tabWorkspaceController]);
 
   const handleSidebarNewChat = useCallback(() => {
-    const currentTabs = tabsRef.current;
+    const currentTabs = tabWorkspaceController.getSnapshot().tabs;
     const leftmostLauncher = currentTabs.find((tab) => tab.view === 'launcher');
     if (leftmostLauncher) {
-      setActiveTabId(leftmostLauncher.id, currentTabs);
+      setActiveTabId(leftmostLauncher.id);
       return;
     }
     handleNewTab();
-  }, [handleNewTab, setActiveTabId]);
+  }, [handleNewTab, setActiveTabId, tabWorkspaceController]);
 
   const handleOpenWorkspaceFromSidebar = useCallback(
     async (
@@ -3769,7 +3098,7 @@ export default function App() {
       initialMessage?: InitialMessage,
       entryIntent: 'open_workspace' | 'workspace_init' = 'open_workspace',
     ): Promise<boolean> => {
-      if (tabsRef.current.length >= MAX_TABS) {
+      if (tabWorkspaceController.getSnapshot().tabs.length >= MAX_TABS) {
         toastRef.current.error(t('appChrome.tabLimitReached'));
         return false;
       }
@@ -3781,7 +3110,9 @@ export default function App() {
           surface: 'global_sidebar',
           entryIntent,
         });
-        return tabsRef.current.some((tab) => tab.id === launchTab.id);
+        return tabWorkspaceController
+          .getSnapshot()
+          .tabs.some((tab) => tab.id === launchTab.id);
       } catch (error) {
         console.error(
           '[App] Failed to open workspace from global sidebar:',
@@ -3791,18 +3122,22 @@ export default function App() {
         return false;
       }
     },
-    [handleLaunchProject, openLaunchTabNow, removeUnusedPrecreatedLaunchTab, t],
+    [
+      handleLaunchProject,
+      openLaunchTabNow,
+      removeUnusedPrecreatedLaunchTab,
+      t,
+      tabWorkspaceController,
+    ],
   );
 
   // Handle tab reordering via drag and drop
-  const handleReorderTabs = useCallback((activeId: string, overId: string) => {
-    setTabs((prev) => {
-      const oldIndex = prev.findIndex((t) => t.id === activeId);
-      const newIndex = prev.findIndex((t) => t.id === overId);
-      if (oldIndex === -1 || newIndex === -1) return prev;
-      return arrayMove(prev, oldIndex, newIndex);
-    });
-  }, []);
+  const handleReorderTabs = useCallback(
+    (activeId: string, overId: string) => {
+      tabWorkspaceController.reorder(activeId, overId);
+    },
+    [tabWorkspaceController],
+  );
 
   // Open Settings as a new tab (or switch to existing one)
   // Optional initialSection parameter to open a specific section (e.g., 'providers')
@@ -3811,46 +3146,18 @@ export default function App() {
     async (initialSection?: string) => {
       // Track settings_open event
       track('settings_open', { section: initialSection ?? null });
-
-      // Set initial section for Settings component
-      setSettingsInitialSection(initialSection);
-
-      // Check if there's already a Settings tab
-      const currentTabs = tabsRef.current;
-      const existingSettingsTab = currentTabs.find(
-        (t) => t.view === 'settings',
-      );
-      if (existingSettingsTab) {
-        // Switch to existing Settings tab
-        setActiveTabId(existingSettingsTab.id);
-        return;
-      }
-
-      // Create new Settings tab
-      if (currentTabs.length >= MAX_TABS) {
-        console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
-        return;
-      }
-
-      // Create Tab first (instant UI response). The 5.8k-line Settings subtree
-      // is a renderer-only mount with the same click-frame jank as the Launcher,
-      // so it goes through the shared deferred-mount path (placeholder this
-      // commit → real Settings on a transition render). settingsInitialSection
-      // etc. are set urgently above, so Settings reads the right section when it
-      // mounts on the transition.
-      const newTab: Tab = {
-        id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        agentDir: null,
-        sessionId: null,
-        view: 'settings',
+      const result = tabWorkspaceController.open('settings', {
         title: t('tabs.settings'),
-        sidecarConfigDisposition: 'push',
-      };
-      openNewTabDeferred(newTab);
-
-      // Global Sidecar is now started on App mount, no need to start here
+        navigationIntent: {
+          generation: tabWorkspaceController.nextIntentGeneration(),
+          section: initialSection,
+        },
+      });
+      if (result.kind === 'rejected') {
+        console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
+      }
     },
-    [openNewTabDeferred, setActiveTabId, t],
+    [t, tabWorkspaceController],
   );
 
   const handleOpenCapabilities = useCallback(
@@ -3866,99 +3173,91 @@ export default function App() {
           : initialSection === 'plugins'
             ? 'plugins'
             : 'skills';
-      if (initialSection) {
-        setCapabilityInitialSection(resolvedSection);
-        setCapabilityNavigationNonce((current) => current + 1);
-      }
-      setCapabilityInitialMcpId(mcpServerId);
-      setCapabilityInitialOfficialToolId(officialToolId);
-      setCapabilityInitialSelect(initialSelect);
-
-      const currentTabs = tabsRef.current;
-      const existing = currentTabs.find((tab) => tab.view === 'capabilities');
-      if (existing) {
-        setActiveTabId(existing.id);
-        return;
-      }
-      if (currentTabs.length >= MAX_TABS) {
-        console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
-        return;
-      }
-      openNewTabDeferred({
-        id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        agentDir: null,
-        sessionId: null,
-        view: 'capabilities',
+      const hasNavigation = Boolean(
+        initialSection || mcpServerId || initialSelect || officialToolId,
+      );
+      const result = tabWorkspaceController.open('capabilities', {
         title: t('tabs.capabilities'),
-        sidecarConfigDisposition: 'push',
+        ...(hasNavigation
+          ? {
+              navigationIntent: {
+                generation: tabWorkspaceController.nextIntentGeneration(),
+                section: resolvedSection,
+                mcpServerId,
+                officialToolId,
+                select: initialSelect,
+              },
+            }
+          : {}),
       });
-      if (!initialSection) setCapabilityInitialSection('skills');
+      if (result.kind === 'rejected') {
+        console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
+      }
     },
-    [openNewTabDeferred, setActiveTabId, t],
+    [t, tabWorkspaceController],
   );
 
   const handleRecordingSnapshotChange = useCallback(
     (recordId: string, snapshot: RecordingSnapshot | null) => {
       recordingSnapshotEpochRef.current += 1;
-      setTabs((current) =>
-        current.map((tab) => {
-          if (tab.view !== 'record' || tab.recordId !== recordId) return tab;
-          if (!snapshot) {
-            if (
-              tab.recordingStatus === undefined &&
-              tab.recordingMediaDurationMs === undefined &&
-              tab.recordingGeneration === undefined
-            ) {
-              return tab;
-            }
-            return {
-              ...tab,
-              recordingStatus: undefined,
-              recordingMediaDurationMs: undefined,
-              recordingStartedAtWallTime: undefined,
-              recordingPausedWallMs: undefined,
-              recordingRevision: undefined,
-              recordingGeneration: undefined,
-              recordingSources: undefined,
-              recordingSourceActivity: undefined,
-              recordingWarnings: undefined,
-            };
-          }
-          const currentSnapshot = recordingSnapshotFromTab(tab);
+      const recordTab = tabWorkspaceController
+        .getSnapshot()
+        .tabs.find((tab) => tab.view === 'record' && tab.recordId === recordId);
+      if (!recordTab) return;
+      tabWorkspaceController.update(recordTab.id, 'record', (tab) => {
+        if (!snapshot) {
           if (
-            currentSnapshot &&
-            isRecordingSnapshotOlder(currentSnapshot, snapshot)
+            tab.recordingStatus === undefined &&
+            tab.recordingMediaDurationMs === undefined &&
+            tab.recordingGeneration === undefined
           ) {
             return tab;
           }
-          if (sameRecordingTabProjection(tab, snapshot)) return tab;
-          return { ...tab, ...recordingTabProjection(snapshot) };
-        }),
-      );
+          return {
+            ...tab,
+            recordingStatus: undefined,
+            recordingMediaDurationMs: undefined,
+            recordingStartedAtWallTime: undefined,
+            recordingPausedWallMs: undefined,
+            recordingRevision: undefined,
+            recordingGeneration: undefined,
+            recordingSources: undefined,
+            recordingSourceActivity: undefined,
+            recordingWarnings: undefined,
+          };
+        }
+        const currentSnapshot = recordingSnapshotFromTab(tab);
+        if (
+          currentSnapshot &&
+          isRecordingSnapshotOlder(currentSnapshot, snapshot)
+        ) {
+          return tab;
+        }
+        if (sameRecordingTabProjection(tab, snapshot)) return tab;
+        return { ...tab, ...recordingTabProjection(snapshot) };
+      });
     },
-    [],
+    [tabWorkspaceController],
   );
 
   const handleRecordTitleChange = useCallback(
     (recordId: string, title: string) => {
-      setTabs((current) =>
-        current.map((tab) =>
-          tab.view === 'record' &&
-          tab.recordId === recordId &&
-          tab.title !== title
-            ? { ...tab, title }
-            : tab,
-        ),
+      const recordTab = tabWorkspaceController
+        .getSnapshot()
+        .tabs.find((tab) => tab.view === 'record' && tab.recordId === recordId);
+      if (!recordTab) return;
+      tabWorkspaceController.update(recordTab.id, 'record', (tab) =>
+        tab.title === title ? tab : { ...tab, title },
       );
     },
-    [],
+    [tabWorkspaceController],
   );
 
   const handleRecordDeleted = useCallback(
     (tabId: string) => {
-      void performCloseTab(tabId);
+      requestCloseTab(tabId, 'record-deleted');
     },
-    [performCloseTab],
+    [requestCloseTab],
   );
 
   const openOrFocusRecord = useCallback(
@@ -3973,38 +3272,22 @@ export default function App() {
         openInNewTab?: boolean;
       } = {},
     ): Promise<boolean> => {
-      const currentTabs = tabsRef.current;
+      const currentTabs = tabWorkspaceController.getSnapshot().tabs;
       const existing = currentTabs.find(
         (tab) => tab.view === 'record' && tab.recordId === recordId,
       );
       if (existing) {
-        if (options.snapshot || options.mediaMs !== undefined) {
-          setTabs((current) => {
-            const next = current.map((tab) => {
-              if (tab.id !== existing.id) return tab;
-              return {
-                ...tab,
-                ...(options.snapshot
-                  ? recordingTabProjection(options.snapshot)
-                  : {}),
-                ...(options.mediaMs !== undefined
-                  ? {
-                      recordSeekMediaMs: options.mediaMs,
-                      recordSeekNonce: (tab.recordSeekNonce ?? 0) + 1,
-                    }
-                  : {}),
-              };
-            });
-            tabsRef.current = next;
-            return next;
-          });
-        }
-        setActiveTabId(existing.id);
+        tabWorkspaceController.open('record', {
+          recordId,
+          title: options.title ?? existing.title,
+          snapshot: options.snapshot,
+          mediaMs: options.mediaMs,
+        });
         return true;
       }
 
       const activeTab = currentTabs.find(
-        (tab) => tab.id === activeTabIdRef.current,
+        (tab) => tab.id === tabWorkspaceController.getSnapshot().activeTabId,
       );
       const sourceTab = options.sourceTabId
         ? currentTabs.find(
@@ -4018,40 +3301,32 @@ export default function App() {
             (tab) => tab.view === 'launcher' || tab.view === 'taskcenter',
           )
         : undefined;
-      const reusable = options.openInNewTab
+      const mustReuseStopSurface =
+        Boolean(options.activeRecording) && currentTabs.length >= MAX_TABS;
+      const reusable = options.openInNewTab && !mustReuseStopSurface
         ? undefined
-        : sourceTab ??
+        : (sourceTab ??
           (options.activeRecording &&
           (activeTab?.view === 'launcher' || activeTab?.view === 'taskcenter')
             ? activeTab
-            : functionalTab);
+            : functionalTab));
       const title = options.title ?? t('tabs.record');
-      const recordTab: Tab = {
-        id:
-          reusable?.id ??
-          `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        agentDir: null,
-        sessionId: null,
-        view: 'record',
-        title,
+      const intent = {
         recordId,
-        sidecarConfigDisposition: 'push',
-        ...(options.snapshot ? recordingTabProjection(options.snapshot) : {}),
-        ...(options.mediaMs !== undefined
-          ? {
-              recordSeekMediaMs: options.mediaMs,
-              recordSeekNonce: 1,
-            }
-          : {}),
+        title,
+        snapshot: options.snapshot,
+        mediaMs: options.mediaMs,
       };
 
       if (reusable) {
-        const nextTabs = currentTabs.map((tab) =>
-          tab.id === reusable.id ? recordTab : tab,
+        const captured = tabWorkspaceController.capture(reusable.id);
+        if (!captured) return false;
+        const replaced = tabWorkspaceController.replaceWith(
+          captured,
+          'record',
+          intent,
         );
-        tabsRef.current = nextTabs;
-        setTabs(nextTabs);
-        setActiveTabId(recordTab.id, nextTabs);
+        if (replaced.kind === 'rejected') return false;
       } else {
         if (currentTabs.length >= MAX_TABS) {
           if (!options.activeRecording) {
@@ -4064,7 +3339,10 @@ export default function App() {
           // full tab strip contains no reusable Launcher/Task Center tab, one
           // bounded emergency Record tab is safer than replacing a live Chat.
         }
-        openNewTabDeferred(recordTab);
+        const opened = tabWorkspaceController.open('record', intent, {
+          allowOverCapacity: Boolean(options.activeRecording),
+        });
+        if (opened.kind === 'rejected') return false;
       }
 
       void recordGet(recordId)
@@ -4075,14 +3353,14 @@ export default function App() {
         .catch(() => undefined);
       return true;
     },
-    [handleRecordTitleChange, openNewTabDeferred, setActiveTabId, t],
+    [handleRecordTitleChange, t, tabWorkspaceController],
   );
 
   const handleStartRecording = useCallback(
     async (tabId: string, selection: RecordingSourceSelection) => {
-      const openInNewTab = tabsRef.current.some(
-        (tab) => tab.id === tabId && tab.view === 'taskcenter',
-      );
+      const openInNewTab = tabWorkspaceController
+        .getSnapshot()
+        .tabs.some((tab) => tab.id === tabId && tab.view === 'taskcenter');
       recordingAdmissionTabsRef.current.add(tabId);
       setLoadingTabs((current) => ({ ...current, [tabId]: true }));
       try {
@@ -4098,7 +3376,7 @@ export default function App() {
         setLoadingTabs((current) => ({ ...current, [tabId]: false }));
       }
     },
-    [openOrFocusRecord],
+    [openOrFocusRecord, tabWorkspaceController],
   );
 
   const handleOpenRecord = useCallback(
@@ -4152,12 +3430,10 @@ export default function App() {
   }, [handleOpenRecord, handleRecordingSnapshotChange]);
 
   const activeRecordingTab = tabs.find(
-    (tab) =>
+    (tab): tab is RecordTab =>
       tab.view === 'record' &&
-      tab.recordId &&
-      tab.recordingStatus &&
       ['preparing', 'recording', 'paused', 'stopping', 'finalizing'].includes(
-        tab.recordingStatus,
+        tab.recordingStatus ?? '',
       ),
   );
   const activeRecordingRecordId = activeRecordingTab?.recordId;
@@ -4199,9 +3475,9 @@ export default function App() {
       .then((active) => {
         if (recordingSnapshotEpochRef.current !== epoch) return;
         if (!active) return;
-        const sourceTab = tabsRef.current.find(
-          (tab) => tab.view === 'launcher',
-        );
+        const sourceTab = tabWorkspaceController
+          .getSnapshot()
+          .tabs.find((tab) => tab.view === 'launcher');
         void openOrFocusRecord(active.recordId, {
           sourceTabId: sourceTab?.id,
           snapshot: active,
@@ -4209,7 +3485,7 @@ export default function App() {
         });
       })
       .catch(() => undefined);
-  }, [openOrFocusRecord]);
+  }, [openOrFocusRecord, tabWorkspaceController]);
 
   // Listen for OPEN_SETTINGS custom event from child components
   useEffect(() => {
@@ -4250,69 +3526,55 @@ export default function App() {
     };
   }, [handleOpenCapabilities, handleOpenSettings]);
 
-  // Open TaskCenter as a singleton tab (mirrors handleOpenSettings)
-  const handleOpenTaskCenter = useCallback(() => {
-    const currentTabs = tabsRef.current;
-    const sourceTab = currentTabs.find(
-      (tab) => tab.id === activeTabIdRef.current,
-    );
-    if (sourceTab?.view === 'chat') {
-      const sourceSessionId = sourceTab.sessionId?.trim();
-      setTaskCenterCurrentSessionId(
-        sourceSessionId && !isPendingSessionId(sourceSessionId)
-          ? sourceSessionId
-          : null,
+  // Open TaskCenter as a singleton tab. Reopen intents live on that exact tab,
+  // so repeated search/route requests cannot leak into a later instance.
+  const handleOpenTaskCenter = useCallback(
+    (options?: {
+      autofocusSearch?: boolean;
+      clearSearchIntent?: boolean;
+      routeIntent?: PendingAppRoute;
+    }): boolean => {
+      const currentTabs = tabWorkspaceController.getSnapshot().tabs;
+      const sourceTab = currentTabs.find(
+        (tab) => tab.id === tabWorkspaceController.getSnapshot().activeTabId,
       );
-    } else if (sourceTab?.view !== 'taskcenter') {
-      setTaskCenterCurrentSessionId(null);
-    }
-    const existing = currentTabs.find((t) => t.view === 'taskcenter');
-    if (existing) {
-      setActiveTabId(existing.id);
+      let updateCurrentSession = false;
+      let currentSessionId: string | null = null;
+      if (sourceTab?.view === 'chat') {
+        const sourceSessionId = sourceTab.sessionId?.trim();
+        updateCurrentSession = true;
+        currentSessionId =
+          sourceSessionId && !isPendingSessionId(sourceSessionId)
+            ? sourceSessionId
+            : null;
+      } else if (sourceTab?.view !== 'taskcenter') {
+        updateCurrentSession = true;
+      }
+      const result = tabWorkspaceController.open('taskcenter', {
+        title: t('tabs.taskCenter'),
+        ...(options?.autofocusSearch
+          ? {
+              searchIntent: {
+                generation: tabWorkspaceController.nextIntentGeneration(),
+                autofocusSearch: true as const,
+              },
+            }
+          : {}),
+        clearSearchIntent: options?.clearSearchIntent,
+        routeIntent: options?.routeIntent,
+        updateCurrentSession,
+        currentSessionId,
+      });
+      if (result.kind === 'rejected') {
+        console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
+        return false;
+      }
       acknowledgeNotificationTarget({ type: 'task-center' });
-      return;
-    }
-    if (currentTabs.length >= MAX_TABS) {
-      console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
-      return;
-    }
-    const newTab: Tab = {
-      id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      agentDir: null,
-      sessionId: null,
-      view: 'taskcenter',
-      title: t('tabs.taskCenter'),
-      sidecarConfigDisposition: 'push',
-    };
-    openNewTabDeferred(newTab);
-    acknowledgeNotificationTarget({ type: 'task-center' });
-  }, [acknowledgeNotificationTarget, openNewTabDeferred, setActiveTabId, t]);
+      return true;
+    },
+    [acknowledgeNotificationTarget, t, tabWorkspaceController],
+  );
 
-  // Intent carried across `OPEN_TASK_CENTER` — the event dispatcher
-  // (Launcher "我的任务" tab's search icon) wants more than just "open
-  // the tab": it wants the Task Center's search box focused on arrival.
-  // Propagating via a direct `window` listener in TaskListPanel misses
-  // the first-mount case (the event fires before the tab exists), so
-  // we stash the intent in state here and pass it down as a prop.
-  //
-  // Intent lifecycle (cross-review C2):
-  //   1. Every event overwrites state — including with `null` when the
-  //      event carries no focus request. Otherwise a stale intent from
-  //      an earlier search path would persist and trigger unexpected
-  //      focus when the user later opens Task Center via the titlebar
-  //      icon or any other entry.
-  //   2. Each intent gets a monotonically-increasing `nonce` (not
-  //      `Date.now()`) so back-to-back same-millisecond firings still
-  //      produce distinct dep-array values for the consuming effect.
-  //      `useRef + ++` is cheap and collision-free.
-  const taskCenterIntentCounterRef = useRef(0);
-  const [taskCenterPendingIntent, setTaskCenterPendingIntent] = useState<{
-    autofocusSearch?: boolean;
-    nonce: number;
-  } | null>(null);
-  const [taskCenterCurrentSessionId, setTaskCenterCurrentSessionId] = useState<
-    string | null
-  >(null);
   const [taskCreateIntent, setTaskCreateIntent] =
     useState<TaskCreateIntent | null>(null);
 
@@ -4323,12 +3585,15 @@ export default function App() {
     });
   }, []);
   const handleSidebarCreateTask = useCallback(() => {
+    const taskCenterCurrentSessionId = tabWorkspaceController
+      .getSnapshot()
+      .tabs.find((tab) => tab.view === 'taskcenter')?.currentSessionId;
     handleOpenTaskCreate({
       initialMode: 'smart',
       source: 'sidebar',
-      currentSessionId: taskCenterCurrentSessionId,
+      currentSessionId: taskCenterCurrentSessionId ?? null,
     });
-  }, [handleOpenTaskCreate, taskCenterCurrentSessionId]);
+  }, [handleOpenTaskCreate, tabWorkspaceController]);
 
   // Listen for OPEN_TASK_CENTER custom event from child components
   useEffect(() => {
@@ -4336,19 +3601,10 @@ export default function App() {
       const detail = (e as CustomEvent).detail as
         | { autofocusSearch?: boolean }
         | undefined;
-      if (detail?.autofocusSearch) {
-        taskCenterIntentCounterRef.current += 1;
-        setTaskCenterPendingIntent({
-          autofocusSearch: true,
-          nonce: taskCenterIntentCounterRef.current,
-        });
-      } else {
-        // Non-focus open (titlebar icon, Chat 新建 dispatch, etc.) —
-        // clear any lingering search intent so returning to Task Center
-        // doesn't auto-focus the search field unexpectedly.
-        setTaskCenterPendingIntent(null);
-      }
-      handleOpenTaskCenter();
+      handleOpenTaskCenter({
+        autofocusSearch: detail?.autofocusSearch,
+        clearSearchIntent: !detail?.autofocusSearch,
+      });
     };
     window.addEventListener(CUSTOM_EVENTS.OPEN_TASK_CENTER, handler);
     return () =>
@@ -4371,6 +3627,33 @@ export default function App() {
 
   const lastNativeAppRouteGenerationRef = useRef(0);
   const openedSpaceRouteGenerationRef = useRef(0);
+  const openSpaceRoute = useCallback(
+    (pending: PendingAppRoute): boolean => {
+      if (openedSpaceRouteGenerationRef.current >= pending.generation) {
+        return true;
+      }
+      const result = tabWorkspaceController.open('space', {
+        title: t('tabs.team'),
+        navigationIntent: pending,
+      });
+      if (result.kind === 'rejected') {
+        toastRef.current.error(
+          t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }),
+        );
+        if (pendingSpaceRouteRef.current?.generation === pending.generation) {
+          pendingSpaceRouteRef.current = null;
+        }
+        return false;
+      }
+      openedSpaceRouteGenerationRef.current = pending.generation;
+      spaceRouteTabIdRef.current = result.tab.id;
+      if (pendingSpaceRouteRef.current?.generation === pending.generation) {
+        pendingSpaceRouteRef.current = null;
+      }
+      return true;
+    },
+    [t, tabWorkspaceController],
+  );
   const handleOpenAppRoute = useCallback(
     (route: AppRoute, nativeGeneration?: number): boolean => {
       try {
@@ -4386,7 +3669,7 @@ export default function App() {
         return true;
       }
       if (route.name === 'task.comment') {
-        const currentTabs = tabsRef.current;
+        const currentTabs = tabWorkspaceController.getSnapshot().tabs;
         const existing = currentTabs.find((tab) => tab.view === 'taskcenter');
         if (!existing && currentTabs.length >= MAX_TABS) {
           toastRef.current.error(
@@ -4398,11 +3681,19 @@ export default function App() {
           lastNativeAppRouteGenerationRef.current = nativeGeneration;
         }
         appRouteGenerationRef.current += 1;
-        setTaskPendingRoute({
-          generation: appRouteGenerationRef.current,
-          route,
+        const opened = handleOpenTaskCenter({
+          clearSearchIntent: true,
+          routeIntent: {
+            generation: appRouteGenerationRef.current,
+            route,
+          },
         });
-        handleOpenTaskCenter();
+        if (!opened) {
+          toastRef.current.error(
+            t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }),
+          );
+          return false;
+        }
         return true;
       }
       if (!spaceBuildCapability.isLoading && !spaceBuildCapability.available) {
@@ -4411,8 +3702,13 @@ export default function App() {
         );
         return false;
       }
-      const existing = tabsRef.current.find((tab) => tab.view === 'space');
-      if (!existing && tabsRef.current.length >= MAX_TABS) {
+      const existing = tabWorkspaceController
+        .getSnapshot()
+        .tabs.find((tab) => tab.view === 'space');
+      if (
+        !existing &&
+        tabWorkspaceController.getSnapshot().tabs.length >= MAX_TABS
+      ) {
         toastRef.current.error(
           t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }),
         );
@@ -4422,87 +3718,69 @@ export default function App() {
         lastNativeAppRouteGenerationRef.current = nativeGeneration;
       }
       appRouteGenerationRef.current += 1;
-      setSpacePendingRoute({
+      const pending = {
         generation: appRouteGenerationRef.current,
         route,
-      });
-      return true;
+      } satisfies PendingAppRoute;
+      pendingSpaceRouteRef.current = pending;
+      return spaceBuildCapability.isLoading ? true : openSpaceRoute(pending);
     },
     [
       handleOpenTaskCenter,
+      openSpaceRoute,
       spaceBuildCapability.available,
       spaceBuildCapability.isLoading,
       spaceBuildCapability.reason,
       t,
+      tabWorkspaceController,
     ],
   );
 
   useEffect(() => {
-    if (!spacePendingRoute || spaceBuildCapability.isLoading) return;
+    const pending = pendingSpaceRouteRef.current;
+    if (!pending || spaceBuildCapability.isLoading) return;
     if (!spaceBuildCapability.available) {
-      if (
-        openedSpaceRouteGenerationRef.current < spacePendingRoute.generation
-      ) {
-        openedSpaceRouteGenerationRef.current = spacePendingRoute.generation;
+      if (openedSpaceRouteGenerationRef.current < pending.generation) {
+        openedSpaceRouteGenerationRef.current = pending.generation;
         toastRef.current.info(
           spaceBuildCapability.reason ?? t('titlebar.teamBuildUnavailable'),
         );
       }
-      setSpacePendingRoute((current) =>
-        current?.generation === spacePendingRoute.generation ? null : current,
-      );
+      if (pendingSpaceRouteRef.current?.generation === pending.generation) {
+        pendingSpaceRouteRef.current = null;
+      }
       return;
     }
-    if (openedSpaceRouteGenerationRef.current >= spacePendingRoute.generation)
-      return;
-    openedSpaceRouteGenerationRef.current = spacePendingRoute.generation;
-    const currentTabs = tabsRef.current;
-    const existing = currentTabs.find((tab) => tab.view === 'space');
-    if (existing) {
-      spaceRouteTabIdRef.current = existing.id;
-      setActiveTabId(existing.id);
-      return;
-    }
-    if (currentTabs.length >= MAX_TABS) {
-      toastRef.current.error(
-        t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }),
-      );
-      setSpacePendingRoute((current) =>
-        current?.generation === spacePendingRoute.generation ? null : current,
-      );
-      return;
-    }
-    const routeTabId = `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    spaceRouteTabIdRef.current = routeTabId;
-    openNewTabDeferred({
-      id: routeTabId,
-      agentDir: null,
-      sessionId: null,
-      view: 'space',
-      title: t('tabs.team'),
-      sidecarConfigDisposition: 'push',
-    });
+    openSpaceRoute(pending);
   }, [
-    openNewTabDeferred,
-    setActiveTabId,
+    openSpaceRoute,
     spaceBuildCapability.available,
     spaceBuildCapability.isLoading,
     spaceBuildCapability.reason,
-    spacePendingRoute,
     t,
   ]);
 
-  const handleSpaceRouteConsumed = useCallback((generation: number) => {
-    setSpacePendingRoute((current) =>
-      current?.generation === generation ? null : current,
-    );
-  }, []);
+  const handleSpaceRouteConsumed = useCallback(
+    (tabId: string, generation: number) => {
+      tabWorkspaceController.update(tabId, 'space', (tab) =>
+        tab.navigationIntent?.generation === generation
+          ? { ...tab, navigationIntent: undefined }
+          : tab,
+      );
+    },
+    [tabWorkspaceController],
+  );
 
-  const handleTaskRouteConsumed = useCallback((generation: number) => {
-    setTaskPendingRoute((current) =>
-      current?.generation === generation ? null : current,
-    );
-  }, []);
+  const handleTaskRouteConsumed = useCallback(
+    (tabId: string, generation: number) => {
+      tabWorkspaceController.update(tabId, 'taskcenter', (tab) =>
+        tab.routeIntent?.generation === generation
+          ? { ...tab, routeIntent: undefined }
+          : tab,
+      );
+    },
+    [tabWorkspaceController],
+  );
 
   useEffect(() => {
     if (!isTauriEnvironment()) return;
@@ -4545,32 +3823,18 @@ export default function App() {
       toastRef.current.info(t('titlebar.teamUnavailable'));
       return;
     }
-    const currentTabs = tabsRef.current;
-    const existing = currentTabs.find((t) => t.view === 'space');
-    if (existing) {
-      setActiveTabId(existing.id);
-      return;
-    }
-    if (currentTabs.length >= MAX_TABS) {
-      console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
-      return;
-    }
-    const newTab: Tab = {
-      id: `tab-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      agentDir: null,
-      sessionId: null,
-      view: 'space',
+    const result = tabWorkspaceController.open('space', {
       title: t('tabs.team'),
-      sidecarConfigDisposition: 'push',
-    };
-    openNewTabDeferred(newTab);
+    });
+    if (result.kind === 'rejected') {
+      console.warn(`[App] Max tabs (${MAX_TABS}) reached`);
+    }
   }, [
-    openNewTabDeferred,
-    setActiveTabId,
-    spaceBuildCapability.available,
     spaceBuildCapability.isLoading,
+    spaceBuildCapability.available,
     spaceBuildCapability.reason,
     teamSpaceAvailable,
+    tabWorkspaceController,
     t,
   ]);
 
@@ -4605,7 +3869,7 @@ export default function App() {
       }
 
       try {
-        const currentTabs = tabsRef.current;
+        const currentTabs = tabWorkspaceController.getSnapshot().tabs;
         if (currentTabs.length >= MAX_TABS) {
           toastRef.current?.error(
             t('appChrome.maxTabsReachedWithCount', { count: MAX_TABS }),
@@ -4623,8 +3887,7 @@ export default function App() {
         const workspace =
           (workspaceId
             ? projects.find((p) => p.id === workspaceId)
-            : undefined) ??
-          projects[0];
+            : undefined) ?? projects[0];
 
         // PRD 0.2.3: 从前端唯一 builtin selection helper 解析出成对的 (provider, model)。
         // 早期实现直接吃 config.defaultProviderId、跳过 workspace/agent 两层，导致
@@ -4730,22 +3993,22 @@ export default function App() {
         // handleLaunchProject waits on ensureSessionSidecar, then the tab
         // "jumps" to Chat. createPendingSessionId is deterministic
         // (`pending-<tabId>`), so handleLaunchProject's internal call
-        // resolves to the same id and its later setTabs is a no-op for
+        // resolves to the same id and its later controller update is a no-op for
         // view/agentDir/sessionId.
         const newTab = createNewTab();
         if (initialMessage.providerExecutionIdentity) {
           openLaunchTabNow(newTab);
         } else {
-          const seeded = {
-            ...newTab,
+          const seeded: ChatTab = {
+            id: newTab.id,
             view: 'chat' as const,
             agentDir: workspace.path,
             sessionId: createPendingSessionId(newTab.id),
             title: t('appChrome.discussionTabTitle'),
             initialMessage,
+            sidecarConfigDisposition: 'pending',
           };
-          setTabs((prev) => [...prev, seeded]);
-          setActiveTabId(newTab.id);
+          tabWorkspaceController.append(seeded, { mount: 'immediate' });
         }
 
         const launched = await handleLaunchProject(workspace, initialMessage, {
@@ -4754,17 +4017,14 @@ export default function App() {
         });
         if (!launched) return false;
 
-        // handleLaunchProject's internal setTabs overwrites `title` with the
+        // handleLaunchProject's internal controller update overwrites `title` with the
         // workspace display name. Restore the "任务讨论" title afterwards so
         // the tab consistently reads as a discussion session, not the
         // workspace's generic name.
-        setTabs((prev) =>
-          prev.map((tab) =>
-            tab.id === newTab.id
-              ? { ...tab, title: t('appChrome.discussionTabTitle') }
-              : tab,
-          ),
-        );
+        tabWorkspaceController.update(newTab.id, 'chat', (tab) => ({
+          ...tab,
+          title: t('appChrome.discussionTabTitle'),
+        }));
         return true;
       } catch (err) {
         console.error('[App] OPEN_AI_DISCUSSION failed:', err);
@@ -4777,7 +4037,7 @@ export default function App() {
         return false;
       }
     },
-    [handleLaunchProject, openLaunchTabNow, setActiveTabId, t],
+    [handleLaunchProject, openLaunchTabNow, t, tabWorkspaceController],
   );
 
   const handleCreateDialogDiscussion = useCallback(
@@ -4864,7 +4124,9 @@ export default function App() {
       const { targetTabId, sessionId } = event.detail;
       console.log(`[App] Jump to tab ${targetTabId} for session ${sessionId}`);
       // Check if target Tab exists
-      const targetTab = tabsRef.current.find((t) => t.id === targetTabId);
+      const targetTab = tabWorkspaceController
+        .getSnapshot()
+        .tabs.find((t) => t.id === targetTabId);
       if (targetTab) {
         setActiveTabId(targetTabId);
       } else {
@@ -4881,7 +4143,7 @@ export default function App() {
         handleJumpToTab as EventListener,
       );
     };
-  }, [setActiveTabId]);
+  }, [setActiveTabId, tabWorkspaceController]);
 
   // Listen for LAUNCH_BUG_REPORT custom event (AI-powered bug reporting)
   useEffect(() => {
@@ -4921,7 +4183,7 @@ export default function App() {
           return;
         }
 
-        if (tabsRef.current.length >= MAX_TABS) {
+        if (tabWorkspaceController.getSnapshot().tabs.length >= MAX_TABS) {
           console.warn(
             `[App] Max tabs (${MAX_TABS}) reached, cannot open bug report`,
           );
@@ -5090,19 +4352,13 @@ export default function App() {
           }
 
           // Override tab title
-          setTabs((prev) =>
-            prev.map((tab) =>
-              tab.id === newTab.id
-                ? {
-                    ...tab,
-                    title:
-                      scenario === 'space_tool_install'
-                        ? t('space.tools.installSessionTitle')
-                        : t('appChrome.diagnosticsTabTitle'),
-                  }
-                : tab,
-            ),
-          );
+          tabWorkspaceController.update(newTab.id, 'chat', (tab) => ({
+            ...tab,
+            title:
+              scenario === 'space_tool_install'
+                ? t('space.tools.installSessionTitle')
+                : t('appChrome.diagnosticsTabTitle'),
+          }));
         } finally {
           removeUnusedPrecreatedLaunchTab(newTab.id);
         }
@@ -5132,15 +4388,41 @@ export default function App() {
   }, [configAddProject, configPatchProject, t]);
 
   // Stable callback for Settings onSectionChange — avoids inline arrow creating new ref every render
-  const handleSettingsSectionChange = useCallback(() => {
-    setSettingsInitialSection(undefined);
-  }, []);
+  const handleSettingsSectionChange = useCallback(
+    (tabId: string, generation: number) => {
+      tabWorkspaceController.update(tabId, 'settings', (tab) =>
+        tab.navigationIntent?.generation === generation
+          ? { ...tab, navigationIntent: undefined }
+          : tab,
+      );
+    },
+    [tabWorkspaceController],
+  );
 
-  const handleCapabilitySectionChange = useCallback(() => {
-    setCapabilityInitialMcpId(undefined);
-    setCapabilityInitialOfficialToolId(undefined);
-    setCapabilityInitialSelect(undefined);
-  }, []);
+  const handleCapabilitySectionChange = useCallback(
+    (tabId: string, generation: number) => {
+      tabWorkspaceController.update(tabId, 'capabilities', (tab) =>
+        tab.navigationIntent?.generation === generation
+          ? { ...tab, navigationIntent: undefined }
+          : tab,
+      );
+    },
+    [tabWorkspaceController],
+  );
+
+  const handleTaskSearchIntentConsumed = useCallback(
+    (tabId: string, generation: number) => {
+      tabWorkspaceController.update(tabId, 'taskcenter', (tab) =>
+        tab.searchIntent?.generation === generation
+          ? {
+              ...tab,
+              searchIntent: { ...tab.searchIntent, consumed: true },
+            }
+          : tab,
+      );
+    },
+    [tabWorkspaceController],
+  );
 
   const handleOpenGeneralSettings = useCallback(() => {
     void handleOpenSettings('general');
@@ -5159,43 +4441,53 @@ export default function App() {
     [handleOpenTargetSession],
   );
 
-  const handleDeleteSession = useCallback(async (sessionId: string) => {
-    const releaseTransition = tryClaimSessionResourceTransition(
-      sessionResourceTransitionsRef.current,
-      sessionId,
-      'deleting',
-    );
-    if (!releaseTransition) {
-      return {
-        deleted: false as const,
-        reason: 'transition-in-progress' as const,
-      };
-    }
-
-    try {
-      return await deleteSessionThroughAppOwner({
+  const handleDeleteSession = useCallback(
+    async (sessionId: string) => {
+      const releaseTransition = tryClaimSessionResourceTransition(
+        sessionResourceTransitionsRef.current,
         sessionId,
-        getTabs: () => tabsRef.current,
-        terminateTabsForSession: (targetSessionId) => {
-          for (const tab of tabsRef.current) {
-            if (tab.view === 'chat' && tab.sessionId === targetSessionId) {
-              clearPendingSessionBirth(tab.id);
+        'deleting',
+      );
+      if (!releaseTransition) {
+        return {
+          deleted: false as const,
+          reason: 'transition-in-progress' as const,
+        };
+      }
+
+      try {
+        return await deleteSessionThroughAppOwner({
+          sessionId,
+          getTabs: () => tabWorkspaceController.getSnapshot().tabs,
+          terminateTabsForSession: (targetSessionId) => {
+            const plans = [];
+            for (const tab of tabWorkspaceController.getSnapshot().tabs) {
+              if (tab.view === 'chat' && tab.sessionId === targetSessionId) {
+                clearPendingSessionBirth(tab.id);
+                const captured = tabWorkspaceController.capture(tab.id);
+                if (captured) {
+                  plans.push({
+                    captured,
+                    replacement: resetTabToLauncher(tab),
+                    mount: 'immediate' as const,
+                  });
+                }
+              }
             }
-          }
-          setTabs((current) => [
-            ...applyTerminalSessionToTabs(current, targetSessionId),
-          ]);
-        },
-        hasPersistentOwners: querySessionHasPersistentOwners,
-        handoffMountedSessionActivity: startBackgroundCompletionForDeletion,
-        stopSseProxy,
-        deletePersistedSession: (targetSessionId, releasableTabIds) =>
-          taskCenterActions.deleteSession(targetSessionId, releasableTabIds),
-      });
-    } finally {
-      releaseTransition();
-    }
-  }, []);
+            tabWorkspaceController.replaceMany(plans);
+          },
+          hasPersistentOwners: querySessionHasPersistentOwners,
+          handoffMountedSessionActivity: startBackgroundCompletionForDeletion,
+          stopSseProxy,
+          deletePersistedSession: (targetSessionId, releasableTabIds) =>
+            taskCenterActions.deleteSession(targetSessionId, releasableTabIds),
+        });
+      } finally {
+        releaseTransition();
+      }
+    },
+    [tabWorkspaceController],
+  );
 
   const requestLifecycleExitConfirmation =
     useCallback(async (): Promise<boolean> => {
@@ -5280,9 +4572,13 @@ export default function App() {
         const route = resolveNotificationClickRoute(
           event.payload,
           (tabId, sessionId) => {
-            const tab = tabsRef.current.find((t) => t.id === tabId);
+            const tab = tabWorkspaceController
+              .getSnapshot()
+              .tabs.find((t) => t.id === tabId);
             if (!tab) return false;
-            return !sessionId || tab.sessionId === sessionId;
+            return (
+              !sessionId || (tab.view === 'chat' && tab.sessionId === sessionId)
+            );
           },
         );
         if (route.type === 'select-tab') {
@@ -5325,9 +4621,163 @@ export default function App() {
       ac.signal,
     );
     return () => ac.abort();
-  }, [acknowledgeNotificationTarget, handleSelectTab, updateTabUnread]);
+  }, [
+    acknowledgeNotificationTarget,
+    handleSelectTab,
+    tabWorkspaceController,
+    updateTabUnread,
+  ]);
 
   const activeWorkspacePath = resolveGlobalSidebarWorkspace(activeTab);
+  const launcherBinding = useMemo<BuiltinTabBindings['launcher']>(
+    () => ({
+      isStarting: (tabId) => loadingTabs[tabId] ?? false,
+      startError: (tabId) => tabErrors[tabId] ?? null,
+      onWorkspaceSelectionChange: handleLauncherWorkspaceSelectionChange,
+      onLaunchProject: handleLaunchProject,
+      onStartRecording: handleStartRecording,
+      onOpenRecord: (recordId) =>
+        handleOpenRecord(recordId, undefined, 'launcher_input'),
+    }),
+    [
+      handleLaunchProject,
+      handleLauncherWorkspaceSelectionChange,
+      handleOpenRecord,
+      handleStartRecording,
+      loadingTabs,
+      tabErrors,
+    ],
+  );
+  const chatBinding = useMemo<BuiltinTabBindings['chat']>(
+    () => ({
+      windowPresentation,
+      onOpenHistorySession: handleOpenChatHistorySession,
+      onOpenHistoryTag: handleOpenHistoryTag,
+      onNewSession: handleNewSession,
+      onLaunchRuntimeBackedProviderSession:
+        handleLaunchRuntimeBackedProviderSession,
+      onUpdateGenerating: updateTabGenerating,
+      onUpdateTitle: updateTabTitle,
+      onUpdateUnread: updateTabUnread,
+      onRenameSession: handleRenameSession,
+      onForkSession: handleForkSession,
+      onUpdateSessionId: updateTabSessionId,
+      claimSessionOpeningTransition,
+      onClearInitialMessage: clearInitialMessage,
+      onSidecarConfigAdopted: markSidecarConfigAdopted,
+      onFilePreviewIntentConsumed: handleFilePreviewIntentConsumed,
+      sessionNotificationBadgeCounts,
+    }),
+    [
+      claimSessionOpeningTransition,
+      clearInitialMessage,
+      handleFilePreviewIntentConsumed,
+      handleForkSession,
+      handleLaunchRuntimeBackedProviderSession,
+      handleNewSession,
+      handleOpenChatHistorySession,
+      handleOpenHistoryTag,
+      handleRenameSession,
+      markSidecarConfigAdopted,
+      sessionNotificationBadgeCounts,
+      updateTabGenerating,
+      updateTabSessionId,
+      updateTabTitle,
+      updateTabUnread,
+      windowPresentation,
+    ],
+  );
+  const settingsUpdaterBinding = useMemo(
+    () => ({
+      updateReady,
+      updateVersion,
+      updateChecking,
+      updateDownloading,
+      updateInstalling,
+      updatePreparing,
+      onCheckForUpdate: checkForUpdate,
+      onRestartAndUpdate: () => void handleRestartAndUpdate(),
+    }),
+    [
+      checkForUpdate,
+      handleRestartAndUpdate,
+      updateChecking,
+      updateDownloading,
+      updateInstalling,
+      updatePreparing,
+      updateReady,
+      updateVersion,
+    ],
+  );
+  const settingsBinding = useMemo<BuiltinTabBindings['settings']>(
+    () => ({
+      ...settingsUpdaterBinding,
+      onNavigationConsumed: handleSettingsSectionChange,
+    }),
+    [handleSettingsSectionChange, settingsUpdaterBinding],
+  );
+  const capabilitiesBinding = useMemo<BuiltinTabBindings['capabilities']>(
+    () => ({
+      ...settingsUpdaterBinding,
+      onNavigationConsumed: handleCapabilitySectionChange,
+    }),
+    [handleCapabilitySectionChange, settingsUpdaterBinding],
+  );
+  const taskCenterBinding = useMemo<BuiltinTabBindings['taskcenter']>(
+    () => ({
+      activeRecordingSnapshot,
+      onStartRecording: handleStartRecording,
+      onOpenRecord: (recordId, mediaMs, activeRecording) =>
+        handleOpenRecord(recordId, mediaMs, 'task_center', activeRecording),
+      onSearchIntentConsumed: handleTaskSearchIntentConsumed,
+      onRouteConsumed: handleTaskRouteConsumed,
+    }),
+    [
+      activeRecordingSnapshot,
+      handleOpenRecord,
+      handleStartRecording,
+      handleTaskRouteConsumed,
+      handleTaskSearchIntentConsumed,
+    ],
+  );
+  const spaceBinding = useMemo<BuiltinTabBindings['space']>(
+    () => ({ onRouteConsumed: handleSpaceRouteConsumed }),
+    [handleSpaceRouteConsumed],
+  );
+  const recordBinding = useMemo<BuiltinTabBindings['record']>(
+    () => ({
+      onRecordingSnapshotChange: handleRecordingSnapshotChange,
+      registerPendingNoteSubmitter: registerPendingRecordNoteSubmitter,
+      onTitleChange: handleRecordTitleChange,
+      onDeleted: handleRecordDeleted,
+    }),
+    [
+      handleRecordDeleted,
+      handleRecordTitleChange,
+      handleRecordingSnapshotChange,
+      registerPendingRecordNoteSubmitter,
+    ],
+  );
+  const tabBindings = useMemo<BuiltinTabBindings>(
+    () => composeBuiltinTabBindings({
+      launcher: launcherBinding,
+      chat: chatBinding,
+      settings: settingsBinding,
+      capabilities: capabilitiesBinding,
+      taskcenter: taskCenterBinding,
+      space: spaceBinding,
+      record: recordBinding,
+    }),
+    [
+      capabilitiesBinding,
+      chatBinding,
+      launcherBinding,
+      recordBinding,
+      settingsBinding,
+      spaceBinding,
+      taskCenterBinding,
+    ],
+  );
 
   return (
     <SessionDeletionContext.Provider value={handleDeleteSession}>
@@ -5349,6 +4799,9 @@ export default function App() {
             onOpenBugReport={handleOpenBugReport}
             onOpenWorkspace={handleOpenWorkspaceFromSidebar}
             onOpenSession={handleOpenSidebarSession}
+            onRenameSession={renamePersistedSession}
+            historyTagIntent={historyTagIntent}
+            onHistoryTagIntentConsumed={handleHistoryTagIntentConsumed}
           />
           <div className="flex min-w-0 flex-1 flex-col" data-tab-workspace>
             {/* Chrome-style titlebar with tabs */}
@@ -5379,92 +4832,12 @@ export default function App() {
               data-tab-content-workspace
             >
               {tabs.map((tab) => (
-                <MemoizedTabContent
+                <BuiltinTabSlot
                   key={tab.id}
                   tab={tab}
                   isActive={tab.id === activeTabId}
-                  windowPresentation={windowPresentation}
-                  isLoading={loadingTabs[tab.id] ?? false}
-                  error={tabErrors[tab.id] ?? null}
-                  isDeferredMount={deferredMountTabIds.has(tab.id)}
-                  onLauncherWorkspaceSelectionChange={
-                    handleLauncherWorkspaceSelectionChange
-                  }
-                  settingsInitialSection={
-                    tab.view === 'settings' ? settingsInitialSection : undefined
-                  }
-                  capabilityInitialSection={capabilityInitialSection}
-                  capabilityNavigationNonce={capabilityNavigationNonce}
-                  capabilityInitialMcpId={
-                    tab.view === 'capabilities'
-                      ? capabilityInitialMcpId
-                      : undefined
-                  }
-                  capabilityInitialOfficialToolId={
-                    tab.view === 'capabilities'
-                      ? capabilityInitialOfficialToolId
-                      : undefined
-                  }
-                  capabilityInitialSelect={
-                    tab.view === 'capabilities'
-                      ? capabilityInitialSelect
-                      : undefined
-                  }
-                  onSettingsSectionChange={
-                    tab.view === 'capabilities'
-                      ? handleCapabilitySectionChange
-                      : handleSettingsSectionChange
-                  }
-                  updateReady={updateReady}
-                  updateVersion={updateVersion}
-                  updateChecking={updateChecking}
-                  updateDownloading={updateDownloading}
-                  updateInstalling={updateInstalling}
-                  updatePreparing={updatePreparing}
-                  onCheckForUpdate={checkForUpdate}
-                  onRestartAndUpdate={handleRestartAndUpdate}
-                  onLaunchProject={handleLaunchProject}
-                  onStartRecording={handleStartRecording}
-                  onRecordingSnapshotChange={handleRecordingSnapshotChange}
-                  registerPendingRecordNoteSubmitter={
-                    registerPendingRecordNoteSubmitter
-                  }
-                  onRecordTitleChange={handleRecordTitleChange}
-                  onRecordDeleted={handleRecordDeleted}
-                  activeRecordingSnapshot={
-                    tab.view === 'taskcenter' ? activeRecordingSnapshot : null
-                  }
-                  onOpenRecord={handleOpenRecord}
-                  onOpenHistorySession={handleOpenChatHistorySession}
-                  onNewSession={handleNewSession}
-                  onLaunchRuntimeBackedProviderSession={
-                    handleLaunchRuntimeBackedProviderSession
-                  }
-                  onUpdateGenerating={updateTabGenerating}
-                  onUpdateTitle={updateTabTitle}
-                  onUpdateUnread={updateTabUnread}
-                  onRenameSession={handleRenameSession}
-                  onForkSession={handleForkSession}
-                  onUpdateSessionId={updateTabSessionId}
-                  claimSessionOpeningTransition={claimSessionOpeningTransition}
-                  onClearInitialMessage={clearInitialMessage}
-                  onSidecarConfigAdopted={markSidecarConfigAdopted}
-                  onFilePreviewIntentConsumed={handleFilePreviewIntentConsumed}
-                  sessionNotificationBadgeCounts={
-                    tab.id === activeTabId
-                      ? sessionNotificationBadgeCounts
-                      : undefined
-                  }
-                  taskCenterPendingIntent={taskCenterPendingIntent}
-                  taskCenterCurrentSessionId={taskCenterCurrentSessionId}
-                  taskPendingRoute={
-                    tab.view === 'taskcenter' ? taskPendingRoute : null
-                  }
-                  onTaskRouteConsumed={handleTaskRouteConsumed}
-                  spacePendingRoute={
-                    tab.view === 'space' ? spacePendingRoute : null
-                  }
-                  onSpaceRouteConsumed={handleSpaceRouteConsumed}
+                  isDeferred={deferredMountTabIds.has(tab.id)}
+                  bindings={tabBindings}
                 />
               ))}
             </div>
@@ -5490,65 +4863,7 @@ export default function App() {
             />
           )}
 
-          {recordCloseConfirmState && (
-            <ConfirmDialog
-              title={t('appChrome.recordCloseTitle')}
-              message={t('appChrome.recordCloseMessage')}
-              confirmText={t('appChrome.recordStopSaveClose')}
-              cancelText={t('appChrome.cancel')}
-              confirmVariant="danger"
-              loading={recordCloseConfirmState.loading}
-              onConfirm={() => {
-                const pending = recordCloseConfirmState;
-                setRecordCloseConfirmState((current) =>
-                  current ? { ...current, loading: true } : current,
-                );
-                void flushPendingRecordNote(pending.snapshot.recordId)
-                  .then((noteSaved) => {
-                    if (!noteSaved) {
-                      setRecordCloseConfirmState((current) =>
-                        current ? { ...current, loading: false } : current,
-                      );
-                      return null;
-                    }
-                    return recordingStop(pending.snapshot);
-                  })
-                  .then((stopped) => {
-                    if (!stopped) return;
-                    setRecordCloseConfirmState(null);
-                    performCloseTab(pending.tabId);
-                  })
-                  .catch(async (error) => {
-                    console.error(
-                      '[App] Failed to stop recording before closing tab:',
-                      error,
-                    );
-                    try {
-                      const active = await recordingSnapshot();
-                      if (
-                        !active ||
-                        active.recordId !== pending.snapshot.recordId
-                      ) {
-                        setRecordCloseConfirmState(null);
-                        performCloseTab(pending.tabId);
-                        return;
-                      }
-                      setRecordCloseConfirmState({
-                        tabId: pending.tabId,
-                        snapshot: active,
-                        loading: false,
-                      });
-                    } catch {
-                      setRecordCloseConfirmState((current) =>
-                        current ? { ...current, loading: false } : current,
-                      );
-                    }
-                    toastRef.current.error(t('appChrome.recordStopFailed'));
-                  });
-              }}
-              onCancel={() => setRecordCloseConfirmState(null)}
-            />
-          )}
+          {recordCloseDialog}
 
           {/* One exit confirmation for scheduler and recording lifecycle. */}
           {exitConfirmState && (

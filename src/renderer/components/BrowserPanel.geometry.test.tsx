@@ -142,7 +142,9 @@ describe('BrowserPanel geometry reconciler (#339)', () => {
     await flushFrame();
 
     expect(createCalls()).toHaveLength(1);
-    expect(createCalls()[0]).toMatchObject({ x: 698, y: 80, width: 690, height: 662 });
+    expect(createCalls()[0]).toMatchObject({
+      bounds: { x: 698, y: 80, width: 690, height: 662 },
+    });
   });
 
   it('keeps converging onto the container rect across successive layout moves', async () => {
@@ -151,21 +153,25 @@ describe('BrowserPanel geometry reconciler (#339)', () => {
     // Frame 1: first usable rect delivered.
     await flushFrame();
     expect(resizeCalls()).toHaveLength(1);
-    expect(resizeCalls()[0]).toMatchObject({ x: 698, y: 80, width: 690, height: 662 });
+    expect(resizeCalls()[0]).toMatchObject({
+      bounds: { x: 698, y: 80, width: 690, height: 662 },
+    });
 
     // The #339 sequence: workspace overlay flip moves the panel WITHOUT
     // resizing it (never fires ResizeObserver)…
     containerRect = { x: 272, y: 80, width: 690, height: 662 };
     await flushFrame();
     expect(resizeCalls()).toHaveLength(2);
-    expect(resizeCalls()[1]).toMatchObject({ x: 272, y: 80 });
+    expect(resizeCalls()[1]).toMatchObject({ bounds: { x: 272, y: 80 } });
 
     // …then the %-width transition settles the panel somewhere else entirely,
     // long after any one-shot mechanism would have declared "stable".
     containerRect = { x: 440, y: 95, width: 820, height: 610 };
     await flushFrame();
     expect(resizeCalls()).toHaveLength(3);
-    expect(resizeCalls()[2]).toMatchObject({ x: 440, y: 95, width: 820, height: 610 });
+    expect(resizeCalls()[2]).toMatchObject({
+      bounds: { x: 440, y: 95, width: 820, height: 610 },
+    });
   });
 
   it('stays idle while the rect is unchanged (no IPC churn at rest)', async () => {
@@ -193,7 +199,9 @@ describe('BrowserPanel geometry reconciler (#339)', () => {
 
     await flushFrame(); // retried with the same rect
     expect(resizeCalls()).toHaveLength(3);
-    expect(resizeCalls()[2]).toMatchObject({ x: 440, y: 95, width: 820, height: 610 });
+    expect(resizeCalls()[2]).toMatchObject({
+      bounds: { x: 440, y: 95, width: 820, height: 610 },
+    });
   });
 
   it('keeps resize invokes serialized across visibility-driven effect restarts', async () => {
@@ -231,7 +239,9 @@ describe('BrowserPanel geometry reconciler (#339)', () => {
     });
     await flushFrame(); // first settled → new rect delivered
     expect(resizeCalls()).toHaveLength(2);
-    expect(resizeCalls()[1]).toMatchObject({ x: 440, y: 95, width: 820, height: 610 });
+    expect(resizeCalls()[1]).toMatchObject({
+      bounds: { x: 440, y: 95, width: 820, height: 610 },
+    });
   });
 
   it('never syncs degenerate rects (issue #290 floor still holds)', async () => {

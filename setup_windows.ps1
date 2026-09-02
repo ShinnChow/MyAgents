@@ -361,60 +361,6 @@ try {
         Write-Host "OK - VC++ Runtime ready" -ForegroundColor Green
     }
 
-    function Test-MSVC {
-        Write-Host "  检查 MSVC Build Tools... " -NoNewline
-
-        # Method 1: cl.exe in PATH (Developer Command Prompt)
-        $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
-        if ($cl) {
-            Write-Host "OK" -ForegroundColor Green
-            return $true
-        }
-
-        # Method 2: vswhere (standard VS installer location)
-        $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
-        $vsWhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
-        if (Test-Path $vsWhere) {
-            $vsPath = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
-            if ($vsPath) {
-                Write-Host "OK" -ForegroundColor Green
-                return $true
-            }
-            # Fallback: any VS/BuildTools installation
-            $vsPath = & $vsWhere -latest -products * -property installationPath 2>$null
-            if ($vsPath) {
-                Write-Host "OK (found VS installation)" -ForegroundColor Green
-                return $true
-            }
-        }
-
-        # Method 3: check common BuildTools paths directly
-        $btPaths = @(
-            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools",
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\BuildTools",
-            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\Community",
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community"
-        )
-        foreach ($p in $btPaths) {
-            if (Test-Path $p) {
-                Write-Host "OK" -ForegroundColor Green
-                return $true
-            }
-        }
-
-        # Method 4: winget list check
-        try {
-            $wingetList = winget list --id Microsoft.VisualStudio.2022.BuildTools 2>$null
-            if ($LASTEXITCODE -eq 0 -and $wingetList -match "BuildTools") {
-                Write-Host "OK (winget)" -ForegroundColor Green
-                return $true
-            }
-        } catch { }
-
-        Write-Host "MISSING" -ForegroundColor Red
-        return $false
-    }
-
     # Main
     Write-Host "Step 1/8: 检查并安装依赖" -ForegroundColor Blue
     # Eight numbered steps remain: the Mino template now ships with the repo,
@@ -443,27 +389,10 @@ try {
         Write-Host "    请安装: https://rustup.rs" -ForegroundColor Yellow
     }
 
-    # MSVC Build Tools (required by Rust on Windows)
-    if (-not (Test-MSVC)) {
-        if ($HasWinget) {
-            Write-Host "  自动安装 Visual Studio Build Tools (C++ 工作负载)..." -ForegroundColor Cyan
-            winget install --id Microsoft.VisualStudio.2022.BuildTools -e --accept-source-agreements --accept-package-agreements --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
-                Write-Host "  MSVC 安装失败，请手动安装 Visual Studio Build Tools" -ForegroundColor Red
-            } else {
-                Write-Host "  MSVC Build Tools 安装完成" -ForegroundColor Green
-            }
-            Refresh-ProcessPath
-        } else {
-            Write-Host "    请安装 Visual Studio Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/" -ForegroundColor Yellow
-        }
-    }
-
     # Pre-toolchain check: rustc/cargo are installed by ensure_rust_toolchain.ps1.
     $Missing = $false
     if (-not (Test-Dependency "Node.js" "node --version" "")) { $Missing = $true }
     if (-not (Test-Dependency "Rustup" "rustup --version" "")) { $Missing = $true }
-    if (-not (Test-MSVC)) { $Missing = $true }
 
     if ($Missing) {
         Write-Host "`n仍有缺失依赖，请手动安装后重新运行" -ForegroundColor Red
@@ -492,6 +421,18 @@ try {
         Read-Host
         exit 1
     }
+
+    # Keep target/cache/tool policy in the native prepare owner. Run its
+    # read-only preflight before runtime downloads, npm install, or cargo fetch.
+    Write-Host "`nStep 1.75/8: 检查原生推理构建依赖" -ForegroundColor Blue
+    & node "$ProjectDir\scripts\prepare-native-inference.mjs" "x86_64-pc-windows-msvc" --check-prerequisites
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  原生推理构建依赖不完整，请按上方提示安装后重新运行" -ForegroundColor Red
+        Write-Host "`n按回车键退出..." -ForegroundColor Yellow
+        Read-Host
+        exit 1
+    }
+    Write-Host "OK - 原生推理构建依赖检查完成" -ForegroundColor Green
 
     Write-Host "`nStep 2/8: 下载 Node.js 运行时 (Sidecar + MCP Server + 社区工具统一 runtime)" -ForegroundColor Blue
     Get-NodeJSBinary

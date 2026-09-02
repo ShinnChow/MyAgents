@@ -564,7 +564,18 @@ export class BrowserContextRegistry {
     if (!entry) return;
     if (entry.closePromise) return entry.closePromise;
     entry.closePromise = (async () => {
-      await this.checkpointBeforeDestructiveClose(productSessionId);
+      let checkpointFailure: unknown;
+      try {
+        await this.checkpointBeforeDestructiveClose(productSessionId);
+      } catch (error) {
+        checkpointFailure = error;
+        // Browser Identity owns persistence, not Context lifetime. Once the
+        // Product Session has asked to retire this exact Context, an identity
+        // outage is a bounded data-risk diagnostic and cannot veto close.
+        console.warn(
+          `[browser-host] checkpoint=failed phase=destructive-close code=BROWSER_IDENTITY_CHECKPOINT_FAILED error=${error instanceof Error ? error.name : 'unknown'}`,
+        );
+      }
       let closeTimeout: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
@@ -577,7 +588,10 @@ export class BrowserContextRegistry {
             closeTimeout.unref?.();
           }),
         ]);
-      } catch {
+      } catch (closeFailure) {
+        console.warn(
+          `[browser-host] context=close-failed phase=destructive-close checkpoint=${checkpointFailure ? 'failed' : 'committed'} error=${closeFailure instanceof Error ? closeFailure.name : 'unknown'}`,
+        );
         const error = new Error('The browser context could not be closed');
         error.name = 'BROWSER_CONTEXT_CLOSE_FAILED';
         throw error;

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { CODEX_SUBSCRIPTION_PROVIDER_ID } from '../shared/config-types';
 import { CUSTOM_EVENTS } from '../shared/constants';
+import type { SessionMetadata } from '@/api/sessionClient';
 import { SessionDeletionContext } from '@/context/SessionDeletionContext';
 import { useTabStateOptional } from '@/context/TabContext';
 
@@ -59,6 +60,10 @@ const mocks = vi.hoisted(() => {
       lastActiveAt: '2026-06-27T00:00:00.000Z',
     })),
     deleteSession: vi.fn(async () => ({ deleted: true as const })),
+    updateSession: vi.fn<(
+      sessionId: string,
+      updates: { title?: string; titleSource?: 'user' | 'auto' },
+    ) => Promise<SessionMetadata | undefined>>(async () => undefined),
     deleteTargetSessionId: null as string | null,
     deleteResults: [] as Array<{ deleted: boolean; reason?: string }>,
     startGlobalSidecar: vi.fn(async () => undefined),
@@ -106,11 +111,26 @@ const mocks = vi.hoisted(() => {
       convertedTaskIds: string[];
       revision: number;
     } | null),
+    recordingStart: vi.fn(async () => ({
+      snapshot: {
+        recordId: 'active-record',
+        revision: 1,
+        generation: 1,
+        captureStatus: 'recording' as const,
+        startedAtWallTime: 1_700_000_000_000,
+        mediaDurationMs: 0,
+        pausedWallMs: 0,
+        sources: [],
+        sourceActivity: [],
+        warnings: [],
+      },
+      attachedToExisting: false,
+    })),
     durableTabs: null as null | {
       version: 1;
       tabs: Array<
         | {
-            view?: 'chat';
+            view: 'chat';
             id: string;
             agentDir: string;
             sessionId: string;
@@ -139,6 +159,7 @@ const mocks = vi.hoisted(() => {
     sidebarProps: [] as Array<Record<string, unknown>>,
     tabbarProps: [] as Array<Record<string, unknown>>,
     settingsProps: [] as Array<Record<string, unknown>>,
+    taskCenterProps: [] as Array<Record<string, unknown>>,
     toast: {
       error: vi.fn(),
       success: vi.fn(),
@@ -148,7 +169,6 @@ const mocks = vi.hoisted(() => {
     selfAwarenessProject: project as typeof project | null,
   };
 });
-
 vi.mock('@/analytics', () => ({
   initAnalytics: vi.fn(async () => undefined),
   track: mocks.track,
@@ -234,11 +254,17 @@ vi.mock('@/api/sessionClient', () => ({
   createSession: mocks.createSession,
   deleteSession: mocks.deleteSession,
   getSessions: vi.fn(async () => []),
-  updateSession: vi.fn(async () => undefined),
+  updateSession: mocks.updateSession,
 }));
 
 vi.mock('@/api/taskCenter', () => ({
   recordGet: mocks.recordGet,
+}));
+
+vi.mock('@/api/recording', () => ({
+  recordingSnapshot: vi.fn(async () => null),
+  recordingStart: mocks.recordingStart,
+  recordingStop: vi.fn(async (snapshot: unknown) => snapshot),
 }));
 
 vi.mock('@/components/ChatBootOverlay', () => ({
@@ -349,7 +375,10 @@ vi.mock('@/pages/Settings', () => ({
 }));
 
 vi.mock('@/pages/TaskCenter', () => ({
-  default: () => <div data-testid="taskcenter-page" />,
+  default: (props: Record<string, unknown>) => {
+    mocks.taskCenterProps.push(props);
+    return <div data-testid="taskcenter-page" />;
+  },
 }));
 
 vi.mock('@/pages/RecordDetail', () => ({
@@ -508,6 +537,7 @@ describe('App helper launch', () => {
     mocks.sidebarProps.length = 0;
     mocks.tabbarProps.length = 0;
     mocks.settingsProps.length = 0;
+    mocks.taskCenterProps.length = 0;
     mocks.selfAwarenessProject = mocks.project;
     mocks.deleteTargetSessionId = null;
     mocks.deleteResults.length = 0;
@@ -533,6 +563,8 @@ describe('App helper launch', () => {
     mocks.upgradeSessionId.mockResolvedValue(true);
     mocks.getSessionActivation.mockResolvedValue(null);
     mocks.updateSessionTab.mockResolvedValue(undefined);
+    mocks.updateSession.mockReset();
+    mocks.updateSession.mockResolvedValue(undefined);
     mocks.cancelBackgroundCompletion.mockResolvedValue(undefined);
     mocks.querySessionHasPersistentOwners.mockResolvedValue(false);
     mocks.canRestoreSession.mockResolvedValue(true);
@@ -546,6 +578,21 @@ describe('App helper launch', () => {
       archived: false,
       convertedTaskIds: [],
       revision: 1,
+    });
+    mocks.recordingStart.mockResolvedValue({
+      snapshot: {
+        recordId: 'active-record',
+        revision: 1,
+        generation: 1,
+        captureStatus: 'recording',
+        startedAtWallTime: 1_700_000_000_000,
+        mediaDurationMs: 0,
+        pausedWallMs: 0,
+        sources: [],
+        sourceActivity: [],
+        warnings: [],
+      },
+      attachedToExisting: false,
     });
     mocks.resolveBuiltinSelection.mockReturnValue({ provider: mocks.provider, model: 'mimo-v2.5-pro' });
   });
@@ -616,6 +663,7 @@ describe('App helper launch', () => {
         entryIntent?: 'open_workspace' | 'workspace_init',
       ) => Promise<boolean>;
       onOpenSession: (session: { id: string; agentDir: string; title: string }, project: typeof mocks.project) => Promise<boolean>;
+      onRenameSession: (sessionId: string, newTitle: string) => Promise<SessionMetadata | null>;
     };
   }
 
@@ -636,6 +684,14 @@ describe('App helper launch', () => {
       .find((candidate) => candidate.mode === 'capabilities');
     if (!props) throw new Error('Capabilities Settings props were not captured');
     return props;
+  }
+
+  function latestTaskCenterProps() {
+    const props = mocks.taskCenterProps.at(-1);
+    if (!props) throw new Error('Task Center props were not captured');
+    return props as {
+      onStartRecording: (selection: { microphone: boolean; system: boolean }) => Promise<void>;
+    };
   }
 
   it('reuses the leftmost Launcher from the sidebar while the Tab plus keeps creating', () => {
@@ -955,6 +1011,47 @@ describe('App helper launch', () => {
         entry_source: 'global_sidebar',
       }));
     });
+  });
+
+  it('does not let an older sidebar rename response overwrite the latest Tab title', async () => {
+    const session: SessionMetadata = {
+      id: 'rename-race-session',
+      agentDir: mocks.project.path,
+      title: 'Original title',
+      createdAt: '2026-07-20T00:00:00.000Z',
+      lastActiveAt: '2026-07-20T00:00:00.000Z',
+    };
+    let resolveOlder!: (session: SessionMetadata) => void;
+    let resolveNewer!: (session: SessionMetadata) => void;
+    mocks.updateSession
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOlder = resolve; }))
+      .mockReturnValueOnce(new Promise((resolve) => { resolveNewer = resolve; }));
+
+    render(<App />);
+    await act(async () => {
+      await latestSidebarProps().onOpenSession(session, mocks.project);
+    });
+
+    let olderRename!: Promise<SessionMetadata | null>;
+    let newerRename!: Promise<SessionMetadata | null>;
+    act(() => {
+      olderRename = latestSidebarProps().onRenameSession(session.id, 'Older response');
+      newerRename = latestSidebarProps().onRenameSession(session.id, 'Newest title');
+    });
+
+    await act(async () => {
+      resolveNewer({ ...session, title: 'Newest title', titleSource: 'user' });
+      await newerRename;
+    });
+    expect(latestTabbarProps().tabs.find((tab) => tab.sessionId === session.id)?.title)
+      .toBe('Newest title');
+
+    await act(async () => {
+      resolveOlder({ ...session, title: 'Older response', titleSource: 'user' });
+      await olderRename;
+    });
+    expect(latestTabbarProps().tabs.find((tab) => tab.sessionId === session.id)?.title)
+      .toBe('Newest title');
   });
 
   it('releases an owner acquired after the existing target Tab closes during reconcile', async () => {
@@ -1303,9 +1400,9 @@ describe('App helper launch', () => {
           view: 'record',
           recordId: 'restored-record',
           title: 'Recovered Record',
-          sessionId: null,
         }),
       );
+      expect(restored).not.toHaveProperty('sessionId');
       expect(latest.activeTabId).toBe('restored-record-tab');
     });
     expect(mocks.recordGet).toHaveBeenCalledWith('restored-record');
@@ -1341,15 +1438,58 @@ describe('App helper launch', () => {
       expect(fallback).toEqual(
         expect.objectContaining({
           view: 'taskcenter',
-          sessionId: null,
         }),
       );
+      expect(fallback).not.toHaveProperty('sessionId');
       expect(fallback).not.toHaveProperty('recordId');
       expect(latest.activeTabId).toBe('missing-record-tab');
     });
     expect(mocks.toast.info).toHaveBeenCalledTimes(1);
     expect(mocks.canRestoreSession).not.toHaveBeenCalled();
     expect(mocks.ensureSessionSidecar).not.toHaveBeenCalled();
+  });
+
+  it('collapses multiple deleted Record restore fallbacks into one Task Center', async () => {
+    localStorage.clear();
+    mocks.lastExitWasClean = false;
+    mocks.recordGet.mockResolvedValue(null);
+    mocks.durableTabs = {
+      version: 1,
+      tabs: [
+        { view: 'record', id: 'missing-record-a', recordId: 'deleted-a', title: 'Deleted A' },
+        { view: 'record', id: 'missing-record-b', recordId: 'deleted-b', title: 'Deleted B' },
+      ],
+      activeTabId: 'missing-record-b',
+    };
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId('restore-session'));
+
+    await waitFor(() => {
+      const taskTabs = latestTabbarProps().tabs.filter((tab) => tab.view === 'taskcenter');
+      expect(taskTabs).toHaveLength(1);
+      expect(taskTabs[0]?.id).toBe('missing-record-a');
+      expect(latestTabbarProps().activeTabId).toBe('missing-record-a');
+    });
+  });
+
+  it('does not add a deleted Record fallback beside an already-open Task Center', async () => {
+    localStorage.clear();
+    mocks.lastExitWasClean = false;
+    mocks.recordGet.mockResolvedValue(null);
+    mocks.durableTabs = {
+      version: 1,
+      tabs: [{ view: 'record', id: 'missing-record', recordId: 'deleted-record', title: 'Deleted' }],
+      activeTabId: 'missing-record',
+    };
+    render(<App />);
+    act(() => latestSidebarProps().onOpenTaskCenter());
+    await waitFor(() => expect(latestTabbarProps().tabs.filter((tab) => tab.view === 'taskcenter')).toHaveLength(1));
+
+    fireEvent.click(await screen.findByTestId('restore-session'));
+
+    await waitFor(() => expect(latestTabbarProps().tabs.filter((tab) => tab.view === 'taskcenter')).toHaveLength(1));
+    expect(latestTabbarProps().tabs.some((tab) => tab.id === 'missing-record')).toBe(false);
   });
 
   it('holds Session opening admission while a restore candidate is validated', async () => {
@@ -1363,6 +1503,7 @@ describe('App helper launch', () => {
     mocks.durableTabs = {
       version: 1,
       tabs: [{
+        view: 'chat',
         id: 'restored-tab',
         agentDir: mocks.project.path,
         sessionId,
@@ -1416,13 +1557,15 @@ describe('App helper launch', () => {
       version: 1,
       tabs: [
         {
-          id: 'restore-active',
+          view: 'chat',
+        id: 'restore-active',
           agentDir: mocks.project.path,
           sessionId: '11111111-2222-4333-8444-555555555551',
           title: 'Active history',
         },
         {
-          id: 'restore-inactive',
+          view: 'chat',
+        id: 'restore-inactive',
           agentDir: mocks.project.path,
           sessionId: '11111111-2222-4333-8444-555555555552',
           title: 'Inactive history',
@@ -1475,6 +1618,7 @@ describe('App helper launch', () => {
     mocks.durableTabs = {
       version: 1,
       tabs: [{
+        view: 'chat',
         id: 'refused-delete-restored-tab',
         agentDir: mocks.project.path,
         sessionId,
@@ -1520,13 +1664,15 @@ describe('App helper launch', () => {
       version: 1,
       tabs: [
         {
-          id: 'restored-first',
+          view: 'chat',
+        id: 'restored-first',
           agentDir: mocks.project.path,
           sessionId: firstSessionId,
           title: 'First restored history',
         },
         {
-          id: 'restored-second',
+          view: 'chat',
+        id: 'restored-second',
           agentDir: mocks.project.path,
           sessionId: secondSessionId,
           title: 'Second restored history',
@@ -1587,6 +1733,7 @@ describe('App helper launch', () => {
     mocks.durableTabs = {
       version: 1,
       tabs: [{
+        view: 'chat',
         id: 'restored-during-terminal-read',
         agentDir: mocks.project.path,
         sessionId,
@@ -1646,13 +1793,15 @@ describe('App helper launch', () => {
       version: 1,
       tabs: [
         {
-          id: 'history-first',
+          view: 'chat',
+        id: 'history-first',
           agentDir: mocks.project.path,
           sessionId: firstSessionId,
           title: 'First history',
         },
         {
-          id: 'history-second',
+          view: 'chat',
+        id: 'history-second',
           agentDir: mocks.project.path,
           sessionId: secondSessionId,
           title: 'Second history',
@@ -1727,13 +1876,15 @@ describe('App helper launch', () => {
       version: 1,
       tabs: [
         {
-          id: 'restore-fails',
+          view: 'chat',
+        id: 'restore-fails',
           agentDir: mocks.project.path,
           sessionId: failedSessionId,
           title: 'Fails',
         },
         {
-          id: 'restore-succeeds',
+          view: 'chat',
+        id: 'restore-succeeds',
           agentDir: mocks.project.path,
           sessionId: successfulSessionId,
           title: 'Succeeds',
@@ -1942,6 +2093,29 @@ describe('App helper launch', () => {
     act(() => latestSidebarProps().onOpenSpace());
 
     expect(mocks.tabbarProps.at(-1)?.tabs).toHaveLength(3);
+  });
+
+  it('reuses Task Center for the active recording stop surface when the tab strip is full', async () => {
+    render(<App />);
+    act(() => latestSidebarProps().onOpenTaskCenter());
+    await waitFor(() => expect(latestTabbarProps().tabs.some((tab) => tab.view === 'taskcenter')).toBe(true));
+    for (let index = latestTabbarProps().tabs.length; index < 12; index += 1) {
+      act(() => latestTabbarProps().onNewTab());
+    }
+    expect(latestTabbarProps().tabs).toHaveLength(12);
+    const taskCenter = latestTabbarProps().tabs.find((tab) => tab.view === 'taskcenter')!;
+    act(() => latestTabbarProps().onSelectTab(taskCenter.id));
+    await waitFor(() => expect(mocks.taskCenterProps.length).toBeGreaterThan(0));
+
+    await act(async () => {
+      await latestTaskCenterProps().onStartRecording({ microphone: true, system: true });
+    });
+
+    expect(latestTabbarProps().tabs).toHaveLength(12);
+    expect(latestTabbarProps().tabs.some((tab) => tab.view === 'taskcenter')).toBe(false);
+    expect(latestTabbarProps().tabs).toContainEqual(
+      expect.objectContaining({ view: 'record', recordId: 'active-record' }),
+    );
   });
 
   it('routes capability deep links and item targets into the singleton Capabilities tab', async () => {
@@ -2621,8 +2795,10 @@ describe('App helper launch', () => {
     }>;
     expect(currentTabs).toContainEqual(expect.objectContaining({
       view: 'launcher',
-      sessionId: null,
     }));
+    expect(currentTabs.find((tab) => tab.view === 'launcher')).not.toHaveProperty(
+      'sessionId',
+    );
   });
 
   it('keeps a refused deletion from reviving the pending creator it already defeated', async () => {
@@ -2673,8 +2849,10 @@ describe('App helper launch', () => {
     }>;
     expect(currentTabs).toContainEqual(expect.objectContaining({
       view: 'launcher',
-      sessionId: null,
     }));
+    expect(currentTabs.find((tab) => tab.view === 'launcher')).not.toHaveProperty(
+      'sessionId',
+    );
   });
 
   it('releases the fork tab owner when owner reconciliation fails', async () => {

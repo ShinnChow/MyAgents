@@ -66,6 +66,7 @@ import {
     subscribe,
     subscribePassive,
     ensureWorkspaceSessions,
+    registerPassiveWorkspaceSessionDemand,
     setSidebarWorkspaceSessionDemand,
     __resetTaskCenterStoreForTest,
     __setTaskCenterSessionsForTest,
@@ -270,6 +271,42 @@ describe('store snapshot', () => {
             expect(sessionClientMocks.getSessions).toHaveBeenCalledWith('/work/mino');
         } finally {
             unsubscribe();
+        }
+    });
+
+    it('keeps a Chat workspace demanded when sidebar expansion changes, then releases it by ref count', async () => {
+        const chatDir = '/work/chat';
+        const sidebarDir = '/work/sidebar';
+        sessionClientMocks.getSessions.mockImplementation(async (agentDir?: string) => ([{
+            ...favoriteSession(false),
+            id: agentDir === chatDir ? 'chat-session' : 'sidebar-session',
+            agentDir: agentDir ?? '',
+        }]));
+        browserMocks.isTauri = true;
+        const unsubscribeStore = subscribePassive(() => undefined);
+        const releaseChat = registerPassiveWorkspaceSessionDemand(chatDir);
+        try {
+            await vi.waitFor(() => expect(sessionClientMocks.getSessions).toHaveBeenCalledWith(chatDir));
+            setSidebarWorkspaceSessionDemand([sidebarDir]);
+            await vi.waitFor(() => expect(sessionClientMocks.getSessions).toHaveBeenCalledWith(sidebarDir));
+
+            const beforeRefresh = sessionClientMocks.getSessions.mock.calls.length;
+            for (const handler of tauriListenMocks.handlers.get('session:metadata-changed') ?? []) {
+                handler({ payload: { agentDirs: [chatDir] } });
+            }
+            await vi.waitFor(() => expect(sessionClientMocks.getSessions.mock.calls.length).toBe(beforeRefresh + 1));
+            expect(sessionClientMocks.getSessions).toHaveBeenLastCalledWith(chatDir);
+
+            releaseChat();
+            const afterRelease = sessionClientMocks.getSessions.mock.calls.length;
+            for (const handler of tauriListenMocks.handlers.get('session:metadata-changed') ?? []) {
+                handler({ payload: { agentDirs: [chatDir] } });
+            }
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(sessionClientMocks.getSessions).toHaveBeenCalledTimes(afterRelease);
+        } finally {
+            releaseChat();
+            unsubscribeStore();
         }
     });
 
@@ -744,5 +781,95 @@ describe('actions.setSessionFavorite', () => {
         secondPatch.resolve(favoriteSession());
         await expect(Promise.all([firstResult, secondResult])).resolves.toEqual([true, true]);
         expect(!!getSnapshot().sessions[0]?.favorite).toBe(false);
+    });
+});
+
+describe('actions.applySessionMetadata', () => {
+    it('publishes a canonical Tag mutation response and fences an older workspace read', async () => {
+        const pending = deferred<SessionMetadata[]>();
+        sessionClientMocks.getSessions.mockReturnValueOnce(pending.promise);
+        ensureWorkspaceSessions(['/work/a']);
+
+        actions.applySessionMetadata({
+            ...favoriteSession(false),
+            id: 'tagged-session',
+            agentDir: '/work/a',
+            userTags: ['Alpha'],
+        });
+        pending.resolve([{
+            ...favoriteSession(false),
+            id: 'tagged-session',
+            agentDir: '/work/a',
+        }]);
+        await pending.promise;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect(getSnapshot().sessions.find((session) => session.id === 'tagged-session')?.userTags)
+            .toEqual(['Alpha']);
+    });
+
+    it('rejects an older Tag mutation response after a newer intent was issued', () => {
+        __setTaskCenterSessionsForTest([{ ...favoriteSession(), userTags: ['Start'] }]);
+        const older = actions.beginSessionMetadataMutation('s1');
+        const newer = actions.beginSessionMetadataMutation('s1');
+
+        expect(actions.applySessionMetadata({ ...favoriteSession(), userTags: ['Newer'] }, newer)).toBe(true);
+        expect(actions.applySessionMetadata({ ...favoriteSession(), userTags: ['Older'] }, older)).toBe(false);
+        expect(getSnapshot().sessions[0]?.userTags).toEqual(['Newer']);
+    });
+
+    it('re-arms unrelated demanded workspaces after fencing their in-flight reads', async () => {
+        const firstA = deferred<SessionMetadata[]>();
+        const firstB = deferred<SessionMetadata[]>();
+        const secondA = deferred<SessionMetadata[]>();
+        const secondB = deferred<SessionMetadata[]>();
+        sessionClientMocks.getSessions.mockImplementation((agentDir?: string) => {
+            const callsForWorkspace = sessionClientMocks.getSessions.mock.calls
+                .filter(([candidate]) => candidate === agentDir).length;
+            if (agentDir === '/work/a') return callsForWorkspace === 1 ? firstA.promise : secondA.promise;
+            if (agentDir === '/work/b') return callsForWorkspace === 1 ? firstB.promise : secondB.promise;
+            return Promise.resolve([]);
+        });
+        setSidebarWorkspaceSessionDemand(['/work/a', '/work/b']);
+
+        actions.applySessionMetadata({
+            ...favoriteSession(false),
+            id: 'tagged-session',
+            agentDir: '/work/a',
+            userTags: ['Alpha'],
+        });
+
+        firstB.resolve([{ ...favoriteSession(), id: 'stale-b', agentDir: '/work/b' }]);
+        secondA.resolve([{
+            ...favoriteSession(false),
+            id: 'tagged-session',
+            agentDir: '/work/a',
+            userTags: ['Alpha'],
+        }]);
+        secondB.resolve([{ ...favoriteSession(), id: 'fresh-b', agentDir: '/work/b' }]);
+        firstA.resolve([]);
+        await Promise.all([firstA.promise, firstB.promise, secondA.promise, secondB.promise]);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+
+        expect(sessionClientMocks.getSessions).toHaveBeenCalledTimes(4);
+        expect(getSnapshot().sessions.some((session) => session.id === 'fresh-b')).toBe(true);
+        expect(getSnapshot().sessions.some((session) => session.id === 'stale-b')).toBe(false);
+        expect(getSnapshot().workspaceSessionStates.get('/work/b')).toEqual({
+            isLoading: false,
+            error: null,
+        });
+    });
+
+    it('rejects a Session-local response issued before a global Tag mutation', () => {
+        __setTaskCenterSessionsForTest([
+            { ...favoriteSession(), id: 's1', userTags: ['Start'] },
+            { ...favoriteSession(), id: 's2', userTags: ['Start'] },
+        ]);
+        const olderLocal = actions.beginSessionMetadataMutation('s2');
+        const globalMutation = actions.beginSessionMetadataMutation('s1', 'global');
+
+        expect(actions.applySessionMetadata({ ...favoriteSession(), id: 's1', userTags: ['Renamed'] }, globalMutation)).toBe(true);
+        expect(actions.applySessionMetadata({ ...favoriteSession(), id: 's2', userTags: ['Start', 'Old'] }, olderLocal)).toBe(false);
+        expect(getSnapshot().sessions.find((session) => session.id === 's2')?.userTags).toEqual(['Start']);
     });
 });

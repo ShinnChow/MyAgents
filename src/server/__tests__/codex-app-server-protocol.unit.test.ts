@@ -24,6 +24,7 @@ import {
   configureCodexSkillExtraRoots,
   createCodexMcpStartupBarrier,
   initializeCodexRpc,
+  isCodexNoActiveTurnSteerRejection,
   KNOWN_CODEX_SERVER_REQUEST_METHODS,
   mapCodexTurnCompletedNotification,
   mapCodexTurnPlanUpdatedNotification,
@@ -37,6 +38,7 @@ import {
   type PendingCodexRequest,
 } from '../runtimes/codex';
 import { projectManagedCodexMcpLaunchConfig } from '../runtimes/managed-codex/extensions/mcp-launch-projection';
+import { RuntimeSteerUnavailableError } from '../runtimes/types';
 
 describe('Codex app-server protocol helpers', () => {
   const tempRoots: string[] = [];
@@ -1494,6 +1496,7 @@ describe('Codex app-server protocol helpers', () => {
     const codexProc = {
       threadId: 'thread-1',
       currentTurnId: '',
+      activeSteerTurnId: '',
       activeRootTurnAdmission: null,
       deferredSubAgentEvents: new Map(),
       subThreadToCard: new Map(),
@@ -1537,13 +1540,107 @@ describe('Codex app-server protocol helpers', () => {
       turn: { id: 'turn-1', status: 'completed' },
     }, () => {})).toEqual([]);
     expect(emitted).toEqual([]);
+    expect(codexProc.activeSteerTurnId).toBe('');
 
     internals.completeRootTurnAdmission(codexProc, 'turn-1', event => emitted.push(event));
+    expect(codexProc.activeSteerTurnId).toBe('');
     expect(emitted).toEqual([
       { kind: 'root_turn_admitted', runtimeTurnId: 'turn-1', clientUserMessageId: 'user-1' },
       { kind: 'turn_complete', status: 'completed' },
       { kind: 'agent_plan_update', todos: [] },
     ]);
+  });
+
+  it('does not restore steerability when an early root terminal is held for a child tail', () => {
+    const runtime = new CodexRuntime();
+    const codexProc = {
+      threadId: 'thread-1',
+      currentTurnId: '',
+      activeSteerTurnId: '',
+      activeRootTurnAdmission: null,
+      deferredSubAgentEvents: new Map(),
+      subThreadToCard: new Map([['child-thread', 'spawn-call']]),
+      subThreadToParent: new Map([['child-thread', 'thread-1']]),
+      subThreadMeta: new Map(),
+      collabControlToolParents: new Map(),
+      activeSubAgentTurns: new Map([['child-thread', 'child-turn']]),
+      completedSubAgentTurnsBeforeActivity: new Set(),
+      subAgentThreadsAwaitingActivity: new Set(),
+      codexV2SubAgentActivityObserved: false,
+      codexV2InteractionDeliveryByCallId: new Map(),
+      subAgentActivitySeenBeforeTurnStart: new Set(),
+      subAgentLifecycleByThread: new Map(),
+      emittedSubAgentLifecycleByCard: new Map(),
+      openedReasoningTracesByItem: new Map(),
+      exactUsageByTurn: new Map(),
+      subAgentInterruptsInFlight: new Map(),
+      pendingMainTurnCompletion: null,
+      interruptPendingSubAgentTurns: false,
+      releaseHeldMainTurnOnExit: false,
+      exited: false,
+    };
+    const internals = runtime as unknown as {
+      beginRootTurnAdmission(process: object, clientUserMessageId: string): void;
+      completeRootTurnAdmission(
+        process: object,
+        runtimeTurnId: string,
+        emit: (event: unknown) => void,
+      ): unknown;
+      parseNotification(
+        process: object,
+        method: string,
+        params: unknown,
+        emit: (event: unknown) => void,
+      ): unknown;
+    };
+
+    internals.beginRootTurnAdmission(codexProc, 'user-1');
+    expect(internals.parseNotification(codexProc, 'turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed' },
+    }, () => {})).toBeNull();
+    expect(codexProc.pendingMainTurnCompletion).not.toBeNull();
+
+    internals.completeRootTurnAdmission(codexProc, 'turn-1', () => {});
+    expect(codexProc.currentTurnId).toBe('turn-1');
+    expect(codexProc.activeSteerTurnId).toBe('');
+    expect(runtime.canSteerMessage?.(codexProc as never)).toBe(false);
+  });
+
+  it('classifies only Codex no-active steer rejection as safe to defer', () => {
+    expect(isCodexNoActiveTurnSteerRejection(Object.assign(
+      new Error('RPC error -32600: no active turn to steer'),
+      { code: -32600 },
+    ))).toBe(true);
+    expect(isCodexNoActiveTurnSteerRejection(Object.assign(
+      new Error('RPC error -32600: expected turn id mismatch'),
+      { code: -32600 },
+    ))).toBe(false);
+    expect(isCodexNoActiveTurnSteerRejection(
+      new Error('JSON-RPC call "turn/steer" timed out after 15000ms'),
+    )).toBe(false);
+  });
+
+  it('revokes the stale steer target when Codex definitively rejects it as inactive', async () => {
+    const runtime = new CodexRuntime();
+    const rejection = Object.assign(
+      new Error('RPC error -32600: no active turn to steer'),
+      { code: -32600 },
+    );
+    const codexProc = {
+      exited: false,
+      threadId: 'thread-1',
+      currentTurnId: 'turn-1',
+      activeSteerTurnId: 'turn-1',
+      rpc: { call: vi.fn(async () => { throw rejection; }) },
+    };
+
+    await expect(runtime.steerMessage(
+      codexProc as unknown as import('../runtimes/types').RuntimeProcess,
+      'next input',
+    )).rejects.toBeInstanceOf(RuntimeSteerUnavailableError);
+    expect(codexProc.activeSteerTurnId).toBe('');
+    expect(codexProc.currentTurnId).toBe('turn-1');
   });
 
   it('terminates the Codex process when response and notification bind different root turns', () => {

@@ -4,13 +4,15 @@
 // Each Chat Tab can have one browser Webview. The Webview floats
 // above the React DOM at OS level, positioned by frontend coordinates.
 
-use std::collections::HashMap;
+use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tauri::{
     webview::{PageLoadEvent, WebviewBuilder},
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Url,
 };
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::{ulog_info, ulog_warn};
 use std::path::Path;
@@ -105,7 +107,14 @@ const BROWSER_INIT_SCRIPT: &str = r#"
 /// and reroutes it to the OS default browser.
 pub(crate) fn spawn_external_open(url: &str) {
     if let Err(e) = open_external(url) {
-        ulog_info!("[browser] spawn_external_open failed for {}: {}", url, e);
+        let target = Url::parse(url)
+            .map(|parsed| describe_url_for_log(&parsed))
+            .unwrap_or_else(|_| "<invalid>".to_string());
+        ulog_info!(
+            "[browser] spawn_external_open failed target={}: {}",
+            target,
+            e
+        );
     }
 }
 
@@ -203,16 +212,333 @@ struct BrowserSession {
     last_height: f64,
 }
 
+enum BrowserGeneration {
+    Creating {
+        webview_label: String,
+    },
+    Live(BrowserSession),
+    /// Close was requested before `add_child()` settled. There is no native
+    /// resource to close yet; the settling create must perform that close.
+    RetiringBirth,
+    /// A native resource exists and remains owned until close succeeds.
+    RetiringNative {
+        webview_label: String,
+    },
+}
+
+#[derive(Default)]
+struct BrowserTabLifecycle {
+    desired_token: Option<String>,
+    generations: HashMap<String, BrowserGeneration>,
+    /// Exact close commands can overtake their async create command. Keep a
+    /// process-local tombstone so that late create is rejected before it can
+    /// supersede a newer generation.
+    retired_before_admit: HashSet<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CreateSettlement {
+    Publish,
+    Retire(NativeClose),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CreateAdmission {
+    Create(Vec<NativeClose>),
+    Retired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeClose {
+    lifecycle_token: String,
+    webview_label: String,
+}
+
+/// Transient authority for one native child WebView generation.
+///
+/// `tab_id` is durable UI scope; `lifecycle_token` is resource-instance
+/// identity. A Creating reservation is installed before `add_child()`, so an
+/// exact close can retire an admitted birth even while native creation is in
+/// flight. This registry is intentionally process-local and non-persistent.
+#[derive(Default)]
+struct BrowserLifecycleRegistry {
+    tabs: HashMap<String, BrowserTabLifecycle>,
+}
+
+impl BrowserLifecycleRegistry {
+    fn admit_create(
+        &mut self,
+        tab_id: &str,
+        lifecycle_token: &str,
+        webview_label: &str,
+    ) -> Result<CreateAdmission, String> {
+        let tab = self.tabs.entry(tab_id.to_string()).or_default();
+        if tab.retired_before_admit.remove(lifecycle_token) {
+            self.remove_empty_tab(tab_id);
+            return Ok(CreateAdmission::Retired);
+        }
+        if tab.generations.contains_key(lifecycle_token) {
+            return Err(format!(
+                "Browser generation already admitted for tab {tab_id}"
+            ));
+        }
+
+        let mut close_now = Vec::new();
+        for (token, generation) in &mut tab.generations {
+            match generation {
+                BrowserGeneration::Creating { .. } => {
+                    *generation = BrowserGeneration::RetiringBirth;
+                }
+                BrowserGeneration::Live(session) => {
+                    let webview_label = session.webview_label.clone();
+                    *generation = BrowserGeneration::RetiringNative {
+                        webview_label: webview_label.clone(),
+                    };
+                    close_now.push(NativeClose {
+                        lifecycle_token: token.clone(),
+                        webview_label,
+                    });
+                }
+                BrowserGeneration::RetiringBirth | BrowserGeneration::RetiringNative { .. } => {}
+            }
+        }
+
+        tab.desired_token = Some(lifecycle_token.to_string());
+        tab.generations.insert(
+            lifecycle_token.to_string(),
+            BrowserGeneration::Creating {
+                webview_label: webview_label.to_string(),
+            },
+        );
+        Ok(CreateAdmission::Create(close_now))
+    }
+
+    fn settle_create_success(
+        &mut self,
+        tab_id: &str,
+        lifecycle_token: &str,
+        session: BrowserSession,
+    ) -> CreateSettlement {
+        let label = session.webview_label.clone();
+        let tab = self.tabs.entry(tab_id.to_string()).or_default();
+        let generation = tab.generations.remove(lifecycle_token);
+        let should_publish = matches!(
+            generation,
+            Some(BrowserGeneration::Creating { ref webview_label })
+                if webview_label == &label
+        ) && tab.desired_token.as_deref() == Some(lifecycle_token);
+        if should_publish {
+            tab.generations.insert(
+                lifecycle_token.to_string(),
+                BrowserGeneration::Live(session),
+            );
+            CreateSettlement::Publish
+        } else {
+            tab.generations.insert(
+                lifecycle_token.to_string(),
+                BrowserGeneration::RetiringNative {
+                    webview_label: label.clone(),
+                },
+            );
+            if tab.desired_token.as_deref() == Some(lifecycle_token) {
+                tab.desired_token = None;
+            }
+            CreateSettlement::Retire(NativeClose {
+                lifecycle_token: lifecycle_token.to_string(),
+                webview_label: label,
+            })
+        }
+    }
+
+    fn settle_create_failure(&mut self, tab_id: &str, lifecycle_token: &str) {
+        let Some(tab) = self.tabs.get_mut(tab_id) else {
+            return;
+        };
+        tab.generations.remove(lifecycle_token);
+        if tab.desired_token.as_deref() == Some(lifecycle_token) {
+            tab.desired_token = None;
+        }
+        self.remove_empty_tab(tab_id);
+    }
+
+    fn close(&mut self, tab_id: &str, lifecycle_token: &str) -> Option<NativeClose> {
+        let tab = self.tabs.entry(tab_id.to_string()).or_default();
+        let Some(generation) = tab.generations.get_mut(lifecycle_token) else {
+            tab.retired_before_admit.insert(lifecycle_token.to_string());
+            return None;
+        };
+        let close_now = match generation {
+            BrowserGeneration::Creating { .. } => {
+                *generation = BrowserGeneration::RetiringBirth;
+                None
+            }
+            BrowserGeneration::Live(session) => {
+                let webview_label = session.webview_label.clone();
+                *generation = BrowserGeneration::RetiringNative {
+                    webview_label: webview_label.clone(),
+                };
+                Some(NativeClose {
+                    lifecycle_token: lifecycle_token.to_string(),
+                    webview_label,
+                })
+            }
+            BrowserGeneration::RetiringBirth => None,
+            BrowserGeneration::RetiringNative { webview_label } => Some(NativeClose {
+                lifecycle_token: lifecycle_token.to_string(),
+                webview_label: webview_label.clone(),
+            }),
+        };
+        if tab.desired_token.as_deref() == Some(lifecycle_token) {
+            tab.desired_token = None;
+        }
+        close_now
+    }
+
+    fn settle_native_close_success(&mut self, tab_id: &str, close: &NativeClose) {
+        let Some(tab) = self.tabs.get_mut(tab_id) else {
+            return;
+        };
+        let matches_exact_native = matches!(
+            tab.generations.get(&close.lifecycle_token),
+            Some(BrowserGeneration::RetiringNative { webview_label })
+                if webview_label == &close.webview_label
+        );
+        if matches_exact_native {
+            tab.generations.remove(&close.lifecycle_token);
+        }
+        self.remove_empty_tab(tab_id);
+    }
+
+    fn live_session(&self, tab_id: &str, lifecycle_token: &str) -> Option<&BrowserSession> {
+        match self.tabs.get(tab_id)?.generations.get(lifecycle_token)? {
+            BrowserGeneration::Live(session) => Some(session),
+            BrowserGeneration::Creating { .. }
+            | BrowserGeneration::RetiringBirth
+            | BrowserGeneration::RetiringNative { .. } => None,
+        }
+    }
+
+    fn live_session_mut(
+        &mut self,
+        tab_id: &str,
+        lifecycle_token: &str,
+    ) -> Option<&mut BrowserSession> {
+        match self
+            .tabs
+            .get_mut(tab_id)?
+            .generations
+            .get_mut(lifecycle_token)?
+        {
+            BrowserGeneration::Live(session) => Some(session),
+            BrowserGeneration::Creating { .. }
+            | BrowserGeneration::RetiringBirth
+            | BrowserGeneration::RetiringNative { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn has_generation(&self, tab_id: &str, lifecycle_token: &str) -> bool {
+        self.tabs
+            .get(tab_id)
+            .is_some_and(|tab| tab.generations.contains_key(lifecycle_token))
+    }
+
+    fn drain_native(&mut self) -> Vec<String> {
+        let mut labels = Vec::new();
+        for tab in self.tabs.values_mut() {
+            for generation in tab.generations.values() {
+                match generation {
+                    BrowserGeneration::Live(session) => {
+                        labels.push(session.webview_label.clone());
+                    }
+                    BrowserGeneration::RetiringNative { webview_label } => {
+                        labels.push(webview_label.clone());
+                    }
+                    BrowserGeneration::Creating { .. } | BrowserGeneration::RetiringBirth => {}
+                }
+            }
+        }
+        self.tabs.clear();
+        labels
+    }
+
+    fn native_count(&self) -> usize {
+        self.tabs
+            .values()
+            .map(|tab| {
+                tab.generations
+                    .values()
+                    .filter(|generation| {
+                        matches!(
+                            generation,
+                            BrowserGeneration::Live(_) | BrowserGeneration::RetiringNative { .. }
+                        )
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    fn remove_empty_tab(&mut self, tab_id: &str) {
+        if self.tabs.get(tab_id).is_some_and(|tab| {
+            tab.generations.is_empty()
+                && tab.retired_before_admit.is_empty()
+                && tab.desired_token.is_none()
+        }) {
+            self.tabs.remove(tab_id);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 pub struct BrowserManager {
-    sessions: Mutex<HashMap<String, BrowserSession>>,
+    lifecycle: Mutex<BrowserLifecycleRegistry>,
 }
 
 impl BrowserManager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            sessions: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(BrowserLifecycleRegistry::default()),
         })
     }
+}
+
+fn validate_lifecycle_token(lifecycle_token: &str) -> Result<(), String> {
+    Uuid::parse_str(lifecycle_token)
+        .map(|_| ())
+        .map_err(|_| "Invalid browser lifecycle token".to_string())
+}
+
+fn browser_event_name(kind: &str, tab_id: &str, lifecycle_token: &str) -> String {
+    format!("browser:{kind}:{tab_id}:{lifecycle_token}")
+}
+
+fn describe_url_for_log(url: &Url) -> String {
+    match url.scheme() {
+        "file" => "file://<local>".to_string(),
+        scheme => url
+            .host_str()
+            .map(|host| format!("{scheme}://{host}"))
+            .unwrap_or_else(|| format!("{scheme}:<internal>")),
+    }
+}
+
+fn close_webview_label(app: &AppHandle, label: &str) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(label) {
+        webview.close().map_err(|error| {
+            ulog_warn!("[browser] close failed label={}: {}", label, error);
+            format!("Failed to close browser webview label={label}: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────
@@ -225,19 +551,24 @@ pub async fn cmd_browser_create(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
     url: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+    bounds: BrowserBounds,
 ) -> Result<(), String> {
     let _lifecycle_spawn_permit = crate::sidecar::begin_lifecycle_spawn_permit()?;
-    let label = format!("browser-{}", tab_id);
+    validate_lifecycle_token(&lifecycle_token)?;
+    let label = format!("browser-{}-{}", tab_id, lifecycle_token);
+    let BrowserBounds {
+        x,
+        y,
+        width,
+        height,
+    } = bounds;
 
     ulog_info!(
-        "[browser] cmd_browser_create: tab={} url={} pos=({},{}) size={}x{}",
+        "[browser] cmd_browser_create: tab={} generation={} pos=({},{}) size={}x{}",
         tab_id,
-        url,
+        lifecycle_token,
         x,
         y,
         width,
@@ -261,22 +592,50 @@ pub async fn cmd_browser_create(
         (width, height)
     };
 
-    // Prevent duplicate creation
-    {
-        let sessions = state.sessions.lock().await;
-        if sessions.contains_key(&tab_id) {
-            ulog_info!("[browser] Duplicate creation blocked for tab {}", tab_id);
-            return Err(format!("Browser already exists for tab {}", tab_id));
-        }
-    }
-
     let parsed_url = parse_url_or_path(&url)?;
+
+    // Resolve fallible prerequisites before reserving, then publish birth
+    // intent before the native add_child call. A matching close can now see
+    // and retire this exact generation throughout native creation.
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "Main window not found".to_string())?;
+    let admission = state
+        .lifecycle
+        .lock()
+        .await
+        .admit_create(&tab_id, &lifecycle_token, &label)?;
+    let CreateAdmission::Create(superseded_generations) = admission else {
+        ulog_info!(
+            "[browser] create skipped for pre-retired tab={} generation={}",
+            tab_id,
+            lifecycle_token
+        );
+        return Ok(());
+    };
+    for superseded in superseded_generations {
+        if let Err(error) = close_webview_label(&app, &superseded.webview_label) {
+            state
+                .lifecycle
+                .lock()
+                .await
+                .settle_create_failure(&tab_id, &lifecycle_token);
+            return Err(error);
+        }
+        state
+            .lifecycle
+            .lock()
+            .await
+            .settle_native_close_success(&tab_id, &superseded);
+    }
 
     // Clone values for closures
     let app_nav = app.clone();
     let tab_id_nav = tab_id.clone();
+    let lifecycle_token_nav = lifecycle_token.clone();
     let app_load = app.clone();
     let tab_id_load = tab_id.clone();
+    let lifecycle_token_load = lifecycle_token.clone();
     let app_new_win = app.clone();
     let label_new_win = label.clone();
 
@@ -291,9 +650,8 @@ pub async fn cmd_browser_create(
             // already sandboxed (browser.json zero Tauri permissions).
             if scheme == "javascript" {
                 ulog_info!(
-                    "[browser] on_navigation BLOCKED: {} (scheme: {})",
-                    nav_url,
-                    scheme
+                    "[browser] on_navigation BLOCKED target={}",
+                    describe_url_for_log(nav_url)
                 );
                 return false;
             }
@@ -310,8 +668,8 @@ pub async fn cmd_browser_create(
                     if let Ok(target) = Url::parse(&target_str) {
                         if matches!(target.scheme(), "http" | "https" | "mailto") {
                             ulog_info!(
-                                "[browser] open-external (Cmd/Ctrl/middle-click): {}",
-                                target
+                                "[browser] open-external (Cmd/Ctrl/middle-click) target={}",
+                                describe_url_for_log(&target)
                             );
                             spawn_external_open(target.as_str());
                         } else {
@@ -326,37 +684,45 @@ pub async fn cmd_browser_create(
             }
             // Emit URL changes for http/https/file (skip about:, data:, blob: noise)
             if scheme == "http" || scheme == "https" || scheme == "file" {
-                ulog_info!("[browser] on_navigation ALLOW: {}", nav_url);
+                ulog_info!(
+                    "[browser] on_navigation ALLOW target={}",
+                    describe_url_for_log(nav_url)
+                );
                 let _ = app_nav.emit(
-                    &format!("browser:url-changed:{}", tab_id_nav),
+                    &browser_event_name("url-changed", &tab_id_nav, &lifecycle_token_nav),
                     nav_url.to_string(),
                 );
             } else {
                 ulog_info!(
-                    "[browser] on_navigation ALLOW (internal): {} (scheme: {})",
-                    nav_url,
-                    scheme
+                    "[browser] on_navigation ALLOW target={}",
+                    describe_url_for_log(nav_url)
                 );
             }
             true
         })
         .on_page_load(move |_webview, payload| {
             let url_str = payload.url().to_string();
-            let event_name = format!("browser:loading:{}", tab_id_load);
+            let event_name = browser_event_name("loading", &tab_id_load, &lifecycle_token_load);
             match payload.event() {
                 PageLoadEvent::Started => {
-                    ulog_info!("[browser] on_page_load STARTED: {}", url_str);
+                    ulog_info!(
+                        "[browser] on_page_load STARTED target={}",
+                        describe_url_for_log(payload.url())
+                    );
                     let _ = app_load.emit(&event_name, true);
                 }
                 PageLoadEvent::Finished => {
-                    ulog_info!("[browser] on_page_load FINISHED: {}", url_str);
+                    ulog_info!(
+                        "[browser] on_page_load FINISHED target={}",
+                        describe_url_for_log(payload.url())
+                    );
                     let _ = app_load.emit(&event_name, false);
                     // Use the load-event's payload URL — calling _webview.url()
                     // here panics inside wry's url_from_webview when WKWebView.URL
                     // is nil (notably for about:blank in transient states), which
                     // tao's stop_app_on_panic then escalates to a process crash.
                     let _ = app_load.emit(
-                        &format!("browser:url-changed:{}", tab_id_load),
+                        &browser_event_name("url-changed", &tab_id_load, &lifecycle_token_load),
                         url_str.clone(),
                     );
                 }
@@ -364,8 +730,8 @@ pub async fn cmd_browser_create(
         })
         .on_new_window(move |url, _features| {
             ulog_info!(
-                "[browser] on_new_window: {} — redirecting to current webview",
-                url
+                "[browser] on_new_window target={} — redirecting to exact generation",
+                describe_url_for_log(&url)
             );
             // Redirect target="_blank" / window.open() into the current webview
             let app = app_new_win.clone();
@@ -379,23 +745,23 @@ pub async fn cmd_browser_create(
             tauri::webview::NewWindowResponse::Deny
         });
 
-    // Get the Window (not WebviewWindow) to add a child webview
-    let window = app
-        .get_window("main")
-        .ok_or_else(|| "Main window not found".to_string())?;
-
     let position = LogicalPosition::new(x, y);
     let size = LogicalSize::new(width, height);
 
     ulog_info!(
-        "[browser] Calling window.add_child for label='{}' url={}",
+        "[browser] Calling window.add_child for label='{}' target={}",
         label,
-        parsed_url
+        describe_url_for_log(&parsed_url)
     );
-    window.add_child(builder, position, size).map_err(|e| {
-        ulog_info!("[browser] add_child FAILED: {}", e);
-        format!("Failed to create browser webview: {e}")
-    })?;
+    if let Err(error) = window.add_child(builder, position, size) {
+        state
+            .lifecycle
+            .lock()
+            .await
+            .settle_create_failure(&tab_id, &lifecycle_token);
+        ulog_info!("[browser] add_child FAILED: {}", error);
+        return Err(format!("Failed to create browser webview: {error}"));
+    }
 
     ulog_info!("[browser] add_child SUCCESS for label='{}'", label);
 
@@ -406,10 +772,9 @@ pub async fn cmd_browser_create(
     // wry-0.54.4/src/wkwebview/mod.rs:1349. add_child returning Ok is itself
     // sufficient evidence that the webview was created.
 
-    // Store session
-    let mut sessions = state.sessions.lock().await;
-    sessions.insert(
-        tab_id.clone(),
+    let settlement = state.lifecycle.lock().await.settle_create_success(
+        &tab_id,
+        &lifecycle_token,
         BrowserSession {
             webview_label: label.clone(),
             tab_id: tab_id.clone(),
@@ -420,12 +785,30 @@ pub async fn cmd_browser_create(
             last_height: height,
         },
     );
-
-    ulog_info!(
-        "[browser] Created webview '{}' for tab {} — session stored",
-        label,
-        tab_id
-    );
+    match settlement {
+        CreateSettlement::Publish => {
+            ulog_info!(
+                "[browser] Created webview '{}' for tab {} generation={} — published",
+                label,
+                tab_id,
+                lifecycle_token
+            );
+        }
+        CreateSettlement::Retire(retired) => {
+            close_webview_label(&app, &retired.webview_label)?;
+            state
+                .lifecycle
+                .lock()
+                .await
+                .settle_native_close_success(&tab_id, &retired);
+            ulog_info!(
+                "[browser] Retired stale birth '{}' for tab {} generation={}",
+                retired.webview_label,
+                tab_id,
+                lifecycle_token
+            );
+        }
+    }
     Ok(())
 }
 
@@ -435,13 +818,19 @@ pub async fn cmd_browser_navigate(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
     url: String,
 ) -> Result<(), String> {
-    ulog_info!("[browser] cmd_browser_navigate: tab={} url={}", tab_id, url);
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&tab_id)
-        .ok_or_else(|| format!("No browser for tab {}", tab_id))?;
+    validate_lifecycle_token(&lifecycle_token)?;
+    ulog_info!(
+        "[browser] cmd_browser_navigate: tab={} generation={}",
+        tab_id,
+        lifecycle_token
+    );
+    let lifecycle = state.lifecycle.lock().await;
+    let session = lifecycle
+        .live_session(&tab_id, &lifecycle_token)
+        .ok_or_else(|| format!("No matching browser generation for tab {}", tab_id))?;
 
     let parsed_url = parse_url_or_path(&url)?;
     let webview = app
@@ -459,11 +848,13 @@ pub async fn cmd_browser_go_back(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
 ) -> Result<(), String> {
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&tab_id)
-        .ok_or_else(|| format!("No browser for tab {}", tab_id))?;
+    validate_lifecycle_token(&lifecycle_token)?;
+    let lifecycle = state.lifecycle.lock().await;
+    let session = lifecycle
+        .live_session(&tab_id, &lifecycle_token)
+        .ok_or_else(|| format!("No matching browser generation for tab {}", tab_id))?;
 
     let webview = app
         .get_webview(&session.webview_label)
@@ -480,11 +871,13 @@ pub async fn cmd_browser_go_forward(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
 ) -> Result<(), String> {
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&tab_id)
-        .ok_or_else(|| format!("No browser for tab {}", tab_id))?;
+    validate_lifecycle_token(&lifecycle_token)?;
+    let lifecycle = state.lifecycle.lock().await;
+    let session = lifecycle
+        .live_session(&tab_id, &lifecycle_token)
+        .ok_or_else(|| format!("No matching browser generation for tab {}", tab_id))?;
 
     let webview = app
         .get_webview(&session.webview_label)
@@ -501,11 +894,13 @@ pub async fn cmd_browser_reload(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
 ) -> Result<(), String> {
-    let sessions = state.sessions.lock().await;
-    let session = sessions
-        .get(&tab_id)
-        .ok_or_else(|| format!("No browser for tab {}", tab_id))?;
+    validate_lifecycle_token(&lifecycle_token)?;
+    let lifecycle = state.lifecycle.lock().await;
+    let session = lifecycle
+        .live_session(&tab_id, &lifecycle_token)
+        .ok_or_else(|| format!("No matching browser generation for tab {}", tab_id))?;
 
     let webview = app
         .get_webview(&session.webview_label)
@@ -520,11 +915,16 @@ pub async fn cmd_browser_resize(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
+    lifecycle_token: String,
+    bounds: BrowserBounds,
 ) -> Result<(), String> {
+    validate_lifecycle_token(&lifecycle_token)?;
+    let BrowserBounds {
+        x,
+        y,
+        width,
+        height,
+    } = bounds;
     // Drop degenerate resizes (width/height ≤ 0) instead of collapsing the
     // webview and caching zeros that a later SHOW would restore (issue #290).
     // Keep the last good geometry untouched so the next valid resize wins.
@@ -540,10 +940,10 @@ pub async fn cmd_browser_resize(
         return Ok(());
     }
 
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions
-        .get_mut(&tab_id)
-        .ok_or_else(|| format!("No browser for tab {}", tab_id))?;
+    let mut lifecycle = state.lifecycle.lock().await;
+    let session = lifecycle
+        .live_session_mut(&tab_id, &lifecycle_token)
+        .ok_or_else(|| format!("No matching browser generation for tab {}", tab_id))?;
 
     // Update cached position
     session.last_x = x;
@@ -595,11 +995,13 @@ pub async fn cmd_browser_show(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions
-        .get_mut(&tab_id)
-        .ok_or_else(|| format!("No browser for tab {}", tab_id))?;
+    validate_lifecycle_token(&lifecycle_token)?;
+    let mut lifecycle = state.lifecycle.lock().await;
+    let session = lifecycle
+        .live_session_mut(&tab_id, &lifecycle_token)
+        .ok_or_else(|| format!("No matching browser generation for tab {}", tab_id))?;
 
     if session.visible {
         return Ok(());
@@ -639,11 +1041,13 @@ pub async fn cmd_browser_hide(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    let session = sessions
-        .get_mut(&tab_id)
-        .ok_or_else(|| format!("No browser for tab {}", tab_id))?;
+    validate_lifecycle_token(&lifecycle_token)?;
+    let mut lifecycle = state.lifecycle.lock().await;
+    let session = lifecycle
+        .live_session_mut(&tab_id, &lifecycle_token)
+        .ok_or_else(|| format!("No matching browser generation for tab {}", tab_id))?;
 
     if !session.visible {
         return Ok(());
@@ -665,16 +1069,26 @@ pub async fn cmd_browser_close(
     app: AppHandle,
     state: tauri::State<'_, Arc<BrowserManager>>,
     tab_id: String,
+    lifecycle_token: String,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().await;
-    if let Some(session) = sessions.remove(&tab_id) {
-        if let Some(webview) = app.get_webview(&session.webview_label) {
-            let _ = webview.close();
-        }
+    validate_lifecycle_token(&lifecycle_token)?;
+    let close_now = state
+        .lifecycle
+        .lock()
+        .await
+        .close(&tab_id, &lifecycle_token);
+    if let Some(close) = close_now {
+        close_webview_label(&app, &close.webview_label)?;
+        state
+            .lifecycle
+            .lock()
+            .await
+            .settle_native_close_success(&tab_id, &close);
         ulog_info!(
-            "[browser] Closed webview '{}' for tab {}",
-            session.webview_label,
-            tab_id
+            "[browser] Closed webview '{}' for tab {} generation={}",
+            close.webview_label,
+            tab_id,
+            lifecycle_token
         );
     }
     Ok(())
@@ -686,12 +1100,10 @@ pub async fn cmd_browser_close(
 
 /// Close all browser webviews (app exit cleanup).
 pub async fn close_all_browsers(state: &Arc<BrowserManager>, app: &AppHandle) {
-    let mut sessions = state.sessions.lock().await;
-    let count = sessions.len();
-    for (_tab_id, session) in sessions.drain() {
-        if let Some(webview) = app.get_webview(&session.webview_label) {
-            let _ = webview.close();
-        }
+    let mut lifecycle = state.lifecycle.lock().await;
+    let count = lifecycle.native_count();
+    for label in lifecycle.drain_native() {
+        let _ = close_webview_label(app, &label);
     }
     if count > 0 {
         ulog_info!("[browser] Closed {} browser(s) on shutdown", count);
@@ -700,9 +1112,12 @@ pub async fn close_all_browsers(state: &Arc<BrowserManager>, app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_degenerate_bounds;
     #[cfg(target_os = "windows")]
     use super::wide_null_terminated;
+    use super::{
+        is_degenerate_bounds, BrowserLifecycleRegistry, CreateAdmission, CreateSettlement,
+        NativeClose,
+    };
 
     // Issue #290: the renderer can hand us a 0-width container reading while
     // the split panel's width transition is mid-flight. These must be rejected
@@ -721,6 +1136,190 @@ mod tests {
     fn real_bounds_are_accepted() {
         assert!(!is_degenerate_bounds(694.0, 662.0));
         assert!(!is_degenerate_bounds(1.0, 1.0));
+    }
+
+    #[test]
+    fn close_during_create_retires_the_late_native_birth_once() {
+        let mut registry = BrowserLifecycleRegistry::default();
+        let admitted = registry
+            .admit_create("tab-a", "generation-a", "browser-a")
+            .unwrap();
+        assert_eq!(admitted, CreateAdmission::Create(Vec::new()));
+        assert!(registry.close("tab-a", "generation-a").is_none());
+
+        let retired = NativeClose {
+            lifecycle_token: "generation-a".to_string(),
+            webview_label: "browser-a".to_string(),
+        };
+        assert_eq!(
+            registry.settle_create_success("tab-a", "generation-a", session("browser-a")),
+            CreateSettlement::Retire(retired.clone())
+        );
+        assert!(registry.has_generation("tab-a", "generation-a"));
+        registry.settle_native_close_success("tab-a", &retired);
+        assert!(!registry.has_generation("tab-a", "generation-a"));
+    }
+
+    #[test]
+    fn close_that_overtakes_create_tombstones_only_that_exact_generation() {
+        let mut registry = BrowserLifecycleRegistry::default();
+        assert!(registry.close("tab-a", "generation-a").is_none());
+        registry
+            .admit_create("tab-a", "generation-b", "browser-b")
+            .unwrap();
+        assert_eq!(
+            registry.settle_create_success("tab-a", "generation-b", session("browser-b")),
+            CreateSettlement::Publish,
+        );
+
+        assert_eq!(
+            registry
+                .admit_create("tab-a", "generation-a", "browser-a")
+                .unwrap(),
+            CreateAdmission::Retired,
+        );
+        assert_eq!(
+            registry
+                .live_session("tab-a", "generation-b")
+                .map(|value| value.webview_label.as_str()),
+            Some("browser-b"),
+        );
+    }
+
+    #[test]
+    fn reopening_supersedes_creating_and_live_generations_without_stale_writes() {
+        let mut registry = BrowserLifecycleRegistry::default();
+        registry
+            .admit_create("tab-a", "generation-a", "browser-a")
+            .unwrap();
+        registry
+            .admit_create("tab-a", "generation-b", "browser-b")
+            .unwrap();
+
+        let retired_a =
+            match registry.settle_create_success("tab-a", "generation-a", session("browser-a")) {
+                CreateSettlement::Retire(close) => close,
+                CreateSettlement::Publish => panic!("stale generation must retire"),
+            };
+        registry.settle_native_close_success("tab-a", &retired_a);
+        assert_eq!(
+            registry.settle_create_success("tab-a", "generation-b", session("browser-b")),
+            CreateSettlement::Publish,
+        );
+        assert!(registry.live_session("tab-a", "generation-a").is_none());
+        assert_eq!(
+            registry
+                .live_session("tab-a", "generation-b")
+                .map(|value| value.webview_label.as_str()),
+            Some("browser-b"),
+        );
+
+        assert!(registry.close("tab-a", "generation-a").is_none());
+        assert_eq!(
+            registry
+                .live_session("tab-a", "generation-b")
+                .map(|value| value.webview_label.as_str()),
+            Some("browser-b"),
+        );
+    }
+
+    #[test]
+    fn superseding_a_live_generation_returns_only_its_exact_native_label() {
+        let mut registry = BrowserLifecycleRegistry::default();
+        registry
+            .admit_create("tab-a", "generation-a", "browser-a")
+            .unwrap();
+        assert_eq!(
+            registry.settle_create_success("tab-a", "generation-a", session("browser-a")),
+            CreateSettlement::Publish,
+        );
+
+        assert_eq!(
+            registry
+                .admit_create("tab-a", "generation-b", "browser-b")
+                .unwrap(),
+            CreateAdmission::Create(vec![NativeClose {
+                lifecycle_token: "generation-a".to_string(),
+                webview_label: "browser-a".to_string(),
+            }])
+        );
+        assert!(registry.live_session("tab-a", "generation-a").is_none());
+    }
+
+    #[test]
+    fn native_close_failure_keeps_exact_generation_tracked_for_retry_and_shutdown() {
+        let mut registry = BrowserLifecycleRegistry::default();
+        registry
+            .admit_create("tab-a", "generation-a", "browser-a")
+            .unwrap();
+        assert_eq!(
+            registry.settle_create_success("tab-a", "generation-a", session("browser-a")),
+            CreateSettlement::Publish,
+        );
+
+        let first_close = registry.close("tab-a", "generation-a").unwrap();
+        assert!(registry.has_generation("tab-a", "generation-a"));
+        assert_eq!(
+            registry.close("tab-a", "generation-a"),
+            Some(first_close.clone()),
+        );
+        assert_eq!(registry.native_count(), 1);
+        assert_eq!(registry.drain_native(), vec!["browser-a".to_string()]);
+    }
+
+    #[test]
+    fn stale_non_close_lookup_never_resolves_to_the_new_live_generation() {
+        let mut registry = BrowserLifecycleRegistry::default();
+        registry
+            .admit_create("tab-a", "generation-a", "browser-a")
+            .unwrap();
+        registry
+            .admit_create("tab-a", "generation-b", "browser-b")
+            .unwrap();
+        let retired_a =
+            match registry.settle_create_success("tab-a", "generation-a", session("browser-a")) {
+                CreateSettlement::Retire(close) => close,
+                CreateSettlement::Publish => panic!("stale generation must retire"),
+            };
+        registry.settle_native_close_success("tab-a", &retired_a);
+        assert_eq!(
+            registry.settle_create_success("tab-a", "generation-b", session("browser-b")),
+            CreateSettlement::Publish,
+        );
+
+        assert!(registry.live_session("tab-a", "generation-a").is_none());
+        assert!(registry.live_session_mut("tab-a", "generation-a").is_none());
+        assert_eq!(
+            registry
+                .live_session("tab-a", "generation-b")
+                .map(|session| session.webview_label.as_str()),
+            Some("browser-b"),
+        );
+    }
+
+    #[test]
+    fn failed_birth_clears_only_its_reservation_and_allows_a_retry() {
+        let mut registry = BrowserLifecycleRegistry::default();
+        registry
+            .admit_create("tab-a", "generation-a", "browser-a")
+            .unwrap();
+        registry.settle_create_failure("tab-a", "generation-a");
+        assert!(!registry.has_generation("tab-a", "generation-a"));
+        assert!(registry
+            .admit_create("tab-a", "generation-b", "browser-b")
+            .is_ok());
+    }
+
+    fn session(label: &str) -> super::BrowserSession {
+        super::BrowserSession {
+            webview_label: label.to_string(),
+            tab_id: "tab-a".to_string(),
+            visible: true,
+            last_x: 0.0,
+            last_y: 0.0,
+            last_width: 640.0,
+            last_height: 480.0,
+        }
     }
 
     #[cfg(target_os = "windows")]

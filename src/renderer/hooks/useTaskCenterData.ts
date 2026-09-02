@@ -18,10 +18,12 @@ import {
     getSnapshot,
     refresh,
     ensureWorkspaceSessions,
+    registerPassiveWorkspaceSessionDemand,
     setSidebarWorkspaceSessionDemand,
     TASK_CENTER_FRESHNESS_TTL_MS,
     type TaskCenterData,
 } from '@/hooks/taskCenterStore';
+import type { SessionMetadata } from '@/api/sessionClient';
 import { CUSTOM_EVENTS } from '../../shared/constants';
 
 export type {
@@ -90,4 +92,23 @@ export function useGlobalSidebarTaskCenterData(
     }, [workspaceKey, workspacePaths]);
 
     return data;
+}
+
+/**
+ * Read one Session from the app-global passive metadata projection. Open Chat
+ * tabs share the existing watcher and request authority instead of each
+ * installing their own filesystem listener or Task Center polling lifecycle.
+ */
+export function usePassiveSessionMetadata(
+    workspacePath: string,
+    sessionId: string | null,
+): SessionMetadata | undefined {
+    const data = useSyncExternalStore(subscribePassive, getSnapshot);
+
+    useEffect(
+        () => registerPassiveWorkspaceSessionDemand(workspacePath),
+        [workspacePath],
+    );
+
+    return data.sessions.find((session) => session.id === sessionId);
 }

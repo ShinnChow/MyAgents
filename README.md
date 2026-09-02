@@ -153,6 +153,7 @@ MyAgents 是一个桌面端 AI Agent 产品，不是单纯的前端项目。改�
 - Node.js `>=22.0.0`，推荐 Node.js 24。
 - npm，仓库当前声明 `npm@11.13.0`。
 - Rust 通过 [rustup](https://rustup.rs) 安装，实际 toolchain 由 [rust-toolchain.toml](rust-toolchain.toml) 固定。
+- 原生推理资源冷构建需要 CMake 3.28+ 和平台 C/C++ 工具链；macOS 还需要 Git、Python 3.10+ 与 Apple Clang。
 - macOS 13+ / Windows 10+ / Linux Ubuntu 22.04+ 或 Debian 12+。
 
 ### 本地开发
@@ -175,7 +176,7 @@ cd MyAgents
 .\build_windows.ps1
 ```
 
-`setup.sh` 会准备内置 Node.js runtime、安装依赖并缓存离线文档转换资源；重复运行会复用已校验的文档资源缓存。默认 Mino 工作区模板已经提交在 `bundled-workspaces/mino/`，构建和初始化不需要额外的 GitHub SSH 或模板下载。
+setup 脚本会先按当前 target 和已验证缓存检查原生推理构建工具，再开始下载 Node runtime、安装项目依赖或拉取 Rust crates；缺失的原生构建工具会得到安装与验证提示，不会被脚本自动安装。随后它会缓存离线文档与语音推理资源；重复运行会复用已验证的资源缓存。默认 Mino 工作区模板已经提交在 `bundled-workspaces/mino/`，构建和初始化不需要额外的 GitHub SSH 或模板下载。
 
 ### 常用命令
 
@@ -428,6 +429,7 @@ Developers:
 - Node.js `>=22.0.0`, Node.js 24 recommended.
 - npm. The repository currently declares `npm@11.13.0`.
 - Rust installed through [rustup](https://rustup.rs). The actual toolchain is pinned by [rust-toolchain.toml](rust-toolchain.toml).
+- Cold native-inference resource builds require CMake 3.28+ and the platform C/C++ toolchain. macOS additionally requires Git, Python 3.10+, and Apple Clang.
 - macOS 13+ / Windows 10+ / Linux Ubuntu 22.04+ or Debian 12+.
 
 ### Local Development
@@ -450,7 +452,7 @@ cd MyAgents
 .\build_windows.ps1
 ```
 
-`setup.sh` prepares the bundled Node.js runtime, installs dependencies, and caches the offline document-processing resources. Repeated runs reuse the verified document-resource cache. The default Mino workspace template is committed under `bundled-workspaces/mino/`, so builds and initialization require no extra GitHub SSH access or template download.
+The setup scripts first check native-inference build tools for the current target and verified cache before downloading the Node runtime, installing project dependencies, or fetching Rust crates. Missing native build tools produce install and verification guidance and are not installed automatically. Setup then caches offline document and speech-inference resources, and repeated runs reuse verified resource caches. The default Mino workspace template is committed under `bundled-workspaces/mino/`, so builds and initialization require no extra GitHub SSH access or template download.
 
 ### Common Commands
 

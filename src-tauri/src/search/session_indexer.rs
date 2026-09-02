@@ -12,7 +12,7 @@ use crate::utils::bom::strip_bom;
 use crate::utils::system_reminder::strip_leading_system_reminder;
 
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermSetQuery};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyError, Term};
 
 use super::schema::{self, SessionFields, SCHEMA_VERSION};
@@ -142,9 +142,19 @@ impl SessionIndex {
         self.with_recovery("session delete", |state| state.delete_session(session_id))
     }
 
+    #[cfg(test)]
     pub fn search(&self, query: &str, limit: usize) -> Result<SessionSearchResult, String> {
+        self.search_with_tag(query, limit, None)
+    }
+
+    pub fn search_with_tag(
+        &self,
+        query: &str,
+        limit: usize,
+        tag: Option<&str>,
+    ) -> Result<SessionSearchResult, String> {
         self.with_recovery("session search", |state| {
-            state.search(query, limit, &self.data_dir)
+            state.search(query, limit, &self.data_dir, tag)
         })
     }
 
@@ -753,6 +763,7 @@ impl SessionIndexState {
         query: &str,
         limit: usize,
         data_dir: &Path,
+        tag: Option<&str>,
     ) -> Result<SessionSearchResult, String> {
         let start = std::time::Instant::now();
         let searcher = self.reader.searcher();
@@ -762,9 +773,34 @@ impl SessionIndexState {
         let mut parser = QueryParser::for_index(&self.index, vec![f.title, f.content]);
         parser.set_field_boost(f.title, 3.0);
 
-        let tantivy_query = parser
+        let text_query = parser
             .parse_query(query)
             .map_err(|e| format!("Query parse error: {}", e))?;
+
+        let eligible_session_ids = tag
+            .map(|tag_name| read_tag_eligible_session_ids(data_dir, tag_name))
+            .transpose()?;
+        if eligible_session_ids
+            .as_ref()
+            .is_some_and(|eligible| eligible.is_empty())
+        {
+            return Ok(SessionSearchResult {
+                total_count: 0,
+                hits: Vec::new(),
+                query_time_ms: start.elapsed().as_secs_f64() * 1000.0,
+            });
+        }
+        let tantivy_query: Box<dyn Query> = if let Some(eligible) = eligible_session_ids.as_ref() {
+            let session_terms = eligible
+                .iter()
+                .map(|session_id| Term::from_field_text(f.session_id, session_id));
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, text_query),
+                (Occur::Must, Box::new(TermSetQuery::new(session_terms))),
+            ]))
+        } else {
+            text_query
+        };
 
         let top_docs = searcher
             .search(&tantivy_query, &TopDocs::with_limit(limit * 3))
@@ -781,7 +817,10 @@ impl SessionIndexState {
                 .map_err(|e| tantivy_error("Doc retrieval error", e))?;
 
             let session_id = get_text_field(&doc, f.session_id);
-            if !is_session_currently_history_visible(data_dir, &session_id) {
+            if !eligible_session_ids.as_ref().map_or_else(
+                || is_session_currently_history_visible(data_dir, &session_id),
+                |eligible| eligible.contains(&session_id),
+            ) {
                 continue;
             }
             if !seen_sessions.insert(session_id.clone()) {
@@ -931,6 +970,30 @@ fn is_session_currently_history_visible(data_dir: &Path, session_id: &str) -> bo
         .is_some_and(|session| {
             crate::session_visibility::is_history_visible_session(session, &sessions_dir)
         })
+}
+
+fn read_tag_eligible_session_ids(
+    data_dir: &Path,
+    requested_tag: &str,
+) -> Result<HashSet<String>, String> {
+    if crate::session_tags::normalize_session_user_tag(requested_tag).is_none() {
+        return Err("Invalid Session Tag filter.".to_string());
+    }
+    let sessions_file = data_dir.join("sessions.json");
+    let sessions_dir = data_dir.join("sessions");
+    let content = fs::read_to_string(&sessions_file)
+        .map_err(|error| format!("Failed to read sessions.json for Tag filter: {}", error))?;
+    let sessions = serde_json::from_str::<Vec<serde_json::Value>>(strip_bom(&content))
+        .map_err(|error| format!("Failed to parse sessions.json for Tag filter: {}", error))?;
+    Ok(sessions
+        .iter()
+        .filter(|session| {
+            crate::session_visibility::is_history_visible_session(session, &sessions_dir)
+                && crate::session_tags::session_has_user_tag(session, requested_tag)
+        })
+        .filter_map(|session| session.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Read exactly the JSONL byte range needed for an incremental index pass.
@@ -1637,6 +1700,113 @@ mod tests {
                 .total_count,
             0
         );
+    }
+
+    #[test]
+    fn tag_filter_is_applied_before_top_k_and_reads_fresh_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let sessions_dir = data_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let sessions: Vec<_> = (0..8)
+            .map(|index| {
+                let session_id = format!("tag-filter-{index}");
+                fs::write(
+                    sessions_dir.join(format!("{session_id}.jsonl")),
+                    message_line(&format!("m-{index}"), "sharedquery searchable text"),
+                )
+                .unwrap();
+                json!({
+                    "id": session_id,
+                    "title": "sharedquery",
+                    "agentDir": format!("/tmp/myagents-workspace-{index}"),
+                    "lastActiveAt": "2026-06-06T00:00:00.000Z",
+                    "source": "desktop",
+                    "userTags": if index == 7 { json!(["跨工作区"]) } else { json!([]) },
+                    "stats": { "messageCount": 1 }
+                })
+            })
+            .collect();
+        fs::write(
+            data_dir.join("sessions.json"),
+            serde_json::to_vec(&sessions).unwrap(),
+        )
+        .unwrap();
+
+        let index = SessionIndex::new(
+            data_dir.join("search_index").join("sessions"),
+            data_dir.clone(),
+        )
+        .unwrap();
+        index.index_all_sessions(&data_dir).unwrap();
+
+        let filtered = index
+            .search_with_tag("sharedquery", 1, Some(" 跨工作区 "))
+            .unwrap();
+        assert_eq!(filtered.total_count, 1);
+        assert_eq!(filtered.hits[0].session_id, "tag-filter-7");
+
+        let mut updated = sessions;
+        updated[7].as_object_mut().unwrap().remove("userTags");
+        updated[0]["userTags"] = json!(["跨工作区"]);
+        fs::write(
+            data_dir.join("sessions.json"),
+            serde_json::to_vec(&updated).unwrap(),
+        )
+        .unwrap();
+
+        let refreshed = index
+            .search_with_tag("sharedquery", 1, Some("跨工作区"))
+            .unwrap();
+        assert_eq!(refreshed.total_count, 1);
+        assert_eq!(refreshed.hits[0].session_id, "tag-filter-0");
+    }
+
+    #[test]
+    fn tag_filter_sanitizes_legacy_arrays_and_surfaces_authority_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let sessions_dir = data_dir.join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let session_id = "tag-filter-legacy";
+        write_session_metadata_value(
+            &data_dir,
+            json!({
+                "id": session_id,
+                "title": "legacytagquery",
+                "agentDir": "/tmp/myagents-test-agent",
+                "lastActiveAt": "2026-06-06T00:00:00.000Z",
+                "source": "desktop",
+                "userTags": [42, " Cafe\u{301} ", "café", "", "Beta"],
+                "stats": { "messageCount": 1 }
+            }),
+        );
+        fs::write(
+            sessions_dir.join(format!("{session_id}.jsonl")),
+            message_line("m1", "legacytagquery searchable text"),
+        )
+        .unwrap();
+        let index = SessionIndex::new(
+            data_dir.join("search_index").join("sessions"),
+            data_dir.clone(),
+        )
+        .unwrap();
+        index.index_all_sessions(&data_dir).unwrap();
+
+        assert_eq!(
+            index
+                .search_with_tag("legacytagquery", 10, Some("CAFÉ"))
+                .unwrap()
+                .total_count,
+            1
+        );
+
+        fs::write(data_dir.join("sessions.json"), "not-json").unwrap();
+        let error = index
+            .search_with_tag("legacytagquery", 10, Some("café"))
+            .unwrap_err();
+        assert!(error.contains("Failed to parse sessions.json for Tag filter"));
     }
 
     #[test]

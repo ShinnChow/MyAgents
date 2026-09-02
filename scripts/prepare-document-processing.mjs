@@ -196,6 +196,60 @@ async function extractArchive(entry, name) {
   return destination;
 }
 
+function readGitOutput(source, args) {
+  try {
+    return execFileSync('git', args, {
+      cwd: source,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function readGitHead(source) {
+  return readGitOutput(source, ['rev-parse', '--verify', 'HEAD']);
+}
+
+export function ensureLockedGitCheckout(source, repository, commit) {
+  mkdirSync(source, { recursive: true });
+  if (!existsSync(join(source, '.git'))) {
+    execFileSync('git', ['init'], { cwd: source, stdio: 'inherit' });
+  }
+
+  const origin = readGitOutput(source, ['remote', 'get-url', 'origin']);
+  if (origin === null) {
+    execFileSync('git', ['remote', 'add', 'origin', repository], {
+      cwd: source,
+      stdio: 'inherit',
+    });
+  } else if (origin !== repository) {
+    execFileSync('git', ['remote', 'set-url', 'origin', repository], {
+      cwd: source,
+      stdio: 'inherit',
+    });
+  }
+
+  let actualCommit = readGitHead(source);
+  if (actualCommit !== commit) {
+    execFileSync('git', ['fetch', '--depth', '1', 'origin', commit], {
+      cwd: source,
+      stdio: 'inherit',
+    });
+    execFileSync('git', ['checkout', '--detach', '--force', commit], {
+      cwd: source,
+      stdio: 'inherit',
+    });
+    actualCommit = readGitHead(source);
+  } else {
+    console.log(`  [cache] reused locked ONNX Runtime source ${actualCommit}`);
+  }
+  if (actualCommit !== commit)
+    throw new Error(`ONNX Runtime source mismatch: ${actualCommit}`);
+  return actualCommit;
+}
+
 function prepareMacOrtSourceBuild(entry) {
   const source = join(
     cacheRoot,
@@ -210,39 +264,11 @@ function prepareMacOrtSourceBuild(entry) {
       '  [cache] migrated ONNX Runtime source/build cache from legacy Cargo target cache',
     );
   }
-  if (!existsSync(join(source, '.git'))) {
-    mkdirSync(source, { recursive: true });
-    execFileSync('git', ['init'], { cwd: source, stdio: 'inherit' });
-    execFileSync(
-      'git',
-      ['remote', 'add', 'origin', entry.sourceBuild.repository],
-      { cwd: source, stdio: 'inherit' },
-    );
-  }
-  let actualCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-    cwd: source,
-    encoding: 'utf8',
-  }).trim();
-  if (actualCommit !== entry.sourceBuild.commit) {
-    execFileSync(
-      'git',
-      ['fetch', '--depth', '1', 'origin', entry.sourceBuild.commit],
-      { cwd: source, stdio: 'inherit' },
-    );
-    execFileSync(
-      'git',
-      ['checkout', '--detach', '--force', entry.sourceBuild.commit],
-      { cwd: source, stdio: 'inherit' },
-    );
-    actualCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: source,
-      encoding: 'utf8',
-    }).trim();
-  } else {
-    console.log(`  [cache] reused locked ONNX Runtime source ${actualCommit}`);
-  }
-  if (actualCommit !== entry.sourceBuild.commit)
-    throw new Error(`ONNX Runtime source mismatch: ${actualCommit}`);
+  ensureLockedGitCheckout(
+    source,
+    entry.sourceBuild.repository,
+    entry.sourceBuild.commit,
+  );
   execFileSync('git', ['submodule', 'sync', '--recursive'], {
     cwd: source,
     stdio: 'inherit',

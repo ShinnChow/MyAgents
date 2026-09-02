@@ -15,19 +15,13 @@ import { useTabSwipeGesture } from './useTabSwipeGesture';
 const tabs: Tab[] = [
   {
     id: 'tab-a',
-    agentDir: null,
-    sessionId: null,
     view: 'launcher',
     title: 'A',
-    sidecarConfigDisposition: 'push',
   },
   {
     id: 'tab-b',
-    agentDir: null,
-    sessionId: null,
     view: 'launcher',
     title: 'B',
-    sidecarConfigDisposition: 'push',
   },
 ];
 
@@ -35,11 +29,8 @@ const threeTabs: Tab[] = [
   ...tabs,
   {
     id: 'tab-c',
-    agentDir: null,
-    sessionId: null,
     view: 'launcher',
     title: 'C',
-    sidecarConfigDisposition: 'push',
   },
 ];
 
@@ -59,8 +50,8 @@ function Harness({
   children?: ReactNode;
 }) {
   const contentRef = useRef<HTMLDivElement | null>(null);
-  const tabsRef = useRef<Tab[]>(tabItems);
-  const activeTabIdRef = useRef<string | null>(initialActiveTabId);
+  const tabsRef = useRef<readonly Tab[]>(tabItems);
+  const activeTabIdRef = useRef(initialActiveTabId);
 
   function handleSwitchTab(tabId: string) {
     activeTabIdRef.current = tabId;
@@ -69,8 +60,8 @@ function Harness({
 
   useTabSwipeGesture({
     contentRef,
-    tabsRef,
-    activeTabIdRef,
+    getTabs: () => tabsRef.current,
+    getActiveTabId: () => activeTabIdRef.current,
     onSwitchTab: handleSwitchTab,
   });
 

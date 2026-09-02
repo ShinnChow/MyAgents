@@ -15,6 +15,8 @@ interface SessionMetadata {
     title: string;
     createdAt: string;
     lastActiveAt: string;
+    pinnedAt?: string;          // workspace sidebar pin order; absent = unpinned
+    userTags?: string[];        // user-managed global names; max 5 per Session
     sdkSessionId?: string;      // exact SDK create/resume candidate；不证明 transcript 已存在
     unifiedSession?: boolean;   // legacy birth marker；true 时缺省 SDK candidate 为 id
     stats?: SessionStats;
@@ -58,7 +60,11 @@ interface SessionStats {
 
 MCP 是分层 authority：`mcpEnabledServers` 冻结该 Session 选择的 server ID；`command / args / env / headers / url` 定义和全局 enabled 安全总闸仍以当前 `config.json` 为权威。任何输入先解析成“snapshot IDs ∩ global enabled ∩ current definitions”，再比较完整 fingerprint；因此 Project 默认变化不能偷改 owned Session 的选择，同 ID 定义变化与全局 disable/re-enable 又都能更新并重启 SDK/MCP。新会话 pre-warm 前按当前 Project/global 配置重新解析有效 MCP，不能复用旧 Session 留在 Sidecar 内存里的启动对象。
 
-`lastActiveAt` 表示 Session 最近一次 meaningful activity，是历史排序时间，不是真人输入时间，也不是任意 transcript 写入时间。被 turn lifecycle 真正接纳的普通 desktop、Space、Task/Cron/Goal、Session Inbox 等工作在 admission 推进一次，并在 complete/stopped/error terminal 再反映终态时间；Memory、silent Heartbeat、prewarm、replay、纯持久化重写与 system maintenance Session 不推进。Heartbeat 只有携带 visible work，或终态在移除 `HEARTBEAT_OK` 与格式空白后仍有内容时才算 meaningful。`isHumanUserMessage` 只服务真人 query/Memory/统计语义，不拥有 recency。用户显式编辑 title/model/permission/provider 等 Session 设置仍可由 metadata PATCH 推进排序时间，favorite 不推进。`SessionStore.updateSessionMetadata` 在 sessions file lock 内保证 `lastActiveAt` 单调不回退；读取方若需要真人 query 时间，必须按 JSONL message timestamp 精确判断，不能用 `lastActiveAt` 预筛。
+`lastActiveAt` 表示 Session 最近一次 meaningful activity，是历史排序时间，不是真人输入时间，也不是任意 transcript 写入时间。被 turn lifecycle 真正接纳的普通 desktop、Space、Task/Cron/Goal、Session Inbox 等工作在 admission 推进一次，并在 complete/stopped/error terminal 再反映终态时间；Memory、silent Heartbeat、prewarm、replay、纯持久化重写与 system maintenance Session 不推进。Heartbeat 只有携带 visible work，或终态在移除 `HEARTBEAT_OK` 与格式空白后仍有内容时才算 meaningful。`isHumanUserMessage` 只服务真人 query/Memory/统计语义，不拥有 recency。用户显式编辑 model/permission/provider 等执行设置仍可由 metadata PATCH 推进排序时间；title、favorite、Tag 与 sidebar pin 都属于整理动作，不推进。`SessionStore.updateSessionMetadata` 在 sessions file lock 内保证 `lastActiveAt` 单调不回退；读取方若需要真人 query 时间，必须按 JSONL message timestamp 精确判断，不能用 `lastActiveAt` 预筛。
+
+`pinnedAt` 是 Product Session 在所属 Workspace 左侧列表中的置顶顺序事实，不是全局历史排序、收藏或 Tab 顺序。Renderer 只提交 `pinned: boolean` intent；`SessionStore.updateSessionMetadata()` 在既有 sessions file lock 内分配严格递增的 canonical ISO 时间，避免同一毫秒的连续置顶失序，取消置顶则移除字段。侧边栏先按“是否置顶”分区，置顶区按 `pinnedAt` 倒序，未置顶区按 `lastActiveAt` 倒序，再做分页截取。pending → real identity migration 保留同一 metadata；新建、Reset 与 Fork 的新 Product Session 不继承。
+
+用户 Session Tag 是 `SessionMetadata.userTags?: string[]` 上的产品 Session 元数据：最多 5 个、顺序稳定、名称 trim + Unicode NFC 后按 locale-independent lowercase identity 去重。assignment 绑定产品 `id`，不绑定 Tab、Sidecar 或 Runtime identity；pending → real identity migration 保留它，新建/Reset/Fork 的新产品 Session 不继承。Tag mutation 不属于 meaningful activity，因此不推进 `lastActiveAt`。Renderer 只提交 typed intent：单 Session 使用 `add/remove`，全局管理使用 `rename/delete`（目标已存在时由 rename intent 显式确认 merge）；两类 mutation 都由 `SessionStore` 在既有 `sessions.json` 全局锁内 fresh read-modify-write 并一次原子提交，不接受前端 replacement array，也不建立独立 Tag catalog。异常旧数组在读侧容错过滤，下一次命中该 Session 的 Tag mutation 才修复写回。
 
 `providerRoute` 是 owned builtin snapshot 的 canonical provider/model 身份。它只持久化 `{kind, providerId, model}`，不持久化 `baseUrl`、`apiKey`、`authType`、`modelAliases` 等运行时 env。真正发起请求时，Sidecar 用 `providerRoute` + 当前磁盘配置 materialize 出 `ProviderEnv`；subscription route materialize 为 `'subscription'` sentinel，API route 必须能从当前配置解析出 API key，否则本次发送失败并提示用户修复配置。
 
@@ -900,7 +906,7 @@ Tab 翻成 chat 时，Chat 要决定**如何与该 session 的 sidecar 对齐配
 
 即时进入还包含 `ChatBootOverlay` 的"AI 启动中"毛玻璃蒙层（翻页瞬时出现、就绪时淡出衔接），它同时是 App 的 lazy-Chat Suspense fallback。
 
-从全局侧栏等资源入口“在新 Tab 打开已有 Session”时，`spawnTabForExistingSession` 必须用 `flushSync` 先把带真实 `sessionId`、`view:'chat'`、`sidecarConfigDisposition:'pending'` 的 Tab 加入并激活，再等待 `ensureSessionSidecar` 与 Tab owner 确认。这里仍用 functional `setTabs` 与既有 render-mirror `tabsRef`，禁止提前手写 `tabsRef.current` 形成第二 authority。Chat owner 子树立即挂载，由 `ChatBootOverlay` 覆盖进程启动窗口；不能用 `isLoading` 条件替换整个 `TabProvider/Chat`，否则会破坏 SSE/Session 生命周期。ensure 完成只结算 `pending → push|adopt`，不得再次强制 active（用户可能已主动切走）。ensure 或 owner 确认失败则移除临时 Tab；只有它仍是 active 时才恢复仍存在的前一 Tab。planner 必须先于 Tab 构造运行，避免把刚预塞的 Tab 误判为既有 owner。侧栏 flyout / 搜索 overlay 的关闭只消费 active Tab projection 与发起时的 resource-surface interaction generation；Sidecar 的晚到完成不是 UI authority。
+从全局侧栏等资源入口“在新 Tab 打开已有 Session”时，`spawnTabForExistingSession` 必须用 `flushSync` 调用 `tabWorkspaceController.append(..., { mount: 'immediate' })`，先把带真实 `sessionId`、`view:'chat'`、`sidecarConfigDisposition:'pending'` 的 Tab 加入并激活，再等待 `ensureSessionSidecar` 与 Tab owner 确认。前一 active identity 来自 controller snapshot；失败回滚先 capture exact Tab，再经 `removeMany` 原子移除并只在目标仍 active 时恢复仍存在的前一 Tab，禁止绕过 controller 直接写 React state 或 ref 形成第二 authority。Chat owner 子树立即挂载，由 `ChatBootOverlay` 覆盖进程启动窗口；不能用 `isLoading` 条件替换整个 `TabProvider/Chat`，否则会破坏 SSE/Session 生命周期。ensure 完成只结算 `pending → push|adopt`，不得再次强制 active（用户可能已主动切走）。planner 必须先于 Tab 构造运行，避免把刚预塞的 Tab 误判为既有 owner。侧栏 flyout / 搜索 overlay 的关闭只消费 active Tab projection 与发起时的 resource-surface interaction generation；Sidecar 的晚到完成不是 UI authority。
 
 ### Session 配置写入方向矩阵：setter 边界的 snapshot guard（#327，0.2.32+）
 

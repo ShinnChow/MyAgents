@@ -70,6 +70,24 @@ describe('SessionSearchItem', () => {
         expect(screen.queryByText('08:00')).not.toBeInTheDocument();
     });
 
+    it('shows a canonical renamed title before the search index catches up', () => {
+        render(
+            <SessionSearchItem
+                hit={hit({ title: 'Stale indexed title', titleHighlights: [[0, 5]] })}
+                session={session({ title: 'Canonical renamed title' })}
+                project={project}
+                deleteProtected={false}
+                onClick={vi.fn()}
+                onContextMenu={vi.fn()}
+                onShowStats={vi.fn()}
+                onDelete={vi.fn()}
+            />,
+        );
+
+        expect(screen.getByText('Canonical renamed title')).toBeInTheDocument();
+        expect(screen.queryByText('Stale indexed title')).not.toBeInTheDocument();
+    });
+
     it('suppresses right-click selection and forwards the context-menu request', () => {
         const onContextMenu = vi.fn((event: React.MouseEvent) => event.preventDefault());
         render(

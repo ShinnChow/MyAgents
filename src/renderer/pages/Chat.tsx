@@ -1,5 +1,5 @@
 import { AlertTriangle, Bot, Globe, History, Loader2, MessageSquarePlus, PanelRight, RotateCcw, TerminalSquare, X } from 'lucide-react';
-import { forwardRef, lazy, Suspense, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { forwardRef, lazy, Suspense, useCallback, useEffect, useImperativeHandle, useMemo, useReducer, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 
@@ -23,6 +23,7 @@ import MessageList from '@/components/MessageList';
 import SessionHistoryDropdown from '@/components/SessionHistoryDropdown';
 import SessionSurfaceTags from '@/components/SessionSurfaceTags';
 import SessionMenuButton, { type BotChannelCandidate } from '@/components/SessionMenuButton';
+import UserTagPills from '@/components/session-tags/UserTagPills';
 import { FileActionProvider } from '@/context/FileActionContext';
 import SimpleChatInput, { type ImageAttachment, type SimpleChatInputHandle } from '@/components/SimpleChatInput';
 import type { SlashCommand as InputSlashCommand } from '@/components/SlashCommandMenu';
@@ -55,7 +56,9 @@ import { useChatScrollModel } from '@/hooks/useChatScrollModel';
 import { useAgentStatuses } from '@/hooks/useAgentStatuses';
 import { useProjectCapabilities } from '@/hooks/useProjectCapabilities';
 import { useSessionSurfaces, type ChannelSurface } from '@/hooks/useSessionSurfaces';
-import { resolveFloatingBallBoundSession } from '@/hooks/taskCenterStore';
+import { actions as taskCenterActions, resolveFloatingBallBoundSession } from '@/hooks/taskCenterStore';
+import { usePassiveSessionMetadata } from '@/hooks/useTaskCenterData';
+import { sameSessionUserTags } from '../../shared/session-user-tags';
 import { useConfig } from '@/hooks/useConfig';
 import { useFileDropZone } from '@/hooks/useFileDropZone';
 import { useTauriFileDrop } from '@/hooks/useTauriFileDrop';
@@ -160,8 +163,10 @@ import {
   shouldUseExternalRuntimeInputControls,
 } from '@/utils/runtimeUiProjection';
 import {
+  createWorkspacePanelDisclosureState,
   DEFAULT_WORKSPACE_LAYOUT_METRICS,
   nextSplitViewAfterBrowserClose,
+  reduceWorkspacePanelDisclosure,
   resolveWorkspacePanelMode,
   shouldPresentBrowserFullscreen,
 } from '@/utils/chatWorkspaceLayout';
@@ -488,13 +493,15 @@ interface ChatProps {
   pendingFilePreview?: FilePreviewIntent;
   onFilePreviewIntentConsumed?: (intentId: string) => void;
   sessionNotificationBadgeCounts?: ReadonlyMap<string, number>;
+  /** Open App Shell history with a clean, single-Tag aggregation intent. */
+  onOpenHistoryTag?: (tag: string) => void;
 }
 
 function isCurrentSessionGoal(goal: SessionGoal | null | undefined): goal is SessionGoal {
   return Boolean(goal);
 }
 
-export default function Chat({ windowPresentation, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts }: ChatProps) {
+export default function Chat({ windowPresentation, onNewSession, onOpenSession, onOpenSessionInNewTab, initialMessage, onInitialMessageConsumed, sidecarConfigDisposition, onSidecarConfigAdopted, sessionTitle, onRenameSession, onForkSession, onLaunchRuntimeBackedProviderSession, pendingFilePreview, onFilePreviewIntentConsumed, sessionNotificationBadgeCounts, onOpenHistoryTag }: ChatProps) {
   // Get state from TabContext (required - Chat must be inside TabProvider)
   const {
     tabId,
@@ -550,6 +557,16 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     forceExecuteQueuedMessage,
     isConnected,
   } = useTabState();
+  const projectedSessionMeta = usePassiveSessionMetadata(agentDir, sessionId);
+
+  useEffect(() => {
+    if (!projectedSessionMeta) return;
+    setSessionMeta((current) => {
+      if (!current || current.id !== projectedSessionMeta.id) return current;
+      if (sameSessionUserTags(current.userTags, projectedSessionMeta.userTags)) return current;
+      return { ...current, userTags: projectedSessionMeta.userTags };
+    });
+  }, [projectedSessionMeta, setSessionMeta]);
   const isActive = useTabActive();
   const toast = useToast();
   const { t } = useTranslation('chat');
@@ -689,9 +706,16 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   const isNarrowLayout = workspaceLayoutMetrics.viewportWidthPx < workspaceLayoutMetrics.contentMinWidthPx;
   // If workspace would render as an overlay at startup, keep it hidden so it
   // does not block the chat before the user explicitly opens it.
-  const [showWorkspace, setShowWorkspace] = useState(shouldShowWorkspaceByDefault);
-  const [workspacePanelMounted, setWorkspacePanelMounted] = useState(shouldShowWorkspaceByDefault);
-  const [workspacePanelMotion, setWorkspacePanelMotion] = useState<'expand' | 'collapse' | null>(null);
+  const [workspacePanelDisclosure, dispatchWorkspacePanelDisclosure] = useReducer(
+    reduceWorkspacePanelDisclosure,
+    undefined,
+    () => createWorkspacePanelDisclosureState(shouldShowWorkspaceByDefault()),
+  );
+  const {
+    visible: showWorkspace,
+    mounted: workspacePanelMounted,
+    motion: workspacePanelMotion,
+  } = workspacePanelDisclosure;
   const workspacePanelUnmountTimerRef = useRef<number | null>(null);
   const clearWorkspacePanelUnmountTimer = useCallback(() => {
     if (workspacePanelUnmountTimerRef.current === null) return;
@@ -700,16 +724,13 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   }, []);
   const handleExpandWorkspace = useCallback(() => {
     clearWorkspacePanelUnmountTimer();
-    setWorkspacePanelMounted(true);
-    setWorkspacePanelMotion('expand');
-    setShowWorkspace(true);
+    dispatchWorkspacePanelDisclosure({ type: 'open' });
   }, [clearWorkspacePanelUnmountTimer]);
   const handleCollapseWorkspace = useCallback(() => {
     clearWorkspacePanelUnmountTimer();
-    setWorkspacePanelMotion('collapse');
-    setShowWorkspace(false);
+    dispatchWorkspacePanelDisclosure({ type: 'close' });
     workspacePanelUnmountTimerRef.current = window.setTimeout(() => {
-      setWorkspacePanelMounted(false);
+      dispatchWorkspacePanelDisclosure({ type: 'settle-close' });
       workspacePanelUnmountTimerRef.current = null;
     }, WORKSPACE_PANEL_TRANSITION_MS);
   }, [clearWorkspacePanelUnmountTimer]);
@@ -784,6 +805,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   // ── Embedded browser state ──
   const [browserUrl, setBrowserUrl] = useState<string | null>(null);
   const [browserAlive, setBrowserAlive] = useState(false);
+  const [browserReloadSignal, setBrowserReloadSignal] = useState(0);
   // When browser is previewing a local file, store its metadata for editor toggle
   const [browserSourceFile, setBrowserSourceFile] = useState<{ name: string; content: string; size: number; path: string } | null>(null);
   // Live URL surfaced from BrowserPanel (Rust `browser:url-changed`). Drives
@@ -1040,11 +1062,9 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
     setSplitActiveView('browser');
     // Give auto-save a moment to flush, then reload the webview
     setTimeout(() => {
-      import('@tauri-apps/api/core').then(({ invoke: inv }) => {
-        inv('cmd_browser_reload', { tabId }).catch(() => {});
-      });
+      setBrowserReloadSignal(value => value + 1);
     }, 300);
-  }, [browserUrl, tabId]);
+  }, [browserUrl]);
 
   // Stable context value for the Chat-owned browser. Presentation (split vs.
   // fullscreen) is decided here, not by individual link renderers.
@@ -1241,6 +1261,8 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   const [treeExternalReveal, setTreeExternalReveal] = useState<{ id: number; path: string } | null>(null);
   const treeExternalRevealIdRef = useRef(0);
   const handleRevealInTree = useCallback((path: string) => {
+    // Opening is idempotent: a reveal into an already-visible tree must not
+    // manufacture another panel/conversation entrance animation.
     handleExpandWorkspace();
     setTreeExternalReveal({ id: ++treeExternalRevealIdRef.current, path });
   }, [handleExpandWorkspace]);
@@ -5155,6 +5177,11 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                 />
               </>
             )}
+            <UserTagPills
+              tags={sessionMeta?.userTags}
+              onTagClick={(name) => onOpenHistoryTag?.(name)}
+              className="max-w-56"
+            />
             {/* Surface tags (channel/cron/floating-ball pill) — display-only since the menu owns actions */}
             <SessionSurfaceTags
               channel={surfaces.channel}
@@ -5171,6 +5198,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                 availableChannels={availableHandoverChannels}
                 deleteProtected={sessionDeleteProtected}
                 favorite={!!sessionMeta?.favorite}
+                userTags={sessionMeta?.userTags}
                 // The inline editor only mounts once a session has a real
                 // title (see the `sessionTitle && sessionTitle !== 'New Tab' …`
                 // gate above). Mirror that condition here so the menu's
@@ -5182,6 +5210,13 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                 onShowContext={isExternalRuntime ? undefined : () => { void handleSendMessageRef.current('/context'); }}
                 onOpenRename={() => titleEditorRef.current?.openRename()}
                 onFavoriteChanged={(_, updated) => { if (updated) setSessionMeta(updated); }}
+                onSessionMetadataMutationStart={taskCenterActions.beginSessionMetadataMutation}
+                onSessionMetadataChanged={(updated, mutationSequence) => {
+                  const accepted = taskCenterActions.applySessionMetadata(updated, mutationSequence);
+                  if (accepted) setSessionMeta(updated);
+                  return accepted;
+                }}
+                onGlobalTagChange={() => taskCenterActions.refreshSessions()}
               />
             )}
           </div>
@@ -5909,6 +5944,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                     isDraggingSplit={isDraggingSplit}
                     isSplitTransitioning={isSplitWidthTransitioning}
                     browserAlive={browserAlive}
+                    reloadSignal={browserReloadSignal}
                     sourceFile={browserSourceFile}
                     workspace={agentDir}
                     onBrowserCreated={handleBrowserCreated}

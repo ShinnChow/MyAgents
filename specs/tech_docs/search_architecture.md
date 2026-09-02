@@ -74,7 +74,7 @@ MyAgents 的全文搜索由一个 Rust 层单例 `SearchEngine` 提供，构建�
 
 | 命令 | 返回 | 说明 |
 |------|------|------|
-| `cmd_search_sessions(query, limit?)` | `SessionSearchResult` | 全局会话搜索（标题 + 内容） |
+| `cmd_search_sessions(query, limit?, tag?)` | `SessionSearchResult` | 全局会话搜索（标题 + 内容），可用一个用户 Tag 精确限定候选 Session |
 | `cmd_search_records(query, limit?)` | `RecordSearchResult` | 全局 Record 搜索；每个 Record 至多一个 hit |
 | `cmd_search_workspace_files(query, workspace, limit?, maxMatchesPerFile?)` | `FileSearchResult` | 工作区文件搜索 |
 | `cmd_search_index_status()` | `IndexStatus` | 索引文档数 + 存储目录（调试用） |
@@ -91,6 +91,8 @@ MyAgents 的全文搜索由一个 Rust 层单例 `SearchEngine` 提供，构建�
 索引字段（用于全文匹配，走 `"chinese"` 分词器）：`title`、`content`。
 
 Session `content` 只索引用户可见文本：leading `<system-reminder>...</system-reminder>` 的 hidden payload 属于模型上下文，不进入搜索；有 visible tail 时只索引 tail，纯 hidden reminder 索引为空。这个语义变化也必须 bump `SCHEMA_VERSION`，让旧索引重建。
+
+用户 Session Tag 不进入 Tantivy schema，也不参与标题/正文分词和高亮。带 `tag` 的查询在 blocking worker 上 fresh 读取 `sessions.json`，用与 metadata 投影一致的容错规则规范化 `userTags`，先构造 history-visible `session_id` 精确候选集合，再用 `TermSetQuery` 与全文 query 组合为两个 `Must` 条件，最后才应用 `TopDocs` limit。这样 Tag mutation 无需等待 5s 内容索引 watcher，且不能退化成对前 50 条结果做 Renderer 后过滤。权威 metadata 读取或解析失败必须让命令失败并由 UI 显示可恢复错误，不能伪装成零结果。
 
 ### File Schema (`schema::file_schema`)
 
@@ -281,7 +283,7 @@ snippet 构建常见 "取匹配位置前后各 N 字符" 的近似切片。裸 `
 
 全局侧栏搜索只把 `searchOpen` 交给 `useGlobalSidebarTaskCenterData`，由该 app-global store projection 发起一次静默 full revalidate；`HistorySearchOverlayContent` mount 时不得再发第二次全量刷新。Overlay 先消费当前 snapshot，冷模块加载期间由 App Shell 立即绘制同尺寸搜索壳，搜索按钮 hover/focus 时提前请求 lazy chunk，避免点击后出现空白间隔。Backdrop、面板 DOM、`useCloseLayer` 和入口动画的唯一 owner 是 Suspense 外层的 App Shell frame；lazy `HistorySearchOverlayContent` 只渲染面板内容。fallback → real content 的交接必须保留同一个面板节点，禁止真实内容再持有第二套 opacity-from-zero 根动画，否则首次加载会表现为“出现 → 消失 → 再出现”。
 
-空 query 是“浏览全部历史”而不是全文搜索：Session metadata 仍由既有全局 authority 一次加载，以保留工作区/收藏/来源筛选和 SessionID 直达语义；前端用 `react-virtuoso` 只 mount 可视区及小幅 overscan，禁止对 `filteredSessions` 全量 `.map()` 成 DOM。这里不新增后端 offset/page authority，否则会让客户端筛选、全局排序和直接 ID 匹配跨页漂移。非空 query 继续走 Tantivy，并由 `searchSessions()` 的 50 条上限保持结果集有界。
+空 query 是“浏览全部历史”而不是全文搜索：Session metadata 仍由既有全局 authority 一次加载，以保留工作区/收藏/用户 Tag/来源筛选和 SessionID 直达语义；前端用 `react-virtuoso` 只 mount 可视区及小幅 overscan，禁止对 `filteredSessions` 全量 `.map()` 成 DOM。这里不新增后端 offset/page authority，否则会让客户端筛选、全局排序和直接 ID 匹配跨页漂移。非空 query 继续走 Tantivy，并由 `searchSessions()` 的 50 条上限保持结果集有界；单选用户 Tag 作为结构化参数传给 Rust，不拼进 query string。
 
 ## 工作区文件搜索结果导航
 

@@ -9,5 +9,45 @@
     "system": "跟随系统",
     "zhCN": "简体中文",
     "enUS": "English"
+  },
+  "sessionTags": {
+    "addTag": "添加 Tag",
+    "allTags": "全部 Tag",
+    "close": "关闭标签管理",
+    "createTag": "创建「{{name}}」",
+    "filterLabel": "按 Tag 筛选",
+    "limitHint": "每个 Session 最多 {{count}} 个 Tag",
+    "manageTags": "管理标签",
+    "noTags": "没有匹配的 Tag",
+    "remainingTags": "其余 Tag",
+    "searchTags": "搜索 Tag",
+    "sessionCount": "{{count}} 个 Session",
+    "showMore": "显示其余 {{count}} 个 Tag",
+    "errors": {
+      "conflict": "标签已发生变化，请重试",
+      "invalidName": "Tag 名称无效，最多 32 个字符且不能包含换行",
+      "ioError": "Tag 保存失败，请重试",
+      "limitReached": "每个 Session 最多 5 个 Tag",
+      "loadFailed": "Tag 加载失败，请重试",
+      "protectedSession": "系统维护 Session 不能编辑 Tag",
+      "sessionNotFound": "Session 已不存在",
+      "tagNotFound": "Tag 已不存在，请刷新后重试"
+    },
+    "manager": {
+      "cancel": "取消",
+      "delete": "删除 {{name}}",
+      "deleteConfirm": "删除",
+      "deleteMessage": "确定删除「{{name}}」吗？这会从 {{count}} 个 Session 中移除该 Tag。",
+      "deleteTitle": "删除 Tag",
+      "description": "重命名、合并或删除全局 Session Tag",
+      "empty": "暂无可管理的 Tag",
+      "mergeConfirm": "合并",
+      "mergeMessage": "「{{source}}」已与「{{target}}」同名。是否将它们合并？",
+      "mergeTitle": "合并 Tag",
+      "rename": "重命名 {{name}}",
+      "renameInput": "重命名 {{name}}",
+      "save": "保存",
+      "title": "管理标签"
+    }
   }
 }
