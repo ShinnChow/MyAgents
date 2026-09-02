@@ -79,6 +79,7 @@ interface UseAttachmentHandlingParams {
   undoStack: AttachmentUndoStack;
   setInputValue: Dispatch<SetStateAction<string>>;
   setShowPlusMenu: Dispatch<SetStateAction<boolean>>;
+  notifyUnsupportedImageFallback: () => void;
   onWorkspaceRefresh?: () => void;
 }
 
@@ -96,6 +97,7 @@ export function useAttachmentHandling({
   undoStack,
   setInputValue,
   setShowPlusMenu,
+  notifyUnsupportedImageFallback,
   onWorkspaceRefresh,
 }: UseAttachmentHandlingParams) {
   const { t } = useTranslation('chat');
@@ -308,9 +310,7 @@ export function useAttachmentHandling({
       !modelSupportsModality(provider, currentModelId, 'image');
 
     if (fallbackImagesToFiles) {
-      toastRef.current.info(
-        t('input.attachments.imagesConvertedToFiles'),
-      );
+      notifyUnsupportedImageFallback();
       for (const img of imageFiles) {
         otherFiles.push(renameIfBareClipboardImage(img));
       }
@@ -382,7 +382,7 @@ export function useAttachmentHandling({
         toastRef.current.error(err instanceof Error ? err.message : t('input.attachments.fileUploadFailed'));
       }
     }
-  }, [fileService, workspacePath, addImage, undoStack, fileToBase64, isImportScopeCurrent, onWorkspaceRefresh, provider, currentModelId, isExternalRuntime, toastRef, insertReferenceText, t]);
+  }, [fileService, workspacePath, addImage, undoStack, fileToBase64, isImportScopeCurrent, notifyUnsupportedImageFallback, onWorkspaceRefresh, provider, currentModelId, isExternalRuntime, toastRef, insertReferenceText, t]);
 
   const processDroppedFilePaths = useCallback(async (paths: string[]) => {
     const importScope = currentImportScopeRef.current;
@@ -420,9 +420,7 @@ export function useAttachmentHandling({
     const userIntendedPathCount = otherPaths.length;
 
     if (fallbackImagesToFiles) {
-      toastRef.current.info(
-        t('input.attachments.imagesConvertedToFiles'),
-      );
+      notifyUnsupportedImageFallback();
       otherPaths.push(...imagePaths);
       imagePaths.length = 0;
     }
@@ -527,7 +525,7 @@ export function useAttachmentHandling({
         toastRef.current.error(err instanceof Error ? err.message : t('input.attachments.fileCopyFailed'));
       }
     }
-  }, [fileService, workspacePath, addPreparedImageAttachment, undoStack, isImportScopeCurrent, onWorkspaceRefresh, provider, currentModelId, isExternalRuntime, attachmentSessionId, toastRef, insertReferenceText, t]);
+  }, [fileService, workspacePath, addPreparedImageAttachment, undoStack, isImportScopeCurrent, notifyUnsupportedImageFallback, onWorkspaceRefresh, provider, currentModelId, isExternalRuntime, attachmentSessionId, toastRef, insertReferenceText, t]);
 
   const handleUploadButtonClick = useCallback(async () => {
     setShowPlusMenu(false);

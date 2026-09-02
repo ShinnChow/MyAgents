@@ -46,6 +46,7 @@ import { useUndoStack } from '@/hooks/useUndoStack';
 import { mcpServerState, type McpEffectiveServerState } from '../../../shared/mcpEffectiveState';
 import { hasUserEditableMcpSettings } from '../../../shared/browserTools';
 import { CUSTOM_EVENTS } from '../../../shared/constants';
+import { IMAGE_UNDERSTANDING_TOOL_ID } from '../../../shared/official-tools';
 import { reasoningEffortChoices, REASONING_EFFORT_DESCRIPTIONS, REASONING_EFFORT_DEFAULT } from '../../../shared/reasoningEffort';
 import { retainFocusOnMouseDown } from '@/utils/focusRetention';
 import { detectExcessiveRepetition } from '@/utils/excessiveRepetition';
@@ -82,21 +83,6 @@ function isProviderWarning(
 ): boolean {
   if (p.type === 'subscription') return false;
   return !!apiKeys[p.id] && verifyStatus[p.id]?.status === 'invalid';
-}
-
-/**
- * Resolve the human-friendly label for the current model — display name from
- * the provider's model list if known, else the raw ID, else a generic
- * fallback. Used by modality toasts so the message names the actual model
- * the user picked.
- */
-function getCurrentModelLabel(
-  provider: Provider | null | undefined,
-  modelId: string | undefined,
-  fallbackLabel: string,
-): string {
-  if (!modelId) return fallbackLabel;
-  return provider ? getModelDisplayName(provider, modelId) : modelId;
 }
 
 function runtimeMcpServerId(toolName: string): string | null {
@@ -414,6 +400,13 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
     ),
     [globalOfficialToolEnabled, officialToolNeedsConfig, officialTools],
   );
+  const imageUnderstandingReady =
+    visibleOfficialTools.some(tool => tool.id === IMAGE_UNDERSTANDING_TOOL_ID) &&
+    workspaceOfficialToolEnabled.includes(IMAGE_UNDERSTANDING_TOOL_ID);
+  const notifyUnsupportedImageFallback = useCallback(() => {
+    if (imageUnderstandingReady) return;
+    toastRef.current.warning(t('input.attachments.imageUnderstandingNotReady'));
+  }, [imageUnderstandingReady, t]);
   const runtimeMcpServers = useMemo(() => {
     const configuredServers = new Map(mcpServers.map(server => [server.id, server]));
     const ids = [...new Set(runtimeMcpTools.map(runtimeMcpServerId).filter((id): id is string => id !== null))];
@@ -730,6 +723,7 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
     undoStack,
     setInputValue,
     setShowPlusMenu,
+    notifyUnsupportedImageFallback,
     onWorkspaceRefresh,
   });
 
@@ -1094,21 +1088,15 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
 
     sendingRef.current = true;
 
-    // Send-time modality reminder: paste-time toast may have scrolled past or
-    // the user may have just switched the model AFTER pasting an image. Sidecar
-    // is still the authoritative filter — this is just one final heads-up.
-    // Skipped for external runtimes (filter only lives in builtin path).
+    // The user may switch to a text-only model after attaching an image.
+    // Sidecar owns conversion; this surface only reports when the effective
+    // image-understanding fallback is unavailable.
     if (
       images.length > 0 &&
       !isExternalRuntime &&
       !modelSupportsModality(provider, currentModelId, 'image')
     ) {
-      toastRef.current.warning(
-        t('input.imageFilteredOnSend', {
-          model: getCurrentModelLabel(provider, currentModelId, t('input.currentModel')),
-          count: images.length,
-        }),
-      );
+      notifyUnsupportedImageFallback();
     }
 
     try {
@@ -1127,7 +1115,7 @@ const SimpleChatInput = memo(forwardRef<SimpleChatInputHandle, SimpleChatInputPr
     } finally {
       sendingRef.current = false;
     }
-  }, [onSend, images, inputValue, provider, currentModelId, isExternalRuntime, setImages, t, onSlashAction, enabledClientActionCommands, showConfigLockedReason]);
+  }, [onSend, images, inputValue, provider, currentModelId, isExternalRuntime, setImages, onSlashAction, enabledClientActionCommands, showConfigLockedReason, notifyUnsupportedImageFallback]);
 
   // Handle keyboard navigation in file search and slash menu
   // Handler for selecting a slash command — shared by the click path

@@ -158,6 +158,10 @@ import {
   PLAYWRIGHT_DEVICE_PRESETS,
 } from './settingsSections';
 import {
+  applyVisionToolSettings,
+  planVisionToolToggle,
+} from './visionToolSettingsPolicy';
+import {
   EMPTY_CUSTOM_FORM,
   parsePositiveInt,
   type CustomProviderForm,
@@ -1240,12 +1244,25 @@ export default function Settings({
     Record<string, boolean>
   >({});
   const [visionToolSettingsOpen, setVisionToolSettingsOpen] = useState(false);
+  const [visionToolEnableAfterSave, setVisionToolEnableAfterSave] =
+    useState(false);
+  const [visionToolSaving, setVisionToolSaving] = useState(false);
   const [visionToolDraftValue, setVisionToolDraftValue] = useState('');
   const [visionModelCandidates, setVisionModelCandidates] = useState<
     ImageUnderstandingModelOption[]
   >([]);
   const [visionModelsLoading, setVisionModelsLoading] = useState(false);
   const [visionModelsLoadFailed, setVisionModelsLoadFailed] = useState(false);
+
+  const resetVisionToolSettings = useCallback(() => {
+    setVisionToolSettingsOpen(false);
+    setVisionToolEnableAfterSave(false);
+  }, []);
+
+  const closeVisionToolSettings = useCallback(() => {
+    if (visionToolSaving) return;
+    resetVisionToolSettings();
+  }, [resetVisionToolSettings, visionToolSaving]);
 
   const officialEnabledIds = useMemo(
     () => normalizeOfficialToolIds(config.enabledOfficialToolIds ?? []),
@@ -1508,7 +1525,7 @@ export default function Settings({
       return true;
     }
     if (visionToolSettingsOpen) {
-      setVisionToolSettingsOpen(false);
+      closeVisionToolSettings();
       return true;
     }
     if (builtinMcpSettings) {
@@ -1682,7 +1699,7 @@ export default function Settings({
   };
 
   const openOfficialToolSettings = useCallback(
-    (tool: OfficialToolDefinition) => {
+    (tool: OfficialToolDefinition, enableAfterSave = false) => {
       if (tool.id === SPEECH_RECOGNITION_TOOL_ID) {
         window.requestAnimationFrame(() => {
           document
@@ -1695,6 +1712,7 @@ export default function Settings({
       const initial = savedVisionModelStillValid
         ? savedVisionModelValue
         : (visionModelOptions[0]?.value ?? '');
+      setVisionToolEnableAfterSave(enableAfterSave);
       setVisionToolDraftValue(initial);
       setVisionToolSettingsOpen(true);
       void loadVisionModelCandidates();
@@ -1719,6 +1737,15 @@ export default function Settings({
 
   const handleOfficialToolToggle = useCallback(
     async (tool: OfficialToolDefinition, enabled: boolean) => {
+      if (
+        tool.id === IMAGE_UNDERSTANDING_TOOL_ID &&
+        planVisionToolToggle(enabled, visionToolNeedsConfig) ===
+          'configure-before-enable'
+      ) {
+        openOfficialToolSettings(tool, true);
+        return;
+      }
+
       setOfficialToolEnabling((prev) => ({ ...prev, [tool.id]: true }));
       try {
         await atomicModifyConfig((current) => {
@@ -1736,13 +1763,6 @@ export default function Settings({
             ? tSettings('toolbox.toasts.officialToolEnabled')
             : tSettings('toolbox.toasts.officialToolDisabled'),
         );
-        if (
-          enabled &&
-          tool.id === IMAGE_UNDERSTANDING_TOOL_ID &&
-          visionToolNeedsConfig
-        ) {
-          openOfficialToolSettings(tool);
-        }
       } catch (err) {
         console.error('[Settings] Failed to toggle official tool:', err);
         toast.error(tSettings('toolbox.toasts.officialToolToggleFailed'));
@@ -1760,27 +1780,39 @@ export default function Settings({
   );
 
   const saveVisionToolSettings = useCallback(async () => {
+    if (visionToolSaving) return;
     const parsed = parseVisionModelOptionValue(visionToolDraftValue);
     if (!parsed) {
       toast.error(tSettings('toolbox.toasts.visionModelRequired'));
       return;
     }
+    setVisionToolSaving(true);
     try {
-      await atomicModifyConfig((current) => ({
-        ...current,
-        officialToolSettings: {
-          ...(current.officialToolSettings ?? {}),
-          imageUnderstanding: parsed,
-        },
-      }));
+      await atomicModifyConfig((current) =>
+        applyVisionToolSettings(
+          current,
+          parsed,
+          visionToolEnableAfterSave,
+        ),
+      );
       await refreshConfig();
-      setVisionToolSettingsOpen(false);
+      resetVisionToolSettings();
       toast.success(tSettings('toolbox.toasts.visionModelSaved'));
     } catch (err) {
       console.error('[Settings] Failed to save vision tool settings:', err);
       toast.error(tSettings('toolbox.toasts.saveFailed'));
+    } finally {
+      setVisionToolSaving(false);
     }
-  }, [refreshConfig, tSettings, toast, visionToolDraftValue]);
+  }, [
+    refreshConfig,
+    resetVisionToolSettings,
+    tSettings,
+    toast,
+    visionToolDraftValue,
+    visionToolEnableAfterSave,
+    visionToolSaving,
+  ]);
 
   const resetMcpForm = () => {
     setEditingMcpId(null);
@@ -7039,7 +7071,7 @@ export default function Settings({
       {/* Official image understanding tool settings */}
       {visionToolSettingsOpen && (
         <OverlayBackdrop
-          onClose={() => setVisionToolSettingsOpen(false)}
+          onClose={closeVisionToolSettings}
           className="z-50"
         >
           <div className="mx-4 flex max-h-[85vh] w-full max-w-lg flex-col rounded-2xl bg-[var(--paper-elevated)] shadow-xl">
@@ -7054,8 +7086,9 @@ export default function Settings({
                 </p>
               </div>
               <button
-                onClick={() => setVisionToolSettingsOpen(false)}
-                className="shrink-0 rounded-lg p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)]"
+                onClick={closeVisionToolSettings}
+                disabled={visionToolSaving}
+                className="shrink-0 rounded-lg p-1 text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <X className="h-5 w-5" />
               </button>
@@ -7111,14 +7144,18 @@ export default function Settings({
 
             <div className="flex justify-end gap-2 border-t border-[var(--line)] px-6 py-4">
               <button
-                onClick={() => setVisionToolSettingsOpen(false)}
-                className="rounded-lg border border-[var(--line)] px-4 py-2 text-sm text-[var(--ink-muted)] hover:bg-[var(--paper-inset)]"
+                onClick={closeVisionToolSettings}
+                disabled={visionToolSaving}
+                className="rounded-lg border border-[var(--line)] px-4 py-2 text-sm text-[var(--ink-muted)] hover:bg-[var(--paper-inset)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {tSettings('toolbox.common.cancel')}
               </button>
               <button
                 onClick={() => void saveVisionToolSettings()}
-                disabled={!parseVisionModelOptionValue(visionToolDraftValue)}
+                disabled={
+                  visionToolSaving ||
+                  !parseVisionModelOptionValue(visionToolDraftValue)
+                }
                 className="rounded-lg bg-[var(--button-primary-bg)] px-4 py-2 text-sm font-medium text-[var(--button-primary-text)] hover:bg-[var(--button-primary-bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {tSettings('toolbox.common.save')}
