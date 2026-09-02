@@ -98,8 +98,8 @@ function expectSharedSessionMenu() {
     const menu = document.querySelector<HTMLElement>('.session-context-menu');
     expect(menu).not.toBeNull();
     expect(within(menu!).getAllByRole('button').map(button => button.textContent)).toEqual([
-        i18n.t('launcher:rightRail.rename'),
         i18n.t('launcher:rightRail.copySessionId'),
+        i18n.t('launcher:rightRail.rename'),
         i18n.t('launcher:rightRail.favorite'),
         i18n.t('common:sessionTags.addTag'),
         i18n.t('launcher:rightRail.viewStats'),

@@ -836,7 +836,9 @@ describe('GlobalSidebar rail flyout', () => {
     fireEvent.click(within(sessionRow).getByRole('button', { name: String(i18n.t('launcher:rightRail.more')) }));
     const copyButton = screen.getByRole('button', { name: String(i18n.t('launcher:rightRail.copySessionId')) });
     const menu = copyButton.closest<HTMLElement>('.global-sidebar-nested-layer')!;
-    expect(within(menu).getAllByRole('button')[1]).toBe(copyButton);
+    const menuButtons = within(menu).getAllByRole('button');
+    expect(menuButtons[0]).toBe(copyButton);
+    expect(menuButtons[1]).toHaveAccessibleName(String(i18n.t('launcher:rightRail.rename')));
 
     await act(async () => {
       fireEvent.click(copyButton);

@@ -70,17 +70,17 @@ export default function SessionContextMenu({
                 closeOnEscape={!tagLayerOpen}
             >
                 <MenuItem
-                    icon={<Pencil className="h-3.5 w-3.5" />}
-                    label={t('rightRail.rename')}
-                    onClick={() => setRenameOpen(true)}
-                />
-                <MenuItem
                     icon={<Copy className="h-3.5 w-3.5" />}
                     label={t('rightRail.copySessionId')}
                     onClick={() => {
                         onClose();
                         void onCopySessionId();
                     }}
+                />
+                <MenuItem
+                    icon={<Pencil className="h-3.5 w-3.5" />}
+                    label={t('rightRail.rename')}
+                    onClick={() => setRenameOpen(true)}
                 />
                 {onTogglePin && (
                     <MenuItem
