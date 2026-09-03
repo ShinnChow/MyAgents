@@ -116,7 +116,7 @@ https://download.myagents.io/models/speech/sets/<pack-revision>/manifest.json.si
 https://download.myagents.io/models/speech/assets/sha256/<sha256>/<filename>
 ```
 
-远端 manifest bytes 必须与 App/Worker 编译内 source lock 完全一致，签名才会被接受。远端 JSON 不能提供新的本地路径、host、模型或 native library。
+远端 manifest 的原始 bytes 必须通过 detached Minisign 签名验证，并由 App/Worker 使用拒绝未知字段的 typed source lock 做完整语义 identity 比较。JSON 排版和 CRLF/LF 不参与资源身份；任一字段值、字段集合或数组顺序漂移都会被拒绝。验签后的原始 bytes 原样写盘并由 active pointer 固定其 SHA-256 与签名，因此远端 JSON 仍不能提供新的本地路径、host、模型或 native library。
 
 发布 owner 是根目录 `publish_speech_model_set.sh`：它先调用 `scripts/prepare-speech-model-mirror.mjs`，将运行时 source lock 与 release-only `model-pack-mirror-origin-lock.json` 按 exact asset/legal ID join，复用 `acquireLockedResource` 的 content-addressed cache 从锁定 GitHub origin 取得并校验七个 source。publisher 先补传缺失的 content-addressed object 并逐个从公网完整回读比对，再调用 `scripts/package-speech-model-set.mjs` 原样复制编译 source lock、复用 Tauri updater signer 生成 detached signature，最后发布 manifest/signature。任何已有 source/manifest 内容漂移或签名失配都 fail closed，不接受 force、revision、asset、URL 或 trust-root 覆盖。GitHub origin lock 不进入 App 运行时；完整 source lock 语义仍由 Rust/Worker 的同一解析与测试裁决。
 
@@ -139,10 +139,10 @@ https://download.myagents.io/models/speech/assets/sha256/<sha256>/<filename>
 
 1. 用户显式调用 install；同一时刻只允许一个 install/remove operation。
 2. 校验随 App 发布的 media Worker、native manifest 与共享 ORT 都是普通文件。
-3. 从固定第一方地址取得 manifest/signature，验证 byte identity 与 updater Minisign trust root。
+3. 从固定第一方地址取得 manifest/signature，对下载到的原始 bytes 验证 updater Minisign trust root，再验证其 typed source-lock identity；验签后的原始 bytes 在后续流程中保持不变。
 4. 顺序下载锁定 asset 到 0700 private 目录中的 0600 `create_new` 文件；每个响应只允许 HTTPS `download.myagents.io` 固定 host，逐 chunk 执行 exact size、SHA-256 与总下载硬上限。
 5. Rust 内置的 pure-Rust bzip2 decoder + tar reader 只选择 source lock 白名单文件。archive 中任意 traversal、重复路径、symlink 或 special entry 都让整个 staging 失败；运行时不调用系统 tar、Python 或用户 PATH。
-6. manifest 最后写入；Manager 在安装与激活边界要求 manifest byte-identical，并逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。后续 App 启动只同步恢复签名 pointer、exact manifest 与文件元数据；等首屏和 Global Sidecar 启动后 10 秒，再用最低优先级、chunk-level 可让路的 `BackgroundResourceValidation` lease 完整校验 pack。该后台检查期间已激活 pack 仍可被语音功能使用，失败后才撤销内存 active 并投影 repair 状态。同步 live admission 不重复读取整个 pack；Worker 每次实际执行仍独立重开并校验 exact manifest、模型与 legal 文件后才加载模型。
+6. manifest 最后写入；Manager 在安装与激活边界要求磁盘 manifest 的原始 SHA-256 与 pointer 一致、原始 bytes 通过 pointer 中的签名验证，并与编译期 source lock 保持完整 typed identity；逐项重开模型与 legal 文件校验 regular file、无执行位、size 和 SHA-256。后续 App 启动只同步恢复签名 pointer、已签名 manifest 与文件元数据；等首屏和 Global Sidecar 启动后 10 秒，再用最低优先级、chunk-level 可让路的 `BackgroundResourceValidation` lease 完整校验 pack。该后台检查期间已激活 pack 仍可被语音功能使用，失败后才撤销内存 active 并投影 repair 状态。同步 live admission 不重复读取整个 pack；Worker 每次实际执行仍独立重开并校验 manifest 的 typed identity、模型与 legal 文件后才加载模型。
 7. 安装/升级的显式验证取得 `SpeechModelValidation` compute lease，让当前随包 Worker 依次真实创建并释放 ASR、VAD 和 diarizer engine。只有 Record live 到达时才 cooperative cancel exact probe tree、释放 lease 后重试；其它 workload 只影响下一次 admission。
 8. staging 以 no-replace directory rename 发布到唯一 pack 目录，最后 atomic replace `active.json`。rename 前明确失败会删除新 pack并保持旧 pointer；rename 已可见但 parent-directory sync 失败时绝不删除 pointer 已引用的 pack，状态保留新 active 并报告 `SPEECH_RESOURCE_ACTIVATION_DURABILITY_UNCONFIRMED`。
 

@@ -7,9 +7,9 @@ use crate::local_inference::{
     ComputeWorkloadIdentity, ComputeWorkloadKind, LocalComputeCoordinator, LocalComputeLease,
 };
 use crate::speech_model_pack::{
-    inspect_installed_pack, install_plan, verify_installed_pack, verify_installed_pack_with_yield,
-    InstalledPackError, ModelPackAsset, ModelPackAssetFormat, ModelPackInstallPlan,
-    ModelPackLegalSource, MODEL_PACK_SOURCE_LOCK,
+    inspect_installed_pack, install_plan, manifest_matches_source_lock, verify_installed_pack,
+    verify_installed_pack_with_yield, InstalledPackError, ModelPackAsset, ModelPackAssetFormat,
+    ModelPackInstallPlan, ModelPackLegalSource,
 };
 use futures_util::StreamExt;
 use myagents_media_worker_protocol::{
@@ -94,6 +94,11 @@ struct SignedPackIdentity {
     schema_version: u32,
     pack_id: String,
     pack_revision: String,
+}
+
+struct VerifiedReleaseManifest {
+    bytes: Vec<u8>,
+    signature: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -497,7 +502,7 @@ impl SpeechModelPackManager {
         let client_builder = speech_model_http_client_builder();
         let client = crate::proxy_config::build_client_with_proxy(client_builder)
             .map_err(|_| "SPEECH_RESOURCE_NETWORK")?;
-        let signature = fetch_verified_release_manifest(&client, &self.plan).await?;
+        let release_manifest = fetch_verified_release_manifest(&client, &self.plan).await?;
         self.ensure_not_cancelled()?;
         self.set_install_stage(Operation::Downloading)?;
 
@@ -516,7 +521,7 @@ impl SpeechModelPackManager {
                 &download_root,
                 &staging_root,
                 &operation_id,
-                &signature,
+                &release_manifest,
             )
             .await;
         let _ = remove_owned_operation_dir(&download_root);
@@ -532,7 +537,7 @@ impl SpeechModelPackManager {
         download_root: &Path,
         staging_root: &Path,
         operation_id: &str,
-        signature: &str,
+        release_manifest: &VerifiedReleaseManifest,
     ) -> Result<(ActivatedModelPack, ActivePointer, Option<&'static str>), &'static str> {
         let mut downloaded_assets = HashMap::new();
         for asset in &self.plan.assets {
@@ -566,7 +571,10 @@ impl SpeechModelPackManager {
         self.ensure_not_cancelled()?;
 
         let manifest_path = staging_root.join("manifest.json");
-        write_new_synced_file(&manifest_path, MODEL_PACK_SOURCE_LOCK.as_bytes())?;
+        // Persist the exact bytes covered by the detached signature. The App
+        // and Worker compare the typed lock identity, so platform-specific
+        // source checkout line endings never become part of compatibility.
+        write_new_synced_file(&manifest_path, &release_manifest.bytes)?;
         crate::durable_fs::sync_directory(staging_root)
             .map_err(|_| "SPEECH_RESOURCE_STORE_WRITE_FAILED")?;
         verify_installed_pack(&manifest_path).map_err(|_| "SPEECH_RESOURCE_PACK_INVALID")?;
@@ -585,8 +593,8 @@ impl SpeechModelPackManager {
             schema_version: ACTIVE_POINTER_SCHEMA_VERSION,
             pack_revision: self.plan.pack_revision.clone(),
             directory_name,
-            manifest_sha256: format!("{:x}", Sha256::digest(MODEL_PACK_SOURCE_LOCK.as_bytes())),
-            manifest_signature: signature.to_string(),
+            manifest_sha256: format!("{:x}", Sha256::digest(&release_manifest.bytes)),
+            manifest_signature: release_manifest.signature.clone(),
             activated_at: chrono::Utc::now().to_rfc3339(),
         };
         let pointer_commit = match write_active_pointer(&self.models_root, &pointer) {
@@ -764,8 +772,20 @@ impl SpeechModelPackManager {
                         identity: response_identity,
                         ..
                     }))) if response_identity == identity => ready = true,
-                    Ok(Ok(Some(WorkerResponse::Failed { .. })))
-                    | Ok(Ok(Some(_)))
+                    Ok(Ok(Some(WorkerResponse::Failed {
+                        identity: response_identity,
+                        code,
+                        ..
+                    }))) if response_identity == identity => {
+                        let code = model_probe_worker_error(&code);
+                        crate::ulog_warn!(
+                            "[speech-resource] model probe worker failed code={}",
+                            code
+                        );
+                        kill_probe(&child);
+                        break Err(code);
+                    }
+                    Ok(Ok(Some(_)))
                     | Ok(Ok(None))
                     | Ok(Err(_))
                     | Err(mpsc::TryRecvError::Disconnected) => {
@@ -848,7 +868,7 @@ enum ActivePointerCommit {
 async fn fetch_verified_release_manifest(
     client: &reqwest::Client,
     plan: &ModelPackInstallPlan,
-) -> Result<String, &'static str> {
+) -> Result<VerifiedReleaseManifest, &'static str> {
     let manifest_url = release_manifest_url(&plan.pack_revision);
     let signature_url = format!("{manifest_url}.sig");
     let manifest = fetch_limited_bytes(
@@ -858,9 +878,6 @@ async fn fetch_verified_release_manifest(
         MODEL_DOWNLOAD_HOST,
     )
     .await?;
-    if manifest != MODEL_PACK_SOURCE_LOCK.as_bytes() {
-        return Err("SPEECH_RESOURCE_MANIFEST_INVALID");
-    }
     let signature_bytes = fetch_limited_bytes(
         client,
         &signature_url,
@@ -876,7 +893,13 @@ async fn fetch_verified_release_manifest(
     }
     crate::resource_signature::verify_minisign_bytes(&manifest, signature, "speech model manifest")
         .map_err(|_| "SPEECH_RESOURCE_SIGNATURE_INVALID")?;
-    Ok(signature.to_string())
+    if !manifest_matches_source_lock(&manifest) {
+        return Err("SPEECH_RESOURCE_MANIFEST_INVALID");
+    }
+    Ok(VerifiedReleaseManifest {
+        bytes: manifest,
+        signature: signature.to_string(),
+    })
 }
 
 fn release_manifest_url(pack_revision: &str) -> String {
@@ -1228,10 +1251,7 @@ fn verify_pointer_and_pack(
     pointer: &ActivePointer,
     expected_revision: &str,
 ) -> Result<(ActivatedModelPack, ActivePointer), &'static str> {
-    validate_active_pointer(pointer, expected_revision)?;
-    let pack_root = models_root.join("packs").join(&pointer.directory_name);
-    ensure_plain_directory(&pack_root)?;
-    let manifest_path = pack_root.join("manifest.json");
+    let manifest_path = validate_active_pointer(models_root, pointer, expected_revision)?;
     let verified = verify_installed_pack(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
     if verified.pack_revision != pointer.pack_revision {
         return Err("SPEECH_RESOURCE_CORRUPT");
@@ -1251,10 +1271,7 @@ fn verify_pointer_and_pack_with_yield(
     expected_revision: &str,
     should_yield: &dyn Fn() -> bool,
 ) -> Result<(ActivatedModelPack, ActivePointer), &'static str> {
-    validate_active_pointer(pointer, expected_revision)?;
-    let pack_root = models_root.join("packs").join(&pointer.directory_name);
-    ensure_plain_directory(&pack_root)?;
-    let manifest_path = pack_root.join("manifest.json");
+    let manifest_path = validate_active_pointer(models_root, pointer, expected_revision)?;
     let verified = verify_installed_pack_with_yield(&manifest_path, should_yield).map_err(
         |error| match error {
             InstalledPackError::Yielded => SPEECH_RESOURCE_VALIDATION_YIELDED,
@@ -1278,10 +1295,7 @@ fn inspect_pointer_and_pack(
     pointer: &ActivePointer,
     expected_revision: &str,
 ) -> Result<(ActivatedModelPack, ActivePointer), &'static str> {
-    validate_active_pointer(pointer, expected_revision)?;
-    let pack_root = models_root.join("packs").join(&pointer.directory_name);
-    ensure_plain_directory(&pack_root)?;
-    let manifest_path = pack_root.join("manifest.json");
+    let manifest_path = validate_active_pointer(models_root, pointer, expected_revision)?;
     let inspected =
         inspect_installed_pack(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
     if inspected.pack_revision != pointer.pack_revision {
@@ -1297,24 +1311,49 @@ fn inspect_pointer_and_pack(
 }
 
 fn validate_active_pointer(
+    models_root: &Path,
     pointer: &ActivePointer,
     expected_revision: &str,
-) -> Result<(), &'static str> {
+) -> Result<PathBuf, &'static str> {
     if pointer.schema_version != ACTIVE_POINTER_SCHEMA_VERSION
         || pointer.pack_revision != expected_revision
         || !valid_pack_directory_name(&pointer.directory_name)
-        || pointer.manifest_sha256
-            != format!("{:x}", Sha256::digest(MODEL_PACK_SOURCE_LOCK.as_bytes()))
+        || pointer.manifest_sha256.len() != 64
+        || !pointer
+            .manifest_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || pointer.manifest_signature.is_empty()
+        || pointer.manifest_signature.len() as u64 > MAX_SIGNATURE_BYTES
         || chrono::DateTime::parse_from_rfc3339(&pointer.activated_at).is_err()
     {
         return Err("SPEECH_RESOURCE_CORRUPT");
     }
+
+    let pack_root = models_root.join("packs").join(&pointer.directory_name);
+    ensure_plain_directory(&pack_root)?;
+    let manifest_path = pack_root.join("manifest.json");
+    let metadata = fs::symlink_metadata(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() == 0
+        || metadata.len() > MAX_MANIFEST_BYTES
+    {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
+    let manifest = fs::read(&manifest_path).map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    if pointer.manifest_sha256 != format!("{:x}", Sha256::digest(&manifest))
+        || !manifest_matches_source_lock(&manifest)
+    {
+        return Err("SPEECH_RESOURCE_CORRUPT");
+    }
     crate::resource_signature::verify_minisign_bytes(
-        MODEL_PACK_SOURCE_LOCK.as_bytes(),
+        &manifest,
         &pointer.manifest_signature,
         "speech model manifest",
     )
-    .map_err(|_| "SPEECH_RESOURCE_CORRUPT")
+    .map_err(|_| "SPEECH_RESOURCE_CORRUPT")?;
+    Ok(manifest_path)
 }
 
 fn write_active_pointer(
@@ -1557,6 +1596,19 @@ fn kill_probe(child: &Arc<Mutex<crate::process_cmd::ChildTree>>) {
     }
 }
 
+fn model_probe_worker_error(code: &str) -> &'static str {
+    match code {
+        "SPEECH_NATIVE_RUNTIME_UNAVAILABLE" => "SPEECH_NATIVE_RUNTIME_UNAVAILABLE",
+        "SPEECH_MODEL_PACK_UNAVAILABLE" => "SPEECH_MODEL_PACK_UNAVAILABLE",
+        "SPEECH_ASR_MODEL_LOAD_FAILED" => "SPEECH_ASR_MODEL_LOAD_FAILED",
+        "SPEECH_VAD_MODEL_LOAD_FAILED" => "SPEECH_VAD_MODEL_LOAD_FAILED",
+        "SPEECH_DIARIZATION_MODEL_LOAD_FAILED" => "SPEECH_DIARIZATION_MODEL_LOAD_FAILED",
+        "SPEECH_MODEL_LOAD_FAILED" => "SPEECH_MODEL_LOAD_FAILED",
+        "SPEECH_RESOURCE_LIMIT" => "SPEECH_RESOURCE_LIMIT",
+        _ => "SPEECH_WORKER_PROTOCOL_ERROR",
+    }
+}
+
 fn drain_probe_stderr(stderr: std::process::ChildStderr) {
     thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -1582,6 +1634,22 @@ mod tests {
         assert_eq!(plan.source_download_bytes, 209_767_948);
         assert_eq!(total_download_bytes(&plan), 209_785_686);
         assert!(total_download_bytes(&plan) <= plan.download_hard_limit_bytes);
+    }
+
+    #[test]
+    fn model_probe_preserves_known_worker_failures_and_rejects_unknown_codes() {
+        assert_eq!(
+            model_probe_worker_error("SPEECH_MODEL_PACK_UNAVAILABLE"),
+            "SPEECH_MODEL_PACK_UNAVAILABLE"
+        );
+        assert_eq!(
+            model_probe_worker_error("SPEECH_DIARIZATION_MODEL_LOAD_FAILED"),
+            "SPEECH_DIARIZATION_MODEL_LOAD_FAILED"
+        );
+        assert_eq!(
+            model_probe_worker_error("UNTRUSTED_WORKER_DETAIL"),
+            "SPEECH_WORKER_PROTOCOL_ERROR"
+        );
     }
 
     #[test]

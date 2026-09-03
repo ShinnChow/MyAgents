@@ -122,7 +122,7 @@ struct ExpectedInstalledFile {
     size: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SourceLock {
     schema_version: u32,
@@ -137,7 +137,7 @@ struct SourceLock {
     legal_artifacts: Vec<LegalArtifact>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SignaturePolicy {
     algorithm: String,
@@ -145,7 +145,7 @@ struct SignaturePolicy {
     detached_signature_required: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Framework {
     sherpa_onnx_version: String,
@@ -154,7 +154,7 @@ struct Framework {
     sample_rate: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Asset {
     id: String,
@@ -167,14 +167,14 @@ struct Asset {
     selected_files: Vec<SelectedFile>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AssetFormat {
     File,
     TarBz2,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SelectedFile {
     source_path: String,
@@ -184,14 +184,14 @@ struct SelectedFile {
     kind: SelectedFileKind,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum SelectedFileKind {
     Model,
     Tokens,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LegalArtifact {
     id: String,
@@ -201,7 +201,7 @@ struct LegalArtifact {
     source: LegalSource,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",
@@ -220,6 +220,26 @@ enum LegalSource {
         sha256: String,
         size: u64,
     },
+}
+
+/// Compares a signed/downloaded manifest with the source lock compiled into
+/// this binary without making JSON formatting part of the resource identity.
+///
+/// The typed representation denies unknown and duplicate fields and equality
+/// pins every trusted value (including order). This intentionally accepts
+/// harmless CRLF/LF or whitespace differences between independently-built App
+/// and Worker binaries while continuing to reject any semantic drift.
+pub fn manifest_matches_source_lock(bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > 256 * 1024 {
+        return false;
+    }
+    let Ok(candidate) = serde_json::from_slice::<SourceLock>(bytes) else {
+        return false;
+    };
+    let Ok(expected) = serde_json::from_str::<SourceLock>(MODEL_PACK_SOURCE_LOCK) else {
+        return false;
+    };
+    validate_source_lock_json(MODEL_PACK_SOURCE_LOCK).is_ok() && candidate == expected
 }
 
 pub fn validate_source_lock_json(json: &str) -> Result<(), SourceLockError> {
@@ -442,7 +462,7 @@ pub fn install_plan() -> Result<ModelPackInstallPlan, SourceLockError> {
 }
 
 /// Verifies the exact activated speech model pack without trusting mutable
-/// manifest fields. The manifest bytes must equal the source lock compiled
+/// manifest fields. The typed manifest must equal the source lock compiled
 /// into this worker generation; every selected model and legal notice is then
 /// re-opened as a no-symlink regular file and checked by size and SHA-256.
 pub fn verify_installed_pack(
@@ -481,13 +501,14 @@ fn inspect_installed_pack_inner(
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || has_execute_bits(&metadata)
-        || metadata.len() != MODEL_PACK_SOURCE_LOCK.len() as u64
+        || metadata.len() == 0
+        || metadata.len() > 256 * 1024
     {
         return Err(InstalledPackError::ManifestMismatch);
     }
     let manifest_bytes =
         fs::read(manifest_path).map_err(|_| InstalledPackError::ManifestUnavailable)?;
-    if manifest_bytes != MODEL_PACK_SOURCE_LOCK.as_bytes() {
+    if !manifest_matches_source_lock(&manifest_bytes) {
         return Err(InstalledPackError::ManifestMismatch);
     }
     let lock: SourceLock = serde_json::from_slice(&manifest_bytes)
@@ -829,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_manifest_must_be_absolute_and_byte_identical() {
+    fn installed_manifest_must_be_absolute_and_semantically_identical() {
         assert_eq!(
             verify_installed_pack(Path::new("relative/manifest.json")),
             Err(InstalledPackError::UnsafePath)
@@ -845,6 +866,19 @@ mod tests {
             verify_installed_pack(&manifest),
             Err(InstalledPackError::ManifestMismatch)
         );
+    }
+
+    #[test]
+    fn manifest_identity_ignores_line_endings_but_rejects_semantic_drift() {
+        let crlf = MODEL_PACK_SOURCE_LOCK.replace('\n', "\r\n");
+        assert!(manifest_matches_source_lock(crlf.as_bytes()));
+
+        let drift = MODEL_PACK_SOURCE_LOCK.replace(
+            "\"packRevision\": \"local-standard-speech-v2\"",
+            "\"packRevision\": \"local-standard-speech-v3\"",
+        );
+        assert!(!manifest_matches_source_lock(drift.as_bytes()));
+        assert!(!manifest_matches_source_lock(b"{}"));
     }
 
     #[cfg(unix)]

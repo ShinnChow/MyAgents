@@ -50,7 +50,7 @@ async function speechFixture() {
   }
   const expected = {
     adapterAbiVersion: 1,
-    platform: 'linux',
+    platform: process.platform === 'win32' ? 'windows' : 'linux',
     architecture: 'x64',
     buildFingerprint: 'f'.repeat(64),
     sherpaOnnxVersion: '1.13.6',

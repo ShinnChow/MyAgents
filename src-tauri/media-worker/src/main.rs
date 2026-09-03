@@ -142,17 +142,17 @@ fn run_model_pack_probe(
     {
         let _asr = adapter
             .create_asr(models)
-            .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+            .map_err(|_| "SPEECH_ASR_MODEL_LOAD_FAILED")?;
     }
     {
         let _vad = adapter
             .create_vad(models)
-            .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+            .map_err(|_| "SPEECH_VAD_MODEL_LOAD_FAILED")?;
     }
     {
         let _diarizer = adapter
             .create_diarizer(models)
-            .map_err(|_| "SPEECH_MODEL_LOAD_FAILED")?;
+            .map_err(|_| "SPEECH_DIARIZATION_MODEL_LOAD_FAILED")?;
     }
     write_response(
         writer,
