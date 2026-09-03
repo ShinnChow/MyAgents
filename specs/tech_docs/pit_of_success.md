@@ -13,6 +13,7 @@
 - [`system_binary`](#system_binary) — 系统工具查找（Finder PATH 缺失）
 - [`normalize_external_path`](#normalize_external_path) — Windows `\\?\` 长路径前缀剥离
 - [`filesystem_capacity::available_space`](#filesystem_capacity) — 查询目标路径所属文件系统的可用容量
+- [`durable_fs`](#durable-fs) — 跨平台目录持久化与 no-replace rename
 - [`tauri::async_runtime::spawn`](#async_runtime) — 防 macOS startup-abort
 - [Session watcher](#session-watcher) — 文件系统观察索引
 
@@ -184,6 +185,19 @@ v0.2.0 Windows 版的 IM Bot 全部启动失败就是这个 trap：`find_tsx_run
 **Surface.** `crate::filesystem_capacity::available_space(path: &Path) -> io::Result<u64>`——直接查询现存路径所属文件系统。调用方继续拥有容量预算、业务错误和 lifecycle。
 
 **Don't.** 不要枚举卷、比较路径字符串、剥掉 `\\?\` 后继续做前缀匹配，也不要为容量查询增加 mount cache、坏盘表或扫描重试。`normalize_external_path` 只用于路径离开 Rust 的边界，不用于修补 Rust 内 filesystem query。
+
+---
+
+<a id="durable-fs"></a>
+## `durable_fs` (`src-tauri/src/durable_fs.rs`)
+
+**Problem.** 原子写入与目录发布只有在“文件内容同步 → rename → 父目录元数据同步”全部成功后才能报告 durable。Unix 可用只读目录 handle 执行 `fsync`；Windows 的 `FlushFileBuffers` 则要求 handle 具备 `GENERIC_WRITE`。仅加 `FILE_FLAG_BACKUP_SEMANTICS` 后以只读方式打开目录虽然成功，但 `File::sync_all()` 会稳定返回 `ERROR_ACCESS_DENIED`，使 Record 迁移、文档发布和语音模型安装把可写目录误判为存储失败。
+
+**Surface.** `crate::durable_fs::sync_directory(path)` 同步已存在的普通目录；`crate::durable_fs::rename_directory_noreplace(source, destination)` 执行不覆盖既有目标的目录发布。调用方仍拥有业务错误、rollback 和“rename 已可见但 durability 未确认”的生命周期裁决。
+
+**Invariants enforced.** Windows 目录 handle 使用 `FILE_FLAG_BACKUP_SEMANTICS + GENERIC_WRITE` 后再执行 `FlushFileBuffers`；Unix 继续对目录执行 `fsync`。Windows no-replace 发布使用 `MoveFileExW(MOVEFILE_WRITE_THROUGH)`，Linux/macOS 使用各自的原子 no-replace primitive。真实同步失败必须向调用方返回，不能伪装成成功；调用方应先同步新文件，再发布目录或指针，最后同步对应父目录。
+
+**Don't.** 不要在各业务模块复制平台分支；不要把 Windows 目录同步改成无条件 no-op；不要吞掉 `AccessDenied`；也不要用只读 Windows 目录 handle 调用 `sync_all()`。用户可写性、磁盘容量与 durability barrier 是不同事实，错误投影必须在 owner 边界区分。
 
 ---
 

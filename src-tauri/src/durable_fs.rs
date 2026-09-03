@@ -1,5 +1,6 @@
 //! Small cross-platform durability primitives shared by app-owned stores.
 
+#[cfg(not(windows))]
 use std::fs::File;
 #[cfg(windows)]
 use std::fs::OpenOptions;
@@ -11,8 +12,12 @@ pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
+        // FILE_FLAG_BACKUP_SEMANTICS makes a directory openable, while
+        // FlushFileBuffers (used by File::sync_all) requires GENERIC_WRITE.
+        // A read-only directory handle opens successfully but deterministically
+        // fails the flush with ERROR_ACCESS_DENIED.
         return OpenOptions::new()
-            .read(true)
+            .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(path)?
             .sync_all();
@@ -112,4 +117,15 @@ pub(crate) fn rename_directory_noreplace(source: &Path, destination: &Path) -> s
         ));
     }
     std::fs::rename(source, destination)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync_directory;
+
+    #[test]
+    fn sync_directory_succeeds_for_plain_directory() {
+        let root = tempfile::tempdir().unwrap();
+        sync_directory(root.path()).unwrap();
+    }
 }
