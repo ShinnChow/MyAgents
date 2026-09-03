@@ -18,45 +18,7 @@ fn main() {
     expose_managed_codex_runtime_lock();
     expose_managed_browser_runtime_lock();
     expose_space_build_env();
-    expose_windows_test_manifest_dependency();
     tauri_build::build()
-}
-
-fn expose_windows_test_manifest_dependency() {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
-        return;
-    }
-
-    // The Windows UI dependencies import TaskDialogIndirect from Common Controls v6.
-    // Cargo's test harness is a separate executable and does not inherit the Tauri
-    // application manifest, so it must opt into v6 explicitly as well.
-    let manifest_path = env::var_os("OUT_DIR")
-        .map(PathBuf::from)
-        .expect("OUT_DIR is required")
-        .join("windows-test-common-controls.manifest");
-    fs::write(
-        &manifest_path,
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <dependency>
-    <dependentAssembly>
-      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*" />
-    </dependentAssembly>
-  </dependency>
-</assembly>
-"#,
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "Failed to write Windows test manifest {}: {error}",
-            manifest_path.display()
-        )
-    });
-    println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-    println!(
-        "cargo:rustc-link-arg=/MANIFESTINPUT:{}",
-        manifest_path.display()
-    );
 }
 
 fn expose_managed_browser_runtime_lock() {
