@@ -207,6 +207,15 @@ function runPublisher(fixture, extraEnv = {}) {
   );
 }
 
+test("compiled speech model source lock uses canonical LF bytes", () => {
+  const sourceBytes = readFileSync(sourceLockPath);
+  assert.equal(
+    sourceBytes.includes(0x0d),
+    false,
+    "model-pack-source-lock.json must use LF-only line endings so Windows builds embed the signed manifest bytes",
+  );
+});
+
 test("speech model packager publishes the exact compiled source-lock bytes", () => {
   const root = mkdtempSync(join(tmpdir(), "myagents-speech-model-package-"));
   try {
