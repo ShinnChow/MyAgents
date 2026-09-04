@@ -5,7 +5,7 @@
 小 badge。凡是需要"模型可见、用户气泡不直接展示"的投送消息，都应优先复用这套
 协议，不要为单个场景另造隐藏规则。
 
-Space IssueDelivery 在这层通用 envelope 内还有独立的 Registered Agent Prompt contract。0.3.2 active v2、旧客户端 v1 兼容面、完整模板与拼接规则见 `space_issue_delivery_protocol.md`；本文只拥有 leading reminder、badge 与 visible tail 的通用语义。
+Space IssueDelivery 在这层通用 envelope 内还有独立的 Registered Agent Prompt contract。当前结构、旧客户端兼容面、完整模板与拼接规则见 `space_issue_delivery_protocol.md`；本文只拥有 leading reminder、badge 与 visible tail 的通用语义。
 
 ## 适用场景
 
@@ -70,32 +70,9 @@ Space IssueDelivery 在这层通用 envelope 内还有独立的 Registered Agent
 
 因此 `turnCount` 可以统计所有持久 user turn，`humanQueryCount` 只统计真人输入，而 preview/search/detail 只展示 visible 内容；三者不应为了数值一致而复用同一个 classifier。
 
-Cron 结果投送到 IM session 的推荐结构：
-
-```xml
-<system-reminder>
-<HEARTBEAT>
-<instruction>
-  A scheduled task has been triggered and completed. Please relay these results to the user in a helpful
-  and friendly way.
-</instruction>
-<task-meta>
-  Task id: {taskId}
-  Source session id: {fromSessionId} (use `myagents session send {fromSessionId} -p "..."` to follow up)
-  Current time: {now}
-</task-meta>
-<task-result>
-  <inbox-message from="Cron: {taskName}" reply_back="false">
-  {cron AI output}
-  </inbox-message>
-</task-result>
-</HEARTBEAT>
-</system-reminder>
-[System]收到来自系统投送的信息
-```
-
-这里 `[System]收到来自系统投送的信息` 是唯一用户可见气泡正文；前面的 task meta、
-instruction、cron output 都只给模型看。
+Cron 结果投送 IM session 时使用 `HEARTBEAT` builder：task metadata 和结果留在 hidden
+payload，`[System]收到来自系统投送的信息` 是唯一 visible tail。完整 wire shape 由
+`src/server/utils/cron-event-relay.ts` 与测试拥有，不在本文复制模板。
 
 ## 前端展示规则
 
@@ -149,7 +126,7 @@ instruction、cron output 都只给模型看。
 | Goal 自动续跑 | 同一 builder，调用方 `/goal/execute-sync` | `<system-reminder><GOAL_CONTINUATION>...</GOAL_CONTINUATION></system-reminder>`，第二轮起纯隐藏 |
 | Goal 普通 query context | `src/shared/systemReminder.ts::buildGoalContextReminder`，调用方 Goal-aware chat enqueue 路径 | `<system-reminder><GOAL_CONTEXT>...</GOAL_CONTEXT></system-reminder>` + 用户 visible query |
 | 浮球消息 | `src/shared/systemReminder.ts::buildFloatingBallContextReminder`，调用方 `src/renderer/floating-ball/useFloatingSession.ts` | `<system-reminder><FLOATING_BALL_CONTEXT>...</FLOATING_BALL_CONTEXT></system-reminder>` + 用户文本 |
-| Space IssueDelivery（0.3.2 v2） | `src-tauri/src/space_cloud.rs::build_space_issue_delivery_message_for_locale` | `<system-reminder><myagents-space-issue><registered-agent-context>…</registered-agent-context><registered-agent-instruction>…</registered-agent-instruction><operating-guidance>…</operating-guidance><deliveries>…</deliveries></myagents-space-issue></system-reminder>` + 本地化可见提示 |
+| Space IssueDelivery | `src-tauri/src/space_cloud/delivery.rs::build_space_issue_delivery_message_for_locale` | `<system-reminder><myagents-space-issue>…</myagents-space-issue></system-reminder>` + 本地化可见提示 |
 | Cron 结果投送 IM session | `src/server/utils/cron-event-relay.ts::buildCronEventRelayMessage` | `<system-reminder><HEARTBEAT>...</HEARTBEAT></system-reminder>` + `[System]收到来自系统投送的信息` |
 
 command Trigger 命中时仍使用 `CRON_TASK` 这一兼容 tag；builder 在 hidden payload 中追加规范化 `<activation-event>`，只包含 event id/kind/time、reason code 与 untrusted handoff。Detector checkpoint、stderr、命令路径和 harness error 永不进入 Session。handoff 来自外部事实，必须被 XML escape 并明确作为不可信上下文；它不能覆盖 `task.md`、消息 role 或 Session/Runtime 配置。没有 Activation Event 的 always Task 保持原 reminder wire shape。
@@ -158,7 +135,7 @@ command Trigger 命中时仍使用 `CRON_TASK` 这一兼容 tag；builder 在 hi
 
 相关但不是完整复用模板的入口：
 
-Space v2 的内部 trust boundary 不改变通用 reminder wire protocol：Cloud 提供权威 Registered Agent instruction/revision、transport 索引与轻量因果导航；Desktop 描述当前 CLI/workspace/Task 执行方法并组装 Prompt；Issue 用户文本必须有界 XML escape，不能伪造结构。Renderer 仍只消费外层 `myagents-space-issue` badge 与 reminder 后的 visible tail。已发布旧 Desktop 的 v1 结构继续由 Cloud 版本化 projection 支持，但不进入 0.3.2 builder。
+Space 的内部 trust boundary 不改变通用 reminder wire protocol：Cloud 提供权威 Registered Agent instruction/revision、transport 索引与轻量因果导航；Desktop 描述当前 CLI/workspace/Task 执行方法并组装 Prompt；Issue 用户文本必须有界 XML escape，不能伪造结构。Renderer 仍只消费外层 `myagents-space-issue` badge 与 reminder 后的 visible tail。Cloud 继续为受支持的旧 Desktop 提供版本化 projection；current Desktop builder 只生产当前结构。
 
 - `src/server/index.ts` 普通 heartbeat：纯
   `<system-reminder><HEARTBEAT>...</HEARTBEAT></system-reminder>`，没有 visible tail；

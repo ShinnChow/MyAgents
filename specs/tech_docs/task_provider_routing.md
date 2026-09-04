@@ -1,6 +1,6 @@
 # Task Provider Routing
 
-> 状态：0.3.0。Task 是唯一持久化权威；Cron 名称只保留兼容 API/CLI。本文定义 Task、Session 与 Provider 配置各自拥有哪一段生命周期。
+Task 是唯一持久化权威；Cron 名称只保留兼容 API/CLI。本文定义 Task、Session 与 Provider 配置各自拥有哪一段生命周期。
 
 ## 1. 三个配置 Scope
 
@@ -119,7 +119,8 @@ Task 和 Goal 可同时关联同一 Session，因为它们职责不同：
 - Goal 只负责 Session 的长期目标状态与 continuation。
 - Runtime queue 负责实际 Turn 排序；双方不得各自维护并行消息队列。
 
-若未来要“Task 启动后自动进入 Goal”，本期架构已经支持最简单的组合：Task prompt 让 AI 在目标 Session 调 `myagents goal create`。Task Store、Task Scheduler 与 Goal Store 无需新增彼此引用。
+Task prompt 可以显式要求 AI 在目标 Session 调 `myagents goal create`；这种组合仍通过
+Session queue 和现有 CLI 完成。Task Store、Task Scheduler 与 Goal Store 不持有彼此引用。
 
 ## 6. Legacy 迁移
 
