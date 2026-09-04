@@ -266,7 +266,7 @@ HTTP client 的错误文本通常携带完整请求 URL。若协议把凭据放�
 2026-03-26 10:30:45.345 [RUST ] [INFO ] Sidecar process spawned
 ```
 
-> v0.1.x 的 `[BUN  ]` 标签在 v0.2.0+ 渲染为 `[NODE ]`（UnifiedLogsPanel 的 SOURCE_LABELS.bun = 'NODE'）。历史日志文件中的 `[BUN  ]` 字面量保留不变，保证能 grep 到旧日志。
+> 持久化 wire format 仍接受 `[BUN  ]` source tag，UI 将它显示为 `[NODE ]`。已写日志的字面量保持不变，保证诊断搜索与旧文件读取兼容。
 
 > **注意**：时间戳使用**本地时间** `YYYY-MM-DD HH:MM:SS.mmm`（非 UTC ISO 8601）。
 

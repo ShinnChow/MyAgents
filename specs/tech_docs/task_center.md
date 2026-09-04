@@ -1,6 +1,6 @@
 # 任务中心架构
 
-> 0.3.0 起，Task 是所有新定时自动化和任务中心执行的唯一持久化实体。Cron 只保留兼容命令名与旧数据读取，不再是 Task 的调度投影。
+> Task 是所有新定时自动化和任务中心执行的唯一持久化实体。Cron 只保留兼容命令名与旧数据读取，不再是 Task 的调度投影。
 
 ## 1. 所有权
 
@@ -191,9 +191,9 @@ Goal 是 Session 状态，不是 Task execution mode：
 - 不创建 Task、不占用 Task status/schedule 字段。
 - Task 与 Goal 可在同一 Session 共存；Task scheduler 不感知 Goal。
 - Goal turn 的 completion descriptor 保留 `{ kind: 'goal', id: goalId }` owner；generic Session completion 被抑制，Goal terminal/outbox/notification 继续由 Goal domain lifecycle 负责。
-- 未来 Task 如需持续执行，可让其 prompt 中的 AI 在当前 Session 调 `myagents goal create`，无需 Task->Goal 编排字段。
+- Task 需要持续执行时，由 prompt 中的 AI 在当前 Session 调 `myagents goal create`；Task 模型不增加 Task→Goal 编排字段。
 
-详见 `session_architecture.md` 的 Goal Mode 章节。
+详见 [`session_architecture.md`](session_architecture.md) 的“Goal 与跨 Session 协作”。
 
 ## 8. 主要入口
 

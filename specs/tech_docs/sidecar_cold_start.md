@@ -112,7 +112,7 @@ setSessionState((systemInitInfo || sdkControlReady) ? 'running' : 'starting');
 
 ### Builtin MCP 懒加载架构
 
-当前两个 user-toggleable in-process MCP（`gemini-image` / `edge-tts`）通过 `src/server/tools/builtin-mcp-meta.ts` 集中登记 META，运行时按需 `getBuiltinMcpInstance(id)` 加载。历史 `cron-tools` / `im-cron` / `im-media` 已迁移到 `myagents` CLI；runtime-dynamic `im-bridge-tools` 走独立的 context-injected surface owner，不进入该 registry。
+当前两个 user-toggleable in-process MCP（`gemini-image` / `edge-tts`）通过 `src/server/tools/builtin-mcp-meta.ts` 集中登记 META，运行时按需 `getBuiltinMcpInstance(id)` 加载。Task/IM 命令归 `myagents` CLI，runtime-dynamic `im-bridge-tools` 走独立的 context-injected surface owner；它们都不进入该 registry。
 
 - 首次加载付 100-400ms（SDK + zod）
 - 后续 0ms 缓存
@@ -124,6 +124,12 @@ setSessionState((systemInitInfo || sdkControlReady) ? 'running' : 'starting');
 ### Settings UI 的 MCP 列表
 
 从**静态** `PRESET_MCP_SERVERS`（权威定义在 `src/shared/config-types.ts`，renderer 通过 `src/renderer/config/types.ts` barrel 读取）获取——与运行时 META 解耦。META 在 Sidecar 启动时只登记轻量 factory；本次 Sidecar 生命周期内从未启用或测试的 builtin 不会加载 tool module，也不会创建重型 INSTANCE。
+
+### Custom MCP OAuth maintenance
+
+Custom MCP credential 的持久化 authority 是 `src/server/mcp-oauth/state-store.ts`。Global Sidecar 是 proactive refresh scheduler 的唯一 owner；Session Sidecar 只在启动时建立全量 revision baseline 并观察后续 credential revision，不能各自启动周期刷新器。
+
+每个 token grant、refresh 或 revoke 都在 state-store 锁内推进单调 `tokenRevision`。token endpoint 请求开始前捕获 revision，响应只允许通过 `setServerTokenIfRevision()` 做 compare-and-set；若期间发生 revoke 或新的 authorization，旧 refresh 响应必须丢弃，不能复活已删除 credential 或覆盖新 grant。credential 写盘失败必须向调用方报失败，不能把仅存在于当前进程内存的 token 当成功。
 
 ## 排查冷启动退化的 checklist
 

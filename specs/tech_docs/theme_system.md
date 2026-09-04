@@ -1,6 +1,6 @@
 # Theme System
 
-> PRD 0.3.2 的落地架构。修改 Theme、外观模式、Launcher Hero、宿主 CSS Token、xterm、Monaco、Mermaid、Prism、Widget iframe 或 Floating Ball 视觉前必须阅读。
+> 本文是 Theme、外观模式及各渲染 surface 的当前架构。修改 Launcher Hero、宿主 CSS Token、xterm、Monaco、Mermaid、Prism、Widget iframe 或 Floating Ball 视觉前必须阅读。
 
 ## 1. 领域模型与 owner
 
@@ -271,4 +271,4 @@ Space 是全局 Theme 的标准 CSS host surface：组件直接消费 root seman
   `dist/assets/*.css`，验证 font/radius/shadow/duration utility 仍引用 runtime Theme Token，且 bundle
   不存在未编译 raw `@theme`，后者防止 production `?inline` 序列化导致 preset catalog 启动时被拒绝。
 
-发布前仍必须完成 PRD 0.3.2 要求的视觉截图矩阵、browser dev、macOS/Windows 实机门槛；自动化不能替代真实渲染验证。
+发布前仍必须完成视觉截图矩阵、browser dev 和 macOS/Windows 实机验证；自动化不能替代真实渲染验证。

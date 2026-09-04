@@ -340,4 +340,3 @@ snippet 构建常见 "取匹配位置前后各 N 字符" 的近似切片。裸 `
 - 前端组件：`src/renderer/components/search/`
 - 搜索导航 helper：`src/renderer/utils/workspaceSearchNavigation.ts`
 - 文件预览跳转：`src/renderer/components/FilePreviewModal.tsx`, `MonacoEditor.tsx`
-- 产品需求：`specs/prd/prd_0.1.65_full_text_search.md`, `specs/prd/prd_0.2.31_workspace_search_result_navigation.md`, `specs/prd/prd_0.4.9_workspace-file-discovery-and-turn-edit-summary.md`

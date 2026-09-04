@@ -69,7 +69,7 @@ src-tauri/src/cli.rs                       ├── npm-global/       (AI 自�
 
 CLI 脚本只有一条执行 authority：`cli.rs` 使用当前安装包的 bundled Node.js 执行当前安装包的 `resources/cli/myagents.cjs`。`.cjs` 是产物自描述契约：即使开发 `.app` 位于上层声明 `type: module` 的源码目录，Node 也必须按 CommonJS 加载。AI Bash 与用户终端的 `myagents` 先经过薄启动器回到当前 app executable；兼容的 `MyAgents <known-group>` 直调则直接进入同一个 Rust CLI mode。两条入口最终执行同一 bundle，不依赖系统 Node 或 HOME 中的业务脚本。
 
-### 端口发现
+### CLI 端口选择
 
 ```
 优先级：--port 标志 > 已继承 MYAGENTS_PORT > Global sidecar.port
@@ -83,38 +83,11 @@ CLI 脚本只有一条执行 authority：`cli.rs` 使用当前安装包的 bundl
 
 ```
 myagents <group> <action> [args] [flags]
-
-Groups:
-  mcp       管理 MCP 工具服务器（list/add/remove/enable/disable/env/test/oauth）
-  model     管理模型供应商（list/add/remove/set-key/set-default/verify）
-  agent     管理 Agent 与 Channel（list/show/enable/disable/archive/unarchive/set/channel/runtime-status）
-  runtime   查看 Agent Runtime 装机情况、model/permissionMode 清单，跑 runtime 自诊断
-  skill     管理 Skills（list/info/add/remove/enable/disable/sync）
-  tool      用户注册 CLI 工具注册表（实验室开关开启后可用）
-  vision    官方图片理解 CLI 工具（readme/analyze；由设置页工具箱开关和读图模型配置门控）
-  cron      定时 Task 的已发布兼容命令面（不再是 Agent canonical surface）
-  goal      管理当前 session Goal Mode（get/create/update）
-  task      管理任务中心与定时自动化（create/run/start/stop/runs/exit/Trigger/...）
-  record    管理统一 Record（list/create；可按 text/audio 过滤）
-  thought   `record` 的历史兼容 alias
-  speech    当前 Session 的本地附件转录（transcribe/status/wait/cancel/list）
-  im        IM runtime actions（send-media）
-  session   Agent Session 发现与协作（list/start/send/watch）
-  diagnose  Runtime / 系统自诊断（runtime <type>）— `runtime diagnose <type>` 的别名糖
-  widget    Generative UI widget 说明（readme）
-  plugin    管理 OpenClaw 社区插件（list/install/remove）
-  config    读写应用配置（get/set）
-  status    查看应用运行状态
-  version   查看版本
-  reload    热重载配置
-
-Global flags:
-  --help          帮助（顶层静态；子命令走 /api/admin/help 动态渲染）
-  --json          JSON 输出
-  --dry-run       仅精确 leaf help 明示支持的命令可预览；unsupported mutation fail closed
-  --port NUM      覆盖端口
-  --disable-nonessential  禁用非必要校验
 ```
+
+命令按 owner 分组：配置与能力（MCP/model/skill/tool/plugin/config）、Agent 与 Runtime、Session/Goal、Task/Record/Speech、Space/IM，以及 status/version/reload 等应用控制。canonical group、action、flag 和输出字段以当前 bundle 的顶层/leaf `--help` 为准；本文只记录跨命令的路由、身份和 mutation 规则，不维护静态全集。
+
+所有 mutation 对未知 flag fail closed。`--dry-run` 只有在 leaf help 明确声明支持时才有效；不能把拒绝执行描述成成功预览。
 
 Agent-facing system prompt、Required Skills 与 help 只推荐 canonical `myagents record` / `sourceRecordId`。`myagents thought`、`/api/admin/thought/*` 与持久层 `sourceThoughtId` 仅在已发布脚本、旧 JSON shape 和升级读取边界保留；兼容面薄映射到 Record owner，不能重新成为产品主入口或第二份 Store。
 
@@ -165,8 +138,8 @@ myagents session list --agent <agent-id>          # 看最近可复用的 persis
 
 `agent set` 不是裸 JSON 属性写入：只接受帮助中列出的 canonical 字段
 `enabled/runtime/runtimeConfig/providerId/model/permissionMode`，未知字段在写盘前拒绝；
-历史帮助里的 `provider` / `permission` 从未产生有效配置，因此不保留为第二套 alias，
-而是明确提示 `providerId` / `permissionMode`。providerId/model/permissionMode 属于配置 intent，
+`provider` / `permission` 不作为第二套 alias；未知字段应明确提示 canonical
+`providerId` / `permissionMode`。providerId/model/permissionMode 属于配置 intent，
 必须在 Admin API 边界校验并同步 Agent 权威记录、Project 兼容镜像和运行中的
 Agent/IM Channel。Managed Codex 的 Agent 配置只接受产品 permission
 （`auto | plan | fullAgency`）；`agent show` 再精确投影为 effective Codex
@@ -189,7 +162,7 @@ canonical path match。历史 extra/orphan Agent 仍可用 exact ID discovery/co
 但只有 exact Project claim 能做 Project lifecycle mutation。重复 Project path/Agent ID
 仍是硬冲突；多 Project claim 同一 Agent 只隔离相关目标，不拖垮健康 discovery。
 
-### Goal Mode 命令（0.3.0）
+### Goal Mode 命令
 
 `myagents goal --help` 是 Goal Mode 的内置 skill 文档。系统提示词只告诉模型在明确 User 要求“Goal Mode / Goal Loop / 目标模式 / 设立目标 / 持续执行直到完成”时先运行 help，再按 help 使用子命令；不要把 help 全量塞进主 system prompt。
 
@@ -214,7 +187,7 @@ canonical path match。历史 extra/orphan Agent 仍可用 exact ID discovery/co
 - `goal get` 的人类可读投影明确区分 `settled turns`（Rust 已 finalize 的 `turnCount`）与可选 `current turn`（`executionNumber`）；JSON 继续返回既有 `turnCount / isExecuting / executionNumber / endConditions` 字段。
 - current-session Goal 不附带 `CronDelivery`；IM / Agent Channel session 依赖当前 session 输出路由。
 
-### Cron 兼容命令（0.3.0）
+### Cron 兼容命令
 
 `myagents cron` 保留既有用户命令名和 JSON shape，但不再创建 `CronTask`。所有 add/list/update/start/stop/remove/run-now 都由 Rust compatibility facade 直接读写 `TaskStore`，时间触发由 `TaskSchedulerController` 管理；`cron_tasks.json` 只作为启动迁移的只读历史格式。
 
@@ -228,7 +201,7 @@ Cron 兼容面只提供 `list`，不发布 `cron get`；单条详情统一使用
 - `Loop` 被拒绝；持续工作使用 current-session Goal。
 - `/api/admin/cron/*` 是兼容路由名，不代表独立 Cron domain/store。
 
-### Task Automation Skill 与条件激活（0.4.5）
+### Task Automation Skill 与条件激活
 
 `myagents-task-automation` 是 Required system skill，也是所有“定时、未来唤醒、周期执行、等待条件后继续”的统一 Agent 入口。Skill 先建立 Task，再选择默认 `always` 或低成本 `command Detector`；Sensor 不再作为独立 Skill / 产品实体。Detector 详细协议放在 Skill 的按需 reference，普通 scheduled Task 不加载这部分上下文。
 
@@ -255,7 +228,7 @@ CLI 从自身 `MYAGENTS_SESSION_ID` 判定 `agent/cli` 或 `user/cli`，把内�
 
 Agent-facing CLI 统一使用 `myagents task`。`task start/stop/runs/exit` 只是在 CLI 路由层复用既有 Cron compatibility handler，后端仍进入同一个 Rust Task authority；`myagents cron` 命令为外部用户和脚本继续兼容。Task 创建还可用 `--deadline`、`--maxExecutions`、`--aiCanExit` 写入既有 `TaskEndConditions`，不新增结束状态 owner。
 
-### Runtime 自诊断（PRD 0.2.16）
+### Runtime 自诊断
 
 ```bash
 myagents runtime diagnose codex [--workspace=<path>] [--json]
@@ -265,9 +238,9 @@ myagents diagnose runtime codex [--workspace=<path>] [--json]    # 别名糖
 两条命令路由到同一个 admin endpoint（`runtime/diagnose` 与 `diagnose/runtime`，handler 一致）。Spawn 一个短命 `codex app-server` 进程，跑 `initialize` + 4 个 RPC（`getAuthStatus` / `experimentalFeature.list` / `mcpServerStatus.list` / `app.list`），结构化返回 `RuntimeDiagnostics`：
 
 - `--workspace=<path>` 让诊断按该 workspace 的 agent `runtimeConfig.envPolicy` 注入 env（共享 `env-utils.resolveAgentEnvPolicy` 做 proxy 字面量校验），结果反映真实会话会看到的状态而不是 baseline
-- `--json` 输出可直接贴 issue（issue #194 是这个能力的原始来源——用户终端能调 `@oai/artifact-tool`、MyAgents Codex Runtime 里调不到，诊断面板 + CLI 双入口让差异可见）
+- `--json` 输出稳定的结构化诊断，便于比较用户终端与 MyAgents Runtime 的实际环境
 
-详见 `tech_docs/multi_agent_runtime.md` 「Runtime 诊断 + envPolicy」。
+详见 [`multi_agent_runtime.md`](multi_agent_runtime.md) 的“诊断与环境”。
 
 ## Bundle authority 与 launcher 收敛
 
@@ -336,7 +309,7 @@ canonical HOME launcher 总是传私有 marker，Rust 在调用 Node 前剥掉�
 }
 ```
 
-### 端口发现
+### Rust 端口回退
 
 ```rust
 fn discover_sidecar_port() -> Option<String> {
@@ -376,14 +349,14 @@ Admin API 注册在 Sidecar 的 `/api/admin/*` 路由下，提供与 GUI 对等�
 | `/api/admin/reload` | 热重载配置 |
 | `/api/admin/help` | 命令帮助文本（子命令 help 来自这里） |
 
-### Cloud Space CLI 身份与错误边界（0.3.2）
+### Cloud Space CLI 身份与错误边界
 
 - `space list` 是唯一不要求 `--space` 的发现命令；其它 Space 业务命令必须显式 canonical slug，不维护隐式默认 Space。
 - CLI 只解析参数，不接受 `--actor` 或 token。Sidecar Admin API 以当前 workspace path 查 `projects.json` 并补 stable `workspaceId`；Rust `SpaceCliContext` 刷新 `/api/me` 后，只在当前 Session origin 明确携带 exact `spaceId + registeredAgentId`（或显式 legacy `localAgentId` 精确命中）时使用 Agent token。workspace id/path 只做 containment 与 registration 校验，不参与 actor 推断。
 - delivery Session 以持久 Session origin 为 actor authority，并用 `registered_agents.json` 中该精确实例的 Space/device/workspace/owner/token 状态校验绑定；`delivery_log.json` 只保存 transport receipt，不参与 actor 选择。Agent 丢失、失效、跨 Space/device/workspace 或 ID 不一致时 fail closed，绝不降级为 User。没有 exact Agent origin 的普通 Session 始终使用当前 User session token，即使同 workspace 恰好存在一个 Agent。
 - Rust Management API 统一返回 `{ok:false,code,error,suggestion,suggestedCommand?}`；Node Admin API 原样保留，CLI human mode 渲染 `Error:`/`Suggestion:`，`--json` stdout 只输出一个可解析对象且本地参数/文件错误也走同一契约。
 - `myagents <exact leaf> --help` 是 Agent 的工具说明。每个 Space leaf 独立描述 WHEN TO CALL、EFFECT、REQUIRED CONTEXT、OPTIONS、ACTOR AND PERMISSIONS、FILE SAFETY、OUTPUT、EXAMPLES、RECOVERY，不能回落到泛化 group help。
-- `myagents space issue --help` 是 Issue 动作面的统一 discovery 入口；具体参数继续以下一级 leaf help 为权威。0.3.2 不再暴露 `space issue delivery ignore`：不行动是合法模型决策，不需要修改 Delivery；transport ACK 由 connector 自动维护。
+- `myagents space issue --help` 是 Issue 动作面的统一 discovery 入口；具体参数继续以下一级 leaf help 为权威。不提供 `space issue delivery ignore`：不行动是合法模型决策，不需要修改 Delivery；transport ACK 由 connector 自动维护。
 - Goal discovery 走 `space goal list --space <slug> [--include-archived]`，只把 active `data.items[].id` 用作 create/list/update 的 `--goal`。`myagents goal` 是本地 Session Goal Mode，`myagents space goal` 是 Cloud 组织 Goal，help 必须保持命名空间消歧。
 - Issue 元数据编辑走 `space issue update <issueId>`，只接受 title/body/Goal/humanOnly。省略 Goal 表示不变；`--clear-goal` 在 CLI→Rust 使用 tagged action，Rust 最后一跳才映射成 Cloud `goalId:null`。state、assignee、claim、comment 和 attachment 仍由各自命令拥有。
 - top help 不承诺全局 preview。所有 Space write-like command 携带 `--dry-run` 时，CLI 在端口发现、HTTP 与本地文件 IO 前返回 `DRY_RUN_UNSUPPORTED`；只读命令不会把无关 flag 描述成 preview。真正支持 dry-run 的配置类命令以各自精确 leaf help 为准。

@@ -1,11 +1,6 @@
 # MyAgents Space Issue Delivery Protocol
 
-> 状态（2026-07-22）
->
-> - **Protocol v1：已发布客户端兼容行为。** `<0.3.2` Desktop 仍由旧客户端使用 Cloud instruction / trigger snapshot 组装既有 Prompt；legacy ignore endpoint 仅为兼容面，新 transport Delivery 不再产生 ignored 语义。
-> - **Protocol v2：Cloud 已上线、Desktop 待发布。** Cloud v0.1.6 已在 Production 应用 migration `0018` 并部署三档兼容响应；Desktop 0.3.2 源码中的严格 parser、Prompt builder、exact Session origin 与回归测试已落地，最终用户路径要到 Desktop 0.3.2 发布后才生效。
-> - **发布模型：一次协调上线。** Cloud migration/Worker、旧协议验证与 Production health/traffic 已通过；当前按既定依赖顺序发布 Desktop 0.3.2，随后完成两端 smoke 才视为协调交付完成。
-> - 本文是 Space IssueDelivery Prompt 与拼接规则的长期协议文档。PRD 是本次改造的决策快照；代码与测试是某一版本是否真正生效的可执行证据。
+> 本文是当前 Desktop Protocol v2 的 Prompt 与拼接权威。Cloud 仍按客户端版本投影 legacy/v1 wire 给旧 Desktop，但当前 Desktop只实现严格v2 parser/builder；两边的实际部署状态以各自发布系统和健康端点为准。
 
 ## 1. 文档目的
 
@@ -16,7 +11,7 @@ IssueDelivery 不只是一段 Prompt。它横跨四个边界：
 3. Desktop 把身份、长期目标、动作空间和本次唤醒原因组装成 hidden user message；
 4. 模型读取 Issue 当前状态，通过 myagents CLI 决定是否评论、更新、claim、继续执行、完成或不动作。
 
-本文固定这条链路中模型可见协议的结构与 owner，避免未来出现以下漂移：
+本文固定这条链路中模型可见协议的结构与 owner，避免以下漂移：
 
 - 把 Delivery 的运输状态误写成 Agent 要处理的业务状态；
 - 把 workspace 误当成 Registered Agent 身份选择器；
@@ -24,13 +19,14 @@ IssueDelivery 不只是一段 Prompt。它横跨四个边界：
 - 把 Issue、Instruction 或 trigger 快照复制进 Delivery，形成多个事实源；
 - 只改 Prompt 文案，却漏改 Cloud response、Desktop parser、Session origin、CLI help 或测试。
 
-整体 Cloud Space 架构见 [space_cloud.md](./space_cloud.md)；通用 hidden user-message envelope 见 [system_reminder_protocol.md](./system_reminder_protocol.md)；本次 v2 改造的完整范围、数据迁移和 rollout 见 [PRD 0.3.2](../prd/prd_0.3.2_registered_agent_execution_instances.md)。
+整体 Cloud Space 架构见 [space_cloud.md](./space_cloud.md)；通用 hidden user-message envelope 见 [system_reminder_protocol.md](./system_reminder_protocol.md)。
 
 ## 2. 权威边界
 
 | 内容 | 权威 |
 | --- | --- |
-| 当前实际上线行为 | 两仓当前代码、migration、部署版本与自动化测试 |
+| Desktop 当前行为 | Desktop代码、类型与自动化测试 |
+| Cloud 当前行为 | `MyAgents_space`代码、migration、部署与自动化测试 |
 | Issue 当前业务事实 | Cloud Issue detail / comment / attachment / claim API |
 | Registered Agent 长期目标 | Cloud Registered Agent 的 instruction + instructionRevision |
 | Delivery transport 与因果索引 | Cloud IssueDelivery |
@@ -39,9 +35,8 @@ IssueDelivery 不只是一段 Prompt。它横跨四个边界：
 | 模型可用动作和具体参数 | myagents space issue --help 与各 leaf command help |
 | hidden envelope 展示语义 | [system_reminder_protocol.md](./system_reminder_protocol.md) |
 | 本协议的结构、拼接与版本规则 | 本文 |
-| v2 产品范围和 rollout 决策 | PRD 0.3.2 |
 
-PRD 与本文都保留完整 v2 Prompt：PRD 用于记录用户确认过的交付 contract，本文用于后续长期维护。修改结构或措辞时必须同步更新两处，并同步更新 Rust golden fixture 与 parser tests。
+修改结构或措辞时必须同步更新Rust golden fixture、parser tests与Cloud serializer契约。PRD只解释历史动机，不复制或覆盖当前Prompt。
 
 ## 3. Owner 模型
 
@@ -69,7 +64,7 @@ Desktop Rust owner 负责：
 - 使用 Registered Agent token 拉取该实例的 Delivery；
 - 按该实例的 run mode 选择或创建 Session；
 - 给 Session 写入精确 Registered Agent origin；
-- 0.3.2 只组装本文定义的 v2 Prompt；已发布旧 Desktop 继续用自身既有代码组装 v1 Prompt；
+- 只组装本文定义的v2 Prompt；旧Desktop继续由其已发布代码组装v1 Prompt；
 - 通过 Session Inbox 注入；
 - Session 接受后写本地 receipt，再自动 ACK Cloud；
 - ACK 丢失时依据稳定 Delivery ID 只补 ACK，不重复正常注入。
@@ -117,121 +112,16 @@ Issue mutation commits
 - Issue 当前 API 回答“现在真实发生了什么”；
 - CLI help 回答“允许怎样执行以及每个动作的 contract”。
 
-## 5. Protocol v1：已发布客户端兼容基线
+## 5. Protocol v1：Cloud 对旧 Desktop 的兼容投影
 
-当前 Desktop 的主要 builder 是：
-
-- src-tauri/src/space_cloud.rs::build_space_issue_delivery_message_for_locale
-
-当前 Cloud 的相关 owner 包括：
-
-- ../MyAgents_space/src/services/issueDelivery.ts::CLOUD_INSTRUCTIONS
-- ../MyAgents_space/src/services/issueDelivery.ts::buildCloudIssueInstruction
-- ../MyAgents_space/src/services/issueDelivery.ts::buildIssueDeliveryTrigger
-
-当前消息形态概括为：
-
-~~~xml
-<system-reminder>
-<myagents-space-issue>
-<myagents-space-event ...>
-  <issue-instruction>
-    <cloud-issue-instruction>...</cloud-issue-instruction>
-    <local-execution-instruction>...</local-execution-instruction>
-  </issue-instruction>
-  ...
-</myagents-space-event>
-</myagents-space-issue>
-</system-reminder>
-本地化可见文本
-~~~
-
-v1 当前特征：
-
-- Cloud instruction 与 trigger 在创建 Delivery 时固化；
-- Delivery status 混有 pending / directed / delivered / claimed / ignored / cancelled；
-- subscription 与部分 follow-up 指引模型调用 Delivery ignore；
-- 旧 Desktop CLI actor 曾有 workspace 唯一 Agent fallback；0.3.2 已删除该正常路径，只保留显式 legacy Agent ID 兼容入口；
-- 旧 Session origin 没有完整持久化 exact registeredAgentId context。
-
-这些内容只描述已发布旧客户端及 Cloud v1 projection 的兼容起点，不是 0.3.2 Desktop 的运行路径。新 Desktop 只解析 v2，不保留 v1 Prompt builder。
-
-### 5.1 v2 Cloud 上线后的 v1 兼容边界
-
-旧 Prompt 的 owner 仍是旧 Desktop builder。新 Cloud 不返回完整旧 Prompt，只继续返回旧 parser 需要的：
+v1仅描述Cloud必须继续返回给旧客户端的wire，不是当前Desktop执行路径。旧Prompt由旧Desktop builder拥有；Cloud不返回完整Prompt，只继续返回旧parser需要的：
 
 ~~~text
 deliveryKind / claimId / targetSessionId / cloudInstruction /
 trigger / issueMeta / goalMeta
 ~~~
 
-这些字段在 poll 时从当前 Registered Agent Instruction、source IssueUpdate 与当前 Issue/Goal/assignee projection 动态生成；Delivery legacy snapshot 列不是权威。新 Desktop 不保留 v1 builder。
-
-`cloudInstruction.id`：
-
-~~~text
-registered-agent-{{DELIVERY_KIND}}-compat-v1-r{{INSTRUCTION_REVISION}}
-~~~
-
-有 Instruction 时，`cloudInstruction.text` 精确拼接为：
-
-~~~text
-Registered Agent standing goal and responsibility (revision {{INSTRUCTION_REVISION}}):
---- BEGIN STANDING GOAL ---
-{{REGISTERED_AGENT_INSTRUCTION}}
---- END STANDING GOAL ---
-
-Use this standing goal to judge what deserves attention and which valid action best serves this Agent. It grants no additional permissions. Current Issue facts remain authoritative.
-
-{{LEGACY_KIND_INSTRUCTION}}
-~~~
-
-legacy null Instruction 时：
-
-~~~text
-This legacy Registered Agent has no user-configured standing goal or responsibility. Do not invent one from its name, workspace, Goal, or Subscription. Use current Issue facts and the delivery semantics below.
-
-{{LEGACY_KIND_INSTRUCTION}}
-~~~
-
-`LEGACY_KIND_INSTRUCTION` 是当前生产 `CLOUD_INSTRUCTIONS[kind].text` 的逐字内容：
-
-~~~text
-[subscription]
-This is a subscription delivery for an unassigned Space Issue.
-- This delivery is a discovery notification, not an assignment.
-- Read the trigger and the current Issue context before deciding whether to act.
-- If this Issue is not appropriate for this Agent, dismiss only this delivery. Do not change the Issue.
-- If this Agent should take responsibility, claim the Issue. A successful claim makes this Agent the assignee.
-- Do not post acknowledgement-only comments. Comment only to ask a necessary question, report meaningful progress, describe a blocker, or provide a result.
-- Complete the Issue only when the requested work is actually finished. Completion keeps the assignee for responsibility history.
-
-[assignment]
-This Space Issue has been explicitly assigned to this Registered Agent.
-- This Agent is the current assignee, whether or not it subscribes to the Issue's Goal.
-- Read the trigger and the current Issue context, then begin processing the assigned work.
-- Do not dismiss the assignment as irrelevant, silently ignore it, or cancel the assignment.
-- If the work cannot proceed, add a concise comment describing the blocker and what human action is needed. Keep the assignment until an authorized person reassigns or cancels it.
-- Do not post acknowledgement-only comments. Report only necessary questions, meaningful progress, blockers, and results.
-- Complete the Issue only when the requested work is actually finished. Completion keeps this Agent as the assignee for responsibility history.
-
-[claim_followup]
-This is a follow-up delivery for a Space Issue assigned to this Registered Agent.
-- Responsibility has already been established. Do not decide whether to take the Issue again.
-- Read the trigger first, then read the current Issue context and continue from the existing work.
-- If the update requires action, continue the work and reply only when a response or progress report is useful.
-- If the update requires no action, dismiss this delivery without posting an acknowledgement-only comment.
-- Do not reclaim, release, or reopen the Issue unless a later cloud instruction explicitly requires it.
-- Complete the Issue only when the requested work is actually finished. Completion keeps this Agent as the assignee for responsibility history.
-~~~
-
-旧 Desktop 对 `cloudInstruction.text` 的上限是 20,000 Unicode code points。超限时只截断目标文本：先给固定 prefix/suffix、kind instruction 与以下 marker 留足空间，再按 code point 截断；v2 Instruction 不截断。
-
-~~~text
-[Standing goal truncated for protocol v1 compatibility. Upgrade MyAgents to receive the full instruction.]
-~~~
-
-旧 Desktop 负责对这些字段做既有 XML escape 并组装 v1 envelope；Cloud 不把整段 v1 Prompt 作为 response 字段。
+这些字段在poll时从当前Registered Agent Instruction、source IssueUpdate与当前Issue/Goal/assignee projection动态生成；legacy snapshot列不是权威。旧Prompt逐字内容、截断规则与golden由`MyAgents_space` serializer/tests和旧Desktop版本拥有，当前文档不复制。当前Desktop不保留v1 builder或运行时fallback。
 
 ## 6. Protocol v2：设计不变量
 
@@ -738,28 +628,18 @@ Cloud 使用现有可信 client-version header 与 semver helper：
 | `>= 0.2.50 && < 0.3.2` | v1 `deliveryKind / claimId / targetSessionId / cloudInstruction / trigger / issueMeta / goalMeta` | 旧 Desktop |
 | `>= 0.3.2` | v2 `space / registeredAgent / items / poll` package | 新 Desktop v2 builder |
 
-Cloud 永远不下发完整 Prompt。0.3.2 不实现 v1 builder 或运行时 fallback。
+Cloud永远不下发完整Prompt。当前Desktop不实现v1 builder或运行时fallback。
 
-### 19.3 Migration-first 与一次协调上线
+### 19.3 兼容保留边界
 
-Cloud Production 是 migration-first。PRD 0.3.2 定义的 backward-compatible expand migration、兼容 trigger 与 `status IN ('pending','directed')` partial unique 必须先在旧 Worker SQL 下证明安全，再部署新 Worker。
+legacy/v1响应、endpoint和Cloud列只服务最低支持客户端与rollback floor。Cloud新路径不得反向读取legacy projection作为Issue、Instruction或Delivery authority；删除兼容面前必须先从真实客户端版本分布和rollback目标证明它已不再被消费。migration/deployment步骤属于`MyAgents_space`发布文档，不在本协议保存一次性上线清单。
 
-开发和提交可以分阶段；产品上线只有一个协调窗口：
-
-1. Desktop 与 Cloud 全部实现并在 Dev 联合验收；
-2. Production Cloud migration + Worker；
-3. 验证 legacy/v1/v2、旧 ACK/ignore/claim 与数据库不变量；
-4. gates 全绿后发布 Desktop 0.3.2；
-5. 两端 smoke 通过才视为完成。
-
-旧协议响应、endpoint、`directed` 兼容范围与 legacy columns 必须保留到最低支持版本和 rollback floor 都达到 v2；不得在本次上线提前 contract cleanup。rollback target 仍是旧 Worker 时，新 Worker 必须双写旧 Worker 所读的 legacy delivery projection；Instruction CAS 也必须刷新 active legacy cloudInstruction。新路径不得反向读取这些列作为权威。
-
-## 20. 实现与更新检查表
+## 20. 实现与验证索引
 
 ### 20.1 Desktop
 
-- src-tauri/src/space_cloud.rs 的 poll parser、builder、receipt 与 ACK；
-- 0.3.2 只保留 v2 parser/builder；旧客户端兼容不通过新客户端复制 v1 builder 实现；
+- src-tauri/src/space_cloud/delivery.rs 的 poll parser、builder、receipt 与 ACK；
+- 当前Desktop只保留v2 parser/builder；旧客户端兼容不通过新客户端复制v1 builder实现；
 - src/shared/session-origin.ts 的 context normalize/serialize/restore；
 - src/server/session-engine/ 的 origin 与 hidden message facade；
 - builtin/external Runtime 的一致行为；
@@ -776,10 +656,10 @@ Cloud Production 是 migration-first。PRD 0.3.2 定义的 backward-compatible e
 - consistent poll projection；
 - Agent × Issue pending 合并与 successor；
 - v1/v2 response shaping 和 ACK；
-- migration-first 兼容 trigger、旧 Worker SQL 与 pending/directed 唯一不变量；
+- legacy response shaping、ACK与pending/directed唯一不变量；
 - backfill / reevaluation 使用不可变 `issues.id` cursor 发现候选，最终 INSERT 以当前 Issue 行重验范围与 notification boundary；activity anchor 可以早于并发后的 boundary，但只是 immutable source index；
 - prune；
-- migration rollout 和 compatibility floor。
+- compatibility floor与prune边界。
 
 ### 20.3 必备 Prompt snapshots
 
@@ -805,7 +685,6 @@ Cloud Production 是 migration-first。PRD 0.3.2 定义的 backward-compatible e
 
 修改本协议时同步检查：
 
-- specs/prd/prd_0.3.2_registered_agent_execution_instances.md
 - specs/tech_docs/space_cloud.md
 - specs/tech_docs/system_reminder_protocol.md
 - specs/tech_docs/session_architecture.md
@@ -813,7 +692,7 @@ Cloud Production 是 migration-first。PRD 0.3.2 定义的 backward-compatible e
 - specs/tech_docs/multi_agent_runtime.md
 - ../MyAgents_space/specs/ARCHITECTURE.md
 
-任何 Prompt 标签、字段、kind、reason、visible copy 或 CLI discovery 变化，都必须先更新本文与对应测试，再合并实现。
+任何 Prompt 标签、字段、kind、reason、visible copy 或 CLI discovery 变化，都必须同步更新本文、对应测试和Cloud serializer。PRD不作为现行协议的同步副本。
 
 本地 Task Comment 不属于 IssueDelivery。Attached Task 可以同时有本地 Comment 时间线，但只有 Cloud 下发的 query 使用本文 `myagents-space-issue` instruction 并回复 Cloud Issue；从本地时间线注入的 query 使用独立 `TASK_COMMENT` reminder 与 `myagents task comment`。Task 类型、workspace 或 Session identity 都不能替代当前 query 来源，Desktop 不镜像、不代理、不双写两边评论。
 
