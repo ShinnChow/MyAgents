@@ -1597,7 +1597,7 @@ export const PRESET_PROVIDERS: Provider[] = [
       haiku: 'deepseek-v4-flash',
     },
     models: [
-      // DeepSeek V4 系纯文本；视觉能力在独立的 DeepSeek-VL2 / Janus 模型族。
+      // V4 Pro / Flash 为纯文本；Vision Exp 支持图像输入及 Anthropic API。
       // deepseek-chat / deepseek-reasoner 已退化为 v4-flash 的别名且 2026-07-24 硬下线，故移除。
       {
         model: 'deepseek-v4-pro',
@@ -1614,6 +1614,15 @@ export const PRESET_PROVIDERS: Provider[] = [
         contextLength: 1_000_000,
         maxOutputTokens: 384_000,
         inputModalities: ['text'],
+      },
+      // https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ (2026-09-05)
+      {
+        model: 'deepseek-v4-flash-vision-exp',
+        modelName: 'DeepSeek V4 Flash Vision Exp',
+        modelSeries: 'deepseek',
+        contextLength: 1_000_000,
+        maxOutputTokens: 384_000,
+        inputModalities: ['text', 'image'],
       },
     ],
   },
@@ -1720,7 +1729,7 @@ export const PRESET_PROVIDERS: Provider[] = [
     },
     modelAliases: { sonnet: 'glm-5.3', opus: 'glm-5.3', haiku: 'glm-5-turbo' },
     models: [
-      // GLM-5.x chat 端点为纯文本；视觉能力在独立的 GLM-5V 模型族。
+      // GLM-5.3 / 5 Turbo 为纯文本；5.3 Flash 为原生多模态。
       {
         model: 'glm-5.3',
         modelName: 'GLM 5.3',
@@ -1728,6 +1737,15 @@ export const PRESET_PROVIDERS: Provider[] = [
         contextLength: 1_000_000,
         maxOutputTokens: 131_072,
         inputModalities: ['text'],
+      },
+      // https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash (2026-09-05)
+      {
+        model: 'glm-5.3-flash',
+        modelName: 'GLM 5.3 Flash',
+        modelSeries: 'zhipu',
+        contextLength: 1_000_000,
+        maxOutputTokens: 131_072,
+        inputModalities: ['text', 'image', 'video'],
       },
       {
         model: 'glm-5-turbo',
@@ -1762,7 +1780,7 @@ export const PRESET_PROVIDERS: Provider[] = [
     },
     modelAliases: { sonnet: 'glm-5.3', opus: 'glm-5.3', haiku: 'glm-5-turbo' },
     models: [
-      // GLM-5.x chat 端点为纯文本；视觉能力在独立的 GLM-5V 模型族。
+      // GLM-5.3 / 5 Turbo 为纯文本；5.3 Flash 为原生多模态。
       {
         model: 'glm-5.3',
         modelName: 'GLM 5.3',
@@ -1770,6 +1788,15 @@ export const PRESET_PROVIDERS: Provider[] = [
         contextLength: 1_000_000,
         maxOutputTokens: 131_072,
         inputModalities: ['text'],
+      },
+      // https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash (2026-09-05)
+      {
+        model: 'glm-5.3-flash',
+        modelName: 'GLM 5.3 Flash',
+        modelSeries: 'zhipu',
+        contextLength: 1_000_000,
+        maxOutputTokens: 131_072,
+        inputModalities: ['text', 'image', 'video'],
       },
       {
         model: 'glm-5-turbo',

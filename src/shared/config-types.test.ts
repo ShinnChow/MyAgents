@@ -257,13 +257,13 @@ describe('Chat history entry developer gate', () => {
 });
 
 describe('Zhipu preset models', () => {
-  it('ships only GLM-5.3 and GLM-5 Turbo in both presets and defaults to GLM-5.3', () => {
+  it('ships GLM-5.3, GLM-5.3 Flash and GLM-5 Turbo in both presets and defaults to GLM-5.3', () => {
     for (const providerId of ['zhipu', 'zhipu-ai']) {
       const provider = PRESET_PROVIDERS.find(p => p.id === providerId);
       const model = provider?.models.find(m => m.model === 'glm-5.3');
 
       expect(provider?.primaryModel).toBe('glm-5.3');
-      expect(provider?.models.map(item => item.model)).toEqual(['glm-5.3', 'glm-5-turbo']);
+      expect(provider?.models.map(item => item.model)).toEqual(['glm-5.3', 'glm-5.3-flash', 'glm-5-turbo']);
       expect(model).toMatchObject({
         modelName: 'GLM 5.3',
         modelSeries: 'zhipu',
