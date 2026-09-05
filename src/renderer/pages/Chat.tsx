@@ -1,3 +1,4 @@
+import type { FilePreviewHandle } from '@/components/FilePreviewModal';
 import { AlertTriangle, Bot, Globe, History, Loader2, MessageSquarePlus, PanelRight, RotateCcw, TerminalSquare, X } from 'lucide-react';
 import { forwardRef, lazy, Suspense, useCallback, useEffect, useImperativeHandle, useMemo, useReducer, useRef, useState } from 'react';
 import type { TFunction } from 'i18next';
@@ -771,6 +772,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   // markdown rendered preview.
   const isSplitViewEnabled = config.experimentalSplitView ?? true;
   const [splitFile, setSplitFile] = useState<SplitPreviewFile | null>(null);
+  const splitFilePreviewRef = useRef<FilePreviewHandle>(null);
   // Clear split panel when feature is turned off (prevents stale split state)
   useEffect(() => { if (!isSplitViewEnabled) setSplitFile(null); }, [isSplitViewEnabled]);
   const [splitRatio, setSplitRatio] = useState(0.5); // 0-1, left panel fraction
@@ -882,9 +884,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
   useCloseLayer(() => {
     if (!splitPanelVisible) return false;
     if (splitActiveView === 'file' && splitFile) {
-      setSplitFile(null);
-      if (browserUrl) setSplitActiveView('browser');
-      else if (terminalPinned && terminalAlive) setSplitActiveView('terminal');
+      splitFilePreviewRef.current?.close();
       return true;
     }
     if (splitActiveView === 'terminal' && terminalPinned) {
@@ -5741,9 +5741,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
                       role="button"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setSplitFile(null);
-                        if (browserUrl) setSplitActiveView('browser');
-                        else if (terminalPinned && terminalAlive) setSplitActiveView('terminal');
+                        splitFilePreviewRef.current?.close();
                       }}
                       className="ml-0.5 flex h-5 w-5 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--paper-inset)] group-hover:opacity-100"
                       title={t('shell.split.closeFile')}
@@ -5837,6 +5835,7 @@ export default function Chat({ windowPresentation, onNewSession, onOpenSession, 
               <div className={`flex min-w-0 flex-1 flex-col overflow-hidden bg-[var(--paper-elevated)] ${splitActiveView !== 'file' ? 'hidden' : ''}`}>
                 <Suspense fallback={<div className="flex h-full items-center justify-center text-[var(--ink-muted)]"><Loader2 className="h-5 w-5 animate-spin" /></div>}>
                   <FilePreviewModal
+                    ref={splitFilePreviewRef}
                     name={splitFile.name}
                     content={splitFile.content}
                     size={splitFile.size}

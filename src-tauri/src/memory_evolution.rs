@@ -203,6 +203,17 @@ fn job_spec(
     }
 }
 
+// Reconcile owns a complete target, unlike TaskUpdateInput's partial PATCH.
+// Some({}) explicitly replaces stale runtime config; None runtime clears both.
+fn desired_runtime_config(request: &ConfigureMemoryEvolutionTasksRequest) -> Option<Value> {
+    request.runtime.as_ref().map(|_| {
+        request
+            .runtime_config
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({}))
+    })
+}
+
 async fn ensure_job_running(
     store: &std::sync::Arc<task::TaskStore>,
     request: &ConfigureMemoryEvolutionTasksRequest,
@@ -243,7 +254,7 @@ async fn ensure_job_running(
                     permission_mode: None,
                     preselected_session_id: None,
                     runtime: request.runtime.clone(),
-                    runtime_config: request.runtime_config.clone(),
+                    runtime_config: desired_runtime_config(request),
                     mcp_enabled_servers: request.mcp_enabled_servers.clone(),
                     managed_kind: Some(spec.managed_kind.to_string()),
                     source_record_id: None,
@@ -277,22 +288,35 @@ async fn stop_job_for_update(
     task: &task::Task,
     reason: &str,
 ) -> Result<(), String> {
+    let control = crate::task_scheduler::acquire_task_control(&task.id).await;
+    stop_job_with_control(store, task, reason, &control).await
+}
+
+async fn stop_job_with_control(
+    store: &std::sync::Arc<task::TaskStore>,
+    task: &task::Task,
+    reason: &str,
+    control: &crate::task_scheduler::TaskControlGuard,
+) -> Result<(), String> {
     if matches!(task.status, TaskStatus::Running | TaskStatus::Verifying) {
         store
-            .update_status(TaskUpdateStatusInput {
-                id: task.id.clone(),
-                status: TaskStatus::Stopped,
-                message: Some(reason.to_string()),
-                actor: TransitionActor::System,
-                source: Some(TransitionSource::Scheduler),
-            })
+            .update_status_with_task_control_held(
+                TaskUpdateStatusInput {
+                    id: task.id.clone(),
+                    status: TaskStatus::Stopped,
+                    message: Some(reason.to_string()),
+                    actor: TransitionActor::System,
+                    source: Some(TransitionSource::Scheduler),
+                },
+                control,
+            )
             .await?;
     } else if crate::task_scheduler::get_task_scheduler()
         .is_executing(&task.id)
         .await
     {
         crate::task_scheduler::get_task_scheduler()
-            .stop(&task.id)
+            .stop_with_control_held(&task.id, control)
             .await?;
     }
     Ok(())
@@ -304,6 +328,11 @@ async fn reconcile_existing_job(
     spec: &EvoJobSpec,
     existing: task::Task,
 ) -> Result<task::Task, String> {
+    let control = crate::task_scheduler::acquire_task_control(&existing.id).await;
+    let existing = store
+        .get(&existing.id)
+        .await
+        .ok_or_else(|| "memory evolution task disappeared during reconcile".to_string())?;
     let desired_window = recurring_window(
         request.memory_auto_update.as_ref(),
         request.heartbeat.as_ref(),
@@ -341,11 +370,7 @@ async fn reconcile_existing_job(
         .and_then(|dir| std::fs::read_to_string(dir.join("task.md")).ok());
 
     let runtime_drift = existing.runtime != request.runtime
-        || (request.runtime.is_none() && existing.runtime_config.is_some())
-        || request
-            .runtime_config
-            .as_ref()
-            .is_some_and(|desired| existing.runtime_config.as_ref() != Some(desired));
+        || existing.runtime_config != desired_runtime_config(request);
     let mcp_drift = existing.mcp_enabled_servers != request.mcp_enabled_servers;
     let drifted = existing.name != spec.name
         || existing.description.as_deref() != Some(desired_description)
@@ -372,50 +397,50 @@ async fn reconcile_existing_job(
         return Ok(existing);
     }
 
+    let update = TaskUpdateInput {
+        id: existing.id.clone(),
+        name: Some(spec.name.to_string()),
+        executor: None,
+        description: Some(desired_description.to_string()),
+        workspace_id: None,
+        workspace_path: None,
+        execution_mode: Some(TaskExecutionMode::Recurring),
+        run_mode: Some(TaskRunMode::NewSession),
+        end_conditions: Some(TaskEndConditions::default()),
+        interval_minutes: Some(spec.interval_minutes),
+        cron_expression: Some(String::new()),
+        cron_timezone: Some(String::new()),
+        start_at: Some(start_at),
+        recurring_window: Some(desired_window),
+        dispatch_at: None,
+        trigger: None,
+        clear_trigger: true,
+        model: None,
+        provider_id: None,
+        clear_provider_override: true,
+        permission_mode: Some(String::new()),
+        preselected_session_id: Some(String::new()),
+        runtime: request.runtime.clone(),
+        runtime_config: desired_runtime_config(request),
+        clear_runtime_override: request.runtime.is_none(),
+        mcp_enabled_servers: request.mcp_enabled_servers.clone(),
+        clear_mcp_override: request.mcp_enabled_servers.is_none(),
+        tags: Some(desired_tags),
+        notification: Some(desired_notification),
+        notification_patch: None,
+        prompt: Some(spec.prompt.clone()),
+    };
+    task::validate_task_update_execution_routing(&existing, &update)?;
     if matches!(existing.status, TaskStatus::Running | TaskStatus::Verifying) {
-        stop_job_for_update(
+        stop_job_with_control(
             store,
             &existing,
             "memory evolution settings changed; re-arming",
+            &control,
         )
         .await?;
     }
-
-    store
-        .update(TaskUpdateInput {
-            id: existing.id,
-            name: Some(spec.name.to_string()),
-            executor: None,
-            description: Some(desired_description.to_string()),
-            workspace_id: None,
-            workspace_path: None,
-            execution_mode: Some(TaskExecutionMode::Recurring),
-            run_mode: Some(TaskRunMode::NewSession),
-            end_conditions: Some(TaskEndConditions::default()),
-            interval_minutes: Some(spec.interval_minutes),
-            cron_expression: Some(String::new()),
-            cron_timezone: Some(String::new()),
-            start_at: Some(start_at),
-            recurring_window: Some(desired_window),
-            dispatch_at: None,
-            trigger: None,
-            clear_trigger: true,
-            model: None,
-            provider_id: None,
-            clear_provider_override: true,
-            permission_mode: Some(String::new()),
-            preselected_session_id: Some(String::new()),
-            runtime: request.runtime.clone(),
-            runtime_config: request.runtime_config.clone(),
-            clear_runtime_override: request.runtime.is_none(),
-            mcp_enabled_servers: request.mcp_enabled_servers.clone(),
-            clear_mcp_override: request.mcp_enabled_servers.is_none(),
-            tags: Some(desired_tags),
-            notification: Some(desired_notification),
-            notification_patch: None,
-            prompt: Some(spec.prompt.clone()),
-        })
-        .await
+    store.update_with_task_control_held(update, &control).await
 }
 
 async fn backfill_system_maintenance_session_markers(
@@ -716,6 +741,93 @@ async fn find_existing_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reconcile_replaces_legacy_execution_identity_in_place() {
+        task::ensure_test_docs_root();
+        for kind in [MANAGED_KIND_MEMORY_GARDENER, MANAGED_KIND_MEMORY_MOLT] {
+            for runtime in [Some("builtin"), Some("codex"), Some("gemini"), None] {
+                let dir = tempfile::tempdir().unwrap();
+                let id = uuid::Uuid::new_v4().to_string();
+                let legacy: task::Task = serde_json::from_value(serde_json::json!({
+                    "id": id, "name": "legacy", "executor": "agent",
+                    "workspaceId": "workspace", "workspacePath": dir.path(),
+                    "executionMode": "recurring", "runMode": "new-session",
+                    "status": "stopped", "createdAt": 1, "updatedAt": 1,
+                    "dispatchOrigin": "direct", "managedKind": kind,
+                    "runtime": "codex", "runtimeConfig": {"source": "managed-provider"},
+                    "sessionIds": ["historical-session"], "lastExecution": {
+                        "at": 100, "trigger": "scheduled", "success": true, "durationMs": 10
+                    }
+                }))
+                .unwrap();
+                std::fs::write(
+                    dir.path().join("tasks.jsonl"),
+                    format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+                )
+                .unwrap();
+                let store = std::sync::Arc::new(task::TaskStore::new(dir.path().to_path_buf()));
+                let request = ConfigureMemoryEvolutionTasksRequest {
+                    agent_id: "agent".into(),
+                    workspace_id: "workspace".into(),
+                    workspace_path: dir.path().to_string_lossy().into_owned(),
+                    runtime: runtime.map(str::to_string),
+                    runtime_config: None,
+                    mcp_enabled_servers: None,
+                    memory_auto_update: None,
+                    heartbeat: None,
+                    enabled: true,
+                };
+                let spec = job_spec(
+                    kind,
+                    "Memory job",
+                    4320,
+                    "memory-skill",
+                    &request.workspace_path,
+                );
+                let updated = reconcile_existing_job(&store, &request, &spec, legacy.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(updated.id, legacy.id);
+                assert_eq!(updated.created_at, legacy.created_at);
+                assert_eq!(updated.session_ids, legacy.session_ids);
+                assert_eq!(updated.last_execution.as_ref().unwrap().at, 100);
+                assert_eq!(updated.status_history.len(), legacy.status_history.len());
+                assert_eq!(updated.runtime, request.runtime);
+                assert_eq!(
+                    updated.runtime_config,
+                    runtime.map(|_| serde_json::json!({}))
+                );
+                let again = reconcile_existing_job(&store, &request, &spec, updated.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&again).unwrap(),
+                    serde_json::to_value(&updated).unwrap()
+                );
+                let persisted = task::TaskStore::new(dir.path().to_path_buf())
+                    .get(&id)
+                    .await
+                    .unwrap();
+                assert_eq!(persisted.runtime_config, updated.runtime_config);
+                // Reconciliation must not bypass validation or stop/change the old job on rejection.
+                let invalid = ConfigureMemoryEvolutionTasksRequest {
+                    runtime: Some("builtin".into()),
+                    runtime_config: Some(serde_json::json!({"source": "managed-provider"})),
+                    ..request
+                };
+                assert!(
+                    reconcile_existing_job(&store, &invalid, &spec, updated.clone())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    serde_json::to_value(store.get(&id).await.unwrap()).unwrap(),
+                    serde_json::to_value(updated).unwrap()
+                );
+            }
+        }
+    }
 
     fn run(at: i64, success: bool) -> TaskLastExecution {
         TaskLastExecution {

@@ -117,6 +117,7 @@ pub async fn cmd_workspace_rename(
 ) -> Result<RenameResult, String> {
     validate_item_name(new_name.trim())?;
     let workspace_root = validate_workspace_root(&workspace)?;
+    let _mutation = super::acquire_edit_mutation(&workspace_root).await;
     let old_resolved = resolve_inside_workspace(&workspace_root, old_path.trim())?;
     if !slot_occupied(&old_resolved) {
         return Err("File or folder not found".to_string());
@@ -136,6 +137,13 @@ pub async fn cmd_workspace_rename(
         .map_err(|_| "Path escaped workspace".to_string())?
         .to_string_lossy()
         .replace('\\', "/");
+    super::watcher::emit_committed_moves(
+        &workspace_root,
+        &[MovedFile {
+            old_path: relativize(&old_resolved, &workspace_root),
+            new_path: rel.clone(),
+        }],
+    );
     Ok(RenameResult {
         success: true,
         new_path: rel,
@@ -152,6 +160,7 @@ pub async fn cmd_workspace_move(
         return Err("sourcePaths is required".to_string());
     }
     let workspace_root = validate_workspace_root(&workspace)?;
+    let _mutation = super::acquire_edit_mutation(&workspace_root).await;
     let target = resolve_inside_workspace(&workspace_root, target_dir.trim())?;
     reject_managed_global_skill_mutation(&workspace_root, &target)?;
     if !target.is_dir() {
@@ -256,6 +265,7 @@ pub async fn cmd_workspace_move(
         });
     }
 
+    super::watcher::emit_committed_moves(&workspace_root, &moved);
     Ok(MoveResult {
         success: true,
         moved_files: moved,

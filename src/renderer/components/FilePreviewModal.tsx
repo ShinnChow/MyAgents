@@ -15,7 +15,7 @@
  */
 import { AtSign, Check, Copy, Edit2, Expand, Eye, FolderOpen, Loader2, LocateFixed, MoreHorizontal, X } from 'lucide-react';
 import Tip from './Tip';
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useState, useRef } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useImperativeHandle, useMemo, useState, useRef, type Ref } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 
@@ -26,6 +26,7 @@ import { useWorkspaceFileService } from '@/hooks/useWorkspaceFileService';
 import type { RichDocKind } from '../../shared/fileTypes';
 import type { FilePreviewFocusTarget } from '@/types/filePreview';
 import { getEditorMonacoLanguage, hasPathologicallyLongLine, isMarkdownFile } from '@/utils/languageUtils';
+import { remapWorkspacePath, type WorkspacePathMove } from '@/utils/workspacePathMoves';
 import { shortenPathForDisplay } from '@/utils/pathDetection';
 import { retainFocusOnMouseDown } from '@/utils/focusRetention';
 import { copyMarkdownAsRichText, copyPlainText } from '@/utils/markdownClipboard';
@@ -58,7 +59,12 @@ const monacoLoading = (
 const AUTO_SAVE_DELAY = 1000;
 
 
+export interface FilePreviewHandle {
+    close: () => void;
+}
+
 interface FilePreviewModalProps {
+    ref?: Ref<FilePreviewHandle>;
     /** File name to display */
     name: string;
     /** File content */
@@ -353,6 +359,7 @@ function MdViewSegment({
 }
 
 export default function FilePreviewModal({
+    ref,
     name,
     content,
     size,
@@ -439,6 +446,9 @@ export default function FilePreviewModal({
     const externalUpdatePendingRef = useRef(false);
 
     // Auto-save state (for any direct-edit file)
+    const relocationRef = useRef<{ from: string; to: string } | null>(null);
+    const documentGenerationRef = useRef(0);
+    const [fileUnavailable, setFileUnavailable] = useState(false);
     const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
     const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const isSavingRef = useRef(false); // guard against concurrent saves
@@ -456,6 +466,12 @@ export default function FilePreviewModal({
     // `b.md`'s path (pathRef updates synchronously below). Adding `path`/`name` to deps
     // forces the timer-clear + state-reset on file switch even when content is identical.
     useEffect(() => {
+        // A committed rename preserves this document's draft and save baseline.
+        // Only navigation to a different document resets the buffer.
+        if (relocationRef.current?.to === path) return;
+        relocationRef.current = null;
+        documentGenerationRef.current += 1;
+        setFileUnavailable(false);
         if (debounceTimerRef.current) {
             clearTimeout(debounceTimerRef.current);
             debounceTimerRef.current = null;
@@ -463,7 +479,7 @@ export default function FilePreviewModal({
         setEditContent(content);
         setSavedContent(content);
         setMoreMenuOpen(false);
-    }, [content, path, name]);
+    }, [content, path, name, workspacePath]);
 
     // Reset markdown view-mode + cancel any in-flight inline rename when the
     // file identity changes. Modal is reused for split-view file switches
@@ -474,6 +490,10 @@ export default function FilePreviewModal({
     //   - a rename draft from file A could commit against file B if the user
     //     switches files mid-rename.
     useEffect(() => {
+        if (relocationRef.current?.to === path) {
+            relocationRef.current = null;
+            return;
+        }
         setMdViewMode(initialEditMode ? 'edit' : 'preview');
         setIsEditingName(false);
         externalUpdatePendingRef.current = false;
@@ -510,7 +530,9 @@ export default function FilePreviewModal({
     const fileServiceRef = useRef(fileService);
     fileServiceRef.current = fileService;
     const pathRef = useRef(path);
-    pathRef.current = path;
+    if (!relocationRef.current || path !== relocationRef.current.from) {
+        pathRef.current = path;
+    }
     const onSavedRef = useRef(onSaved);
     onSavedRef.current = onSaved;
     const onExternalContentUpdatedRef = useRef(onExternalContentUpdated);
@@ -530,6 +552,8 @@ export default function FilePreviewModal({
                 content: contentToSave,
                 expectedContent,
             });
+        } else {
+            throw new Error('File saving is unavailable');
         }
     }, []); // stable — all deps via refs
 
@@ -542,11 +566,24 @@ export default function FilePreviewModal({
     // Read-only markdown stays in preview regardless of toggle (the toggle is hidden anyway).
     const isMdEditView = isMarkdown && canEdit && mdViewMode === 'edit';
 
+    const liveReloadReqIdRef = useRef(0);
+    const onRenamedRef = useRef(onRenamed);
+    onRenamedRef.current = onRenamed;
+    const applyPathMoves = useCallback((moves: WorkspacePathMove[]) => {
+        const previous = pathRef.current;
+        const next = remapWorkspacePath(previous, moves);
+        if (next === previous) return;
+        relocationRef.current = { from: relocationRef.current?.from ?? previous, to: next };
+        pathRef.current = next;
+        liveReloadReqIdRef.current += 1;
+        setFileUnavailable(false);
+        onRenamedRef.current?.(next, next.split('/').pop() ?? next);
+    }, []);
     const workspaceChangeSignal = useWorkspaceChangeSignal(
         workspacePath,
-        Boolean(workspacePath && path && !richDocKind),
+        Boolean(workspacePath && path),
+        applyPathMoves,
     );
-    const liveReloadReqIdRef = useRef(0);
 
     useLayoutEffect(() => {
         const pendingTop = pendingMarkdownScrollTopRef.current;
@@ -565,6 +602,10 @@ export default function FilePreviewModal({
         const reqId = ++liveReloadReqIdRef.current;
 
         try {
+            // Let this document's pending save settle before comparing its disk
+            // snapshot; a rename notification can arrive before the save receipt.
+            if (inFlightPromiseRef.current) await inFlightPromiseRef.current;
+            if (!isMountedRef.current || reqId !== liveReloadReqIdRef.current || pathRef.current !== targetPath) return;
             const payload = await fileServiceRef.current.readPreview({ path: targetPath });
             if (
                 !isMountedRef.current ||
@@ -574,6 +615,7 @@ export default function FilePreviewModal({
                 return;
             }
 
+            setFileUnavailable(false);
             const decision = decideLiveReload({
                 incomingContent: payload.content,
                 currentContent: editContentRef.current,
@@ -614,9 +656,9 @@ export default function FilePreviewModal({
                 size: payload.size,
             });
         } catch {
-            // File may be temporarily missing/renamed or too large to preview.
-            // Keep the currently visible snapshot instead of flashing an error
-            // over content the user is already reading.
+            if (isMountedRef.current && reqId === liveReloadReqIdRef.current && pathRef.current === targetPath) {
+                setFileUnavailable(true);
+            }
         }
     }, [workspacePath, richDocKind, canEdit, isMarkdown, isMdEditView]);
 
@@ -662,8 +704,6 @@ export default function FilePreviewModal({
     useEffect(() => {
         if (!isEditingName) setNameDraft(name);
     }, [name, isEditingName]);
-    const onRenamedRef = useRef(onRenamed);
-    onRenamedRef.current = onRenamed;
     const handleRenameCommitRef = useRef<(next: string) => void>(() => {});
     const handleRenameCommit = useCallback((next: string) => {
         handleRenameCommitRef.current(next);
@@ -699,9 +739,12 @@ export default function FilePreviewModal({
         isSavingRef.current = true;
         setAutoSaveStatus('saving');
         const expectedContent = savedContentRef.current;
+        const generation = documentGenerationRef.current;
         const savePromise = (async () => {
             try {
                 await executeSave(contentToSave, expectedContent);
+                if (!isMountedRef.current || generation !== documentGenerationRef.current) return;
+                setFileUnavailable(false);
                 // Always update the ref (drives `flushAndClose`'s dirty check)
                 // unless an external-update conflict appeared while this save
                 // was in flight. In that case the buffer remains logically
@@ -735,7 +778,7 @@ export default function FilePreviewModal({
                     }, AUTO_SAVE_DELAY);
                 }
             } catch (err) {
-                if (!isMountedRef.current) return;
+                if (!isMountedRef.current || generation !== documentGenerationRef.current) return;
                 if (isWorkspaceSaveConflict(err)) {
                     setAutoSaveStatus('idle');
                     void revalidateOpenFileRef.current();
@@ -764,7 +807,8 @@ export default function FilePreviewModal({
         }, AUTO_SAVE_DELAY);
     }, [doAutoSave]);
 
-    const flushAndClose = useCallback(async () => {
+    const flushForTransition = useCallback(async (): Promise<boolean> => {
+        const generation = documentGenerationRef.current;
         // Cancel pending debounce
         if (debounceTimerRef.current) {
             clearTimeout(debounceTimerRef.current);
@@ -774,31 +818,34 @@ export default function FilePreviewModal({
         if (inFlightPromiseRef.current) {
             try { await inFlightPromiseRef.current; } catch { /* ignore — error already handled */ }
         }
+        if (!isMountedRef.current || generation !== documentGenerationRef.current) return false;
         if (
             externalUpdatePendingRef.current &&
             isDirectEdit &&
             editContentRef.current !== savedContentRef.current
         ) {
             toastRef.current.warning(tRef.current('workspaceFiles.filePreview.toasts.externalUpdateConflict'));
-            return;
+            return false;
         }
         // If there are STILL unsaved direct-edit changes after in-flight completed, save now
         if (isDirectEdit && editContentRef.current !== savedContentRef.current) {
             const toSave = editContentRef.current;
-            try {
-                await executeSave(toSave, savedContentRef.current);
-                // Update the dirty baseline so the unmount-cleanup effect below does NOT
-                // fire a second redundant save against the same content. Setting the ref
-                // (not React state) is sufficient because the component is about to unmount.
-                savedContentRef.current = toSave;
-                onSavedRef.current?.();
-            } catch {
-                // Save failed on close — don't block the close
+            doAutoSave(toSave);
+            await inFlightPromiseRef.current;
+            if (!isMountedRef.current || generation !== documentGenerationRef.current) return false;
+            if (savedContentRef.current !== toSave) {
+                // The component owns the only copy of this dirty buffer.
+                // Keep it mounted when persistence failed.
                 toastRef.current.error(tRef.current('workspaceFiles.filePreview.toasts.closeAutosaveFailed'));
+                return false;
             }
         }
-        onClose();
-    }, [isDirectEdit, executeSave, onClose]);
+        return !isDirectEdit || editContentRef.current === savedContentRef.current;
+    }, [isDirectEdit, doAutoSave]);
+
+    const flushAndClose = useCallback(async () => {
+        if (await flushForTransition()) onClose();
+    }, [flushForTransition, onClose]);
 
     /** Cmd+S handler for direct-edit mode — flush debounce and save immediately */
     const handleManualFlush = useCallback(() => {
@@ -866,15 +913,15 @@ export default function FilePreviewModal({
                     toastRef.current.warning(tRef.current('workspaceFiles.filePreview.toasts.externalUpdateConflict'));
                     return;
                 }
+                const oldPath = pathRef.current;
                 const { newPath } = await fileServiceRef.current.rename({
-                    oldPath: pathRef.current,
+                    oldPath,
                     newName: trimmed,
                 });
                 if (!isMountedRef.current) return;
-                // Optimistic: update local ref so any in-flight save targets
-                // the new path even before the parent's prop re-flows.
-                pathRef.current = newPath;
-                onRenamedRef.current?.(newPath, trimmed);
+                // The event may arrive before or after this command receipt.
+                // Applying its exact old→new mapping is idempotent.
+                applyPathMoves([{ oldPath, newPath }]);
                 setIsEditingName(false);
                 setNameDraft(trimmed);
             } catch (err) {
@@ -890,7 +937,7 @@ export default function FilePreviewModal({
                 if (isMountedRef.current) setRenameInFlight(false);
             }
         };
-    }, [name, canRename, workspacePath, isDirectEdit, handleManualFlush]);
+    }, [name, canRename, workspacePath, isDirectEdit, handleManualFlush, applyPathMoves]);
 
     // Cleanup on unmount: clear timers and fire best-effort save if dirty
     useEffect(() => {
@@ -918,6 +965,7 @@ export default function FilePreviewModal({
     // Keep the ref pointed at the latest handleClose so the Cmd+W layer (registered above
     // at module-top, before handleClose existed) routes through the autosave-aware path.
     handleCloseRef.current = handleClose;
+    useImperativeHandle(ref, () => ({ close: handleClose }), [handleClose]);
 
 
     // ─── Quote handlers ──────────────────────────────────────────────────────
@@ -934,27 +982,10 @@ export default function FilePreviewModal({
      *  model to read pre-edit content. Mounted-guard after await: handleClose may have run
      *  via a different path (Cmd+W) during the save. */
     const handleQuoteFileClick = useCallback(async () => {
-        if (!onQuoteFileRef.current) return;
-        if (
-            externalUpdatePendingRef.current &&
-            editContentRef.current !== savedContentRef.current
-        ) {
-            toastRef.current.warning(tRef.current('workspaceFiles.filePreview.toasts.externalUpdateConflict'));
-            return;
-        }
-        if (isDirectEdit && editContentRef.current !== savedContentRef.current) {
-            // Kicks off save (no return value); awaits via inFlightPromiseRef below.
-            handleManualFlush();
-        }
-        if (inFlightPromiseRef.current) {
-            try { await inFlightPromiseRef.current; } catch { /* save errors already toast */ }
-        }
-        if (!isMountedRef.current) return;
+        if (!onQuoteFileRef.current || !await flushForTransition()) return;
         onQuoteFileRef.current(pathRef.current);
-        // Close after quoting. handleClose handles autosave-aware close path; with the
-        // save now flushed, its dirty-check is a no-op (no duplicate save).
-        handleCloseRef.current();
-    }, [isDirectEdit, handleManualFlush]);
+        onClose();
+    }, [flushForTransition, onClose]);
 
     const absolutePathForDisplay = useMemo(() => {
         if (localPath) return localPath;
@@ -1020,34 +1051,19 @@ export default function FilePreviewModal({
     // menu off non-chat surfaces (settings, etc.) for free.
     const monacoQuote = onQuoteSelection ? handleMonacoQuote : undefined;
 
-    const hasExternalUpdateConflict = useCallback(() => (
-        externalUpdatePendingRef.current &&
-        editContentRef.current !== savedContentRef.current
-    ), []);
+    const handleSwitchToBrowserClick = useCallback(async () => {
+        if (onSwitchToBrowser && await flushForTransition()) onSwitchToBrowser();
+    }, [flushForTransition, onSwitchToBrowser]);
 
-    const handleSwitchToBrowserClick = useCallback(() => {
-        if (!onSwitchToBrowser) return;
-        if (isDirectEdit && hasExternalUpdateConflict()) {
-            toastRef.current.warning(tRef.current('workspaceFiles.filePreview.toasts.externalUpdateConflict'));
-            return;
+    const onFullscreenRef = useRef(onFullscreen);
+    onFullscreenRef.current = onFullscreen;
+    const handleFullscreenClick = useCallback(async () => {
+        if (onFullscreenRef.current && await flushForTransition()) {
+            // A move can update the parent's selected file while persistence is
+            // pending. Use its current transition callback, not that old snapshot.
+            onFullscreenRef.current?.(isDirectEdit ? editContentRef.current : undefined);
         }
-        if (isDirectEdit) handleManualFlush();
-        onSwitchToBrowser();
-    }, [hasExternalUpdateConflict, handleManualFlush, isDirectEdit, onSwitchToBrowser]);
-
-    const handleFullscreenClick = useCallback(() => {
-        if (!onFullscreen) return;
-        if (isDirectEdit && hasExternalUpdateConflict()) {
-            toastRef.current.warning(tRef.current('workspaceFiles.filePreview.toasts.externalUpdateConflict'));
-            return;
-        }
-        if (isDirectEdit) {
-            handleManualFlush();
-            onFullscreen(editContentRef.current);
-        } else {
-            onFullscreen();
-        }
-    }, [hasExternalUpdateConflict, handleManualFlush, isDirectEdit, onFullscreen]);
+    }, [flushForTransition, isDirectEdit]);
 
     const handleOpenInFinder = useCallback(async () => {
         if (!canReveal) return;
@@ -1274,6 +1290,7 @@ export default function FilePreviewModal({
                             className="text-sm font-medium text-[var(--ink)]"
                         />
                         {isDirectEdit && <AutoSaveIndicator status={autoSaveStatus} />}
+                        {fileUnavailable && <span role="status" className="text-xs text-[var(--error)]">{t('workspaceFiles.filePreview.fileUnavailable')}</span>}
                         <LiveUpdateIndicator updatedAt={lastExternalUpdateAt} pending={externalUpdatePending} />
                     </div>
 
@@ -1356,6 +1373,7 @@ export default function FilePreviewModal({
                                     className="text-sm font-semibold text-[var(--ink)]"
                                 />
                                 {isDirectEdit && <AutoSaveIndicator status={autoSaveStatus} />}
+                                {fileUnavailable && <span role="status" className="text-xs text-[var(--error)]">{t('workspaceFiles.filePreview.fileUnavailable')}</span>}
                                 <LiveUpdateIndicator updatedAt={lastExternalUpdateAt} pending={externalUpdatePending} />
                             </div>
                             <div className="flex items-center gap-1.5">

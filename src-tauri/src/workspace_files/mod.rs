@@ -51,3 +51,17 @@ pub mod watcher;
 // `tauri::generate_handler!` looks up auto-generated `__cmd__<name>` wrappers
 // in the same module that defined the command. Re-exporting at this level
 // would NOT bring the wrapper along, so we deliberately don't.
+
+// A save's existing-file check and atomic replace must not straddle an app
+// rename/move, otherwise the old pathname can be recreated. External processes
+// remain outside this application-owned critical section.
+static EDIT_MUTATIONS: std::sync::LazyLock<crate::keyed_lifecycle::KeyedLifecycleRegistry> =
+    std::sync::LazyLock::new(crate::keyed_lifecycle::KeyedLifecycleRegistry::new);
+
+pub(crate) async fn acquire_edit_mutation(
+    root: &std::path::Path,
+) -> crate::keyed_lifecycle::KeyedLifecycleGuard {
+    let identity =
+        crate::workspace_path::normalize_workspace_path_identity(&root.to_string_lossy());
+    EDIT_MUTATIONS.acquire(&[&identity]).await
+}

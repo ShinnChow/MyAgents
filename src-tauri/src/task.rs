@@ -5455,34 +5455,36 @@ pub fn task_doc_filename(doc: &str) -> Result<&'static str, String> {
 
 // ================ Tests ================
 
+/// Shared task-docs root for the entire test binary. Initialised
+/// exactly once via `ensure_test_docs_root()` before any test touches
+/// `task_docs_dir()`. Each test uses a fresh UUID task id, so writes
+/// never collide even though the root is shared.
+///
+/// Per-test tempdir + env-var swapping doesn't work here: `cargo test`
+/// runs tests in parallel within one process, and env vars are
+/// process-global — two concurrent tests would race each other's
+/// redirects. `std::env::set_var` is also technically unsound when
+/// called from multiple threads (Rust 2024 edition marks it `unsafe`
+/// for this reason), so we call it exactly once inside
+/// `get_or_init`'s closure.
+#[cfg(test)]
+static TEST_DOCS_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn ensure_test_docs_root() {
+    TEST_DOCS_ROOT.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("create shared test docs tempdir");
+        std::env::set_var("MYAGENTS_TASK_DOCS_ROOT", dir.path());
+        dir
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use tempfile::tempdir;
-
-    /// Shared task-docs root for the entire test binary. Initialised
-    /// exactly once via `ensure_test_docs_root()` before any test touches
-    /// `task_docs_dir()`. Each test uses a fresh UUID task id, so writes
-    /// never collide even though the root is shared.
-    ///
-    /// Per-test tempdir + env-var swapping doesn't work here: `cargo test`
-    /// runs tests in parallel within one process, and env vars are
-    /// process-global — two concurrent tests would race each other's
-    /// redirects. `std::env::set_var` is also technically unsound when
-    /// called from multiple threads (Rust 2024 edition marks it `unsafe`
-    /// for this reason), so we call it exactly once inside
-    /// `get_or_init`'s closure.
-    static TEST_DOCS_ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
-
-    fn ensure_test_docs_root() {
-        TEST_DOCS_ROOT.get_or_init(|| {
-            let dir = tempdir().expect("create shared test docs tempdir");
-            std::env::set_var("MYAGENTS_TASK_DOCS_ROOT", dir.path());
-            dir
-        });
-    }
 
     async fn create_direct_with_existing_session(
         store: &TaskStore,

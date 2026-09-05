@@ -638,6 +638,8 @@ Session snapshot 的完整 authority 与写入方向见 [`session_architecture.m
 - 在单个 mutation command 里自行判断 `.claude/skills` 字符串前缀——Windows junction、大小写与断链会绕过。MUST 调用共享 mutation guard；普通项目 Skill 物理目录不应被误伤。
 - watcher 用 path-derived key 做 stop 索引——重命名/删除/symlink swap 后 stop 失效。MUST 用 `watch_start` 返回的 opaque token；`watch_stop({token})` 索引；进程 nonce 防跨重启 token 碰撞。
 
+应用内 rename/move 提交成功后，由 Rust mutation owner 在既有 `workspace:files-changed:<eventKey>` 通道立即发出 `{moves: [{oldPath, newPath}]}`，多项 move 只包含成功项。`useWorkspaceChangeSignal` 先交付映射再触发重读，打开的预览按路径组件映射文件及目录后代；同文档搬迁保留编辑缓冲与已保存基线，普通文件切换仍重置。保存、rename、move 通过 `acquire_edit_mutation` 复用按 canonical workspace identity 的 `KeyedLifecycleRegistry`，使已有文件校验与原子保存不会跨越应用内搬迁、重建旧路径。预览关闭及视图转换复用同一个保存流程，失败不卸载草稿。OS watcher 仍只发粗粒度刷新；外部路径失效显示提示，不推测新路径、不承诺外部进程事务或强制退出时的草稿恢复。
+
 Sidecar HTTP workspace IO endpoint 已全部下线，Renderer 唯一入口是 `useWorkspaceFileService(workspacePath)`。eslint `no-restricted-syntax` 规则封禁已删除 endpoint 的字符串字面量。
 
 ---

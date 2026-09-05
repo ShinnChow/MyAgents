@@ -269,6 +269,7 @@
       "trashMoved": "Moved to Trash"
     },
     "filePreview": {
+      "fileUnavailable": "File unavailable; it may have moved or been deleted. Local edits are retained.",
       "saving": "Saving",
       "saved": "Saved",
       "saveFailed": "Save failed",
@@ -288,7 +289,7 @@
       "fullscreenPreview": "Fullscreen preview",
       "toasts": {
         "externalUpdateConflict": "The file changed externally. Local edits were not overwritten.",
-        "closeAutosaveFailed": "Auto-save failed while closing",
+        "closeAutosaveFailed": "Save failed. The editor remains open with your local edits.",
         "renameFailed": "Rename failed",
         "copiedFilePath": "File path copied",
         "copyWhileLoading": "The file is still loading. Try copying again shortly.",
