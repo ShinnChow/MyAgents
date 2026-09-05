@@ -44,6 +44,8 @@ Sidecar 只拥有本 Session 的 attachment registry。跨 Session 或跨 Sideca
 
 Builtin tool result 还会从结构化 image block、data URL、file ref 和受支持的工具结果文本中提取媒体。可交付原件写入工作区 `myagents_files/<tool>/`；trusted-root 副本用于稳定渲染和 Sidecar restart 后恢复。没有工作区的执行使用 App-owned generated root。
 
+Builtin SDK 同时提供模型侧 `tool_result.content` 和辅助 `tool_use_result`。后者也可能含 Read 的 image/PDF 字节，不能在提取前者后再原样序列化辅助结果。`extractSdkToolResultRenderParts()` 在分发到主 Agent / sub-agent 前统一转换两种表示：保留可解析的结构化结果、移除明确媒体字段中的内联字节，并延续 `_meta` envelope 的显示隔离。辅助结果中的普通 Read/Bash/search 文本不得套用未知块的 base64 猜测规则，否则 `data:` 开头的 YAML 或长字母序列会被误删。SDK 0.3.243+ PDF 分页图片从 `tool_result.content` 提取；完整 PDF 文档块只保留脱敏文本，不额外创建卡片。已持久化的历史结果不在此入口重写。
+
 Codex adapter 从 `imageGeneration`、`mcpToolCall`、`dynamicToolCall` 等原生 item 提取附件；Runtime schema 的完整事件映射由 `src/server/runtimes/codex.ts` 和对应协议测试维护，不在文档复制字段清单。
 
 ## Wire 与持久化

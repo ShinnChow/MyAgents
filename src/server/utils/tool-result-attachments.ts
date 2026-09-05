@@ -113,6 +113,21 @@ export function normalizeSdkToolUseResult(value: unknown): NormalizedSdkToolUseR
   };
 }
 
+/** Project the two SDK result representations once, before main/subagent delivery.
+ * Side data preserves structured Read/WebSearch results, but is not safe display
+ * text: Read image/PDF results can carry the same bytes as content blocks.
+ */
+export function extractSdkToolResultRenderParts(content: unknown, toolUseResult: unknown): ToolResultRenderParts {
+  const normalized = normalizeSdkToolUseResult(toolUseResult);
+  const parts = extractToolResultRenderParts(normalized.isMetadataEnvelope ? normalized.content : content);
+  return {
+    ...parts,
+    text: !normalized.isMetadataEnvelope && toolUseResult && typeof toolUseResult === 'object'
+      ? safeStringifyToolResult(toolUseResult, true)
+      : parts.text,
+  };
+}
+
 function readString(record: Record<string, unknown>, keys: string[]): string | undefined {
   for (const key of keys) {
     const value = record[key];
@@ -230,30 +245,32 @@ function isLikelyBase64Payload(value: string): boolean {
 
 /**
  * JSON.stringify with base64-ish string values redacted to `[N bytes omitted]`.
- * Last line of defense for blocks we DIDN'T recognize as images — even then a
- * fat payload must not reach SSE / session JSONL.
+ * Unknown blocks use conservative heuristics. SDK side data contains ordinary
+ * Read/Bash/search prose, so only explicit media fields are redacted there:
+ * `data:` YAML and long alphabetic file contents must survive unchanged.
  */
-function safeStringifyToolResult(value: unknown): string {
+function safeStringifyToolResult(value: unknown, sdkSideData = false): string {
   try {
     return JSON.stringify(
       value,
-      (key, nestedValue) => {
+      function (this: Record<string, unknown>, key, nestedValue) {
         if (typeof nestedValue !== 'string') {
           return nestedValue;
         }
         if (
-          key === 'data' ||
           key === 'base64' ||
           key === 'b64_json' ||
           key === 'image_base64' ||
-          nestedValue.startsWith('data:') ||
-          isLikelyBase64Payload(nestedValue)
+          (key === 'data' && (!sdkSideData
+            || this.type === 'base64' || this.type === 'image' || this.type === 'audio')) ||
+          (sdkSideData && key === 'stdout' && this.isImage === true) ||
+          (!sdkSideData && (nestedValue.startsWith('data:') || isLikelyBase64Payload(nestedValue)))
         ) {
           return `[${nestedValue.length} bytes omitted]`;
         }
         return nestedValue;
       },
-      2,
+      sdkSideData ? undefined : 2,
     ) ?? '';
   } catch {
     return String(value);

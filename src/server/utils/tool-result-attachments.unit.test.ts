@@ -4,8 +4,73 @@ import {
   appendOmittedImageNote,
   classifyToolAttachmentPresentation,
   extractToolResultRenderParts,
+  extractSdkToolResultRenderParts,
   normalizeSdkToolUseResult,
 } from './tool-result-attachments';
+
+describe('SDK result ingress projection', () => {
+  it.each(['image', 'pdf'] as const)('keeps %s side-data bytes out of text with existing media presentation', (kind) => {
+    const mime = kind === 'pdf' ? 'application/pdf' : 'image/png';
+    const data = 'c3ludGhldGljLWJ5dGVz';
+    const block = { type: kind === 'pdf' ? 'document' : 'image', source: { type: 'base64', media_type: mime, data } };
+    const raw = { type: kind, file: { filePath: `/tmp/test.${kind}`, base64: data } };
+    const result = extractSdkToolResultRenderParts([block], raw);
+    expect(result.text).not.toContain(data);
+    expect(JSON.parse(result.text).file.filePath).toBe(`/tmp/test.${kind}`);
+    expect(result.attachments).toEqual(kind === 'image'
+      ? [{ kind, mimeType: mime, source: { kind: 'base64', data } }]
+      : []); // Full PDF stays a Read result; this upgrade does not add cards.
+  });
+
+  it('handles emitted page reads without inventing pages in side data', () => {
+    const result = extractSdkToolResultRenderParts([
+      { type: 'text', text: 'Page 3' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'cGFnZQ==' } },
+    ], { type: 'parts', firstPage: 3, file: { filePath: '/tmp/test.pdf', count: 1, outputDir: '/tmp/pages' } });
+    expect(result.attachments).toHaveLength(1);
+    expect(JSON.parse(result.text).firstPage).toBe(3);
+    expect(result.text).not.toContain('cGFnZQ==');
+  });
+
+  it('redacts nested side-data payloads and preserves structured search results', () => {
+    const result = extractSdkToolResultRenderParts([], { images: [{ base64: 'aW1hZ2U=', mediaType: 'image/png' }], documents: [{ base64: 'cGRm' }] });
+    expect(result.text).not.toContain('aW1hZ2U=');
+    expect(result.text).not.toContain('cGRm');
+    const search = { query: 'news', results: [{ title: 'Title', url: 'https://example.com' }] };
+    expect(JSON.parse(extractSdkToolResultRenderParts('fallback', search).text)).toEqual(search);
+  });
+
+  it('preserves ordinary Read, Bash and structured text even when it resembles binary data', () => {
+    const file = { type: 'text', file: { filePath: '/tmp/config.yml', content: 'data:\n  mode: production\n' } };
+    const sequence = { type: 'text', file: { filePath: '/tmp/sequence.txt', content: 'ACGT'.repeat(75) } };
+    const bash = { stdout: 'data: no records', stderr: 'A'.repeat(300), interrupted: false };
+    const structured = { data: 'business value', results: [{ text: 'data: search result' }] };
+    for (const raw of [file, sequence, bash, structured]) {
+      expect(extractSdkToolResultRenderParts('fallback', raw).text).toBe(JSON.stringify(raw));
+    }
+  });
+
+  it('redacts typed media data and image stdout without hiding neighboring prose', () => {
+    const raw = {
+      content: [{ type: 'image', source: { type: 'base64', data: 'aW1hZ2U=' } }],
+      stdout: 'aW1hZ2U=', isImage: true, stderr: 'data: diagnostic',
+    };
+    const result = JSON.parse(extractSdkToolResultRenderParts([], raw).text);
+    expect(result.content[0].source.data).toBe('[8 bytes omitted]');
+    expect(result.stdout).toBe('[8 bytes omitted]');
+    expect(result.stderr).toBe(raw.stderr);
+  });
+
+  it('preserves legacy text and metadata envelopes without rendering private metadata', () => {
+    expect(extractSdkToolResultRenderParts('plain text', undefined).text).toBe('plain text');
+    const result = extractSdkToolResultRenderParts('fallback', {
+      content: [{ type: 'text', text: 'visible' }, { type: 'image', data: 'aW1hZ2U=', mimeType: 'image/png' }],
+      _meta: { token: 'private' },
+    });
+    expect(result.text).toBe('visible');
+    expect(result.attachments).toHaveLength(1);
+  });
+});
 
 describe('normalizeSdkToolUseResult', () => {
   it('unwraps SDK 0.3.232+ subagent MCP metadata envelopes', () => {

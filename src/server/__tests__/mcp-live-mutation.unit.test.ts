@@ -76,6 +76,19 @@ describe('live Query MCP mutation ownership', () => {
     expect(getQueryMcpMutation()).toBeNull();
   });
 
+  it('does not treat an added-but-failed SDK 0.3.257+ server as a successful mutation', async () => {
+    const query = {
+      setMcpServers: vi.fn(async () => ({ added: ['failed-server'], removed: [], errors: { 'failed-server': 'connection failed' } })),
+      interrupt: vi.fn(async () => undefined),
+      close: vi.fn(),
+    } as never;
+    setQuerySession(query);
+    setFrozenSdkMcpFingerprint('stale-owner');
+    await expect(ensureSdkMcpInSync()).resolves.toBe(false);
+    expect(isAbortRequested()).toBe(true);
+    expect(getQueryMcpPrewarmOwner()).toBeNull();
+  });
+
   it('bounds a wedged SDK control request and invalidates the unsafe Query', async () => {
     vi.useFakeTimers();
     const setMcpServers = vi.fn(() => new Promise(() => undefined));
