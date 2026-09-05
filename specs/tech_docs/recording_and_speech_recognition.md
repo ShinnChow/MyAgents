@@ -24,7 +24,7 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 - capture fatal event 由同一个 `RecordingManager` operation gate 先关闭 archive/analysis admission、停止旧 session 并冻结媒体时钟，再 durable commit `DeviceGap`；gap 提交失败时不重开设备。随后以固定五次、500 ms 间隔重开 admission 时冻结的 exact `CapturePlan`。live boundary 建立失败只关闭后续实时 analysis，永久 Ogg archive 继续并在 stop 后走既有 backfill 收敛，不能跨 gap 拼接 VAD 状态。成功后沿同一 Record/generation 继续并在 lifecycle 记录 recovery；耗尽后走现有 `interrupted` safe settlement。恢复不会重新 preflight 当前默认设备、热接管不同 identity/格式，也不建立第二个设备 watcher。Renderer 的录音计时、笔记和 Mark 锚点只消费 Manager `mediaDurationMs`，不得用墙钟绕过 pause/recovery freeze。极端 settlement worker/manifest 失败时必须释放 exact generation 的内存槽，保留 durable `stopping/finalizing` 供既有启动恢复处理。
 - 录音接纳后由 `RecordingManager` 独立持有 wake lock；获取失败不阻止录音，但 snapshot 与 lifecycle 保留 `RECORDING_WAKE_LOCK_UNAVAILABLE`，Record Detail 显示非阻塞警告。它只防止 idle sleep，不承诺合盖、用户主动睡眠、OS 强制休眠或断电期间继续采集。
 - 没有 transcript 的历史音频在转录区域显示“开始转录”。只有用户点击后才调用 `cmd_speech_record_transcribe`；安装模型、打开详情或启动 App 都不会自动扫描历史 Record。
-- 本期人工纠错只覆盖 speaker rename、merge 与 exact segment reassign。原始 transcript revision 保留，override 单独持久化并在 projection/export/search 时合成；不提供任意字词改写。
+- 人工纠错只覆盖 speaker rename、merge 与 exact segment reassign。原始 transcript revision 保留，override 单独持久化并在 projection/export/search 时合成；不提供任意字词改写。
 - 所有录音模式只投影当前 Record 内的匿名 `Speaker A/B/C`；物理麦克风不代表“我”。单轨直接 diarize，双物理轨由同一 Media Worker 按共同媒体时间线有界混合后做一次 Record-wide clustering。speaker embedding 只在 exact Worker generation 内短暂存在并在结束时主动清理，不持久化声纹，也不跨 Record 复用身份。
 - audio Record 结束保存后，`RecordStore` 在 Record 根目录生成唯一的 `content.md` 当前态文稿，包含元数据、当前 speaker projection、转写、现场笔记与重点 Mark。它是可重建的派生 artifact：最终转写、diarization、speaker override、metadata 或 timeline 变化后原子覆盖刷新；录音中不生成，损坏或缺失时由 AI 讨论接纳入口按当前 Record revision 重建。Renderer、Session 与 TaskStore 都不维护第二份副本。AI 讨论仍以该文稿为主；`RecordStore` 同时返回经 artifact inventory 验证的实际音轨绝对路径，仅供 Agent 需要时核对原始声音。
 - 托盘只消费 `RecordingManager` projection：录音中 icon 增加状态圆点，菜单出现“正在录音...”，点击打开 exact Record Tab。托盘不拥有录音状态或导航 history。
@@ -33,31 +33,23 @@ Renderer → Tauri 的普通命令属于控制面。Worker 使用私有 stdin/st
 
 ## 依赖复用边界
 
-算法、codec 和通用格式能力优先复用成熟依赖；本模块只保留 MyAgents-specific owner、授权、生命周期、固定内部 profile 和依赖无法表达的 hard limit。2026-08-25 的 live PCM 前审计形成以下约束：
+算法、codec 和通用格式能力优先复用成熟依赖；版本以 `Cargo.lock` 和 native manifest 为准。模块只保留 MyAgents-specific owner、授权、生命周期、固定内部 profile 和依赖无法表达的 hard limit：
 
-- archive 已用固定版本 `rubato 0.16.2` 替换手写线性重采样器。适配层只负责 interleaved/planar 转换、尾部 duration 对齐与 buffer hard limit；capture callback 不执行 DSP，live analysis 不再建立第二套重采样算法；
-- attachment container/codec probe 与解码固定使用 crates.io `symphonia =0.6.1` 及 Cargo.lock checksum，不再依赖同版本 Git release commit；features 仍只打开产品白名单需要的 AAC/ADPCM/AIFF/ALAC/FLAC/ISO-MP4/MP3/Ogg/PCM/Vorbis/WAV，不引入 FFmpeg 或第二个 decoder；
-- `ogg 0.9.2` 继续用于归档 mux/test，Opus 编解码继续使用 bundled libopus。media Worker 的 reader 只接受 MyAgents 自有单 logical stream、20 ms packet 固定 profile；之所以保留最小 parser，是因为通用 `PacketReader` 会在调用方取得 packet 前完成跨页重组，无法在分配前执行 4,000-byte packet 上限，也不暴露本文需要的连续 page sequence/fail-closed 契约；
-- diarization 的模型推理和单窗口能力属于 sherpa-onnx。自有代码只负责 8 小时输入所需的有界窗口、跨窗口 global identity、重叠裁决、确定性稀疏 fallback 与敏感 embedding 清理；不引入通用 clustering 框架或扩张为 ML toolkit；
-- transcript revisions 与 recording lifecycle 共享内部 `DurableRecordJournal`：统一 regular-file 检查、identity/schema、sequence/checksum、单行上限、durable append 和 torn-tail repair；领域模块只保留事件类型与投影。
+- 重采样统一经过 `rubato` adapter；适配层只负责 interleaved/planar 转换、尾部 duration 对齐与 buffer hard limit，capture callback 不执行 DSP；
+- attachment container/codec probe 与解码统一使用 `symphonia` 的产品白名单 features，不引入 FFmpeg 或第二个 runtime decoder；
+- Ogg archive/test 与 bundled libopus 共享固定内部 profile。Worker reader 保留分配前 packet 上限、连续 page sequence 与 fail-closed 校验；
+- diarization 模型推理属于 sherpa-onnx；自有代码只负责有界窗口、跨窗口 identity、重叠裁决、稀疏 fallback 与敏感 embedding 清理；
+- transcript revision 与 recording lifecycle 共享 `DurableRecordJournal` 的 regular-file、identity/schema、sequence/checksum、单行上限、durable append 与 torn-tail repair。
 
-引入或保留底层 primitive 时，必须在 PRD 执行台账记录候选依赖、许可证/target、关键契约与可复现能力缺口；没有缺口就使用依赖，不保留双实现或 feature flag。
+引入新 primitive 前应证明现有依赖无法表达关键约束；没有缺口时不保留双实现或 feature flag。
 
-2026-08-26 稳定版复核没有机械追新：Rubato `5.0.0` 要求 Rust `1.87`，而主 App 仍声明 `rust-version = 1.81`；其 5.0 修复的动态 ratio ramp 路径也不被上述固定 ratio adapter 使用。因此当前继续锁定 `0.16.2`，避免为不相关修复抬高整个 App MSRV并迁移两份 adapter。该结论不妨碍以后在项目统一提高 MSRV或确实需要动态 ratio 时重新评估。
-
-## 版本化质量基准
+## 质量验证
 
 模型质量 release pool 使用 `scripts/speech-quality-corpus-source-lock.json` 作为 corpus source of truth。它固定 AISHELL-1 普通话近讲、AISHELL-4 普通话远场会议、ASCEND 中英混说和 AMI 英文会议的 upstream revision、URL、bytes、SHA-256、许可证、选样窗口与完整 prepared manifest SHA-256；runner 不接受 prepared manifest 自行声明来源。cache/output 在下载前按物理路径拒绝仓库内目录及 symlink/junction escape，原始语料和带正文的 prepared manifest 不进入 App bundle、Git、日志或遥测。
 
-准备入口 `scripts/prepare-speech-quality-corpus.mjs` 继续复用 native resource 的 `acquireLockedResource` 内容寻址下载与离线 cache，不实现第二套 downloader。PyArrow `21.0.0`（Apache-2.0）、Praatio `6.2.0`（MIT）、JiWER、MeetEval 与 WeText 均使用 PEP 723 + uv 原生 lock 固定直接、传递包与 artifact hash，`--offline` 同时约束语料和 Python 环境。FFmpeg `8.0.1` 使用 bitexact mux/codec flag 并去除 metadata；任何工具或输出漂移都会因完整 prepared manifest hash 不符而 fail closed，同一锁连续准备必须得到 byte-identical 的 28 个质量音频、3 个 AMI 词级时间标注 live 片段及 manifest。三个 live 片段在最后一个人工标注词后追加 3 秒确定性静音，只为保证测到自然 VAD 出句而非 stop/finalize flush。FFmpeg 只生成测试输入，不随 App 分发，也不改变产品附件解码继续使用 Symphonia、内部 Record 继续使用固定 Ogg Opus profile 的边界。
+准备入口 `scripts/prepare-speech-quality-corpus.mjs` 复用 native resource 的内容寻址下载与离线 cache，不实现第二套 downloader。Python工具链使用 PEP 723 + uv lock固定依赖与artifact hash；FFmpeg只生成确定性测试输入，不随App分发，也不改变产品解码与archive路径。工具或输出漂移必须使prepared manifest校验失败。
 
-执行入口 `scripts/speech-quality-benchmark.mjs` 直接复用 `media-worker-batch-client.mjs` 与从原 live smoke 抽出的 `media-worker-live-client.mjs`，驱动同一个正式 Worker/native manifest/共享 ORT/模型 manifest，不建立 benchmark-only 推理路径或新 Worker 协议。live 捕获时钟从 Worker spawn 开始，`ready` 前的已提交 PCM 按产品 spool 语义追赶；Worker 对触发帧完成 VAD accept 后先发 `input_ack`，再同步 ASR 并发 `transcript_segment`，因此 runner 能分别记录最后有效语音采样→VAD 确认、VAD 确认→stable final 和总耗时，并要求目标 final 覆盖该最后有效语音采样、拒绝依赖 terminal flush 的样本。CER/WER 委托 JiWER `4.0.0`，DER 委托 MeetEval `0.4.3`，中文数字、全半角与标点归一化委托 WeText `0.1.6`。为避免长跑期间工作树原子替换造成“报告 hash 与实际执行 bytes 不同”，runner 从已快照 bytes 创建私有执行副本：正式 native bundle 保持原 manifest 相对布局并继续由 Worker 校验全部 hash/signing/legal/exact-path identity，指标脚本与 uv lock 同样成对复制；模型、语料和共享 ORT 不复制，仍由正式 Worker 与逐 case/终态 snapshot 校验。`uv → Python/FFmpeg` 按现有跨平台政策以 POSIX process group 或 Windows `taskkill /T` 有界收敛。报告只保存这些 hash、显式 model-pack revision、环境、计数、耗时、错误分解和 rate，不保存 reference、hypothesis 或 transcript 正文。
-
-2026-08-25 Apple M1、16 GiB、固定 `local-standard-speech / sensevoice-2024-07-17-v1` 最终冻结结果为：普通话近讲 CER `2.53%`、普通话会议 CER `11.96%`、英文会议 WER `25.75%`、两段四人会议按 scored speaker seconds 聚合 DER `22.47%`，8 个中英混说样本为 `0` 个整段漏识别，全部通过 PRD 门槛。同一报告的 Worker ready 为 `1,508.153 ms`；cold 首句最后有效语音→VAD 确认 `2,442.567 ms`、VAD→final `327.078 ms`、总计 `2,769.645 ms`；14 个 warm 样本的最后有效语音→final p50/p95 为 `2,652.264 / 3,049.730 ms`，其中 VAD→final p50/p95 为 `217.078 / 258.411 ms`。15 个片段均覆盖各自最后有效语音采样，并在 stop 前以一个稳定 final 发布，无 partial 和 terminal flush；这些值只作为该固定环境的测量证据，不构成产品 SLA。该报告关闭 7.2 的 ASR/DER 质量与 live final/cold 测量门槛，不替代 2/8 小时 capture/backfill、采集 CPU 或五 target 正式安装包门槛。
-
-2026-08-26 首次发布前将上述同一组模型字节的 pack revision 从 `sensevoice-2024-07-17-v1` 收敛为 `local-standard-speech-v1`；所有 asset URL、size 和 SHA-256 不变，因此已冻结的质量结果仍适用，这项 identity-only rename 不单独重跑质量基准。
-
-2026-08-26 中国大陆三网节点对 GitHub release 的 10 秒 HTTP 可达率只约 `58.5%–62.8%`，因此新的 `local-standard-speech-v2` 将相同的四个 asset 和三个 remote legal source 改由 `download.myagents.io` 的 content-addressed R2 object 供应。模型、license、upstream revision、size/SHA-256 和总预算均不变；已发布的 v1 不覆盖，质量基准不重跑。
+执行入口 `scripts/speech-quality-benchmark.mjs` 复用正式 batch/live client、Worker、native manifest、共享 ORT 和模型 manifest，不建立 benchmark-only 推理路径。runner分别测量Worker ready、VAD确认、stable final、CER/WER/DER与资源指标，并拒绝依赖terminal flush才完成的样本。长跑使用已校验snapshot的私有执行副本，报告只保存hash、model-pack revision、环境、计数、耗时、错误分解和rate，不保存reference、hypothesis或transcript正文。具体测量结果属于benchmark artifact，不写入架构文档。
 
 ## Durable speech job
 
@@ -105,8 +97,6 @@ Stop 先停止并落盘 capture/archive/analysis，再提交永久 Ogg artifact�
 - 五份 legal artifact 的 remote/archive 来源；
 - 总下载预算和 300 MiB 硬上限；
 - App updater 同一 Minisign trust root 与 detached signature 要求。
-
-2026-08-26 对 3D-Speaker `ERes2Net-base 200k` 做了候选核验：官方 ONNX 为 `39,593,765` bytes、SHA-256 `e2d2048292e055f7b61cdec3db010503f35369b245bf0b3bbad021c9a91e4053`，在当前随 App 发布的 sherpa `1.13.6` + ORT `1.28.0` 上可加载并输出 512 维 embedding，ABI 与资源预算可兼容。但 Sherpa 官方 diarization 组合仍使用当前 `speech_eres2net_base_sv_zh-cn_3dspeaker_16k@v1.0.1`，候选没有在本项目固定 corpus 上证明 DER 更好；因此当前 source lock 和默认 pack 不变。`ERes2NetV2` 为 192 维，本期不为候选模型改写固定 512 维 adapter ABI或增加并行模型分支。
 
 远端发布面固定为：
 

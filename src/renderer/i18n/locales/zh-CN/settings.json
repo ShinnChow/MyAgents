@@ -181,6 +181,11 @@
   },
   "providers": {
     "title": "模型供应商",
+    "cardTitles": {
+      "claudeSubscription": "Claude (订阅)",
+      "claudeApi": "Claude (API)",
+      "chatgptSubscription": "ChatGPT (订阅)"
+    },
     "description": "配置 API 密钥以使用不同的模型供应商",
     "enableAndSort": "启用和排序",
     "addProvider": "添加供应商",

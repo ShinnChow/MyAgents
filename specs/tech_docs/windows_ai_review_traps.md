@@ -1,273 +1,149 @@
 # Windows AI Review Traps
 
-> Purpose: a living adversarial-review checklist for MyAgents changes that are developed mostly on macOS but must work on Windows.
->
-> This is not a generic Windows compatibility guide and not a release-note archive. Each entry is a recurring failure pattern that AI agents are likely to miss, backed by issues or fixes this repo has already hit, and phrased as review pressure to apply before Windows users rediscover it.
+本文是从 macOS 开发或审查 Windows 相关改动时的 failure-seeking checklist。平台架构和 helper 由 [`windows_platform.md`](windows_platform.md) 拥有，WebView2 实测矩阵由 [`windows_cross_platform_review.md`](windows_cross_platform_review.md) 拥有；这里不保存事故、commit 或 release 历史。
 
-## How To Use This Document
+先列出改动跨过的边界，再为每个边界指出现有 owner。没有 owner 时，先判断是否真的需要新抽象，不要在调用点散落 Windows guard。
 
-Read this when a change touches any boundary that behaves differently on Windows:
+| 边界 | 首选 owner / helper |
+| --- | --- |
+| machine-readable subprocess output | producer-side UTF-8 / base64 envelope |
+| workspace identity | `normalizeWorkspacePathIdentity` / `workspacePathsEqual` |
+| filesystem path ↔ URL | `pathToFileURL` / `fileURLToPath` 或 app resource protocol |
+| Rust path → external consumer | `normalize_external_path` |
+| Rust GUI 后台 subprocess | `process_cmd::new` / `spawn_tree` |
+| executable discovery | `system_binary::find` 或具体 runtime locator |
+| localhost HTTP | `crate::local_http` |
+| WebView policy | `webview_policy.rs` / resource protocol / CSP |
+| config write/fsync | existing config IO owner |
 
-- process spawn, CLI wrappers, shell commands, PowerShell, npm/npx, Git Bash, runtime binaries
-- byte/text decoding, JSON/config files, logs, localized command output
-- workspace paths, resource paths, URLs made from paths, custom protocols, symlinks/junctions
-- WebView2 rendering, CSP, iframe/srcdoc widgets, child webviews, scrollbars, attachments
-- config/session/task persistence, updates, file replacement, fsync, install metadata
-- runtime detection, PATH/proxy/env injection, managed runtime packaging or signing
+## Trap 1：把进程输出当成天然 UTF-8
 
-Review rule: do not ask "does this work on my Mac?". Ask "which Windows boundary did this cross, and what existing MyAgents owner already normalizes that boundary?" If no owner/helper exists, add one close to the boundary instead of sprinkling call-site guards.
+PowerShell、OEM/ANSI code page、localized command和第三方程序都可能产生非 UTF-8 bytes。字节一旦被 SDK或Node错误解码成 string，Renderer无法恢复。
 
-## Evidence Sources
+审查：
 
-These are representative incidents that shaped the patterns below:
+- 结构化 PowerShell输出使用 ASCII-safe envelope，例如 base64(UTF-8(JSON))；
+- SDK shell在 child env设置 UTF-8 locale / Python编码，并通过受管 Bash prelude设置 code page；
+- 用户可编辑 JSON在 file boundary剥 UTF-8 BOM；
+- `from_utf8_lossy` 只用于人读诊断，不解析协议；
+- encoding修复发生在 producer/process/file boundary，不发生在 UI。
 
-| Pattern | Evidence |
-|---|---|
-| PowerShell / localized output is not stable UTF-8 | `managed-codex` Authenticode install failure: `Authenticode output is not UTF-8`; commit `f5edd8eb` hardened publishing; current client-side fix base64-wraps Authenticode JSON |
-| SDK/tool subprocess output can be non-UTF-8 | `cc580bf9 fix(windows): force utf-8 sdk shell output`; `windows_platform.md` SDK shell output encoding section |
-| UTF-8 BOM from Windows editors breaks config parsing | `CHANGELOG.md` entries for issue #170 and Windows config crash; `src/shared/utils.ts` BOM stripping |
-| Workspace path identity mismatch silently breaks features | #320 / `d7d431d2`; `src/shared/workspacePath.ts`; `pit_of_success.md` workspace path section |
-| Archive paths accidentally serialized with OS separators | Managed Codex Windows install wrote `executableRelativePath` as `vendor\\...`; status reads rejected it as an archive path and preserved stale `downloading` at 100% |
-| File URLs are not paths with a prefix | Plugin local install parsed `file:///C:/...` via `new URL().pathname`, which becomes `/C:/...`; on Windows `resolve()` turns that into `C:\C:\...` |
-| `\\?\` long-path prefix breaks non-Rust consumers | `pit_of_success.md::normalize_external_path`; #229 stripped `\\?\` from bundled Node path in `myagents.cmd` |
-| Windows shell quoting drops CLI content | issue #149; `src/cli/myagents.ts` requires `--content-file` / `--prompt-file` for fragile payloads |
-| GUI process spawn flashes or hangs through console wrappers | issue #170; `process_cmd::new`; `ed9c341c`, `1bb503db`, `bcb1a04e` |
-| WebView2 applies CSP/resource rules differently from macOS | `windows_cross_platform_review.md`; `798e59b8` custom protocol URL fix; widget Chart.js inline injection |
-| AV / indexer transient locks break writes | `windows_platform.md::cmd_fsync_path`; `CHANGELOG.md` Windows access denied / OneDrive / Backblaze entries |
-| Health checks and updates race harder on Windows | #236 global sidecar false restart; #232 durable open-tabs restore across Windows NSIS restart; `auto_update.md` cache=disk invariant |
+Smell：`JSON.parse(stdout)` 紧跟 PowerShell、对 machine protocol使用 lossy decode、在消息渲染层替换乱码。
 
-## Trap 1: Treating Process Output As UTF-8 Text
+## Trap 2：把路径字符串当成单一 identity
 
-**Why AI misses it.** On macOS, command output is usually UTF-8. AI code often writes `String::from_utf8(stdout)` or `JSON.parse(result.stdout)` after a subprocess returns JSON. On Windows, PowerShell 5.1, console code pages, localized status messages, and third-party tools can produce bytes that are not UTF-8 even when the script itself was passed as UTF-16LE via `-EncodedCommand`.
+Windows 同一路径可能表现为盘符大小写、正反 slash、trailing separator、UNC 或 `\\?\` long-path。Archive key、URL 和 OS path 又是不同命名空间。
 
-**Real failures.**
+审查：
 
-- Managed Codex download succeeded, but install failed while verifying `codex.exe` Authenticode because PowerShell emitted localized JSON in a non-UTF-8 encoding. The fix is to make PowerShell produce base64 of UTF-8 JSON and have Rust/Node decode the base64 payload.
-- Claude Agent SDK Bash tool output on Windows needed explicit `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `PYTHONUTF8=1`, `PYTHONIOENCODING=utf-8`, and a Git Bash `chcp.com 65001` prelude.
-- Windows Notepad and other editors can save UTF-8 JSON with BOM; config readers must strip leading BOM before JSON parse.
+- 跨 store比较 workspace path使用 shared identity helper；
+- Map/Set key在建表与查找两端使用同一 normalization；
+- ZIP/manifest relative key始终用 `/`，不能序列化 `PathBuf` 的 OS separator；
+- `file://` 使用标准 URL helper，不手拼 prefix或读取 `URL.pathname`；
+- Rust path跨到 Node/npm/spawn/URL前去掉 verbatim prefix；
+- write-side尚不存在路径使用 lexical安全解析，不滥用 read-side canonicalize；
+- junction/symlink测试使用 repo的 reparse-aware helper；
+- 磁盘容量查询交给 filesystem owner，不用字符串 prefix猜 mount。
 
-**Review pressure.**
+Smell：跨 owner raw `===`、inline slash replace、手拼 `file://<path>`、把 `to_string_lossy()` 结果直接当 archive key。
 
-- Is this stdout/stderr meant for machine parsing? If yes, do not rely on ambient console encoding.
-- If the producer is PowerShell, emit one ASCII-safe envelope: base64(UTF-8(JSON)).
-- If the producer is a shell command whose output enters session history/SSE, set the subprocess env before the output is generated. Do not try to repair already-decoded tool-result strings in the renderer.
-- If reading user-editable JSON/config/text, strip a leading UTF-8 BOM at the file boundary.
-- Preserve non-UTF-8 diagnostic output with `String::from_utf8_lossy` only for human-readable error messages, not structured protocol.
+## Trap 3：把 shell quoting 当作协议
 
-**Smells.**
+Git Bash、`cmd.exe`、PowerShell、`.cmd`、npm wrapper和Node argv的解析规则不同。
 
-- `String::from_utf8(output.stdout)` near `powershell`, `cmd`, `Get-*`, `signtool`, `npm`, or other Windows-facing commands.
-- `JSON.parse(result.stdout.trim())` after a PowerShell script.
-- Encoding fixes in UI rendering code instead of at the process/file boundary.
+审查：
 
-## Trap 2: Assuming Path Strings Have One Identity
+- executable、args、cwd分开传递，不拼 command string；
+- prompt、JSON、多行/长文本和 shell-sensitive payload使用 `--prompt-file` / `--content-file` 等文件 handoff；
+- Node侧调用 npm/npx走 wrapper-aware resolver；
+- Rust GUI后台进程走 `process_cmd`，可执行文件走已有 locator；CLI mode 与 Terminal 分别由 console / PTY owner 创建；
+- 测试包含空格、Unicode、引号、反斜杠、换行、`%` 和 metacharacters。
 
-**Why AI misses it.** macOS paths are usually POSIX, case-sensitive enough for developer mental models, and use `/`. Windows paths can arrive as `C:\...`, `C:/...`, `c:/...`, UNC paths, paths with trailing separators, or extended-length `\\?\` paths. Different stores in MyAgents legitimately persist different forms.
+Smell：为了 Windows加 `shell: true`、把用户内容拼进命令、只有 inline text flag没有 file escape hatch。
 
-**Real failures.**
+## Trap 4：把 Tauri GUI 当作终端
 
-- Managed Codex Windows download installed successfully, but `installed.json` stored `executableRelativePath` with backslashes from `PathBuf::to_string_lossy()`. The status reader validates that field as an archive-relative path, failed to locate the nested `vendor/.../codex.exe`, and preserved the stale 100% `downloading` state.
-- Plugin local install accepted `file://` sources, but parsing with `new URL(...).pathname` produced `/C:/...` for Windows drive URLs and could resolve to `C:\C:\...`. The fix is to use Node's `fileURLToPath` and `pathToFileURL` helpers at the URL boundary.
+Explorer启动的应用没有用户 interactive shell的 PATH/console/env语义。长生命周期进程还可能经 wrapper 派生后代。
 
-- #320: legacy cron/task/session/project lookups could not find the owning workspace because one store used backslashes and another used forward slashes. This caused "找不到工作区", empty recent sessions, task cards without workspace names, and invalid workspace filters.
-- `\\?\` paths from Tauri/Rust resource discovery work with Rust `fs`, but break Node file URLs, npm, CLI wrappers, and spawned programs.
-- Windows non-system drive paths previously hit path safety allowlist mistakes for "open with default" / "show in explorer".
+审查：
 
-**Review pressure.**
+- GUI拥有的短后台 child使用 `process_cmd::new`；会派生后代的 long-lived child使用 `spawn_tree` 并保留 `ChildTree`；
+- CLI mode用 raw `Command` 继承用户 console；Terminal由 `portable-pty` / ConPTY管理，不能强行改走 `CREATE_NO_WINDOW`；
+- Windows Job Object在初始线程 resume前绑定，确保 kill-on-close覆盖整棵树；
+- normal shutdown按 live handle/owner清理，不扫描全机；
+- prior instance确定死亡后的 recovery才允许 `process_cleanup` 枚举；
+- localhost proxy bypass和Provider/general env在 spawn owner处构造；
+- GUI不依赖裸 PATH查 node、git、npm或runtime。
 
-- Is a `Project.path` compared with `Task.workspacePath`, `CronTask.workspacePath`, session `agentDir`, or `defaultWorkspacePath`? Use `workspacePathsEqual`.
-- Is a path used as a Map/Set key? Normalize with `normalizeWorkspacePathIdentity` at both build and lookup.
-- Is a path from a ZIP/manifest/archive key persisted to JSON? Store the normalized archive key with `/`, not `PathBuf::to_string_lossy()`. If legacy installed metadata already contains backslashes, accept it only at the installed-metadata read boundary, not in manifest validation.
-- Is a filesystem path crossing a `file://` URL boundary? Use `pathToFileURL` / `fileURLToPath` instead of `new URL(...).pathname`, ``file://${path}``, or manual slash replacement.
-- Is a Rust `PathBuf` crossing into Node, npm, URL, shell args, config JSON, or a child process? Strip `\\?\` via `normalize_external_path` at the boundary. Do not mutate pure path-format helpers to guess callers.
-- Is code deriving a filesystem fact such as available bytes? Query the existing target path through `filesystem_capacity::available_space`; path normalization and mount-prefix matching do not own filesystem identity.
-- Is the code using canonicalize before write? For paths that may not exist yet, use the lexical write-side resolver, not read-side canonicalization.
-- Are symlinks/junctions involved? Directory tests need the repo's junction-aware helpers, not only `Dirent.isDirectory()`.
+Smell：在非 CLI/PTY 等明确 owner 例外中裸用 `std::process::Command::new`、`taskkill /IM`、PowerShell/WMI进程扫描、只 kill root PID、`cmd /c` 包住长生命周期服务。
 
-**Smells.**
+## Trap 5：把 WebView2 当成换了字体的 WKWebView
 
-- Raw `===` path comparison outside same-owner in-memory tree nodes.
-- Inline `.replace(/\\/g, '/')` as a "quick fix".
-- `new URL(fileUrl).pathname`, ``file://${path}``, or ``file:///${path.replace(/\\/g, '/')}`` around local paths.
-- `PathBuf::to_string_lossy()` used to serialize archive members, manifest paths, or installed metadata.
-- `PathBuf::to_string_lossy()` immediately passed to Node/npm/URL/spawn without boundary normalization.
-- `sysinfo::Disks` / mount enumeration followed by `path.starts_with(mount_point)` to decide target capacity.
+CSP、custom protocol、`srcdoc`、clipboard、scrollbar和OS child WebView合成都会分歧。
 
-## Trap 3: Shell Quoting And `.cmd` Wrappers Are Not Portable Protocols
+审查：
 
-**Why AI misses it.** AI-generated commands often work in zsh/bash and look escaped enough. On Windows, MyAgents may pass through Git Bash, `cmd.exe`, `.cmd` shims, npm wrappers, PowerShell, and Node argv parsing. Each layer has different quoting and newline behavior.
+- attachment使用 `myagents-resource` protocol，不把 Sidecar loopback URL直接喂给 subresource；
+- widget外部库只能走已登记的本地 inline source；
+- 所有 WebView builder共用 native scrollbar policy；
+- Browser child geometry持续对账，transition/overlay期间按 contract隐藏；
+- clipboard调用 shared fallback helper；
+- CSP使用标准 directive，并包含 Windows IPC origin；
+- macOS-specific input guard在安装期平台门控。
 
-**Real failures.**
+真机矩阵见 `windows_cross_platform_review.md`。
 
-- issue #149: `myagents thought create '<text>'` sometimes arrived without content on Windows, producing a server-side 422. The durable workaround is `--content-file`.
-- `myagents session send -p` rejects multiline or large inline prompts because `cmd.exe` can treat newline as a command boundary and drop subsequent flags.
-- `.cmd` shim args needed explicit escaping; npm/npx on Windows often require wrapper-aware spawn resolution.
-- Codex TOML config args with quotes previously caused external runtime startup issues.
+## Trap 6：忽略短暂但真实的文件竞争
 
-**Review pressure.**
+Defender、indexer、OneDrive和其它同步工具可能在 rename/fsync/replace间短暂持有文件。
 
-- For user/AI-generated long text, multiline text, JSON, prompts, or shell-sensitive characters: prefer file handoff (`--prompt-file`, `--content-file`, temp file) over inline flags.
-- Do not construct shell command strings when `Command` / `spawn` can pass an argv array.
-- If invoking `npm`/`npx` on Windows from Node, use the repo's spawn invocation resolver so `.cmd` and bundled Node layouts are handled intentionally.
-- If invoking tools from Rust GUI code, use `process_cmd::new` and `system_binary::find` where appropriate.
-- Test the parse boundary with Windows-like argv cases, not only POSIX shell strings.
+审查：
 
-**Smells.**
+- 配置写入沿现有 lock + reread/merge + temp/rename路径；
+- 只对已知 transient sharing violation使用有界退避；
+- 不能把 permission denied一律重试或静默成功；
+- symlink/reparse point在 source、ancestor和publish前再次验证；
+- updater handoff在安装前证明进程和关键文件锁都清零；
+- cleanup target使用明确受管目录，不能宽泛递归用户 HOME。
 
-- `shell: true` added only to "make Windows work" without a quoting test.
-- New CLI flags that accept arbitrary text but no `--*-file` escape hatch.
-- String-built command lines that include user text, TOML, JSON, paths with spaces, or quotes.
+Smell：直接覆盖 config、unbounded retry、catch后忽略、把所有 `AccessDenied` 解释为杀毒软件。
 
-## Trap 4: Spawning Processes As If Tauri Were A Terminal
+## Trap 7：混淆 Runtime identity 和环境
 
-**Why AI misses it.** On macOS dev machines, GUI and terminal often share enough PATH/env that a child process works. On Windows, a Tauri GUI app is not an interactive terminal: PATH differs, console windows can flash, proxies can poison localhost, and process trees can be hidden behind shell wrappers.
+系统 CLI、managed runtime、bundled Node和Provider-backed runtime可能有相同 executable name但不同 owner、版本、auth和proxy。
 
-**Real failures.**
+审查：
 
-- Raw process spawn from GUI caused black console windows.
-- User-installed or MyAgents-managed CLIs were not detected because the app over-relied on shell PATH.
-- Plugin/Sidecar/npm processes needed consistent proxy env and localhost bypass.
-- Stale process cleanup moved to native process enumeration because ad-hoc PowerShell/WMI/pgrep approaches were slow or fragile.
+- Session birth冻结 runtime + source + model的完整 execution identity；
+- runtime-backed Provider不进入 builtin ProviderEnv；
+- probe/status与实际 spawn使用同一 locator和环境 policy；
+- `envPolicy` 只接受 current literal，未知值fail-safe；
+- config变化通过 lifecycle owner replacement，不原地篡改活跃 child env；
+- absolute managed path不回退到 PATH同名 binary。
 
-**Review pressure.**
+Smell：只比较 `runtime === "codex"`、status探测系统 binary但执行 managed binary、把 app proxy与terminal proxy混为一谈。
 
-- Rust process spawn: default to `crate::process_cmd::new()`; apply `proxy_config::apply_to_subprocess` unless there is a documented reason not to.
-- Binary discovery from the app: use `system_binary::find`, bundled-runtime helpers, or runtime-specific detection owners. Do not assume shell PATH.
-- Preserve `NO_PROXY` / localhost exclusions when adding proxy env. A system proxy must not capture app-local HTTP.
-- Do not add ad-hoc PowerShell process cleanup; use `process_cleanup` owners.
-- PTY is the explicit exception: terminal PTY ownership is separate and does not use `process_cmd`.
+## Trap 8：用 macOS证据替代 Windows artifact
 
-**Smells.**
+macOS unit test可以证明 pure policy，不能证明NSIS、WebView2、Authenticode、Job Object、`.cmd` 或 resource layout。
 
-- `std::process::Command::new` in Rust app code outside known exceptions.
-- `powershell` used for process enumeration, deletion, or opening paths when a native owner exists.
-- New runtime detection that shells out to `where`/`which` as the only source of truth.
+审查：
 
-## Trap 5: WebView2 Is Chromium, Not A Mac WebView With Different Fonts
+- pure boundary有 deterministic test；
+- 需要 OS行为的结论明确标为 Windows smoke，不写成已证实；
+- release-like测试使用真实 bundle/resource path和签名流程；
+- installer/updater测试覆盖有空格/Unicode的安装目录、文件锁与重启；
+- smoke在无系统 Node/Python/native DLL fallback下运行，证明 bundled authority；
+- 构建指南拥有命令和 artifact清单，本文件不复制。
 
-**Why AI misses it.** Visual changes are usually built and eyeballed on macOS. Windows runs WebView2/Chromium with different CSP behavior, scrollbar geometry, child-webview composition, custom protocol URL forms, and default font fallback.
+## Review 输出要求
 
-**Real failures.**
+Windows review 应报告：
 
-- Tool attachments initially used loopback HTTP URLs that did not match `img-src`; Windows needed app-owned custom protocol URL shape `http://myagents.localhost/...`.
-- `srcdoc` widgets that load CDN scripts can be blank under Chromium CSP inheritance. Chart.js was fixed by bundled inline injection; the pattern can recur for D3/Lucide/Mermaid-like libraries.
-- Windows scrollbars consume layout width unless gutter is stabilized; macOS overlay scrollbars hide the issue.
-- OS child WebView2 bounds do not participate in CSS transitions like WKWebView; one-shot geometry sampling was replaced with a reconciler after #339.
-- Windows Chinese font fallback showed SimSun when the font stack missed Microsoft YaHei / YaHei UI.
+1. 改动跨过了哪些 Windows-specific boundary；
+2. 每个 boundary 的 owner/helper；
+3. 是否存在上述 smell；
+4. deterministic test 与 Windows-only smoke 各证明什么；
+5. 尚未真机验证的结论必须明确标注，不把静态推理写成 ground truth。
 
-**Review pressure.**
-
-- For subresources, distinguish `connect-src`, `img-src`, `media-src`, and `script-src`. Adding loopback to `connect-src` does not make `<img>` work.
-- Use `myagentsProtocol` / attachment URL helpers for app-owned resources. Do not invent `file://`, `asset://`, raw loopback, or platform-specific URL literals in components.
-- If widget code injects external scripts, prefer bundled raw source + inline injection inside the sandbox over relaxing parent CSP.
-- If a scroll container can cross the overflow threshold on Windows, consider `scrollbar-gutter: stable`.
-- For child webviews, assume CSS transitions and OS controller geometry can desync; use existing browser bounds owners/reconcilers.
-
-**Smells.**
-
-- Comment says "CORS allows this image" for an `<img>` source. CSP, not CORS, is the gate.
-- `http://127.0.0.1:${port}` appears in renderer media URLs.
-- New `iframe srcdoc` code that depends on CDN scripts.
-- UI text/font fixes only tested with Latin characters.
-
-## Trap 6: Windows File IO Has Short, Real Contention Windows
-
-**Why AI misses it.** macOS dev writes rarely collide with antivirus/indexers. Windows users frequently run Defender, OneDrive, enterprise backup, or search indexers that briefly open newly-written files with restrictive sharing.
-
-**Real failures.**
-
-- Config/project/history writes saw `拒绝访问`, `ERROR_ACCESS_DENIED`, or `ERROR_SHARING_VIOLATION` shortly after writes.
-- `FlushFileBuffers` needs write access on Windows even for fsync-like semantics; Unix fsync habits do not transfer.
-- Updater and installer paths can be killed or replaced while sidecars still hold files.
-
-**Review pressure.**
-
-- Config/session/task writes should use the existing atomic write/fsync helpers, including Windows retry/backoff behavior.
-- Do not open a just-written file/directory assuming immediate exclusive availability.
-- Do not treat a single transient health-check or file-open failure as proof a process or install is corrupt.
-- Windows directory fsync is intentionally no-op; do not cargo-cult Unix parent-dir fsync behavior.
-- Update flows need explicit cache=disk consistency: memory state must not point to bytes that are not durably on disk.
-
-**Smells.**
-
-- New direct `fs::rename`, `File::open`, or fsync-like code around persistent app state without checking existing config IO helpers.
-- Single failed health probe triggers restart/delete/reinstall.
-- Update code caches "latest" before the replacement bytes are written.
-
-## Trap 7: Runtime Identity And Environment Drift Are Easier To Hide On Windows
-
-**Why AI misses it.** External runtimes often work in the developer's terminal, then fail inside MyAgents because the app process has different env, PATH, proxy, HOME-like state, or runtime source. Windows makes this more visible because installed CLIs, `.cmd` wrappers, Git Bash, and enterprise proxy settings differ by launch context.
-
-**Real failures.**
-
-- Windows Claude Code CLI runtime lost context until system prompt / session resume handling respected Windows process behavior.
-- Runtime env policy had to distinguish MyAgents proxy from terminal proxy.
-- MyAgents-managed Codex provider must resolve as `runtime='codex'`, `runtimeSource='managed-provider'`, and use managed `CODEX_HOME`; mixing it with user-managed system CLI state creates confusing success/failure.
-- Runtime model/session/provider identity mismatches previously surfaced as "No conversation found", wrong model, or false success.
-
-**Review pressure.**
-
-- Runtime/provider/session routing changes should go through `session-engine` and runtime identity helpers, not route-layer ad-hoc branches.
-- External runtime process env should be produced by the runtime env owner (`env-utils`, managed runtime env, proxy policy), not copied from whichever process happens to call spawn.
-- Managed provider readiness must include install status, auth method, provider gate, runtime source, and disabled state.
-- CLI diagnostics should reflect the same env policy as real sessions.
-- Do not use "terminal works" as proof the app works; compare effective env, PATH first segments, proxy vars, `CODEX_HOME`, and runtime source.
-
-**Smells.**
-
-- New code checks only `runtime === 'codex'` and ignores `runtimeSource`.
-- A route handler decides builtin vs external itself instead of using `SessionEngine`.
-- Managed runtime code reads or writes the user's normal CLI home without an explicit design reason.
-
-## Trap 8: Windows Release Artifacts Need Windows-Specific Proof
-
-**Why AI misses it.** macOS release flows can build, sign, notarize, and upload with a consistent toolchain. Windows artifacts need Authenticode, NSIS behavior, bundled `.exe`/`.cmd` resources, app-local DLLs, Git for Windows, and often a Windows host to verify facts that macOS cannot observe.
-
-**Real failures.**
-
-- Managed Codex Windows artifacts require Authenticode signer certificate metadata. macOS must not publish official Windows runtime artifacts by bypassing this.
-- Windows portable package once used the wrong executable name and could not start.
-- Windows build scripts needed Node heap tuning and rustup path/stderr hardening.
-- Git for Windows and VC++ runtime packaging are release-time prerequisites, not optional local setup.
-
-**Review pressure.**
-
-- If a manifest says a Windows artifact is signed, verify it on Windows and persist the signer certificate SHA-256.
-- If a packaging script emits machine-readable PowerShell output, use the Trap 1 base64 UTF-8 JSON envelope.
-- Release checks should inspect committed artifacts/config, not just a dirty working tree that may contain local fixes.
-- Build scripts should not infer Managed Codex runtime version from the desktop app version; use `src/shared/managed-codex-runtime.json::version` and derive the immutable set as `codex-<version>`.
-- Windows build/test failures can be toolchain environment issues, but do not paper over them until you know whether the binary launches.
-
-**Smells.**
-
-- `--allow-unsigned`, `ForceRepublish`, or manifest override used to "get past" Windows signing without a documented emergency.
-- Windows publish script trusts npm metadata or downloaded bytes without platform signature verification.
-- A release note says Windows support was verified but no Windows-specific artifact path was exercised.
-
-## Adversarial Review Script
-
-Use this as a compact prompt when reviewing a PR from macOS:
-
-1. List every new or changed boundary: process, shell, bytes, path, URL, WebView/CSP, file IO, runtime identity, update/install.
-2. For each boundary, name the existing owner/helper. If there is none, explain why a new owner is required.
-3. Search for the smells in this document. Treat any smell as a finding unless the diff includes a test or explicit invariant.
-4. Ask whether the code would still work when:
-   - paths are `C:\...`, `C:/...`, UNC, lowercase drive, trailing slash, or `\\?\...`
-   - stdout contains Chinese localized text or PowerShell 5.1 chooses a legacy code page
-   - text contains quotes, newlines, backslashes, JSON, or shell metacharacters
-   - the app is launched from Explorer, not a terminal
-   - Defender/OneDrive briefly locks a just-written file
-   - WebView2 enforces CSP stricter than WKWebView
-   - runtime source is `managed-provider`, not `system-cli`
-5. Prefer tests that encode the boundary shape directly: Windows-style path identity tests, argv parser tests, protocol URL tests, BOM/encoding tests, and pure policy tests. If true Windows execution is required, mark it explicitly as an on-Windows smoke rather than pretending macOS CI covered it.
-
-## When To Add A New Entry
-
-Add a new entry only when it is a pattern likely to recur, not just a fixed bug:
-
-- It crosses a Windows-specific boundary.
-- The mistake is plausible for an AI agent or macOS-only developer to repeat.
-- The repo has either a real incident, a code comment, or an invariant that proves the risk.
-- The entry points to the owner/helper or explains what owner should exist.
-
-Do not add one-off symptoms, old release notes with no future design pressure, or generic Windows advice that does not map to this codebase.
+只在出现新的、可复现且跨任务会重复的 failure class 时增加 Trap。单个 bug症状、旧 issue和 release记录不进入本文。

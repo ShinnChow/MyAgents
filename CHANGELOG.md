@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.14] - 2026-09-05
+
+> MyAgents 0.4.14 增加 DeepSeek 与智谱的新模型预设，更新内置执行引擎，并改善文件编辑、插件加载和长期记忆进化的稳定性。
+
+### Added
+
+- **新增模型预设**：DeepSeek 增加 V4 Flash Vision Exp；智谱 API 与 Coding Plan 均增加 GLM 5.3 Flash，可直接在对应供应商中选择。
+
+### Changed
+
+- **内置执行引擎更新**：Claude Agent SDK 升级至 0.3.261，托管 Codex 升级至 0.153.4。
+- **供应商类型更易区分**：设置页明确展示 Claude 订阅、Claude API 和 ChatGPT 订阅的卡片名称。
+
+### Fixed
+
+- **文件改名和移动后可继续编辑保存**：在工作区内重命名文件或移动目录时，已打开的编辑器会同步标题与保存路径，并保留编辑内容；保存失败时显示提示并保持编辑器打开，修复 [#573](https://github.com/hAcKlyc/MyAgents/issues/573)、[#572](https://github.com/hAcKlyc/MyAgents/issues/572)。
+- **更换供应商后可重新开启长期记忆进化 Evo**：已有任务会正确更新运行配置，保留任务与历史记录，修复 [#571](https://github.com/hAcKlyc/MyAgents/issues/571)。
+- **图像与 PDF 工具结果处理更稳定**：避免将媒体编码作为大段文字混入工具结果，同时保留正常的文本和结构化内容。
+- **Windows 本地插件加载更可靠**：启用多个插件或使用较长安装路径时，减少命令行长度限制导致的启动失败。
+
+---
+
 ## [0.4.13] - 2026-09-03
 
 > MyAgents 0.4.13 新增跨工作区的 Session 多标签整理，以及侧边栏重命名和置顶能力；版本同时改善文件夹定位、图片理解配置和 Codex 连续发送体验，并让内嵌浏览器、桌面宠物与源码构建的资源生命周期更可靠。

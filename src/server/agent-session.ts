@@ -232,7 +232,7 @@ import {
   appendOmittedImageNote,
   classifyToolAttachmentPresentation,
   extractToolResultRenderParts,
-  normalizeSdkToolUseResult,
+  extractSdkToolResultRenderParts,
   type ExtractedToolResultAttachment,
 } from './utils/tool-result-attachments';
 import type { ToolAttachment } from '../shared/types/tool-attachment';
@@ -839,7 +839,7 @@ async function awaitSessionTermination(timeoutMs = 10_000, label = ''): Promise<
 
 let isInterruptingResponse = false;
 let isStreamingMessage = false;
-// Every `system` subtype defined in SDK 0.3.220 (sdk.d.ts) — handled here or
+// Every `system` subtype defined in SDK 0.3.261 (sdk.d.ts) — handled here or
 // deliberately untouched. A subtype outside this set means a NEWER SDK started
 // emitting a message kind we have never seen; the loop logs it once per
 // process instead of letting it vanish silently. Update this set when bumping
@@ -857,7 +857,7 @@ const KNOWN_SYSTEM_SUBTYPES = new Set([
 ]);
 const warnedUnknownSystemSubtypes = new Set<string>();
 // Top-level half of the same sentinel: every `type` value an SDKMessage union
-// member carries in 0.3.220. Verified 1:1 against sdk.d.ts at upgrade time
+// member carries in 0.3.261. Verified 1:1 against sdk.d.ts at upgrade time
 // (the system-typed members are covered by KNOWN_SYSTEM_SUBTYPES above).
 const KNOWN_MESSAGE_TYPES = new Set([
   'assistant', 'user', 'result', 'system', 'stream_event', 'rate_limit_event',
@@ -11301,7 +11301,12 @@ async function startStreamingSession(preWarm = false): Promise<void> {
       // already filters to entries that exist on disk as valid plugin roots.
       // Field omitted entirely when no plugins are enabled so empty-array
       // noise doesn't show up in SDK debug output.
-      ...(enabledPluginConfigs.length > 0 ? { plugins: enabledPluginConfigs } : {}),
+      ...(enabledPluginConfigs.length > 0 ? {
+        plugins: enabledPluginConfigs,
+        // SDK/native 0.3.261 delivers paths over stdin, avoiding Windows'
+        // command-line limit without changing the enabled plugin inventory.
+        pluginDelivery: 'initialize' as const,
+      } : {}),
       // (v0.2.12) Enable --replay-user-messages so CLI emits SDKUserMessageReplay
       // (isReplay=true) when it drains a mid-turn queued_command attachment from
       // its commandQueue into the model's context. We use this signal to know
@@ -13003,7 +13008,6 @@ async function startStreamingSession(preWarm = false): Promise<void> {
 
           // Check for structured tool_use_result data (e.g., WebSearch results)
           const toolUseResultData = (sdkMessage as { tool_use_result?: unknown }).tool_use_result;
-          const normalizedToolUseResult = normalizeSdkToolUseResult(toolUseResultData);
 
           // Only iterate if content is an array (tool_result blocks)
           if (Array.isArray(messageContent)) {
@@ -13025,22 +13029,8 @@ async function startStreamingSession(preWarm = false): Promise<void> {
               // below; the remaining text has every base64-ish payload redacted to
               // `[N bytes omitted]`. Session JSONL / SSE only ever carry path refs —
               // the SDK's own transcript (what the model sees) is untouched.
-              const renderParts = extractToolResultRenderParts(
-                normalizedToolUseResult.isMetadataEnvelope
-                  ? normalizedToolUseResult.content
-                  : toolResultBlock.content,
-              );
-
-              // For WebSearch/WebFetch, prefer structured tool_use_result data if available
-              // This contains query, results array with titles/urls, etc.
-              // Otherwise use renderParts.text: passes plain strings / JSON through
-              // verbatim, joins non-image blocks, and (finding 2) yields '' for a bare
-              // data-URL string whose bytes were extracted — so base64 never persists.
-              const contentStr = normalizedToolUseResult.isMetadataEnvelope
-                ? renderParts.text
-                : (toolUseResultData && typeof toolUseResultData === 'object')
-                ? JSON.stringify(toolUseResultData)
-                : renderParts.text;
+              const renderParts = extractSdkToolResultRenderParts(toolResultBlock.content, toolUseResultData);
+              const contentStr = renderParts.text;
 
               const parentToolUseId =
                 childToolToParent.get(toolResultBlock.tool_use_id) ?? sdkMessage.parent_tool_use_id;
@@ -14224,7 +14214,7 @@ async function* messageGenerator(): AsyncGenerator<SDKUserMessage> {
     // Modality re-check at dequeue (see prior comment in pre-fix file).
     const yieldedMessage = stripUnsupportedModalityBlocks(item.message, configState.currentModel);
 
-    console.log(`[messageGenerator] Yielding message, wasQueued=${item.wasQueued}, queueId=${item.id}, requestId=${item.requestId ?? '-'}`);
+    console.log(`[messageGenerator] Yielding message, wasQueued=${item.wasQueued}, queueId=${item.id}, requestId=${item.requestId ?? '-'} summary=${JSON.stringify(summarizeSensitiveSdkMessage({ type: 'user', message: yieldedMessage }))}`);
     yield {
       type: 'user' as const,
       message: yieldedMessage,

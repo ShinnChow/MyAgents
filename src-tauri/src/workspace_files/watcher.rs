@@ -27,6 +27,10 @@
 //! before any other consumer for the same workspace finished `start` —
 //! event_key is deterministic for a given workspace path, tokens are not.
 //!
+//! App rename/move commands emit `{moves: [{oldPath, newPath}]}` immediately
+//! after committing, on this same channel. OS watcher events retain their
+//! coarse workspace-path payload and do not guess rename identity.
+//!
 //! # Debouncing
 //!
 //! Same 5s sliding window as the session watcher. DirectoryPanel adds its
@@ -95,6 +99,27 @@ pub fn event_key_for_workspace(workspace_path: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     workspace_path.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Publish exact successful application moves on the existing workspace channel.
+/// The OS watcher remains a coarse invalidation; it cannot infer document identity.
+pub(crate) fn emit_committed_moves(root: &std::path::Path, moves: &[super::crud::MovedFile]) {
+    if moves.is_empty() {
+        return;
+    }
+    let Some(app) = crate::logger::get_app_handle() else {
+        return;
+    };
+    let event_name = format!(
+        "workspace:files-changed:{}",
+        event_key_for_workspace(&root.to_string_lossy())
+    );
+    if let Err(error) = app.emit(&event_name, serde_json::json!({ "moves": moves })) {
+        ulog_warn!(
+            "[workspace_files] committed move notification failed: {}",
+            error
+        );
+    }
 }
 
 #[derive(Debug, Serialize)]

@@ -117,6 +117,10 @@ describe('summarizeSensitiveSdkMessage', () => {
     expect(summary).toEqual({
       type: 'user',
       isSynthetic: false,
+      isReplay: false,
+      contentKind: 'blocks',
+      textLength: 17,
+      isEmptyContent: false,
       shouldQuery: false,
       priority: 'next',
       originKind: 'peer',
@@ -124,6 +128,21 @@ describe('summarizeSensitiveSdkMessage', () => {
       hasToolUseResult: true,
     });
     expect(serialized).not.toContain('secret');
+  });
+
+  it('distinguishes string, block, media and absent user content without logging payloads', () => {
+    for (const [content, contentKind, textLength, isEmptyContent] of [
+      ['private text', 'string', 12, false],
+      ['', 'string', 0, true],
+      [[{ type: 'text', text: 'private text' }], 'blocks', 12, false],
+      [[{ type: 'image', source: { data: 'private bytes' } }], 'blocks', 0, false],
+      [[], 'blocks', 0, true],
+      [undefined, 'missing', 0, true],
+    ] as const) {
+      const summary = summarizeSensitiveSdkMessage({ type: 'user', isReplay: true, message: { content } });
+      expect(summary).toMatchObject({ contentKind, textLength, isEmptyContent, isReplay: true });
+      expect(JSON.stringify(summary)).not.toContain('private');
+    }
   });
 
   it('fails closed for unknown SDK payloads and non-record values', () => {

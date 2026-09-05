@@ -1,6 +1,6 @@
 # 任务中心架构
 
-> 0.3.0 起，Task 是所有新定时自动化和任务中心执行的唯一持久化实体。Cron 只保留兼容命令名与旧数据读取，不再是 Task 的调度投影。
+> Task 是所有新定时自动化和任务中心执行的唯一持久化实体。Cron 只保留兼容命令名与旧数据读取，不再是 Task 的调度投影。
 
 ## 1. 所有权
 
@@ -124,6 +124,8 @@ TaskStore 维护可重建、最多 5000 条的 Agent Comment locator/excerpt ind
 
 memory update、memory evolution、Agent heartbeat 等内部定时工作也写入带 `managedKind` 的隐藏 Task，由同一个 Task scheduler 执行。普通 Task Center 列表默认过滤 managed Task，但 Session/history/audit 保留。`memory_auto_update_batch` 是遍历多个候选存量 Session 的调度器，本身不拥有持久 Session binding：Task row 使用现有 schema 的非固定绑定形态 `runMode=new-session` 且不写 `preselectedSessionId`，但该 `managedKind` 明确绕过 Session Engine，不会为调度器新建 Session；实际运行时才在 queue authority 下逐个绑定存量 Session 并发送 Memory Update query。历史 single-session 行由配置 reconcile 原位归一。Memory Gardener / Molt 才是实际创建新 Session 执行 Skill 的独立 managed Task。
 
+Evo configure 的 runtime/config 是完整目标配置，不是 Task PATCH：指定 runtime 却未指定 config 时，以 `{}` 显式替换旧配置；取消 runtime override 时清除两者。普通 Task PATCH 的省略字段仍表示保留。已有 Gardener / Molt 在 Task control guard 内重读、校验合并后的执行路由，再停止和原位更新；校验失败不先停任务。这样从 Codex managed-provider 切回 builtin 或同 runtime 移除配置时，不会继承不兼容配置，也不会丢失 Task ID 和历史记录。
+
 Memory Gardener / Molt 的执行 Session 对用户保持隐藏，因此不发送逐次桌面通知，也不生成指向隐藏 Session 的 deep-link。Agent 设置中的 Evo 区域直接读取这两类 managed Task 的 `lastExecution` 权威摘要，只展示最近一次执行成功或失败及其时间；Renderer 不从隐藏 Session 文本或 `cron_runs` 推断结果，也不复制一份独立运行状态。
 
 managed job 不再创建 managed CronTask 旁路。memory auto-update 的 configure 以 exact Agent ID 串行，并以 managed Task 的 `workspace_id` 持久化该 identity；进入锁后重新读取 `config.json`，只有 `Agent.enabled && memoryAutoUpdate.enabled` 才具备主动执行资格，关闭顶层主动能力不改写 Memory 子配置。磁盘上的 exact Agent 配置是 enable/disable、schedule 与参数的唯一权威，renderer 到达顺序和同路径 Agent 的持久化顺序都不能覆盖它。Project projection 解析出的 workspace 只负责当前执行目录与 workspace 级文件 IO 互斥，不参与 AgentConfig 选择或 Task 去重。
@@ -191,9 +193,9 @@ Goal 是 Session 状态，不是 Task execution mode：
 - 不创建 Task、不占用 Task status/schedule 字段。
 - Task 与 Goal 可在同一 Session 共存；Task scheduler 不感知 Goal。
 - Goal turn 的 completion descriptor 保留 `{ kind: 'goal', id: goalId }` owner；generic Session completion 被抑制，Goal terminal/outbox/notification 继续由 Goal domain lifecycle 负责。
-- 未来 Task 如需持续执行，可让其 prompt 中的 AI 在当前 Session 调 `myagents goal create`，无需 Task->Goal 编排字段。
+- Task 需要持续执行时，由 prompt 中的 AI 在当前 Session 调 `myagents goal create`；Task 模型不增加 Task→Goal 编排字段。
 
-详见 `session_architecture.md` 的 Goal Mode 章节。
+详见 [`session_architecture.md`](session_architecture.md) 的“Goal 与跨 Session 协作”。
 
 ## 8. 主要入口
 

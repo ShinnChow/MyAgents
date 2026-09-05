@@ -1,446 +1,171 @@
-# 第三方 LLM 供应商集成指南
+# LLM Provider 架构
 
-本文档总结了在 MyAgents 中集成第三方 LLM 供应商（DeepSeek、智谱、Moonshot、MiniMax 等）的关键技术经验。
+MyAgents 把“用户选择哪个 Provider / model”与“执行时如何取得 credential 和构造 transport”分开。Provider 定义、模型表和当前 endpoint 以 `src/shared/config-types.ts` 及配置 resolver 为准；本文不复制易变的预设列表。
 
----
+## 核心表示
 
-## 核心原理
+### ProviderRoute
 
-Claude Agent SDK 支持通过环境变量配置第三方 API：
+`ProviderRoute` 是可持久化的选择 identity，表达 Provider ID、model 和 subscription/provider kind。Product Session 的 current metadata/config snapshot 使用 route，而不是保存可执行 secret。
 
-| 环境变量 | 作用 |
-|----------|------|
-| `ANTHROPIC_BASE_URL` | API 端点地址 |
-| `ANTHROPIC_AUTH_TOKEN` | API 认证令牌 |
-| `ANTHROPIC_API_KEY` | API 密钥（SDK 可能使用此变量）|
-| `ANTHROPIC_MODEL` | 默认模型 ID |
+### ProviderEnv
 
----
+`src/server/provider-types.ts::ProviderEnv` 是 builtin execution 的进程内 materialization，可能包含：
 
-## 关键经验
+- `providerId` / `providerName`；
+- `baseUrl`、`apiKey`、`authType`；
+- `apiProtocol`、OpenAI upstream format / token limit；
+- model aliases；
+- host-managed credential 的非 secret reference。
 
-### 1. 环境变量必须同时设置两个 Key 变量
+它只供 Sidecar 当前执行、probe、title/vision one-shot 或 Bridge 使用。新 Session 不能把 materialized API key 写回 session metadata；legacy `providerEnvJson` 只在兼容读取边界使用并在外部 projection 中 redacted / 移除。Agent / IM Channel 配置仍可能维护供后台自启动的兼容 projection，但 `config.json` 的 Provider/API-key 配置仍是 credential authority，projection 不能成为第二份可编辑真相。
 
-SDK 不同版本可能使用不同的环境变量名，建议同时设置：
+### Runtime-backed Provider
 
-```typescript
-env.ANTHROPIC_AUTH_TOKEN = apiKey;
-env.ANTHROPIC_API_KEY = apiKey;
+`codex-sub` 是 Provider-shaped 的产品选择，但 execution 实际为 Managed Codex Runtime。它不能 materialize 为 builtin `ProviderEnv`：
+
+```text
+Provider choice: codex-sub
+  -> ProviderExecutionIntent(runtime-backed)
+  -> runtime=codex, source=managed-provider
+  -> Session birth 时冻结 execution identity
 ```
 
-### 2. 切换回官方订阅时必须清除环境变量
+Agent / Channel defaults 保留 Provider choice，不把 managed runtime projection 混成用户自带 Codex CLI 配置。执行 Session snapshot 才携带完整 runtime/source/model。
 
-问题：切换到第三方后再切回 Anthropic 订阅，如果 `ANTHROPIC_BASE_URL` 仍存在，请求会发到错误的端点。
+## Auth owner
 
-解决：显式删除环境变量：
+| Provider 类型 | Credential owner | Materialization |
+| --- | --- | --- |
+| `anthropic-sub` | Claude Code native credential store | 不设置第三方 base URL/key；不设置 host-managed marker |
+| 普通 API Provider | `config.json` / Provider API key store | 按 Provider definition 生成 `ProviderEnv` |
+| `xai-sub` | Rust `GrokAuthManager` | `ProviderEnv` 只携带 managed credential reference，Bridge 每请求取 bearer |
+| `codex-sub` | Managed Codex Runtime | 不进入 builtin ProviderEnv |
 
-```typescript
-if (currentProviderEnv?.baseUrl) {
-  env.ANTHROPIC_BASE_URL = currentProviderEnv.baseUrl;
-} else {
-  delete env.ANTHROPIC_BASE_URL; // 关键！
-}
+Subscription 是产品/计费类型，不决定 auth owner。新增 subscription 必须显式选择 `sdk-native`、`host-managed-oauth` 或 `runtime-managed`，不能把所有 subscription 当成“空 ProviderEnv”。
+
+## API Provider env
+
+`buildClaudeSessionEnv()` 每次从 clean baseline 构造 SDK child env。切换 Provider 时必须显式设置或清除 `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN` 及 model aliases，不能让上一个 Provider 的值泄漏。
+
+Auth header 由 Provider 的 `authType` 决定：
+
+| authType | Env 语义 |
+| --- | --- |
+| `api_key` | 只设置 API key |
+| `auth_token` | 设置 bearer token；当前 SDK 兼容路径同时封住 stale key lookup |
+| `auth_token_clear_api_key` | bearer token + 显式空 API key |
+| `both` | 两个变量都设置；只作为定义明确要求或兼容默认 |
+
+不要在文档中把“所有 Provider 必须设置两个 key”当成通用规则。具体 Provider 的 `authType` 是唯一决策源。
+
+Provider model aliases 同时影响主 Query 和 SDK sub-agent 选择。Context window、output token 参数、input modalities 和模型显示名从 Provider registry / discovered models 解析；静态文档不维护副本。
+
+## Anthropic subscription
+
+`anthropic-sub` 使用 Claude Code native OAuth / keychain：
+
+- 不通过 MyAgents `getOAuthToken` 注入；
+- 不重定向 `CLAUDE_CONFIG_DIR`；
+- 清空 inherited third-party routing/auth variables后让 native client读取其 credential；
+- 跳过 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`，避免把 native subscription误标为 host-managed Provider。
+
+MyAgents 仍拥有 Session、permission、proxy scope 和 tool surface，但不拥有 OAuth refresh。
+
+## Grok subscription
+
+`src-tauri/src/grok_auth/` 的单例 `GrokAuthManager` 拥有 device login、atomic credential store、refresh gate、credential version 和 quarantine。
+
+执行路径：
+
+1. Sidecar Provider resolver生成带 `credentialSource` 的 ProviderEnv；
+2. OpenAI Bridge 每个 upstream request向 Rust management API取得 bearer + opaque credential version；
+3. upstream 首次返回 401 时，只允许针对被拒 generation强制 refresh一次，并以 byte-equivalent request重试；
+4. recovery 后仍是 401，才 quarantine 对应 credential version；
+5. 403 表示 entitlement / region / model 问题，429 表示 rate/quota，不能触发 auth refresh；
+6. completion 只上报 status 与 generation，不记录 bearer。
+
+One-shot verification 必须在完整 SDK / translator terminal success 后才提交 verified state。收到 2xx headers 不等于 turn 成功；旧 generation 的 late failure 不能污染新登录 lineage。
+
+## OpenAI Bridge
+
+OpenAI-protocol Provider 仍让 Claude SDK 对 loopback 发送 Anthropic-shaped request：
+
+```text
+SDK subprocess
+  -> /bridge/<opaque-token>/v1/messages
+  -> bridge registry resolves this subprocess's live upstream config
+  -> translate to Chat Completions or Responses
+  -> Provider-aware proxy + auth
+  -> translate stream/result back to SDK
 ```
 
-### 2.1 Anthropic 订阅的 OAuth owner 是 Claude Code native
-
-`anthropic-sub` 不由 MyAgents 读取、刷新或写回 OAuth token。Claude Code native 自己读取本机官方 credential store（macOS Keychain `Claude Code-credentials`，Linux/Windows `~/.claude/.credentials.json`），这正是独立 `claude` CLI 登录后 MyAgents 应能直接复用的能力。
-
-`buildClaudeSessionEnv()` 必须按 provider 分流：
-
-- `providerId === 'anthropic-sub'`：删除/不设置 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`，让 native Claude Code 自主管理 OAuth。
-- 其它 API provider：继续设置 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1`，阻止 `~/.claude.json` / settings-sourced provider env（cc-switch、Claude Code Router 等）静默劫持 MyAgents 的 provider 路由。
-
-不要给 **Anthropic 订阅** query 传 `getOAuthToken`，也不要为 `anthropic-sub` 新增 MyAgents 私有 token adapter；否则会和本机 Claude Code CLI/桌面端抢 OAuth refresh / Keychain 生命周期。
-
-### 2.2 Grok 订阅的 OAuth owner 是 Rust 应用单例
-
-`xai-sub` 与 `anthropic-sub` 都是 subscription ProviderRoute，但它们不是同一种 credential policy：
-
-- `anthropic-sub`：`sdk-native`，Claude Code native 自己拥有凭据，materialize 为 `'subscription'` sentinel。
-- `xai-sub`：`host-managed-oauth`，Rust `GrokAuthManager` 是 canonical grant、refresh rotation、quarantine 与 logout 的唯一 owner；materialize 为 builtin OpenAI Responses `ProviderEnv`，其中只有非 secret 的 `credentialSource:{kind:'managed-oauth',providerId:'xai-sub'}`。
-- `codex-sub`：`runtime-managed`，由 Managed Codex Runtime 执行，不进入 builtin ProviderEnv。
-
-Grok bearer 的边界：
-
-1. Rust 独立存储 `~/.myagents/credentials/grok-oauth.json`，用文件锁、fresh-read、原子替换与平台权限加固管理 rotating refresh token。
-2. Sidecar 不缓存 bearer。Bridge 的 async registry resolver 在每次上游请求前，经 localhost Management API 获取当前 access token；请求带进程出生时注入的 `MYAGENTS_SIDECAR_ID` 与 `X-MyAgents-Sidecar-Generation`，Rust 只接受当前 live Sidecar process identity。该身份同时覆盖 canonical Global 与 Session Sidecar，不能用可变的 Product Session id 代替。
-3. Bridge 遇到首个 401 才请求一次强制 refresh，并以字节等价的 request body 重试；第二个 401 quarantine 对应 credential version。403/429 只记录 entitlement/rate 状态，绝不 refresh 或删除 grant。
-4. renderer 只调用 Tauri auth/model commands，永远拿不到 bearer。模型目录复用 `ModelManagementPanel`，由宿主 `discoveryAction` 调 Rust `/v1/models`，再进入共享 OpenAI model-list parser。
-5. OAuth 成功不等于“已验证”。Global Sidecar 的 one-shot 验证使用带 expected grant lineage 的 `verification` bearer purpose；只有 builtin SDK 经现有 Responses Bridge 收到 terminal success 后，Tauri verification owner 才按同一 lineage 提交 `providerVerifyStatus[xai-sub]=valid`。它不创建 Product Session，也不借用 Session Sidecar；普通 Bridge 2xx 不写验证状态，`execution` purpose 只允许已 valid（或既有 valid 后的 rate/network 临时态）的 grant。
-
-### 3. API Key 存储与读取
-
-- **存储位置**: `apiKeys[provider.id]`（通过 useConfig 获取）
-- **常见错误**: 误用 `provider.apiKey`（始终为 undefined）
-- **正确做法**: 
-
-```typescript
-const { apiKeys } = useConfig();
-const apiKey = apiKeys[currentProvider.id];
-```
-
-### 4. Provider 配置结构
-
-```typescript
-interface Provider {
-  id: string;
-  name: string;
-  config: {
-    baseUrl?: string;  // 第三方 API 端点
-  };
-  models: ModelEntity[];
-  primaryModel: string;
-}
-```
-
----
-
-## 预设供应商 BaseURL
-
-| 供应商 | BaseURL | 类型 | 备注 |
-|--------|---------|------|------|
-| DeepSeek | `https://api.deepseek.com/anthropic` | 模型官方 | Anthropic 兼容 |
-| Moonshot | `https://api.moonshot.cn/anthropic` | 模型官方 | Anthropic 兼容 |
-| 智谱 AI | `https://open.bigmodel.cn/api/anthropic` | 模型官方 | Anthropic 兼容 |
-| MiniMax | `https://api.minimaxi.com/anthropic` | 模型官方 | Anthropic 兼容 |
-| 火山方舟 Coding Plan | `https://ark.cn-beijing.volces.com/api/coding` | 云服务商 | 字节跳动 |
-| 火山方舟 API调用 | `https://ark.cn-beijing.volces.com/api/compatible` | 云服务商 | 字节跳动 |
-| 硅基流动 | `https://api.siliconflow.cn/` | 云服务商 | authType: api_key |
-| ZenMux | `https://zenmux.ai/api/anthropic` | 云服务商 | 多模型聚合路由 |
-| OpenRouter | `https://openrouter.ai/api` | 云服务商 | authType: auth_token_clear_api_key |
+每个 SDK subprocess 使用独立 bridge token。Active Session、verify、title、vision 和 sub-agent 不能共享 process-global “current upstream”；registry entry 由创建者在 `finally` 注销，没有 token 时 fail closed。
 
-> **注意**：所有供应商使用 Anthropic 兼容端点。不同供应商 `authType` 可能不同，详见 `types.ts` 中的 `PRESET_PROVIDERS`。
+### Cache affinity
 
----
+Active conversation 可按 Session 设置 `prompt_cache_key` / explicit cache breakpoints。One-shot probe、title 和 vision 不使用 conversation affinity。上游明确拒绝某 cache feature 时，只在该 bridge generation 内做一次兼容降级并重放等价 request；不能全局永久关闭，也不能对任意 HTTP error 猜测重试。
 
-## 数据流
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Chat.tsx                                                     │
-│  - 用户选择 provider/model                                  │
-│  - 新写入路径持久化 ProviderRoute: {providerId, model}      │
-│  - 不持久化 apiKey/baseUrl/modelAliases                     │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ POST /chat/send
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ session-engine/builtin-adapter.ts                            │
-│  - 校验 ProviderRoute 与本次 model 一致                     │
-│  - 调 admin-config materialize ProviderEnv                  │
-│  - sdk-native subscription → 'subscription' sentinel          │
-│  - host-managed subscription → managed ProviderEnv            │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ agent-session.ts                                             │
-│  - 存储运行时 currentProviderEnv（非持久身份）              │
-│  - buildClaudeSessionEnv() 设置环境变量                      │
-│  - anthropic-sub 跳过 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST   │
-│  - xai-sub / API provider 保持 host-managed env sealing      │
-│  - SDK query() 使用这些环境变量                             │
-└─────────────────────────────────────────────────────────────┘
-```
+### Timeout 与终态
 
-### ProviderRoute vs ProviderEnv
+Bridge 对“等待 response headers”有有界 timeout；成功 streaming body 由 SDK turn、AbortSignal 和 stream protocol owning，不应用一个短固定总时长截断长回答。HTTP status、stream error、model refusal、translator failure 和 SDK terminal 必须保持可区分。
 
-- `ProviderEnv` 只在 `src/server/provider-types.ts` 定义。它属于 Server 的 Provider 模块，不由 builtin Session facade 或 Renderer 定义。
-- `ProviderRoute` 是会话持久身份，只保存 provider/model：`{kind:'provider', providerId, model}` 或 `{kind:'subscription', providerId:'anthropic-sub'|'xai-sub', model}`。
-- `ProviderEnv` 是请求运行时派生物，包含 `baseUrl`、`apiKey`、`authType`、`modelAliases` 或非 secret `credentialSource`；只能从当前配置即时 materialize，不能作为新会话身份写回 `sessions.json`。`credentialSource` 是 owner 引用，不是 bearer 快照。
-- `providerEnvJson` 只读兼容旧数据：没有 `providerRoute` 的历史 session 才允许 fallback 读取。新写入路径必须写 `providerRoute`，并省略/清空 `providerEnvJson`。
-- `model + configSnapshotAt` 旧 session 缺 provider 时，只在“声明该 model 且本地有凭据/账号证据”的 provider 中修复。API provider 看非空 API key；Anthropic subscription 看 valid 状态、`accountEmail` 或 `verifiedAt` 任一存在。多个候选或没有候选时，不猜默认 provider，要求用户在模型选择器重新选择。
+普通 401/403/429/5xx 不做通用重试。只有明确的 managed-auth 401 recovery 和精确识别的 cache compatibility downgrade 拥有各自单次重试预算。
 
-### OpenAI Bridge prompt cache affinity
+### Proxy
 
-OpenAI-protocol providers use the bridge as the only request-shape owner for both egress formats: `upstreamFormat:'responses'` and Chat Completions (`upstreamFormat:'chat_completions'` / default). Active builtin sessions attach anonymous cache affinity via `agent-session.ts::resolveActiveSessionUpstreamConfig()`:
+SDK child 到 Sidecar 是 loopback，必须剥离 proxy env。Bridge 到 upstream 使用 `getProxyForProviderUrl(providerId, url)`，详见 [`proxy_config.md`](proxy_config.md)。
 
-- active session：`cacheAffinity: { sessionId, promptCacheKeyMode:'session' }`，由 `openai-bridge/prompt-cache.ts` hash 成 protocol-scoped `prompt_cache_key`（`myagents:responses:<hash>` / `myagents:chat_completions:<hash>`），不包含 raw `sessionId`、workspace path、apiKey、baseUrl、prompt 内容。
-- one-shot bridge（provider verify / title / supported-model probing / vision 等）：不设置 `cacheAffinity`，避免短生命周期调用污染 chat session cache routing。
-- SDK request 中的 `cache_control` 是 breakpoint source intent；Bridge 只在 active session 把它投影到目标协议明确支持的 content part。Responses 的 system blocks 使用无状态 `developer` message + `input_text` parts，Chat 使用 structured system content。Responses 支持 `input_text` / `input_image`；Chat 支持 `text` / `image_url`，因此历史 assistant text 与 tool-result text 也可原样投影。tool definitions、Responses function outputs / assistant outputs 等不支持该 target field 的位置不伪造 marker 或补充消息，继续依赖 provider 的 implicit caching。
-- implicit caching 始终是默认机制：不发送 `prompt_cache_options.mode:'explicit'`。显式 breakpoint 只是 source marker 的局部投影，不从消息长度、role 或工具形态推断。
-- `prompt_cache_key` 与 explicit breakpoint 是两个独立 compatibility capability。`openai-bridge/handler.ts` 只在 400/422 且错误精确指向对应字段或 breakpoint 必需 request shape 时，各自去掉对应能力并最多重试一次；重试从原始 Anthropic request 重新翻译。downgrade 只保存在当前 bridge token 的 registry entry，token 注销即释放，不写 provider 配置或持久化 capability matrix。
-- 默认不发送 `store:true`、`previous_response_id`、`conversation`、`prompt_cache_retention`。这些属于 provider capability / 数据保留语义，不是缓存命中率修复的默认路径。
-- 错误日志和 SDK/UI 透出的 upstream error body 必须先脱敏：不得输出 `myagents:responses:<hash>` / `myagents:chat_completions:<hash>`、apiKey、raw session id 或被上游回显的 request body / prompt。
+## Session 切换与 history boundary
 
-### OpenAI Bridge timeout ownership
+Provider / model 是 Session config。用户在已有 Session 修改它时：
 
-Bridge 只拥有“等待 upstream response headers”的连接建立上限，配置字段为
-`BridgeConfig.upstreamHeadersTimeoutMs`（默认 5 分钟）。headers 到达后立即清除该 timer；它不限制
-Chat Completions / Responses 的流式 response body 生命周期。
+1. 通过 SessionEngine / builtin config owner 验证并写入；
+2. process-baked env 或 bridge identity 变化时 replacement 当前 Query，不在旧 child 上热改 env；
+3. Product Session ID 保持不变；
+4. 是否继续 resume 原 SDK transcript 由 `src/shared/providerHistory.ts` 的 policy 决定。
 
-流式 body 不能用“最近有没有字节”代理 turn 活性。推理模型在服务端合法长思考时可能超过 60 秒不输出
-任何字节；Bridge 没有 suspension、交互和 SDK turn 状态，不能据此 abort。真正永久无 SDK event 的 turn
-由 builtin Session 的 suspension-aware 10 分钟 `InactivityWatchdog` 收口。
+当前 history family：
 
-Bridge 在流式阶段只保留三种终止权：下游明确取消、真实 transport EOF/error、协议终态。Chat 以
-`[DONE]`，Responses 以 `response.completed` / `response.failed` 结束下游并释放仍 linger 的 upstream
-socket，不等待 TCP EOF。禁止重新增加 stream byte-idle timer、用户可配置 body timeout 或伪 heartbeat。
+- Anthropic direct；
+- portable third-party（Anthropic protocol 与 OpenAI Bridge 都保持 Anthropic-shaped transcript）；
+- runtime-backed `codex-sub`；
+- 只有确有证据的 Provider/model/endpoint 才进入 isolated key。
 
-### OpenAI Bridge 错误与重试语义
+跨 family 时不能把旧 SDK execution identity 直接 resume 到新 transport；应在同一 Product Session 中创建新的 execution lineage。不要按 Provider 名称在各 UI / route 重新实现比较规则。
 
-OpenAI→Anthropic translator 是上游错误 status/code/type/message 变成 SDK 可执行语义的唯一 owner。它在 wire 投影前形成结构化 failure fact：原始 429 默认保持 `429/rate_limit_error`，由 Claude Agent SDK 拥有同一次 API 请求的 retry lifecycle；只有结构化 `insufficient_quota` / `billing_not_active` 等 code/type，或明确 payment、billing hard-limit、余额不足证据，才把 429 投影为非重试的 402。泛化的 `quota exceeded` 文案不能单独获得永久失败 authority，因为 Provider 也会用它表达短时并发或窗口配额。
+## Server tool projection
 
-上游直接 402 仍按永久失败处理。产品 Turn lifecycle 不为 API error 建立第二套 retry/replay；`api_retry` 继续来自 SDK。Provider verify 读取 Bridge 已投影的结构化 status：429 只在当次响应携带 `retryable`，Settings 显示稍后重试且不覆盖既有 `providerVerifyStatus=valid`；不新增持久化第三态、retry cache 或 coordinator。错误日志只记录 classification/evidence，不记录凭据或请求正文。
+部分兼容 API 会在 stream 中发送 `server_tool_use`，并可能把 input 编成 JSON string 或附带装饰性文本。`agent-session.ts` 负责：
 
-### Runtime-backed Provider（Managed Codex）
+- 把 server tool 与 client-side `tool_use` 分开建模；
+- 在完整 input 到达时解析已知 JSON string；
+- 只对同时满足精确多标记的已知 wrapper 过滤装饰文本；
+- 保留无法安全识别的原文，避免误删用户内容；
+- 对 server tool result 维持正确 stream index、计数和 UI projection。
 
-`codex-sub` 是 Provider 列表中的订阅型入口，但它不 materialize 为 Claude Agent SDK 的 `ProviderEnv`。它的 `Provider.execution.kind === 'runtime-backed'`，选择后会生成 `RuntimeBackedProviderIdentity { providerId:'codex-sub', runtime:'codex', runtimeSource:'managed-provider', model }`，由 Sidecar 以 Codex Runtime 执行。
+这是一条 protocol compatibility boundary，不应写进某个 Provider UI component。
 
-边界规则：
+## 自定义 Provider
 
-- Chat session birth 保存 runtime projection：`runtime:'codex'` + `runtimeSource:'managed-provider'` + `providerExecutionIdentity`；Task/Cron 执行 override 保存 `runtimeConfig.source:'managed-provider'` + 选中的 Codex model。这样 Rust spawn Sidecar 时能注入 `MYAGENTS_RUNTIME=codex` 与 runtime source。
-- IM / Agent Channel session birth 只保存 runtime identity：`runtime:'codex'` + `runtimeSource:'managed-provider'`。model / provider / permission / MCP 继续每条消息 live resolve 当前 Agent 配置；session drift、heartbeat、`/model` 命令唤醒 Sidecar 时必须比较并传递完整 identity。
-- Agent/Channel 默认值保存用户的 Provider 选择：`providerId:'codex-sub'` + model，`runtime` 仍保持 `builtin`，且不得把 `runtimeConfig.source/model` 写进 Agent 默认配置。否则 Codex 订阅会和用户手动安装的 Codex CLI runtime 混成同一种身份。
-- `codex-sub` 的可见性由 `managedCodexProviderDevGate` 控制；可选择性还要求 managed runtime 已安装到要求版本、managed Codex auth 有效（`chatgpt` 或兼容的 `access-token`），并且 provider 未被 `disabledProviderIds` 禁用。
-- 进入 runtime-backed family 后，历史边界是 `runtime-backed:codex-sub`，不与 builtin Anthropic / third-party Provider transcript 互相 resume。
+Custom Provider 复用相同 route/env/bridge 架构。新增或修改时：
 
----
+1. 在 Provider registry 定义 protocol、auth type、endpoint 和 model capability；
+2. credential 留在 config authority，不写 Session；
+3. OpenAI protocol 走 per-subprocess Bridge；
+4. model aliases 缺失时由现有 resolver 按 primary model 补齐，不在调用点猜；
+5. provider probe 使用相同 auth、proxy、timeout 和 protocol projection；
+6. 用 Provider ID / model identity 做 analytics，日志不输出 key 或 bearer。
 
-## 调试技巧
+## 验证
 
-查看后端日志确认环境变量是否正确设置：
+测试至少覆盖：
 
-```
-[env] ANTHROPIC_BASE_URL set to: https://open.bigmodel.cn/api/anthropic
-[env] ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY set from provider config
-[agent] starting query with model: glm-4.7
-```
-
-订阅路径应看到：
-
-```
-[env] CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST skipped for Anthropic subscription
-[env] ANTHROPIC_BASE_URL cleared (using Anthropic default)
-[env] ANTHROPIC_AUTH_TOKEN cleared (using default auth)
-```
-
-如果看到 `apiKeySource: "none"`，说明 API Key 未正确传递。
-
----
-
-## ⚠️ 关键陷阱：会话中途切换供应商
-
-### 问题
-
-环境变量（`ANTHROPIC_BASE_URL`）在 SDK 子进程启动时设置，**无法在运行时更新**。如果用户在会话中途切换供应商：
-
-1. `currentProviderEnv` 更新 ✅
-2. 正在运行的 SDK 进程仍使用旧的 baseUrl ❌
-3. API 请求发往错误的端点 → 报错"模型不存在"
-
-### 解决方案
-
-检测供应商变化时，**终止当前 SDK 会话并重启**。重启后是否 resume 旧 SDK transcript 由 `canResumeAcrossProviderBoundary(...)` 统一判断：
-
-```typescript
-if (providerChanged && querySession) {
-  const crossesProviderHistoryBoundary = !canResumeAcrossProviderBoundary(
-    toProviderHistoryEnv(currentProviderEnv, currentModel),
-    toProviderHistoryEnv(providerEnv, nextModel),
-  );
-  currentProviderEnv = providerEnv;
-  abortPersistentSession();  // 统一中止：设置标志 + 唤醒 generator 门控 + interrupt
-
-  // 等待旧会话完全终止，避免竞态条件
-  if (sessionTerminationPromise) {
-    await sessionTerminationPromise;
-  }
-
-  if (crossesProviderHistoryBoundary) {
-    await resetForProviderHistoryBoundary(); // Product A 不变；持久化 fresh sdkSessionId=S2
-  }
-
-  // schedulePreWarm() 会在 finally 中自动触发
-}
-```
-
-### 注意事项
-
-- **应用层 session 保留**：Product `sessionId`、messages、cursor、title/config 与 Sidecar owner 全部不变
-- **SDK 层 session 重建**：只把同一 Product Session 的 `sdkSessionId` 换成 S2，随后精确 create/resume S2
-- **跨回合状态清理**：`streamIndexToToolId`、`toolResultIndexToId`、`childToolToParent` 由 `builtin-session/turn-lifecycle.ts` 的 terminal cleanup 触发清理（`agent-session.ts` 只组装清理回调）
-- **统一中止**：所有需要终止 session 的场景必须使用 `abortPersistentSession()`，它同时唤醒 generator 的 Promise 门控并调用 `interrupt()`
-
----
-
-## ⚠️ 关键陷阱：Provider 历史边界与 Resume
-
-### 问题
-
-Anthropic 官方 API 会在 thinking block 中嵌入签名，resume session 时校验签名。普通第三方供应商（DeepSeek、GLM 等）默认进入 portable protocol family：provider env 变化仍会重启 SDK subprocess，但重启后可以 resume 旧 transcript，保留用户在同一会话中切换模型 / provider 的工作流。
-
-从第三方供应商切换到 Anthropic 官方后 resume session 会报错：`Invalid signature in thinking block`
-如果未来确认某个 provider / model / endpoint 无法 replay 其他历史，才把它加入 `src/shared/providerHistory.ts::ISOLATED_PROVIDER_HISTORY_KEYS`。进入或离开 isolated entry 时，前端提示“将重置模型上下文”，后端只 fresh SDK execution identity；Product Session 与可见历史仍保持不变。isolated entries 之间不能共享 SDK transcript。
-
-### Resume 规则
-
-| From | To | Resume | 原因 |
-|------|-----|--------|------|
-| 三方 portable | Anthropic 官方 | ❌ fresh SDK identity | Anthropic signed history 边界不同 |
-| Anthropic 官方 | 三方 portable | ❌ fresh SDK identity | Anthropic signed history 边界不同 |
-| 三方 portable A | 三方 portable B | ✅ resume | 保留同一会话内切换 GLM / DeepSeek 等普通三方模型的工作流 |
-| Anthropic-protocol 三方 | OpenAI-bridge 三方 | ✅ resume | SDK transcript 仍是 Anthropic 形态；OpenAI bridge 只在请求边界翻译 |
-| 任意 non-isolated | isolated entry | ❌ fresh SDK identity | 已知该 entry 不支持跨边界 replay |
-| isolated entry A | isolated entry B | ❌ fresh SDK identity | isolated entries 不互串 SDK transcript |
-| Anthropic 订阅 | Anthropic API Key | ✅ resume | 签名兼容 |
-
-### 区分标准
-
-```typescript
-// Provider history identity:
-// - no baseUrl, or https://api.anthropic.com = Anthropic signed family
-// - ordinary third-party providers share `third-party` across apiProtocol
-// - entries listed in ISOLATED_PROVIDER_HISTORY_KEYS get an `isolated:*`
-//   identity that also includes provider/model/endpoint context
-//
-// ISOLATED_PROVIDER_HISTORY_KEYS is intentionally empty initially.
-// Add exact keys only after a concrete incompatibility is confirmed:
-// - provider:<providerId>
-// - model:<modelId>
-// - endpoint:<apiProtocol>:<normalizedBaseUrl>
-```
-
----
-
-## ⚠️ 关键陷阱：不能把所有 subscription 都当成空 providerEnv
-
-### 原则
-
-- 会话配置状态里，`currentProviderEnv = undefined`：只表示 builtin Anthropic 订阅（官方默认 endpoint + Claude Code native OAuth store）。
-- `providerEnv = { baseUrl, apiKey }`：普通第三方 API。
-- `providerEnv = { baseUrl, credentialSource:{kind:'managed-oauth',...} }`：host-managed subscription；静态对象不含 token。
-
-不要再在调用点用 `provider.type !== 'subscription'` 猜 materialization。统一把 `ProviderRoute` 交给 `session-engine` / `materializeProviderRouteEnv()`；只有 `anthropic-sub` 返回 sentinel：
-
-```typescript
-const resolved = route.kind === 'subscription' && route.providerId === SUBSCRIPTION_PROVIDER_ID
-  ? 'subscription'
-  : await materializeProviderRouteEnv(route);
-```
-
-后端检测订阅切换：
-
-```typescript
-// 从 API 模式切换到订阅模式
-const switchingToAnthropicSubscription = resolved === 'subscription' && currentProviderEnv;
-```
-
-### One-shot SDK 子进程
-
-`verifySubscription()`、Anthropic 辅助登录、标题生成、官方 vision 这类 one-shot 调用不属于“切换当前会话 provider”。它们调用 `buildClaudeSessionEnv()` 时不能靠裸 `undefined` 表达订阅身份，因为该函数会把 `providerEnv === undefined` 解释为“沿用当前 active session 的 `configState.currentProviderEnv`”。如果用户当前会话选中第三方 API provider，裸 `undefined` 可能错误继承 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`，或丢失 subscription provider identity。
-
-one-shot 订阅路径必须显式传官方订阅 provider identity：
-
-```typescript
-const officialSubscriptionProvider: ProviderEnv = { providerId: SUBSCRIPTION_PROVIDER_ID };
-const env = buildClaudeSessionEnv(officialSubscriptionProvider, undefined, {
-  providerId: SUBSCRIPTION_PROVIDER_ID,
-});
-```
-
-这既能清理第三方 provider env，又能触发 `anthropic-sub` 的 native OAuth owner 分支（跳过 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`）。
-
----
-
-## ⚠️ 关键陷阱：智谱 GLM-4.7 的 server_tool_use
-
-### 背景
-
-智谱 GLM-4.7 支持服务端工具调用（如 `webReader`、`analyze_image`），返回 `server_tool_use` 类型的内容块，与 Claude 的 `tool_use`（客户端工具）不同：
-
-| 类型 | 执行位置 | 示例工具 |
-|------|----------|----------|
-| `tool_use` | 客户端（本地 Sidecar） | MCP 服务器工具 |
-| `server_tool_use` | 服务端（API 提供商） | webReader, analyze_image |
-
-### 问题 1：input 是 JSON 字符串
-
-智谱返回的 `server_tool_use.input` 是 **JSON 字符串**，而非对象：
-
-```json
-{
-  "type": "server_tool_use",
-  "input": "{\"url\": \"https://example.com\", \"type\": \"markdown\"}"
-}
-```
-
-**解决方案**：
-
-```typescript
-let parsedInput: Record<string, unknown> = {};
-if (typeof serverToolBlock.input === 'string') {
-  try {
-    parsedInput = JSON.parse(serverToolBlock.input);
-  } catch {
-    parsedInput = { raw: serverToolBlock.input };
-  }
-} else {
-  parsedInput = serverToolBlock.input || {};
-}
-```
-
-### 问题 2：装饰性文本包裹
-
-智谱会在 `server_tool_use` 前后插入装饰性文本块，如果不过滤会显示为普通内容：
-
-```
-🌐 Z.ai Built-in Tool: mcp__web_reader__webReader
-**Input:**
-```json
-{"url": "https://example.com", "type": "markdown"}
-```
-Executing on server side...
-```
-
-以及结果包裹：
-
-```
-**Output:** webReader_result_summary:[{"title":"..."}]
-```
-
-**解决方案**：在后端 `agent-session.ts` 中过滤这类文本：
-
-```typescript
-// 检测并过滤装饰性工具文本
-function checkDecorativeToolText(text: string): { filtered: boolean; reason?: string } {
-  if (!text || text.length < 50 || text.length > 5000) {
-    return { filtered: false };
-  }
-  const trimmed = text.trim();
-
-  // Pattern 1: 智谱 tool invocation wrapper - requires ALL markers
-  const hasZaiToolMarker = trimmed.includes('Z.ai Built-in Tool:');
-  const hasInputMarker = trimmed.includes('**Input:**');
-  const hasJsonBlock = trimmed.includes('```json') || trimmed.includes('Executing on server');
-  if (hasZaiToolMarker && hasInputMarker && hasJsonBlock) {
-    return { filtered: true, reason: 'zhipu-tool-invocation-wrapper' };
-  }
-
-  // Pattern 2: 智谱 tool output wrapper - requires ALL markers
-  if (trimmed.startsWith('**Output:**') && trimmed.includes('_result_summary:')) {
-    const hasJsonContent = trimmed.includes('[{') || trimmed.includes('{"');
-    if (hasJsonContent) {
-      return { filtered: true, reason: 'zhipu-tool-output-wrapper' };
-    }
-  }
-
-  return { filtered: false };
-}
-```
-
-**注意事项**：
-- 使用**多条件匹配**，避免误伤正常内容
-- 添加长度限制（50-5000 字符），进一步降低误判风险
-- 记录过滤日志，便于调试
-
----
-
-## 自定义供应商
-
-用户可通过 Settings 或 Admin API 添加自定义 OpenAI 兼容供应商。自定义供应商配置持久化到 `~/.myagents/providers/{id}.json`。
-
-### modelAliases 默认值
-
-自定义供应商如果没有主动设置 modelAliases，`getEffectiveModelAliases()` 和 `resolveProviderEnv()` 会用 `primaryModel` 或第一个可用模型作为 fable/sonnet/opus/haiku 的 fallback，防止子 Agent 发送 raw `claude-*` 到三方 API。
+- route 与 ProviderEnv materialization，以及 runtime-backed Provider 被拒进 builtin path；
+- 四种 auth type 的 env set/clear 与 subscription stale-env 清理；
+- Anthropic native credential owner 和 Grok managed OAuth generation；
+- OpenAI Bridge token isolation、translation、headers timeout、terminal semantics；
+- 401 单次 refresh / quarantine，以及 403/429 不 refresh；
+- Provider history family 与 Query replacement；
+- legacy session providerEnv redaction / repair；
+- `server_tool_use` input 和装饰性 wrapper 的精确兼容。

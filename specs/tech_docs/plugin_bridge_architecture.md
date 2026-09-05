@@ -30,10 +30,10 @@ Plugin Bridge 是 MyAgents 加载社区 OpenClaw Channel Plugin 的核心基础�
 │  │                                                          │  │
 │  │  ┌────────────────────────────────────────────────────┐  │  │
 │  │  │  sdk-shim/ (node_modules/openclaw)                 │  │  │
-│  │  │  package.json (293 exports)                        │  │  │
+│  │  │  package.json (generated exports map)              │  │  │
 │  │  │  plugin-sdk/                                       │  │  │
-│  │  │    37 手写模块 — 真实 Bridge 逻辑                    │  │  │
-│  │  │    340 自动生成 stub — 防崩溃兜底                    │  │  │
+│  │  │    手写模块 — 真实 Bridge 逻辑                       │  │  │
+│  │  │    自动生成 stub — import 兼容兜底                   │  │  │
 │  │  └────────────────────────────────────────────────────┘  │  │
 │  │                                                          │  │
 │  │  ┌────────────────────────────────────────────────────┐  │  │
@@ -49,7 +49,7 @@ Plugin Bridge 是 MyAgents 加载社区 OpenClaw Channel Plugin 的核心基础�
 
 ## 完整生命周期
 
-### Phase 1: 插件安装
+### 阶段 1：插件安装
 
 ```
 用户在 UI 选择/输入插件 npm 包名
@@ -65,7 +65,7 @@ install_sdk_shim()（最后写入，覆盖 npm 可能安装的真 openclaw 包�
 
 **关键原则**：SDK shim 必须在 npm install **之后**安装（last-write-wins），因为 npm 可能将真实 `openclaw` 包写入 `node_modules/openclaw/`，覆盖我们的 shim。
 
-### Phase 2: Bridge 进程启动
+### 阶段 2：Bridge 进程启动
 
 ```
 Rust spawn_plugin_bridge()
@@ -88,7 +88,7 @@ Plugin Bridge 的正常停止只使用创建时保留的 `ChildTree`，不能按
 
 OpenClaw 插件安装目录保持共享（`~/.myagents/openclaw-plugins/<plugin_id>`），但运行时状态必须按 MyAgents Channel 隔离：Agent Channel 使用 `~/.myagents/agents/<agentId>/channels/<channelId>/openclaw-state`，legacy IM Bot 使用 `~/.myagents/im_bots/<botId>/openclaw-state`。不要让 Bridge 回落到上游默认的 `~/.openclaw`；二维码登录类插件（例如 Weixin）会把本地 token list 带给平台，如果多个工作区共享这份状态，平台会把它们识别为同一个 OpenClaw 实例。
 
-### Phase 3: 插件加载与注册
+### 阶段 3：插件加载与注册
 
 ```
 Bridge index.ts
@@ -124,9 +124,7 @@ OpenClaw 插件有三种容易混淆的身份：
 
 ### 入口解析协议
 
-之前 Bridge 信任 `package.json` 的 `main` / `exports` 字段。社区插件（如 `@sliverp/qqbot`、`@larksuite/openclaw-lark`）的发布包**不带** `dist/` 目录，`main` 指向不存在的路径，导致 `ERR_MODULE_NOT_FOUND`。
-
-v0.2.0 起按 OpenClaw **上游规范**解析（`openclaw/src/plugins/manifest.ts::resolvePackageExtensionEntries`）：
+Bridge 按 OpenClaw **上游规范**解析入口（`openclaw/src/plugins/manifest.ts::resolvePackageExtensionEntries`），不能只信任可能指向未发布 `dist/` 的 `main` / `exports`：
 
 ```ts
 // resolveOpenClawPluginEntry(packageDir) 顺序：
@@ -134,17 +132,13 @@ v0.2.0 起按 OpenClaw **上游规范**解析（`openclaw/src/plugins/manifest.t
 // 2. 回退：DEFAULT_PLUGIN_ENTRY_CANDIDATES = ["index.ts","index.js","index.mjs","index.cjs"]
 ```
 
-任一路径存在即返回。4 个已知插件的实际入口：
-- `@sliverp/qqbot` → `./index.ts`（openclaw.extensions）
-- `@larksuite/openclaw-lark` → `./index.js`（openclaw.extensions）
-- `@wecom/wecom-openclaw-plugin` → `./dist/index.js`（openclaw.extensions）
-- `@tencent-weixin/openclaw-weixin` → `./index.ts`（openclaw.extensions）
+任一路径存在即返回。插件包的实际入口属于安装时探测结果，不在文档维护白名单。
 
 ### CJS + ESM 混用插件的运行时补丁
 
 某些插件（`@larksuite/openclaw-lark` 全版本、部分 Microsoft Teams 插件）用 TypeScript 编译到 CJS（`"use strict"; Object.defineProperty(exports, "__esModule", ...)`），但同时调用了 `import.meta.url`（ESM-only）。Node 严格按 ECMAScript 规范：看到 `import.meta.url` 就必须按 ESM 解析 → CJS `exports` 未定义 → `ReferenceError: exports is not defined in ES module scope`。
 
-Bun 之前静默容忍，Node 不。v0.2.0 通过 `module.registerHooks()`（Node 22.15+ 同步 loader hook）**运行时改写**拦截到的 `.js` 源：
+Node 不允许在 CJS scope 直接使用 `import.meta`。Bridge 通过 `module.registerHooks()` 的同步 loader hook **运行时改写**命中的 `.js` 源：
 
 ```ts
 // 触发条件：URL 在 ~/.myagents/openclaw-plugins/*/node_modules/** 且 .js 且同时含
@@ -157,17 +151,15 @@ Bun 之前静默容忍，Node 不。v0.2.0 通过 `module.registerHooks()`（Nod
 // 返回：{ format: 'commonjs', source: patched, shortCircuit: true }
 ```
 
-**关键点**：**必须用 `registerHooks`（同步）而非 `register`（异步）**。`require()` → `loadESMFromCJS` 走主线程同步路径，异步 hook 捕获不到。这是我们在调试 4 小时后才发现的 Node 规范细节。
+**关键点**：必须用同步 `registerHooks`，不能换成异步 `register`。`require()` → `loadESMFromCJS` 走同步路径，异步 hook 捕获不到。
 
 `--import tsx/esm` **在 dev 和 prod 都要注入**（不是只 dev）：qqbot / weixin 这类插件入口是 `.ts`，Node 拒绝对 `node_modules/*.ts` strip types；tsx 对已编译的 `.js` 是 no-op，无副作用。
 
-**tsx 的安装位置（v0.2.0+）**：tsx 不再 `npm install` 到每个 `plugin_dir/`，而是预先打包到 `src-tauri/resources/tsx-runtime/`（per-platform 的 `@esbuild/<triple>` 二进制由构建脚本 `npm run build:tsx-runtime -- <os> <cpu>` 选定）。Spawn 时 Rust 通过 `find_tsx_runtime_loader()` 解析到绝对路径并以 `--import file:///<absolute>/tsx/dist/esm/index.mjs` 形式注入。
-
-为什么这么改：早期版本对每个 plugin_dir 调 `npm install tsx --no-save` ——但 npm 即使带 `--no-save` 也会触发 prune，先前手工拷入的 `node_modules/openclaw/` SDK shim 被它当成"和 package.json 不一致的多余依赖"删除（v0.2.0 macOS 实测）。绕开 npm 的副作用就要把 tsx 的"安装"挪出 plugin_dir，绝对路径 `--import` 是 Node 22 ESM loader 唯一允许的、与 cwd 无关的引用方式。
+**tsx 的安装位置**：tsx 预先打包到 `src-tauri/resources/tsx-runtime/`，per-platform `@esbuild/<triple>` 由构建脚本选择。Spawn 时 Rust 通过 `find_tsx_runtime_loader()` 解析绝对路径并以 file URL 注入。不得在每个 plugin directory 运行 `npm install tsx --no-save`：npm prune 可能删除由 MyAgents 安装、但不在插件 package manifest 中的 SDK shim。
 
 **cwd 不变量**：spawn Plugin Bridge 进程时 cwd 不能依赖任何相对路径（节点 ESM 的 bare specifier 解析与 Node 启动 cwd 强相关）。Rust 端用 `set_current_dir(plugin_dir)` 把工作目录锚定到插件目录，所有运行时文件引用都通过 `import.meta.url` 或绝对 file URL，不允许出现 `./node_modules/x` 这类相对路径。
 
-### Phase 4: 消息流转
+### 阶段 4：消息流转
 
 ```
 用户发消息到 IM 平台 → 插件 gateway 收到
@@ -234,7 +226,7 @@ Rust `BridgeAdapter::send_file/send_photo` 会把 `{ filename, data }` POST 到 
 - 必须把展示名规范化到 NFC，并限制单个 path component 长度，保证 macOS / Windows 都能稳定落盘；
 - 不能用 ASCII-only regex 把非拉丁字符替换为 `_`。
 
-### Phase 5: 错误恢复
+### 阶段 5：错误恢复
 
 | 场景 | 检测方式 | 恢复策略 |
 |------|---------|---------|
@@ -254,18 +246,18 @@ Rust `BridgeAdapter::send_file/send_photo` 会把 `{ filename, data }` POST 到 
 
 ```
 sdk-shim/
-├── package.json                    ← 293 条 exports（含 ./plugin-sdk 根子路径）
+├── package.json                    ← generated exports（含 ./plugin-sdk 根子路径）
 └── plugin-sdk/
-    ├── _handwritten.json           ← 手写清单（37 个，含根模块），生成器绝不覆盖
+    ├── _handwritten.json           ← 手写清单，生成器绝不覆盖
     ├── index.js                    ← 手写：根模块
     ├── core.js                     ← 手写：defineChannelPluginEntry 等
     ├── agent-runtime.js            ← 手写：jsonResult / textResult / ToolInputError
     ├── routing.js                  ← 手写：session key 解析
     ├── feishu.js                   ← 手写：飞书专用适配
-    ├── ... (共 37 个手写文件)
+    ├── ...                         ← 其它手写适配
     ├── discord.js                  ← 自动生成 stub
     ├── telegram.js                 ← 自动生成 stub
-    └── ... (共 340 个自动生成 stub)
+    └── ...                         ← 其它自动生成 stub
 ```
 
 ### 手写模块 vs 自动生成 stub
@@ -302,13 +294,15 @@ sdk-shim/
 | `*Schema`, `*Config`, `*Defaults` | `undefined`（const） | 识别为配置对象常量 |
 | 其他 | `undefined` | |
 
-### 版本同步（三处一致）
+### Shim identity 同步
 
-| 位置 | 变量 | 当前值 | 用途 |
-|------|------|--------|------|
-| `sdk-shim/package.json` | `version` + `"type": "module"` | `2026.6.29-shim` | Bridge 启动完整性检查 |
-| `compat-runtime.ts` | `SHIM_COMPAT_VERSION` | `2026.6.29` | 插件 `assertHostCompatibility()` |
-| `bridge.rs` | `SHIM_COMPAT_VERSION` | `2026.6.29` | Rust 层 peerDependencies 比对 |
+| 位置 | 变量 | 用途 |
+|------|------|------|
+| `sdk-shim/package.json` | `version` + `"type": "module"` | Bridge 启动完整性检查 |
+| `compat-runtime.ts` | `SHIM_COMPAT_VERSION` | 插件 `assertHostCompatibility()` |
+| `bridge.rs` | `SHIM_COMPAT_VERSION` | Rust 层 peerDependencies 比对 |
+
+三处 identity 必须一致；当前字面值以源码和生成器校验为准，不在文档复制。
 
 Shim 用 ESM 格式（`"type": "module"`），生成器输出 `export function`，与上游 OpenClaw `plugin-sdk/*` 子路径导出对齐。
 
@@ -326,13 +320,7 @@ git diff src/server/plugin-bridge/sdk-shim/  # 审查变更
 2. 编辑 `.js` 文件实现真实逻辑
 3. 重跑生成器（它会跳过该文件）
 
-**故障模式降级**：
-```
-之前：插件更新 → 新 import → Cannot find module → Bridge 崩溃
-现在：插件更新 → 新 import → stub 兜底 → 功能可能不工作但不崩溃
-                                         → 控制台警告 "[sdk-shim] xxx.foo() not implemented"
-                                         → 按需升级为手写实现
-```
+插件引入尚未手写适配的 SDK export 时，生成 stub 让单项功能按兼容合同降级并记录未实现警告；不能因一个缺失 module 使整个 Bridge 在 import 阶段崩溃。需要真实行为时再把对应模块升级为受保护的手写实现。
 
 ## HTTP 端点一览
 

@@ -269,6 +269,7 @@
       "trashMoved": "已移至废纸篓"
     },
     "filePreview": {
+      "fileUnavailable": "文件无法读取，可能已移动或删除；本地修改仍保留",
       "saving": "保存中",
       "saved": "已保存",
       "saveFailed": "保存失败",
@@ -288,7 +289,7 @@
       "fullscreenPreview": "全屏预览",
       "toasts": {
         "externalUpdateConflict": "文件已在外部更新，未自动覆盖",
-        "closeAutosaveFailed": "关闭时自动保存失败",
+        "closeAutosaveFailed": "保存失败，编辑器未关闭；本地修改仍保留",
         "renameFailed": "重命名失败",
         "copiedFilePath": "已复制文件路径",
         "copyWhileLoading": "文件加载中，暂时无法复制",

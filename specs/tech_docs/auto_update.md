@@ -1,365 +1,101 @@
-# MyAgents 自动更新系统
+# 自动更新架构
 
-## 设计理念
+本文只描述桌面应用自动更新的当前 owner、平台差异和安全不变量。发布凭据、构建命令和上传步骤由 [`../guides/build_and_release_guide.md`](../guides/build_and_release_guide.md)、各平台构建指南与 `.github/workflows/release.yml` 管理。
 
-采用类似 Chrome/VSCode 的**静默更新**机制：
-- 用户无需选择是否更新
-- 无下载进度显示
-- 更新完全在后台静默完成
-- 仅在更新就绪后显示「重启更新」按钮
+## 产品语义
 
-## 架构概览
+更新检查与下载默认静默进行。用户只在新版本已可安装时看到「重启更新」入口：
 
-```
-应用启动 → 延迟 60s → 静默检查更新
-                         ↓
-                   有新版本? → emit updater:download-started (UI 隐藏按钮)
-                         ↓
-                   后台下载 (macOS/Windows: 写 pending 字节到磁盘；Linux: 原地替换)
-                         ↓
-                   成功 → emit updater:ready-to-restart (UI 显示新版本「重启更新」按钮)
-                   失败 → emit updater:download-failed (UI 恢复显示前一版本按钮)
-                         ↓
-                   用户点击 → macOS: install_pending_update → Update::install(bytes) → 立即受管重启
-                            → Windows: install_pending_update 内部完成 verified-clean handoff → Update::install(bytes)
-                            → Linux: cmd_shutdown_for_update → relaunch
-                   或
-                   下次启动 → Windows/macOS 通过启动期对话框继续提供 pending 更新
+```text
+应用启动
+  -> 延迟检查；Renderer 后续定时检查
+  -> 有新版本时 emit updater:download-started
+  -> 下载并形成平台对应的可安装状态
+  -> 成功 emit updater:ready-to-restart
+     失败 emit updater:download-failed
+  -> 用户明确点击后安装并重启
 ```
 
-**平台路径差异：**
-
-| 平台 | 下载阶段 | 安装阶段 |
-|------|---------|---------|
-| macOS | `download` 后原子写入 pending 字节 | 用户明确点击后 `install_pending_update` 替换 `.app`，随即 `request_restart` |
-| Linux | `download_and_install` 在原地覆盖 AppImage | `relaunch` 直接生效 |
-| Windows | `save_pending_update_to_disk` 写入 NSIS installer 字节 | `install_pending_update` 在 Rust 侧进入 update-quiesce gate，停 IM/Agent/Terminal/Browser/Sidecar，验证进程与关键文件锁清零后再 `Update::install(bytes)`；启动时若发现 pending 字节会弹对话框引导用户安装；安装阶段上游 updater 会在 `%TEMP%` 留下 `MyAgents-<version>-updater-*` 派生目录，由启动期 GC 清理 |
+Rust `src-tauri/src/updater.rs` 拥有检查、下载、pending package、安装和重启流程。Renderer `src/renderer/hooks/useUpdater.ts` 只投影 Rust 事件、控制按钮互斥，并发起安装命令；它不拥有更新包或安装结果。
 
-## 技术实现
-
-### Rust 侧
-
-| 文件 | 说明 |
-|------|------|
-| `src-tauri/Cargo.toml` | 添加 `tauri-plugin-updater` 和 `tauri-plugin-process` |
-| `src-tauri/tauri.conf.json` | updater 配置、endpoints、pubkey |
-| `src-tauri/capabilities/default.json` | updater 权限 |
-| `src-tauri/src/updater.rs` | 静默检查、下载、重启命令 |
-| `src-tauri/src/lib.rs` | 插件注册、启动时触发检查 |
+启动检查在应用启动后延迟 60 秒；Renderer 每 30 分钟再次触发检查。常量与实际时序以实现为准。Debug 构建禁止真实下载和安装，避免线上版本覆盖开发 bundle。
 
-### 前端侧
+## 平台路径
 
-| 文件 | 说明 |
-|------|------|
-| `src/renderer/hooks/useUpdater.ts` | 监听 download-started / download-failed / ready-to-restart 三事件、维护 `preparing` 互斥标志、提供 `restartAndUpdate()` |
-| `src/renderer/components/CustomTitleBar.tsx` | 顶栏「重启更新」按钮（`preparing` 时隐藏） |
-| `src/renderer/pages/Settings.tsx` → `pages/settings/SettingsPage.tsx` | 设置页同款按钮；旧路径是 re-export facade |
-| `src/renderer/App.tsx` | Windows/macOS 启动期 pending 更新对话框（在 `useUpdater.checkPendingUpdate()` 之上） |
+| 平台 | 下载阶段 | 用户点击后的安装阶段 |
+| --- | --- | --- |
+| macOS | 先原子替换 package 文件，再写版本元数据 | 从 pending bytes 安装，成功后立即受管重启 |
+| Windows | 以相同顺序持久化 pending NSIS installer 与元数据 | 进入 update-quiesce，完成 verified-clean handoff 后启动 installer |
+| Linux | Updater 原地替换 AppImage | 关闭 owner 后 relaunch |
 
-### 核心流程
+macOS 和 Windows 的 pending package 是跨进程重启的 durable truth。应用下次启动仍会检测它并提供安装入口。Linux 没有同样的 pending-install 阶段。
 
-```typescript
-// Rust 侧 (updater.rs)
-check_update_on_startup()
-  → sleep(60s)                            // 早于这之前用户的首次操作还没落
-  → check_and_download_silently()
-    → updater.check() → Update 对象 (含 version)
-    → emit("updater:download-started", { version })   // UI 互斥锁：隐藏按钮
-    → 下载阶段 (平台路径差异见上表；debug build 禁止真实下载/安装)
-    → 成功 → cache_update(update) + emit("updater:ready-to-restart", { version })
-       失败 → emit("updater:download-failed", { version })  // UI 恢复前一版本按钮
+## Pending package 与内存状态
 
-// 前端侧 (useUpdater.ts)
-listen("updater:download-started") → setPreparing(true)
-listen("updater:download-failed")  → setPreparing(false)
-listen("updater:ready-to-restart") → setUpdateReady(true) + setPreparing(false)
-restartAndUpdate()
-  → macOS: install_pending_update()  // 本地 install 成功后立即 request_restart
-  → Windows: install_pending_update()  // Rust 内部完成 update-quiesce + verified-clean + Update::install(bytes)
-  → Linux: cmd_shutdown_for_update → relaunch()
-```
+macOS / Windows 使用：
 
-### 关键不变量
+- `pending_update.bin`：已验证的更新包字节；
+- `pending_update.json`：与字节对应的版本元数据；
+- `DOWNLOADED_VERSION`：当前进程对已提交磁盘版本的镜像；
+- `LATEST_UPDATE`：仅用于安装 API 所需的 `Update` 对象缓存。
 
-- **cache=disk 一致性**: `LATEST_UPDATE` 内存缓存与磁盘 pending 字节版本必须始终一致。`cache_update()` 只能在以下三个时机调用：①latest-wins 跳过同版本下载、②Windows/macOS 检测 disk 已有相同版本短路、③Windows/macOS `save_pending_update_to_disk()` 成功之后。**不可**在 `updater.check()` 之后无条件调用——会出现"内存指 v_NEW 但磁盘还是 v_OLD"的窗口期，导致用户在替换中点击破坏 v_OLD 字节。
-- **macOS live bundle 不可后台替换**: 权限服务会根据运行中进程的可执行路径归因 TCC 请求。后台 `download_and_install` 会把当前 `.app` 移入临时目录并在返回时删除，使仍在运行的进程失去可解析路径，随后麦克风/屏幕录制权限弹窗会静默失败。因此 macOS 只在用户点击安装后替换 bundle，并在成功后立即走 `request_restart`；禁止让旧进程继续交互。
-- **UI 互斥**: `preparing=true` 期间所有「重启更新」入口必须隐藏（顶栏 / Settings / Windows 启动对话框）。下载替换的临界区不允许用户点击。
-- **clear_pending_update_from_disk()** 必须同步 reset `DOWNLOADED_VERSION` 和 `LATEST_UPDATE`，否则 stale latest-wins 决策会用旧缓存填回空磁盘。
-- **Windows updater temp GC**: `%TEMP%/MyAgents-<version>-updater-*` 是 Tauri 上游安装阶段的派生目录，不是 MyAgents 的 pending 更新权威状态。启动期只按"目录名精确匹配 + 普通目录 + 超过 24h"清理这些派生目录；不按当前版本保留，也不读取/修改 `~/.myagents/pending_update.*`。
-- **Windows installer handoff 必须 verified-clean**: 用户点击安装后，Rust 先进入 update-quiesce gate：新的 Sidecar / Plugin Bridge / IM Channel / Terminal / Browser creation 必须先拿 shared permit，installer handoff 拿 exclusive permit 并等待已在途 creation 归零，避免“检查通过后又 spawn”。随后按 owner graceful shutdown IM/Agent/Terminal/Browser；Terminal owner 必须 kill 后 bounded wait，残留 shell PID 走 `UPDATE_TERMINALS_STILL_RUNNING` 阻断。最后用 `process_cleanup` 反复 kill + re-scan `--myagents-sidecar`、SDK/MCP、bundled Node，以及 `exe/cmdline` 指向当前 install/resource root 的进程；kill 后残留 descendant PID 也必须继续显式验证。只有进程扫描清零且关键文件（`nodejs/node.exe`、`claude-agent-sdk/claude.exe`、`server-dist.js`、`plugin-bridge-dist.mjs`、`tsx-runtime` loader）Windows 独占打开 probe 通过，才允许调用 `Update::install(bytes)`；关键 probe path 缺失/不可解析走 `UPDATE_LOCK_PROBE_UNAVAILABLE` fail-closed。残留进程或文件锁必须在 MyAgents UI 内失败并保留 pending 更新包，禁止进入 NSIS 的 Abort/Retry/Ignore 分叉。
+当前提交与校验语义：
 
-### 更新检查策略
+1. 新下载替换路径不在 `updater.check()` 刚返回时更新 `LATEST_UPDATE`，而是在 `save_pending_update_to_disk()` 成功后缓存。已下载版本或磁盘同版本命中时会直接对齐 cache；安装期 cache miss 的网络 fallback 也会缓存取得的 `Update`。
+2. package 使用临时文件加 rename 发布，metadata 随后直接写入；两者不是一个原子事务。只有两个步骤都成功后才发 `ready-to-restart`，但 package rename 后 metadata 写入失败会留下可能不一致的磁盘 pair。
+3. 清理 pending package 时必须同时清空 `DOWNLOADED_VERSION` 和 `LATEST_UPDATE`。
+4. 启动期 `check_pending_update()` 用当前应用版本淘汰 stale metadata；安装期读取磁盘 bytes / metadata，优先使用 cache、缺失时经网络取得 `Update`，再要求 `Update.version == pending_version`。版本不匹配时 fail closed 并清理 pending state。
+5. 新版本下载替换旧 pending package 时，`download-started` 到 `ready-to-restart` / `download-failed` 形成完整终态对。`download-failed` 只结束本次 preparing 状态，不保证旧 package 仍然完整可安装。
 
-- **启动时检查**: 应用启动后延迟 **60 秒**（避开冷启动重负载 + 用户首次操作），再 best-effort 清理过期 Windows updater 临时目录并检查更新
-- **定时检查**: 前端每 **30 分钟** 触发一次 `cmd_check_and_download_silently`（`CHECK_INTERVAL_MS` 常量）；即便已有 pending 更新仍会查询，latest-wins 协议保证更新版本会被替换（v_NEW 替换 cached v_OLD 不需要用户重启）
-- **完全静默**: 检查/下载阶段对用户无感；只在 ready-to-restart 时才出现按钮
-- **开发构建不自更新**: `debug_assertions` 下禁止后台及手动下载/安装真实更新，避免线上 release 覆盖本地 debug bundle；联网诊断仍可单独执行。
+Renderer 的 `updateReady`、`preparing` 和启动对话框只是上述磁盘状态的 UI 投影。`preparing=true` 时所有安装入口都必须隐藏，避免用户在替换 pending bytes 的临界区点击。
 
----
+## macOS live bundle 约束
 
-## CI/CD 配置
+运行中的 macOS bundle 不能在后台被替换。Tauri 安装过程会移动当前 `.app`；继续运行的旧进程将失去可解析的 bundle path，TCC 无法正确归因麦克风、屏幕录制等权限请求。
 
-### GitHub Secrets
+因此 macOS 只后台下载，不后台安装。安装必须由用户点击触发，成功后立即进入 `request_restart`，旧进程不能返回普通交互状态。
 
-在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加:
+## Windows installer handoff
 
-| Secret | 说明 | 获取方式 |
-|--------|------|---------|
-| `TAURI_SIGNING_PRIVATE_KEY` | Tauri 签名私钥 | `cat ~/.tauri/myagents.key` |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | 私钥密码 | 生成密钥时设置的密码 |
-| `R2_ACCESS_KEY_ID` | R2 Access Key ID | Cloudflare R2 API Token |
-| `R2_SECRET_ACCESS_KEY` | R2 Secret Access Key | Cloudflare R2 API Token |
-| `R2_ACCOUNT_ID` | Cloudflare Account ID | Dashboard URL 中的 ID |
+Windows 安装前必须证明当前安装目录不再被 MyAgents 进程树占用：
 
-### 生成签名密钥
+1. installer handoff 获取 update-quiesce exclusive permit；Sidecar、Plugin Bridge、IM Channel、Terminal、Browser 等创建入口使用 shared permit。exclusive permit 到手后不能再产生新进程。
+2. 按 owner 依次停止 IM、Agent/Sidecar、Terminal 和 Browser。Terminal kill 后必须 bounded wait。
+3. `process_cleanup` 只在这个 recovery / updater 场景枚举和清理指向当前安装或 resource root 的残留进程；正常 shutdown 不使用全机扫描。
+4. 再次扫描残留 descendant，并对关键 executable / bundle 文件执行 Windows 独占打开 probe。
+5. 只有进程扫描和文件锁 probe 都通过，才调用 `Update::install(bytes)`。
 
-```bash
-cd /path/to/hermitcrab
-npx tauri signer generate -w ~/.tauri/myagents.key
-```
+任何 owner 无法停止、残留进程、关键路径无法解析或文件仍被占用，都在 MyAgents UI 内 fail closed，并保留 pending package 供用户重试。不得把用户送进 NSIS 的 Abort/Retry/Ignore 分叉。
 
-生成的公钥需要更新到 `tauri.conf.json` 的 `plugins.updater.pubkey` 字段。
+上游 installer 可能在 `%TEMP%` 创建 `MyAgents-<version>-updater-*` 派生目录。它们不是 pending authority；启动 GC 只清理名称精确匹配、类型为普通目录且超过保留期的条目，不读取或改写应用数据目录中的 pending package。
 
----
+## 事件与 UI
 
-## Cloudflare R2 配置
+| 事件 | 含义 | Renderer 行为 |
+| --- | --- | --- |
+| `updater:download-started` | 新版本的 pending state 正在构建 | 设置 `preparing`，隐藏安装入口 |
+| `updater:download-failed` | 本次下载或持久化未完成 | 清除 `preparing`；不能据此推断旧 package 仍完整 |
+| `updater:ready-to-restart` | 对应版本已经形成可安装状态 | 设置 `updateReady` 并显示版本 |
+| 下载进度事件 | 后台状态或诊断 | 不改变“静默下载”的产品语义 |
 
-### 1. 创建 Bucket
+`CustomTitleBar`、Settings 和启动 pending 对话框必须共用 `useUpdater` 的同一状态，不各自推导更新是否可安装。
 
-1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
-2. 左侧菜单 → **R2 Object Storage**
-3. **Create bucket** → 名称: `myagents-releases`
+## 网络与发布契约
 
-### 2. 创建 API Token
+- Updater endpoint、公钥和 capability 以 `src-tauri/tauri.conf.json` 及 capability 配置为准。
+- 外部更新请求属于 general network owner，使用 `proxy_config` 的 general helper；loopback 不参与更新下载。
+- 清单、artifact、签名和版本必须由 release workflow 一起发布。文档不复制域名目录结构和示例 JSON，以免与 workflow 漂移。
+- 应用拒绝降级；server/CDN 返回的 stale version 不能覆盖更高的当前版本或 pending version。
 
-1. R2 页面 → **Manage R2 API Tokens**
-2. **Create API token**
-3. 配置:
-   - Token name: `myagents-release`
-   - Permissions: **Object Read & Write**
-   - Specify bucket: `myagents-releases`
-4. 复制 Access Key ID 和 Secret Access Key
+## 验证
 
-### 3. 配置公开访问
+确定性测试至少覆盖：
 
-**方式一: 自定义域名 (推荐)**
+- pending package 的原子提交、清理和 cache=disk 一致性；
+- stale / downgrade / version mismatch；
+- latest-wins 下载的成功与失败终态；
+- Windows quiesce admission、残留进程与文件锁 fail-closed；
+- Windows updater 临时目录 GC 的精确范围；
+- Renderer 三个事件与多入口按钮状态一致。
 
-1. Bucket Settings → Public access → **Connect Domain**
-2. 输入: `download.myagents.io`
-3. 在 DNS 添加 CNAME 记录指向 R2
-
-**方式二: R2.dev 子域名**
-
-1. Public access → 启用 **R2.dev subdomain**
-2. 修改 `tauri.conf.json` 中的 endpoint URL
-
-### 4. 获取 Account ID
-
-- Dashboard 右上角头像 → Account Home
-- URL 格式: `https://dash.cloudflare.com/{ACCOUNT_ID}`
-
----
-
-## R2 目录结构 (自动创建)
-
-```
-myagents-releases/
-├── update/
-│   ├── darwin-aarch64.json    # Apple Silicon 更新清单 (Tauri Updater)
-│   ├── darwin-x86_64.json     # Intel Mac 更新清单 (Tauri Updater)
-│   └── latest.json            # 网站下载页 API
-└── releases/
-    └── v{VERSION}/
-        ├── MyAgents_{VERSION}_aarch64.app.tar.gz  # Updater 用
-        ├── MyAgents_{VERSION}_x64.app.tar.gz      # Updater 用
-        ├── MyAgents_{VERSION}_aarch64.dmg         # 网站下载用
-        └── MyAgents_{VERSION}_x64.dmg             # 网站下载用
-```
-
-> 目录由 GitHub Actions 自动创建，无需手动操作。
-
----
-
-## 发布新版本
-
-### 方式一: Git Tag 触发
-
-**触发规则**: `v` 开头的 tag 会自动触发构建
-
-| Tag | 是否触发 |
-|-----|---------|
-| `v0.1.0` | ✓ |
-| `v0.2.0` | ✓ |
-| `v1.0.0-beta` | ✓ |
-| `0.2.0` | ✗ (没有 v 前缀) |
-| `release-0.2.0` | ✗ |
-
-```bash
-# 1. 以 package.json 为版本源；npm version hook 同步 lockfile、Tauri 与 Cargo 版本
-npm version 0.2.0 --no-git-tag-version
-cargo metadata --manifest-path src-tauri/Cargo.toml --no-deps --format-version 1 >/dev/null
-
-# 2. 只暂存本次发布涉及的文件并提交（显式列出实际文件）
-git add package.json package-lock.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock CHANGELOG.md
-git commit -m "chore: release v0.2.0" -m "Prepare the tracked version metadata and changelog for the v0.2.0 release."
-
-# 3. 打 tag（必须 v 开头）
-git tag v0.2.0
-
-# 4. 推送代码和 tag
-git push origin main --tags
-```
-
-推送 tag 后，GitHub Actions 自动开始构建。
-
-### 方式二: 手动触发
-
-1. GitHub 仓库 → **Actions** → **Release**
-2. **Run workflow**
-3. 输入版本号 (如 `0.2.0`)
-4. 点击运行
-
----
-
-## 验证发布
-
-### 1. 检查 GitHub Release
-
-- 应有 Draft release 包含 DMG 文件
-
-### 2. 检查 R2 文件
-
-```bash
-# 检查更新清单
-curl https://download.myagents.io/update/darwin-aarch64.json
-```
-
-预期返回:
-```json
-{
-  "version": "0.2.0",
-  "notes": "MyAgents v0.2.0",
-  "pub_date": "2026-01-23T14:00:00Z",
-  "platforms": {
-    "darwin-aarch64": {
-      "signature": "...",
-      "url": "https://download.myagents.io/releases/v0.2.0/MyAgents_0.2.0_aarch64.app.tar.gz"
-    }
-  }
-}
-```
-
-### 3. 本地测试更新
-
-1. 构建旧版本 (如 v0.1.0)
-2. 发布新版本到 R2 (如 v0.2.0)
-3. 运行旧版本
-4. 等待启动期检查触发（当前为 60 秒）后，顶栏应出现「重启更新」按钮
-
----
-
-## 用户体验流程
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  用户正常使用应用                                            │
-│                                                             │
-│  (后台静默: 检查更新 → 发现新版本 → 下载完成)                  │
-│                                                             │
-│  顶栏出现按钮:  [🔄 重启更新]  [⚙️]                          │
-│                                                             │
-│  用户可以:                                                   │
-│  • 点击按钮 → 立即重启并更新                                  │
-│  • 忽略按钮 → 下次启动时自动应用更新                          │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 文件格式
-
-### Tauri Updater 清单 (darwin-aarch64.json / darwin-x86_64.json)
-
-供客户端自动更新使用：
-
-```json
-{
-  "version": "0.2.0",
-  "notes": "MyAgents v0.2.0",
-  "pub_date": "2026-01-23T14:00:00Z",
-  "platforms": {
-    "darwin-aarch64": {
-      "signature": "base64编码的签名",
-      "url": "https://download.myagents.io/releases/v0.2.0/MyAgents_0.2.0_aarch64.app.tar.gz"
-    }
-  }
-}
-```
-
-### 网站下载 API (latest.json)
-
-供官网下载页面使用：
-
-```json
-{
-  "version": "0.2.0",
-  "pub_date": "2026-01-23T14:00:00Z",
-  "release_notes": "MyAgents v0.2.0",
-  "downloads": {
-    "mac_arm64": {
-      "name": "Apple Silicon",
-      "url": "https://download.myagents.io/releases/v0.2.0/MyAgents_0.2.0_aarch64.dmg"
-    },
-    "mac_intel": {
-      "name": "Intel Mac",
-      "url": "https://download.myagents.io/releases/v0.2.0/MyAgents_0.2.0_x64.dmg"
-    }
-  }
-}
-```
-
-**网站前端示例**:
-
-```typescript
-// 获取最新版本信息
-const res = await fetch('https://download.myagents.io/update/latest.json');
-const data = await res.json();
-
-// 显示版本号
-console.log(`最新版本: v${data.version}`);
-
-// 根据用户设备选择下载链接
-const isMacARM = /* 检测 Apple Silicon */;
-const downloadUrl = isMacARM
-  ? data.downloads.mac_arm64.url
-  : data.downloads.mac_intel.url;
-```
-
----
-
-## 故障排查
-
-### 更新检查失败
-
-1. 检查网络是否能访问 `download.myagents.io`
-2. 检查 CSP 配置是否允许该域名
-3. 查看 Rust 日志 `[Updater]` 前缀
-
-### 签名验证失败
-
-1. 确认 `tauri.conf.json` 中的 pubkey 正确
-2. 确认 CI 使用的私钥与 pubkey 匹配
-3. 检查 .sig 文件是否正确上传
-
-### 「重启更新」按钮不显示
-
-1. 检查 Console 是否有 `Event received: updater:ready-to-restart` 日志
-2. 检查 Rust 日志 `[Updater]` 是否有 `Emitting 'updater:ready-to-restart' event` 行
-3. 如果按钮一闪即消，看是不是又触发了 `updater:download-started` —— 新版本正在替换旧版本字节，等下载完成会再显示
-
-### 点击「重启更新」无效（Windows）
-
-1. 看 Rust 日志里 `install_pending_update called`、`Update shutdown gate acquired`、`Shutdown for update complete`、`Update file-lock probe passed` 是否连续出现；Windows 不走 `cmd_shutdown_for_update → relaunch` 路径
-2. 如果返回 `UPDATE_PROCESSES_STILL_RUNNING` / `UPDATE_TERMINALS_STILL_RUNNING` / `UPDATE_FILES_STILL_LOCKED` / `UPDATE_LOCK_PROBE_UNAVAILABLE`，说明 Rust 在进入 NSIS 前主动阻断，pending 更新包会保留，用户稍后重试或重启 Windows 后再安装
-3. 网络异常导致 `tauri-plugin-updater::check()` flaky 时 `Update::install(bytes)` 会失败 —— 现在前端会把 outcome 走 toast 反馈给用户（详见 `CustomTitleBar` 的错误处理）
-4. 检查 `~/.myagents/updater_pending/` 是否有 pending 字节文件残留
+发布前还需在对应平台的已签名安装包上验证真实更新：后台下载、退出后恢复 pending、点击安装、进程树收敛、应用重启与版本变化。构建及发布步骤以平台指南为准。

@@ -45,7 +45,7 @@
 // codepoint check fast-paths out on every keystroke off macOS.
 //
 // See `specs/tech_docs/macos_arrow_key_leak_investigation.md` for the
-// full investigation log including the C0-control-codepoint discovery.
+// current guard architecture and shared codepoint policy.
 
 let installed = false;
 

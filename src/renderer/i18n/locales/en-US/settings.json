@@ -181,6 +181,11 @@
   },
   "providers": {
     "title": "Model Providers",
+    "cardTitles": {
+      "claudeSubscription": "Claude (Subscription)",
+      "claudeApi": "Claude (API)",
+      "chatgptSubscription": "ChatGPT (Subscription)"
+    },
     "description": "Configure API keys for different model providers",
     "enableAndSort": "Enable & Sort",
     "addProvider": "Add Provider",

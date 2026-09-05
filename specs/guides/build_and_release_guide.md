@@ -460,6 +460,6 @@ npx tauri signer generate -w ~/.tauri/myagents.key
 ## 相关文档
 
 - [Windows 构建与测试指南](./windows_build_guide.md) - Windows 版本构建流程
-- [自动更新系统](../tech_docs/auto_update.md) - 静默更新流程、CI/CD 配置
+- [自动更新系统](../tech_docs/auto_update.md) - 运行时 owner、平台安装流程与安全不变量
 - [macOS 分发指南](./macos_distribution_guide.md) - 代码签名、公证详解
 - [Node.js Sidecar 打包](../tech_docs/bundled_node.md) - 运行时打包机制

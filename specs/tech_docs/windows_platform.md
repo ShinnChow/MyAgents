@@ -1,351 +1,152 @@
-# Windows 平台适配指南
+# Windows 平台架构
 
-## 概述
+本文记录 Windows 特有的 path、process、WebView2、file IO 与 packaged runtime 边界。构建和发布命令由 [`../guides/windows_build_guide.md`](../guides/windows_build_guide.md) 与脚本本身拥有；跨端 UI 真机矩阵见 [`windows_cross_platform_review.md`](windows_cross_platform_review.md)。
 
-本文档总结了 MyAgents Windows 平台适配的关键技术点和最佳实践，包含路径处理、进程管理、环境变量、CSP 配置等方面的经验。
+## 路径与 identity
 
----
+### Workspace path
 
-## 🗂️ 路径处理
+跨 config、Task、Session、Agent 或 UI store比较 workspace时，使用：
 
-### 跨平台路径工具
+- `normalizeWorkspacePathIdentity()` 生成 Map/Set key；
+- `workspacePathsEqual()` 比较两个可能为空的路径。
 
-**核心原则**：
-- 使用 Tauri `path` 插件获取系统目录
-- 使用 Node.js `path.join()` 拼接路径（自动处理分隔符）
-- 避免硬编码路径分隔符（`/` 或 `\`）
+Windows normalization处理盘符大小写、`/` / `\` 和 trailing separator；Unix仍保持 case-sensitive。不要把 display path、canonical filesystem path和持久化 identity混为同一个字段。
 
-**示例**：
-```typescript
-import { join } from 'path';
-import { homeDir, tempDir } from '@tauri-apps/api/path';
+### 文件系统、URL 与 archive
 
-// ✅ 正确
-const configPath = join(await homeDir(), '.myagents', 'config.json');
-const tempPath = join(await tempDir(), 'myagents-cache');
+- Node filesystem path ↔ `file://` 使用 `pathToFileURL` / `fileURLToPath`；
+- app内 attachment/resource使用 `myagents-resource` protocol helper；
+- ZIP、manifest和installed metadata中的 relative key用 `/`，不是 OS separator；
+- Rust `PathBuf` 交给 Node、npm、URL或child process前走现有 `normalize_external_path`，剥离 `\\?\`；
+- 不存在的 write target走 workspace lexical resolver；已存在 source才可依赖 canonical identity；
+- source、ancestor和publish target的 reparse-point检查由 workspace/path safety owner完成。
 
-// ❌ 错误
-const configPath = `${homeDir}/.myagents/config.json`;  // Linux 路径
-const tempPath = `${homeDir}\\.myagents\\config.json`;  // Windows 路径
-```
+不要手拼 slash、`file://` prefix或用字符串 `starts_with` 做 containment。
 
-### 环境变量
+### Managed global Skill junction
 
-**跨平台环境变量**：
-```typescript
-// src/server/utils/platform.ts
-export function getPlatformPaths() {
-  const isWin = process.platform === 'win32';
+`~/.myagents/skills/<name>` 是 global Skill 的物理 authority；`<workspace>/.claude/skills/<name>` 可以是 Windows junction projection。通过 projection写入会直接修改全局源。
 
-  return {
-    home: isWin
-      ? (process.env.USERPROFILE || 'C:\\Users\\Default')
-      : (process.env.HOME || '/home/user'),
-    temp: isWin
-      ? (process.env.TEMP || process.env.TMP || 'C:\\Windows\\Temp')
-      : (process.env.TMPDIR || '/tmp'),
-  };
-}
-```
+所有 workspace mutation command统一调用 `path_safety::reject_managed_global_skill_mutation`，覆盖链接叶子、后代、尚不存在但祖先受管的路径和 broken reparse point。普通 project-owned Skill目录仍可写；read、reveal和copy-out允许。
 
-**常用环境变量对照**：
+Runtime admission基于 `global-skill-inventory.ts` 的完整快照和可信链接 identity。命名冲突只在证据足够时 block单个候选；不自动 rename/delete/merge，也不建立 watcher或后台 repair。
 
-| 用途 | Windows | macOS/Linux |
-|------|---------|-------------|
-| 用户主目录 | `USERPROFILE` | `HOME` |
-| 临时目录 | `TEMP` / `TMP` | `TMPDIR` |
-| 应用数据 | `APPDATA` | `~/.config` |
-| 路径分隔符 | `;` | `:` |
+## UTF-8 boundary
 
-### 全局 Skill junction 的只读边界
+Claude SDK 的 Bash output最终以 UTF-8 string进入 Session JSONL/SSE，但 Windows child可能按 ANSI/OEM code page输出。`buildClaudeSessionEnv()` 为 SDK subprocess设置：
 
-MyAgents 把 `~/.myagents/skills/<name>` 作为唯一物理权威，并以目录 junction 投影到 `<workspace>/.claude/skills/<name>`。junction 下的 `SKILL.md` 与 references 不是副本：通过工作区路径写入会直接修改全局源，并立即影响其它工作区。因此 Tauri workspace mutation command 必须统一调用 `path_safety::reject_managed_global_skill_mutation`，拒绝链接叶子、链接后代、目标尚不存在但最近存在祖先是 managed junction 的路径，以及指向全局 Skill 根的断链/reparse point。普通项目物理 Skill 目录仍可写；read、reveal 与从 junction copy-out 仍允许。
+- `LANG=C.UTF-8` / `LC_ALL=C.UTF-8`；
+- `PYTHONUTF8=1` / `PYTHONIOENCODING=utf-8`；
+- `LESSCHARSET=utf-8`；
+- MyAgents-owned `BASH_ENV` prelude，在 Git Bash启动时切换到 UTF-8 code page。
 
-Runtime admission 由 Node `global-skill-inventory.ts` 的单次完整根快照裁决，不依赖 Windows Explorer 的命名行为猜测。`SKILL(N).md` 或孤立 `(N)` 目录只形成 warning；只有缺 canonical entry、带后缀目录复用 base identity/与 base sibling 共存、untrusted global junction/symlink 或扫描竞态等强证据才 blocked。被 blocked 的文件保持原样，只从 Runtime、Launcher 与当前工作区 managed projection 中排除；Required 系统 Skill 也只影响该候选，不阻断 Runtime 或 Session。不要增加 watcher、后台 repair、自动 rename/delete/merge 或字符串路径前缀判断。
+PowerShell不读取 `BASH_ENV`。机器可读 PowerShell结果应在 producer端转成 base64(UTF-8(JSON)) 等 ASCII-safe envelope；不要在 Renderer修复已经错误解码的 string。
 
-### SDK Shell 输出编码
+用户可编辑 JSON读取边界剥 UTF-8 BOM。严格协议遇到非 UTF-8应返回可诊断错误；lossy decode只用于人读 stderr。
 
-Claude Agent SDK 的 Bash 工具输出最终会以 UTF-8 字符串进入 MyAgents session JSONL / SSE。Windows 上不少子进程会默认按系统 ANSI/OEM code page（如 CP936/GBK）写 stdout/stderr；一旦 SDK 按 UTF-8 解码成字符串，后续在 renderer 或 SessionStore 已无法可靠恢复原始字节。
+## Process owner
 
-`src/server/agent-session.ts::buildClaudeSessionEnv()` 因此在 Windows SDK subprocess env 中统一设置 `LANG=C.UTF-8`、`LC_ALL=C.UTF-8`、`PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`、`LESSCHARSET=utf-8`。同时写入 MyAgents 管理的 `BASH_ENV` prelude；只要 SDK 使用 Git Bash（无论来自 `CLAUDE_CODE_GIT_BASH_PATH` 还是 PATH fallback），Bash 命令启动前都会执行 `chcp.com 65001`。PowerShell 会忽略 `BASH_ENV`。不要使用 `CLAUDE_CODE_SHELL_PREFIX` 注入 inline shell 片段：SDK 将它当作包装命令而不是 source prelude。也不要把这个逻辑挪到 tool_result 渲染或历史恢复层；那里拿到的已经是 SDK 字符串，不是可逆字节流。
+### Live lifecycle
 
----
+App 拥有的后台 Rust child 默认通过 `crate::process_cmd`：
 
-## 🔧 进程管理
+- 普通短进程：`process_cmd::new()`，Windows使用 `CREATE_NO_WINDOW`；
+- 会派生后代的长生命周期进程：`spawn_tree()`，owner持有 `ChildTree`。
 
-### Node.js 运行时路径
+Windows `spawn_tree()` 先 suspended创建根进程、绑定 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job Object，再恢复线程，避免 child在进入 Job前逃逸。stop / Drop终止整棵树。`CREATE_NO_WINDOW` child没有可靠 console signal，不增加无效 graceful wait。
 
-**Windows 查找顺序**（`src/server/utils/runtime.ts::getBundledNodePath()`）：
-1. Bundled Node.js（`Contents\resources\nodejs\node.exe`，构建时从 nodejs.org 下载）
-2. 用户系统 Node.js（通过 `getSystemNodeDirs()` 扫描 `Program Files\nodejs` / `%USERPROFILE%\AppData\Roaming\npm` 等）
-3. 系统 PATH（`node.exe` / `npm.cmd` / `npx.cmd`）
+创建入口在 App shutdown关闭后必须拒绝新 spawn；owner等待已登记 children，不能边退出边产生新进程。
 
-**macOS / Linux 查找顺序**：
-1. Bundled Node.js（`Contents/Resources/nodejs/bin/node`）
-2. 系统 Node.js（`/opt/homebrew/bin/node` / `/usr/local/bin/node` / nvm / fnm / volta / asdf / mise）
-3. 系统 PATH
+需要继承用户 console 的 CLI mode 是明确例外，使用 raw `Command`；Terminal 的进程创建由 `portable-pty` / ConPTY owner 管理。不要把后台进程的 `CREATE_NO_WINDOW` 规则套到这两条交互路径。
 
-**PATH 注入策略**：SDK 子进程（AI Bash 工具）实际看到的 PATH 优先**系统**，其次 bundled —— 用户自己维护的 Node 往往比我们 bundle 的版本新，npm 也更可靠（见 `buildClaudeSessionEnv`）。详见 `bundled_node.md`。
+### Recovery
 
-`myagents` 是例外的产品保留命令：app-owned Session、external runtime fallback 和内嵌终端都把 `%USERPROFILE%\.myagents\bin` 放在 AppData npm、MyAgents npm-global 与 inherited PATH 之前。这里的 `myagents.cmd` 不直接调用 Node，也不包含 CLI 路由；它 quote 当前 `MyAgents.exe` 的规范路径、传入私有 CLI marker、用 `%*` 透明转交 argv，并返回 child `%ERRORLEVEL%`。extensionless `myagents` 同时服务 Git Bash，使用 POSIX `exec`。两者都由 Rust no-follow + 原子替换，旧全量 payload 与 `.cli-version` 不再可信。
+`process_cleanup::kill_stale_processes()` 只用于 prior instance已死亡后的启动恢复和 updater verified-clean。Normal shutdown不扫描全机进程，也不按 `node.exe` / `chrome.exe` 名称清理。
 
-Windows CLI mode 继续 `AttachConsole(ATTACH_PARENT_PROCESS)` 继承 cmd / PowerShell 控制台；随后只使用当前安装目录 `resources\nodejs\node.exe` 和 `resources\cli\myagents.cjs`。路径离开 Rust 前必须去掉 `\\?\` verbatim 前缀，安装路径的空格、Unicode 与 `%` 必须由 launcher builder 的平台 quoting 处理。bundle 缺失或 launcher 因 Defender / indexer 短暂占用而无法 replace 时有界退避后 fail closed，不得回退系统 Node、AppData 同名命令或旧 HOME JS。
+Task Activation Detector同样拥有 Job Object。timeout、stdout超限、Task stop/delete和App shutdown都结束同一树；structured executable、args和cwd不经 `cmd /c`。
 
-Task command Detector 不经过 SDK shell：bare `node` / `node.exe` 固定解析到 bundled Node.js v24，其他 bare executable 走 `system_binary::find()`；`executable + args + cwd` 分开传递，不经 `cmd /c` 或字符串重拼。Rust 进入进程边界前对绝对路径使用现有 external-path normalize，不能把 Windows verbatim/长路径前缀直接泄漏给 Node。
+### Executable discovery
 
-浏览器工具分两条路径：标准 `playwright` 仍是普通上游 stdio MCP；新增 `myagents-browser` /「浏览器」才是应用自有 Runtime。桌面 release build、installer 和 updater 都不携带 Chromium。用户首次点击“安装资源”后，Rust App owner 才按随 App 签名的版本锁直接下载 Playwright 官方 Chromium artifact，校验固定 size/SHA-256 并安装到 MyAgents 数据目录；以后 App revision 变化自动维护。Global Sidecar 只能使用 Rust 投影的精确 executable path，缺资源时 fail closed，不回退 `npx`、系统 Chrome、npm cache 或临时下载。
+`system_binary::find()` 补充 GUI应用缺少的常见 PATH。具体 runtime优先使用自己的 locator：
 
-受管「浏览器」由一个 Browser generation 为每个 Product Session 创建独立 BrowserContext/原生窗口，不存在 persistent user-data-dir 或 Profile lease。Chromium 后代留在 Global Sidecar 的 `ChildTree` / Windows Job Object 内。正常 App/update shutdown 先由 Rust 对精确 Global generation 发起有界 loopback graceful handshake，等待 Host checkpoint 并调用受支持的 Context/Browser close；随后才关闭 Job Object 作为最终 containment。禁止按 `chrome.exe` 全机清理。Windows 使用锁定 Playwright revision 对应的官方 Chrome for Testing ZIP；资源计划更新需在 Windows release-like smoke 中验证实际 headed launch，但不生成、签署或上传 MyAgents 自有浏览器 artifact。
+- Sidecar、Plugin Bridge和CLI使用 bundled Node绝对路径；
+- Task Detector的 bare Node固定到 bundled Node；
+- SDK shell允许系统 Node优先、bundled Node兜底；
+- managed runtime使用签名/验证后的绝对 executable，不回退 PATH同名程序。
 
-### 进程清理
+详见 [`bundled_node.md`](bundled_node.md) 和 [`multi_agent_runtime.md`](multi_agent_runtime.md)。
 
-进程清理分成两种不能互换的 authority：
+## CLI launcher
 
-1. **Live lifecycle**：Sidecar / Plugin Bridge 使用 `process_cmd::spawn_tree()` 创建。Windows child 先以 `CREATE_SUSPENDED` 创建，绑定配置了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，再恢复初始线程；owner 持有 `ChildTree`，stop / Drop 直接终止 Job 内所有后代。`CREATE_NO_WINDOW` child 没有可靠的 console signal，不能增加无实际作用的等待步骤。应用退出时的创建入口关闭与登记等待是跨平台规则，统一见 `pit_of_success.md` 的 `process_cmd` 小节。正常退出不得扫描全机 argv。
-2. **Recovery**：只有 prior instance 已确定死亡后的启动恢复，以及 updater 的 residual / protected-root / file-lock 验证，才使用 `sysinfo` 枚举。它处理 crash 后已经没有 live handle 的遗留进程，不是正常 shutdown 的 fallback。
+`%USERPROFILE%\.myagents\bin\myagents.cmd` 和 extensionless `myagents` 是 Rust生成的薄 launcher，只调用当前 `MyAgents.exe` 的私有 CLI入口并透明转发 argv。业务代码只存在安装目录 `resources/cli/myagents.cjs`。
 
-**Windows recovery**（`sysinfo` 原生枚举，避免旧 PowerShell/WMI 冷启动开销）：
-```rust
-// src-tauri/src/sidecar/cleanup.rs -> src-tauri/src/process_cleanup.rs
-let report = crate::process_cleanup::kill_stale_processes(STARTUP_CLEANUP_PATTERNS);
-```
+Launcher使用 no-follow检查、临时文件和原子 replace；路径 quoting必须覆盖空格、Unicode和 `%`。CLI mode attach parent console，并只使用当前 bundle的 Node和CLI。资源缺失时fail closed，不执行HOME旧 payload或系统 Node。
 
-**macOS/Linux**（同样走 `sysinfo` native process enumeration，不再 shell out 到 `pgrep`）：
-```rust
-// src-tauri/src/process_cleanup.rs
-pub fn kill_stale_processes(patterns: &[ProcessPattern]) -> CleanupReport;
-```
+## WebView2 与 CSP
 
-> **关键**：普通短生命周期子进程 spawn 仍 MUST 使用 `process_cmd::new()`（Windows CREATE_NO_WINDOW）；会创建后代的长生命周期进程 MUST 再用 `spawn_tree()`。外部 binary 解析继续走 `system_binary::find()`（PATH 补充）。禁止裸 `std::process::Command::new()`，也禁止把 stale cleanup 扩展到正常退出；recovery 扫描统一由 `process_cleanup::kill_stale_processes()` owner，调用方不要再写 ad-hoc PowerShell / `pgrep`。
+Windows production document origin、IPC和custom resource URL与macOS不同：
 
-### Windows 录音与语音 Worker
+- Tauri IPC通过 `http://ipc.localhost` 的 Fetch，需要同时被 `default-src` / `connect-src` 允许；
+- `fetch-src` 不是标准 CSP directive，不能代替 `connect-src`；
+- loopback只出现在 control-plane `connect-src`，工具/用户 attachment subresource走 `myagents-resource` origin；
+- `srcdoc` widget继承 top-level CSP，已登记外部库在 render时替换为bundled inline source；
+- `webview_policy.rs` 为所有共享 data directory的 WebView统一选择 Windows Fluent Overlay scrollbar。
 
-Windows microphone 与 system audio 都走 `cpal` 的 WASAPI backend；system audio 使用默认输出设备的 loopback config，不通过 ffmpeg、PowerShell、浏览器 capture 或虚拟声卡。`RecordingManager` 在 admission 时冻结 exact device ID；设备切换/拔出后 fail closed 为 `RECORDING_DEVICE_CHANGED`，不静默接管另一设备。callback 只写既有 bounded archive/analysis ring 与 activity atomic，不做阻塞 IO、重采样或 UI event。
+CSP authority是 `src-tauri/tauri.conf.json`。新增 network/subresource surface必须明确归入 control面或登记的数据面，不能为了通过WebView2直接扩大 `http:` / CDN通配。
 
-`myagents-media-worker.exe` 与 sherpa adapter/native libraries 位于随包 `speech-inference/v1`，ONNX Runtime identity 复用 `document-processing/v1` 的同 target artifact。Worker 必须通过 `process_cmd::spawn_tree()` 进入 kill-on-close Job Object，使用私有 framed stdin/stdout；禁止搜索 PATH、系统 ORT、用户模型 cache 或在线 ASR。正式安装包 smoke 需要在无系统 ORT/ffmpeg/Python、断网环境验证 microphone、WASAPI loopback、pause/resume/stop、Worker 最小加载、取消/退出进程树与 notices。
+## Native Browser child
 
-Activation Trigger 的 Detector 也属于 Live lifecycle：每次 invocation 保留自己的 Job Object，timeout、stdout 超限、Task Stop/Delete 和 App shutdown 都终止同一棵树；不能只 kill 根 PID。harness 先 `env_clear()`，再恢复 Windows system/home/temp、证书、通用代理、增强 PATH 与 `LANG/LC_ALL/PYTHONUTF8/PYTHONIOENCODING` 规范 baseline，不继承 Provider credential 或 `MYAGENTS_*` 端口。它以 UTF-8 JSON 写 stdin，并把 stdout 当严格 UTF-8 协议解析；任意仍输出本地代码页字节的脚本会得到可诊断的 protocol failure，而不是静默替换字符或激活 AI。
+应用自有「浏览器」为每个 Product Session建立独立 BrowserContext和原生窗口/child WebView。Browser Host由Global Sidecar拥有，Chromium后代进入同一 process tree。
 
----
+Renderer `BrowserPanel` 通过 lifecycle token和常驻 geometry reconciler维护OS child bounds；split过渡、拖拽和overlay期间隐藏native view但继续更新Rust cache。不能用一次性 ResizeObserver或transition-end采样替代。
 
-## 🌐 CSP 配置
+Browser resource由Rust按随App签名的lock下载官方artifact、校验URL/size/SHA-256并安装到应用数据目录。Release不捆绑Chromium，也不回退系统Chrome、npx或用户cache。正常shutdown先做有界Browser checkpoint/close，再由Job Object containment。
 
-### Windows Tauri IPC 特殊要求
+## Windows file IO
 
-**关键点**：
-- Windows Tauri v2 使用 `http://ipc.localhost` 协议
-- IPC 调用使用 **Fetch API**
-- `default-src` 和 `connect-src` 都必须包含 `http://ipc.localhost`
-- `connect-src` 是管 fetch / XHR / WebSocket 的**标准** CSP 指令——IPC 的 Fetch 由它放行。
-  曾配过的 `fetch-src` 是**非标准**指令，WebKit 与 WebView2（Chromium）都不认、直接忽略（只在 console 报 `Unrecognized Content-Security-Policy directive 'fetch-src'`），已移除。
+Config/workspace写入沿现有owner的 lock、disk reread/merge、temp write、fsync和atomic rename。
 
-**正确配置**：
-```json
-{
-  "app": {
-    "security": {
-      "csp": "default-src 'self' ipc: tauri: asset: http://ipc.localhost; connect-src 'self' ipc: tauri: asset: http://ipc.localhost http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:* https://download.myagents.io; ..."
-    }
-  }
-}
-```
+`cmd_fsync_path` 的Windows差异：
 
-**常见错误**：
-```
-❌ connect-src 缺少 http://ipc.localhost（IPC Fetch 被 CSP 拦截）
-❌ 误以为要用 fetch-src（非标准、引擎忽略；真正生效的是 connect-src）
-```
+- `FlushFileBuffers` 需要可写handle，因此 `opts_for_fsync()` 使用对应权限；
+- Defender/indexer/sync工具可能短暂返回sharing violation或access denied，helper只对精确transient错误做有限退避；
+- parent directory fsync在Windows是no-op，不伪造Unix语义。
 
-**详见**：[build_troubleshooting.md#CSP配置错误](../guides/build_troubleshooting.md#csp-配置错误)
+不能把所有权限错误都重试，也不能在失败后继续刷新UI为成功。
 
----
+## Recording、Document 与 Media Worker
 
-## 🔌 代理配置
+Windows microphone/system audio使用 cpal WASAPI；system audio从默认输出设备取得loopback config，不依赖ffmpeg、PowerShell、浏览器capture或虚拟声卡。Recording admission冻结exact device ID，设备变化返回 `RECORDING_DEVICE_CHANGED`，不静默切换。
 
-### localhost 排除
+Document/Media Worker及native inference artifact由resource lock和target manifest拥有：
 
-**问题**：
-- reqwest 默认使用系统代理
-- Windows 系统代理（如 Clash）未正确处理 localhost 排除
-- 导致 localhost 请求失败
+- executable通过 `spawn_tree()` 进入Job Object；
+- DLL/model只从manifest的绝对resource path加载；
+- 不搜索PATH、系统ONNX Runtime/PDFium或用户cache；
+- document source/output拒绝reparse escape；
+- callback只写bounded buffer/atomic状态，不执行阻塞IO。
 
-**解决方案**：
+详细协议见 [`document_processing.md`](document_processing.md) 和 [`recording_and_speech_recognition.md`](recording_and_speech_recognition.md)。
 
-所有 localhost 请求强制禁用代理：
-```rust
-let client = reqwest::Client::builder()
-    .no_proxy()  // 禁用所有代理（包括系统代理）
-    .build()?;
-```
+## Proxy
 
-外部请求使用应用内代理配置：
-```rust
-use crate::proxy_config;
+Localhost Rust HTTP统一走 `crate::local_http` 并显式no-proxy。外部request/subprocess按general或Provider owner走 `proxy_config`；未选择应用代理时继承系统/TUN baseline，不强制direct。完整规则见 [`proxy_config.md`](proxy_config.md)。
 
-let builder = reqwest::Client::builder()
-    .timeout(Duration::from_secs(30));
+## Git Bash dependency
 
-let client = proxy_config::build_client_with_proxy(builder)?;
-```
+Builtin Claude shell在Windows需要Git Bash。NSIS installer检测并可安装随包Git installer；开发或自定义环境也可通过 `CLAUDE_CODE_GIT_BASH_PATH` 指定。缺失应返回明确dependency error，不能通过 `cmd.exe` 模拟或把问题归因于Node。
 
-**详见**：[proxy_config.md](../tech_docs/proxy_config.md)
+具体Git artifact/version、构建前置和签名以 `build_windows.ps1`、NSIS模板及Windows构建指南为准。
 
----
+## 验证
 
-## 📦 构建脚本
+确定性测试覆盖path identity、URL conversion、reparse safety、launcher quoting、process tree、CSP/resource URL、UTF-8/BOM、fsync retry policy和runtime locator。
 
-### 关键清理步骤
+Windows release-like smoke还必须在Explorer启动、无系统Node/native DLL fallback、断网/代理组合和有空格/Unicode安装路径下验证：
 
-正式 Windows x64 构建在 Tauri snapshot 前运行 `scripts/prepare-native-inference.mjs x86_64-pc-windows-msvc`，在同一锁和 content-addressed cache 下准备 document 与 speech capability：按 `resource-lock.json` 下载并校验共享 ONNX Runtime CPU、PDFium、PP-OCRv6 模型/字典，使用锁定 Rust toolchain 构建 `myagents-document-worker.exe`、`myagents-media-worker.exe` 与 sherpa adapter，再生成各自包含最终文件 hash/签名的 target manifest。Sherpa 源码继续由锁定 archive 的 size/SHA-256/revision 裁决，但系统 tar 只展开根 `CMakeLists.txt`、`LICENSE`、`cmake/` 与 `sherpa-onnx/`；无关示例、移动端和仓库元数据中的 symlink 不属于 Windows build input，不要求 Developer Mode、管理员权限或长路径开关。运行时只从 manifest 的绝对路径加载 DLL；不得搜索 PATH、系统目录或联网补 native 资源。安装包 smoke 必须在无系统 ONNX Runtime/PDFium/ffmpeg、断网环境验证文档/语音最小推理、WASAPI capture、Job Object 取消、notices 与安装包签名。
-
-文档 source/output 的每个已存在祖先都拒绝 reparse point；source 使用 no-follow regular-file handle，输出发布前再次比较 held directory identity。Worker 由 `process_cmd::spawn_tree()` 在 resume 前加入 kill-on-close Job Object；不能退回裸 `Command` 或 `taskkill`。详细跨平台资源矩阵和错误码见 `document_processing.md`。
-
-**必须清理的目录**：
-1. `dist/` - 前端构建产物
-2. `src-tauri/target/{arch}/{profile}/bundle/` - Tauri 安装包
-3. `src-tauri/target/{arch}/{profile}/resources/` - **缓存的配置文件**（最容易被忽略）
-
-**resources 目录的重要性**：
-- Tauri 在此目录缓存 `tauri.conf.json` 等配置文件
-- 如果不清理，配置更新后构建仍使用旧缓存
-- 导致 CSP 等配置修改不生效
-
-**正确的清理脚本**（`build_windows.ps1` 发布构建）：
-```powershell
-# 杀死残留 MyAgents 进程
-Get-Process | Where-Object { $_.ProcessName -eq "MyAgents" } | Stop-Process -Force
-
-# 清理构建产物
-Remove-Item dist -Recurse -Force
-Remove-Item src-tauri\target\x86_64-pc-windows-msvc\release\bundle -Recurse -Force
-
-# CRITICAL: 清理 resources 缓存
-Remove-Item src-tauri\target\x86_64-pc-windows-msvc\release\resources -Recurse -Force
-```
-
-**快速 debug 构建**：
-
-```powershell
-.\build_dev_win.ps1
-```
-
-默认只生成 `src-tauri\target\x86_64-pc-windows-msvc\debug\myagents.exe`，不打 NSIS，便于 Windows 真机快速验证功能。脚本仍会清理 `debug\resources`，避免 Tauri 复用旧配置；需要验证安装器时使用：
-
-```powershell
-.\build_dev_win.ps1 -BundleNsis
-```
-
-**详见**：[build_troubleshooting.md](../guides/build_troubleshooting.md)
-
----
-
-## 🚀 发布流程
-
-### Windows 发布检查清单
-
-**构建前**：
-- [ ] 版本号同步（`package.json`, `tauri.conf.json`, `Cargo.toml`）
-- [ ] TypeScript 类型检查通过
-- [ ] `npm run build:cli` 后 `resources/cli/` 只有当前 `myagents.cjs`（以及 tracked `.gitkeep`），没有旧 `myagents.cmd` staging 残留
-- [ ] `scripts/prepare-native-inference.mjs x86_64-pc-windows-msvc --offline` 可从已验证 cache 重建 document/speech resource projection
-- [ ] `.env` 文件包含 `TAURI_SIGNING_PRIVATE_KEY`
-- [ ] Rust 工具链已安装目标 `x86_64-pc-windows-msvc`
-
-**构建**：
-```powershell
-.\build_windows.ps1
-```
-
-**产物验证**：
-- [ ] NSIS 安装包（~150MB）
-- [ ] 便携版 ZIP（~150MB）
-- [ ] Updater 签名文件（`.sig`）
-- [ ] 安装目录包含校验通过的 `document-processing/v1` 与 `speech-inference/v1`，第三方 notices/许可完整
-
-**发布**：
-```powershell
-.\publish_windows.ps1
-```
-
-**发布验证**：
-- [ ] R2 上传成功（NSIS, ZIP, SIG）
-- [ ] `latest_win.json` 生成正确
-- [ ] 版本号、下载链接、签名正确
-
-**详见**：[windows_build_guide.md](../guides/windows_build_guide.md)
-
----
-
-## Pit-of-Success 进程管理模块
-
-### process_cmd (`src-tauri/src/process_cmd.rs`)
-
-所有 Rust 层子进程 MUST 通过 `crate::process_cmd::new()` 创建，以统一应用 Windows `CREATE_NO_WINDOW`。会派生后代的长生命周期进程还 MUST 使用 `crate::process_cmd::spawn_tree()` 并保留返回的 `ChildTree`。完整跨平台不变量、例外和禁止项只在 [`pit_of_success.md`](pit_of_success.md#process_cmd) 维护，本节只记录 Windows 的 Job Object 行为。
-
-### system_binary (`src-tauri/src/system_binary.rs`)
-
-Tauri GUI 应用从 Finder/Explorer 启动时不继承 shell PATH（无 homebrew、无用户 PATH）。`system_binary::find(binary_name)` 自动补充常见路径（`/opt/homebrew/bin`、`/usr/local/bin`、`C:\Program Files\nodejs` 等），确保系统工具（npm、git、node、systemd-inhibit 等）可被发现。
-
-### `cmd_fsync_path` Windows-specific quirks (`src-tauri/src/config_io.rs`)
-
-跨平台 fsync 在 Windows 上有两类需要专门处理的失败：
-
-1. **`FlushFileBuffers` 要求 `GENERIC_WRITE`**：Unix 下 `fsync(2)` 接受只读 fd，但 Windows 的等价 API 要求写权限，否则 `os error 5 (拒绝访问)`。`opts_for_fsync()` 在 Windows 上加 `.write(true)`，Unix 上保持只读以避免不必要的写权限请求。
-2. **AV / search-indexer transient share violation**：Defender 实时扫描、OneDrive 同步、Backblaze 索引器在我们刚写完文件之后会瞬间用 `FILE_SHARE_NONE` 打开它，让我们的后续打开返回 `ERROR_SHARING_VIOLATION (32)` 或偶发的 `ERROR_ACCESS_DENIED (5)`。失败窗口是 ms 级，配置 25/50/100ms 退避循环（4 次尝试），透明跳过这段。
-
-`fsync_parent_dir` 在 Windows 上是 no-op：`FlushFileBuffers` 对目录句柄是 documented no-op，且需要 `FILE_FLAG_BACKUP_SEMANTICS` 才能拿到目录句柄。NTFS 自身的 journaling 提供等价的 crash-consistency 保证。
-
-## Plugin 安装 Fallback 链
-
-三级 fallback 确保社区插件安装成功：
-
-```
-1. 系统 npm（system_binary::find("npm")）
-   └─ 失败 →
-2. 内置 npm（bundled Node.js + npm-cli.js）
-   └─ NODE_OPTIONS=--no-experimental-require-module（Windows Node.js v24 CJS/ESM 修复）
-```
-
-生产构建与 setup 脚本统一依赖 bundled Node.js + npm。
-
-安装后流程：
-1. `npm install` → 安装插件及其依赖
-2. **依赖修复**：`npm install --ignore-scripts --omit=peer`
-3. **SDK Shim 安装**（最后一步，last-write-wins）：覆盖 `node_modules/openclaw/` 为自定义 shim
-4. **Bridge 启动前 shim 完整性检查**：解析 `package.json` version 字段，检测损坏自动修复
-
----
-
-## ⚠️ Windows 依赖项
-
-### Git for Windows（必需）
-
-**为什么需要**：Claude Agent SDK 在 Windows 上需要 Git Bash 来执行 shell 命令。
-
-**自动安装**：NSIS 安装程序内置 Git for Windows，自动检测并安装（无需网络）。
-
-**构建要求**：构建前需将 Git 安装包放置在 `src-tauri/nsis/Git-Installer.exe`
-
-**手动安装**：https://git-scm.com/downloads/win
-
-**环境变量**：若 Git 已安装但不在 PATH 中，可设置：
-```powershell
-$env:CLAUDE_CODE_GIT_BASH_PATH="C:\Program Files\Git\bin\bash.exe"
-```
-
-### 排查 `exit code 1` 错误
-
-1. **检查日志**：查找 `[sdk-stderr]` 输出
-2. **常见原因**：`requires git-bash` 表示缺少 Git
-3. **解决方案**：安装 Git for Windows 或设置 `CLAUDE_CODE_GIT_BASH_PATH`
-
-**详见**：[bundled_node.md](../tech_docs/bundled_node.md) 中的 Windows Git 依赖说明
-
----
-
-## 📚 相关文档
-
-- [Windows 构建指南](../guides/windows_build_guide.md)
-- [构建问题排查](../guides/build_troubleshooting.md)
-- [代理配置](../tech_docs/proxy_config.md)
-- [自动更新](../tech_docs/auto_update.md)
+- Builtin/External Runtime与Git Bash；
+- Sidecar/Plugin Bridge/Task Detector child-tree cleanup；
+- attachment/widget/Browser child WebView；
+- microphone/WASAPI loopback与workers；
+- NSIS install、updater handoff、Defender/file-lock场景。

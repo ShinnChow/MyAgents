@@ -24,6 +24,21 @@ function arrayLength(value: unknown): number {
   return Array.isArray(value) ? value.length : 0;
 }
 
+/** Content shape, never content bytes. A string is not an empty block array. */
+function summarizeUserContent(content: unknown): UnknownRecord {
+  if (typeof content === 'string') {
+    return { contentKind: 'string', textLength: content.length, isEmptyContent: content.length === 0 };
+  }
+  if (Array.isArray(content)) {
+    const textLength = content.reduce((length, block) =>
+      length + (isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? block.text.length : 0), 0);
+    return { contentKind: 'blocks', textLength, isEmptyContent: content.length === 0 };
+  }
+  return content == null
+    ? { contentKind: 'missing', textLength: 0, isEmptyContent: true }
+    : { contentKind: 'unknown' };
+}
+
 /**
  * Redact every SDK payload before it enters unified or session logs. SDK
  * messages can contain workspace/plugin paths, prompts, assistant output,
@@ -91,6 +106,8 @@ export function summarizeSensitiveSdkMessage(message: unknown): unknown {
     return {
       type: 'user',
       isSynthetic: message.isSynthetic === true,
+      isReplay: message.isReplay === true,
+      ...summarizeUserContent(userMessage.content),
       shouldQuery: message.shouldQuery !== false,
       priority: safeProtocolLabel(message.priority),
       originKind: safeProtocolLabel(origin.kind),

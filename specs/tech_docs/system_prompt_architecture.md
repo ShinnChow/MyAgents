@@ -69,8 +69,8 @@ assembler。调用方传入：
 - `userCliToolsEnabled`：是否读取用户 CLI 工具注册表，受实验开关控制。
 - `enabledOfficialToolIds`：当前 Session 实际启用的官方 CLI 工具。
 
-模板直接内联在 TypeScript 中，不从运行时文件系统加载。原因是打包后的 Bun
-`__dirname` 不能稳定定位模板资源；内联内容同时让生产包与源码使用同一个事实来源。
+模板直接内联在 TypeScript 中，不从运行时文件系统加载。单文件 bundle 不能依赖源码
+目录中的模板路径；内联内容让生产包与源码使用同一个事实来源。
 
 受管「浏览器」的登录态保存不属于 Prompt 契约。应用级 Browser Host 会在成功工具调用和 Context teardown 边界自动 checkpoint Cookie；模型无需、也不应被提示主动调用存储工具来维持产品正确性。该 headed Context 不使用 Playwright `storageState()`，避免身份维护创建用户可见的临时页面；localStorage 与 IndexedDB 不跨 Product Session 恢复。标准 `playwright` 仍遵循上游 MCP 的 argv/storage-state 语义，MyAgents 不用隐藏 Prompt 改写它。
 
@@ -91,8 +91,7 @@ assembler。调用方传入：
 
 ### 组装层次
 
-早期实现称为“三层 Prompt”；当前代码已经包含独立的 CLI capability appendix，可按
-四类内容理解：
+当前产品级 append 分为四类内容：
 
 | 层                | 职责                                                                           | 组合方式             |
 | ----------------- | ------------------------------------------------------------------------------ | -------------------- |
@@ -193,8 +192,9 @@ systemPrompt = { type: preset, preset: claude_code, append: MyAgentsPrompt }
   `--append-system-prompt-file`；保留 Claude Code 默认 preset 和 OAuth/Keychain 行为。
 - Codex：使用 `developerInstructions`，新建与 resume thread 都走同一字段。
 - Gemini：`GEMINI_SYSTEM_MD` 会整体替换内置 Prompt，因此先导出并缓存当前 Gemini
-  版本的 base prompt，再生成“ MyAgents + Workspace + Gemini base”的 per-session
-  合并文件；结束时清理 session 文件，base 版本缓存保留。
+  版本的 base prompt，再生成“MyAgents + Workspace + Gemini base”的 deterministic
+  per-session 文件。Windows `.cmd` grandchild 可能晚于父进程读取该文件，所以进程退出时
+  不立即删除；只由 age-based GC 清理 stale 文件。base 版本缓存独立保留。
 
 Managed Codex 的 IM/Agent Channel 当前还会在中央 assembler 之后追加
 `myagents-managed-codex-interaction-limits`：禁用结构化问答工具的场景必须改用普通聊天

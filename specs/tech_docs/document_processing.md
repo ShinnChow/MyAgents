@@ -1,6 +1,6 @@
 # 本地文档转换与端侧 OCR 架构
 
-本文是 `myagents anydoc` 当前实现的模块规范。产品范围与验收目标见 PRD 0.4.9；本文件只维护 owner、状态机、协议、资源、限制、安全不变量和排查路径。若数值或字段与代码冲突，以 `src-tauri/src/document_processing.rs`、`src-tauri/document-worker/`、CLI exact help 和测试为准，并同步修正文档。
+本文是 `myagents anydoc` 当前实现的模块规范，只维护 owner、状态机、协议、资源、限制、安全不变量和排查路径。若数值或字段与代码冲突，以 `src-tauri/src/document_processing.rs`、`src-tauri/document-worker/`、CLI exact help 和测试为准，并同步修正文档。
 
 ## 定位与边界
 
@@ -94,11 +94,11 @@ Manager 与 Worker 使用 4-byte big-endian payload length + UTF-8 JSON；单 fr
 
 ### 结构化文档 fast path
 
-AnyDoc 0.1.9 源码以精确上游版本 vendored，MyAgents patch 只增加 typed recovery diagnostic 与 opt-in asset serialization：parser 生成 `Document` 后，由 caller 给安全 asset 分配相对路径，renderer 才写 `![alt](assets/...)`。Worker 对资产做 MIME + magic sniff，只发布 PNG/JPEG/WebP passive raster；SVG、HTML、OLE、executable、外部 payload、未引用资产均不写出并产生 warning。被省略的内嵌资产会在原文位置留下 `**[Embedded asset omitted]**`，同时在顶部 warning summary 汇总。
+AnyDoc 使用资源锁固定的 vendored 上游源码；MyAgents patch 只增加 typed recovery diagnostic 与 opt-in asset serialization。parser 生成 `Document` 后，由 caller 给安全 asset 分配相对路径，renderer 才写 `![alt](assets/...)`。Worker 对资产做 MIME + magic sniff，只发布 PNG/JPEG/WebP passive raster；SVG、HTML、OLE、executable、外部 payload、未引用资产均不写出并产生 warning。被省略的内嵌资产会在原文位置留下 `**[Embedded asset omitted]**`，同时在顶部 warning summary 汇总。
 
 AnyDoc 的 recoverable 分支直接产生 typed `{code, message, location}` diagnostic；日志只供本地排查，不作为产品 warning 数据源。能定位的恢复项还必须占据原内容位置，例如不可读 PPTX slide 在对应 slide 顺序插入可见 warning placeholder；Worker 再于文首汇总同一 typed diagnostics。CSV 等结构化格式不加载 OCR native runtime。
 
-加密 OOXML/legacy Office 由精确 vendored 的 `office-crypto 0.3.0` 在 Worker 内解密；MyAgents 的窄 patch 只把 legacy DOC verifier 的密码校验失败提升为独立 `InvalidPassword`，其余 `InvalidStructure` 继续映射 `DOCUMENT_MALFORMED`。解密 bytes 只存在内存；缺密码、错误密码和不支持 scheme 分别返回稳定错误，损坏文件不得默认映射成密码错误。
+加密 OOXML/legacy Office 由资源锁固定的 `office-crypto` 在 Worker 内解密；MyAgents 的窄 patch 只把 legacy DOC verifier 的密码校验失败提升为独立 `InvalidPassword`，其余 `InvalidStructure` 继续映射 `DOCUMENT_MALFORMED`。解密 bytes 只存在内存；缺密码、错误密码和不支持 scheme 分别返回稳定错误，损坏文件不得默认映射成密码错误。
 
 ### PDF 逐页 routing
 
@@ -110,15 +110,9 @@ PDF 始终先由 `pdf-inspector` 区分损坏与加密；传入密码不会把�
 
 图片按内容 sniff 解码 PNG/JPEG/WebP，扩展不一致产生 warning；JPEG EXIF orientation 在 OCR 前归一。单图/单 PDF render 超过像素上限即失败。
 
-OCR 固定为 PP-OCRv6 Small detector + recognizer，CPU-only ONNX Runtime 1.28：
+OCR 使用资源锁固定的 PP-OCRv6 Small detector、recognizer 与 dictionary，并通过随 App 发布的 CPU-only ONNX Runtime 执行。revision、digest、字典规模和 native runtime 版本只在 `resource-lock.json` 与 manifest 维护。
 
-| 资源 | 固定 revision / digest |
-|---|---|
-| detector | HF `28fe5895c24fd108c19eb3e8479f4ab385fbfc62`; SHA-256 `d73e0058...c9410e` |
-| recognizer | HF `b8f84f0b80c529de40b4fbb3544b84fa7233a513`; SHA-256 `5435fd74...24634` |
-| PP-OCRv6 dictionary | PaddleOCR `b03f46425e8ff4442b268ce449e3eef758146cd4`; 18,708 行；SHA-256 `b5f2bfe2...01c5d` |
-
-Adapter 负责 detector resize/normalize、DB bitmap/box filtering、crop/order、recognizer dynamic width/normalize、CTC collapse、space class 与 confidence。任何模型 shape/class mismatch fail closed。正式发布必须用相同 revision 的官方 PaddleOCR pipeline 作为 oracle 跑 golden corpus；模型能加载不等于 OCR 正确。
+Adapter 负责 detector resize/normalize、DB bitmap/box filtering、crop/order、recognizer dynamic width/normalize、CTC collapse、space class 与 confidence。任何模型 shape/class mismatch fail closed。质量验证必须用相同 revision 的官方 PaddleOCR pipeline 作为 oracle 跑 golden corpus；模型能加载不等于 OCR 正确。
 
 ## 固定资源限制
 
@@ -189,11 +183,11 @@ speech 的用户可移除模型权重不属于本节的 build cache，也不进�
 - `system-prompt-cli-tools.ts` 不增加 AnyDoc section/hint。
 - exact group/leaf help 是当前 CLI 参数、输出、exit 和 recovery authority；没有 `readme` route。
 
-## 验证与发布门槛
+## 验证
 
 本地确定性检查至少包括 CLI/Admin/help/Skill parity、Manager path/protocol/state helper、Worker protocol/manifest/AnyDoc asset、OCR pre/postprocess、resource-lock/build staging、Rust fmt/clippy/test、TypeScript typecheck/lint 和 CLI/Tauri build。
 
-发布前还必须在五个真实 target 的签名/安装包中完成：解包 manifest/hash/notices、断网启动、无系统 native runtime fallback、PDFium load/password/render、ONNX Runtime + PP-OCRv6 最小推理、混合 PDF coverage、真实 process-tree cancel、资源增量和 cold/warm 性能/RSS。OCR golden corpus需覆盖中英混排、表格/小字、旋转/透视、低清扫描、长图、EXIF、空白页和 adversarial input。未取得这些证据时只能称“本地实现/本机 smoke 通过”，不能称 0.4.9 可发布。
+正式安装包验证必须覆盖所有支持 target 的 manifest/hash/notices、断网启动、无系统 native runtime fallback、PDFium load/password/render、ONNX Runtime + PP-OCRv6 最小推理、混合 PDF routing、真实 process-tree cancel、资源增量和 cold/warm 性能/RSS。OCR golden corpus 覆盖中英混排、表格/小字、旋转/透视、低清扫描、长图、EXIF、空白页和 adversarial input；单机 smoke 不能替代跨 target 证据。
 
 ## 排查
 

@@ -266,7 +266,7 @@ HTTP client 的错误文本通常携带完整请求 URL。若协议把凭据放�
 2026-03-26 10:30:45.345 [RUST ] [INFO ] Sidecar process spawned
 ```
 
-> v0.1.x 的 `[BUN  ]` 标签在 v0.2.0+ 渲染为 `[NODE ]`（UnifiedLogsPanel 的 SOURCE_LABELS.bun = 'NODE'）。历史日志文件中的 `[BUN  ]` 字面量保留不变，保证能 grep 到旧日志。
+> 持久化 wire format 仍接受 `[BUN  ]` source tag，UI 将它显示为 `[NODE ]`。已写日志的字面量保持不变，保证诊断搜索与旧文件读取兼容。
 
 > **注意**：时间戳使用**本地时间** `YYYY-MM-DD HH:MM:SS.mmm`（非 UTC ISO 8601）。
 
@@ -319,6 +319,8 @@ HTTP client 的错误文本通常携带完整请求 URL。若协议把凭据放�
 | L6 | `agent-session.ts` SDK message | 摘要替代完整 JSON（`type=assistant model=opus`） |
 
 Builtin / external runtime 在成功持久化边界输出 `[assistant-output]`：组合文本先归一化为单行，仅保留前 100 个 Unicode code point，并记录原始 `chars`。流式 delta 与 raw partial transport 永不进入统一日志；既有低频 SDK result 诊断仍可保留自身的有界字段摘要。Plugin Bridge 的 pending dispatch terminal 只记录 `canonical_final` 的 count/chars/hash，不再复制同一 IM 正文。Codex `thread/start|resume` 的 `developerInstructions`、`cwd`、thread ID 属于敏感启动参数，notification 中的 command、file path、tool value、provider error 和 stderr 也属于敏感 runtime payload；日志只允许计数、稳定协议枚举与 `{present, chars, hash}`，不得记录任何文本前缀，实际 RPC/事件参数保持原值。`external-session.ts` 的 terminal/log owner 同样只能把 Runtime error 投影成这组不可逆 metadata 后写 `console`/perf trace；面向 Chat/IM 的原始 terminal error 仍沿既有产品事件传递，不能为了日志脱敏破坏用户错误契约。
+
+SDK user message 摘要通过 `contentKind`、`textLength`、`isEmptyContent` 区分字符串、内容块、空值与缺失，并保留 `isReplay`。`contentBlockCount=0` 只表示没有数组内容块，不表示字符串消息为空；仅图片的非空数组也不算空消息。generator yield 沿既有 `queueId` / `requestId` 关联这份摘要，不记录原始正文或改变投递队列。
 
 **时间戳格式**：本地时间 `YYYY-MM-DD HH:MM:SS.mmm`（非 UTC ISO 8601）。
 

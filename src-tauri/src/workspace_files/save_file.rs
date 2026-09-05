@@ -40,6 +40,7 @@ pub async fn cmd_workspace_save_file(
         return Err("Content too large".to_string());
     }
     let workspace_root = validate_workspace_root(&workspace)?;
+    let _mutation = super::acquire_edit_mutation(&workspace_root).await;
     let resolved = resolve_existing_inside_workspace(&workspace_root, trimmed)?;
     reject_managed_global_skill_mutation(&workspace_root, &resolved)?;
 
@@ -64,6 +65,62 @@ pub async fn cmd_workspace_save_file(
 mod tests {
     use super::*;
     use crate::workspace_files::test_support::make_test_workspace;
+
+    #[tokio::test]
+    async fn app_save_and_relocation_share_one_commit_order() {
+        use crate::workspace_files::crud::{cmd_workspace_move, cmd_workspace_rename};
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let ws = make_test_workspace("save_relocation_order");
+        fs::write(ws.join("a.md"), "old").unwrap();
+        fs::create_dir(ws.join("target")).unwrap();
+        let workspace = ws.to_string_lossy().to_string();
+        let root = validate_workspace_root(&workspace).unwrap();
+        let guard = crate::workspace_files::acquire_edit_mutation(&root).await;
+        let mut save = std::pin::pin!(cmd_workspace_save_file(
+            workspace.clone(),
+            "a.md".into(),
+            "draft".into(),
+            Some("old".into())
+        ));
+        let mut rename = std::pin::pin!(cmd_workspace_rename(
+            workspace.clone(),
+            "a.md".into(),
+            "b.md".into()
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(save.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(rename.as_mut().poll(&mut cx), Poll::Pending));
+        drop(guard);
+        save.await.unwrap();
+        rename.await.unwrap();
+        assert!(!ws.join("a.md").exists());
+        assert_eq!(fs::read_to_string(ws.join("b.md")).unwrap(), "draft");
+
+        // Conversely a move admitted first invalidates an old-path save;
+        // the save must reject rather than recreating the vacated pathname.
+        let guard = crate::workspace_files::acquire_edit_mutation(&root).await;
+        let mut relocate = std::pin::pin!(cmd_workspace_move(
+            workspace.clone(),
+            vec!["b.md".into()],
+            "target".into()
+        ));
+        let mut stale_save = std::pin::pin!(cmd_workspace_save_file(
+            workspace.clone(),
+            "b.md".into(),
+            "newer draft".into(),
+            Some("draft".into())
+        ));
+        assert!(matches!(relocate.as_mut().poll(&mut cx), Poll::Pending));
+        assert!(matches!(stale_save.as_mut().poll(&mut cx), Poll::Pending));
+        drop(guard);
+        relocate.await.unwrap();
+        assert!(stale_save.await.is_err());
+        assert!(!ws.join("b.md").exists());
+        assert_eq!(fs::read_to_string(ws.join("target/b.md")).unwrap(), "draft");
+        fs::remove_dir_all(ws).unwrap();
+    }
 
     #[tokio::test]
     async fn writes_existing_file() {

@@ -1,13 +1,15 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type { ReactNode } from 'react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { createRef, useEffect, useState, type ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import FilePreviewModal, {
+  type FilePreviewHandle,
   decideLiveReload,
   formatFilePreviewUpdateTime,
 } from './FilePreviewModal';
 
 const mocks = vi.hoisted(() => ({
+  moves: new Set<(moves: { oldPath: string; newPath: string }[]) => void>(),
   readPreview: vi.fn(),
   saveFile: vi.fn(),
   rename: vi.fn(),
@@ -32,7 +34,14 @@ vi.mock('@/hooks/useWorkspaceFileService', () => ({
 }));
 
 vi.mock('@/hooks/useWorkspaceChangeSignal', () => ({
-  useWorkspaceChangeSignal: () => 0,
+  useWorkspaceChangeSignal: (_workspace: unknown, _enabled: unknown, onMoved?: (moves: { oldPath: string; newPath: string }[]) => void) => {
+    useEffect(() => {
+      if (!onMoved) return;
+      mocks.moves.add(onMoved);
+      return () => { mocks.moves.delete(onMoved); };
+    }, [onMoved]);
+    return 0;
+  },
 }));
 
 vi.mock('@/components/Toast', () => ({
@@ -90,6 +99,115 @@ describe('FilePreviewModal live reload', () => {
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
+  });
+
+  it('retains dirty edits when closing cannot save', async () => {
+    mocks.saveFile.mockRejectedValue(new Error('File not found'));
+    const onClose = vi.fn();
+    render(<FilePreviewModal {...baseProps} initialEditMode onClose={onClose} />);
+    fireEvent.change(await screen.findByTestId('monaco-editor'), { target: { value: 'unsaved draft' } });
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalled());
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByTestId('monaco-editor')).toHaveValue('unsaved draft');
+    mocks.saveFile.mockResolvedValue(undefined);
+  });
+
+  it('remaps all open descendants and preserves independent dirty buffers', async () => {
+    mocks.saveFile.mockResolvedValue(undefined);
+    function Viewer({ file }: { file: string }) {
+      const [identity, setIdentity] = useState({ path: `old/${file}`, name: file });
+      return <FilePreviewModal {...baseProps} {...identity} initialEditMode
+        onRenamed={(path, name) => setIdentity({ path, name })} />;
+    }
+    render(<><Viewer file="a.md" /><Viewer file="b.md" /></>);
+    const editors = await screen.findAllByTestId('monaco-editor');
+    fireEvent.change(editors[0], { target: { value: 'draft a' } });
+    fireEvent.change(editors[1], { target: { value: 'draft b' } });
+    act(() => mocks.moves.forEach(callback => callback([{ oldPath: 'old', newPath: 'new' }])));
+    fireEvent.click(screen.getAllByRole('button', { name: '关闭' })[0]);
+    fireEvent.click(screen.getAllByRole('button', { name: '关闭' })[1]);
+    await waitFor(() => {
+      expect(mocks.saveFile).toHaveBeenCalledWith({ path: 'new/a.md', content: 'draft a', expectedContent: 'old content' });
+      expect(mocks.saveFile).toHaveBeenCalledWith({ path: 'new/b.md', content: 'draft b', expectedContent: 'old content' });
+    });
+  });
+
+  it('retains a draft when the split-pane close handle or fullscreen cannot save', async () => {
+    mocks.saveFile.mockRejectedValue(new Error('File not found'));
+    const onClose = vi.fn();
+    const onFullscreen = vi.fn();
+    const ref = createRef<FilePreviewHandle>();
+    render(<FilePreviewModal {...baseProps} ref={ref} initialEditMode onClose={onClose} onFullscreen={onFullscreen} />);
+    fireEvent.change(await screen.findByTestId('monaco-editor'), { target: { value: 'draft' } });
+    act(() => ref.current?.close());
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByLabelText('全屏预览'));
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalledTimes(2));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onFullscreen).not.toHaveBeenCalled();
+    expect(screen.getByTestId('monaco-editor')).toHaveValue('draft');
+    mocks.saveFile.mockResolvedValue(undefined);
+  });
+
+  it('enters fullscreen with the latest document identity after a move during save', async () => {
+    let finishSave!: () => void;
+    mocks.saveFile.mockImplementationOnce(() => new Promise<void>(resolve => { finishSave = resolve; }));
+    mocks.saveFile.mockResolvedValue(undefined);
+    function Viewer() {
+      const [file, setFile] = useState({ path: 'notes.md', name: 'notes.md', content: 'old content' });
+      const [fullscreen, setFullscreen] = useState<typeof file | null>(null);
+      return <><span data-testid="fullscreen-path">{fullscreen?.path}</span>
+        <FilePreviewModal {...baseProps} {...(fullscreen ?? file)} embedded={!fullscreen} initialEditMode
+          onRenamed={(path, name) => setFile(prev => ({ ...prev, path, name }))}
+          onFullscreen={content => setFullscreen({ ...file, content: content ?? file.content })} /></>;
+    }
+    render(<Viewer />);
+    fireEvent.change(await screen.findByTestId('monaco-editor'), { target: { value: 'saved draft' } });
+    fireEvent.click(screen.getByLabelText('全屏预览'));
+    expect(mocks.saveFile).toHaveBeenCalledTimes(1);
+    act(() => mocks.moves.forEach(callback => callback([{ oldPath: 'notes.md', newPath: 'renamed.md' }])));
+    await act(async () => finishSave());
+    expect(screen.getByTestId('fullscreen-path')).toHaveTextContent('renamed.md');
+    expect(screen.getByTestId('monaco-editor')).toHaveValue('saved draft');
+    fireEvent.change(screen.getByTestId('monaco-editor'), { target: { value: 'fullscreen edit' } });
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    await waitFor(() => expect(mocks.saveFile).toHaveBeenLastCalledWith({ path: 'renamed.md', content: 'fullscreen edit', expectedContent: 'saved draft' }));
+  });
+
+  it('preserves the draft through an extension rename but resets on a real document switch', async () => {
+    function Viewer() {
+      const [identity, setIdentity] = useState({ path: 'notes.md', name: 'notes.md' });
+      return <><button onClick={() => setIdentity({ path: 'other.txt', name: 'other.txt' })}>other</button>
+        <FilePreviewModal {...baseProps} {...identity} initialEditMode onRenamed={(path, name) => setIdentity({ path, name })} /></>;
+    }
+    render(<Viewer />);
+    fireEvent.change(await screen.findByTestId('monaco-editor'), { target: { value: 'draft' } });
+    act(() => mocks.moves.forEach(callback => callback([{ oldPath: 'notes.md', newPath: 'notes.txt' }])));
+    expect(screen.getByTestId('monaco-editor')).toHaveValue('draft');
+    fireEvent.click(screen.getByRole('button', { name: 'other' }));
+    expect(screen.getByTestId('monaco-editor')).toHaveValue('old content');
+  });
+
+  it('settles an in-flight save across a move before saving newer edits at the new path', async () => {
+    let finishSave!: () => void;
+    mocks.saveFile.mockImplementationOnce(() => new Promise<void>(resolve => { finishSave = resolve; }));
+    mocks.saveFile.mockResolvedValue(undefined);
+    function Viewer() {
+      const [identity, setIdentity] = useState({ path: 'notes.md', name: 'notes.md' });
+      return <FilePreviewModal {...baseProps} {...identity} initialEditMode onRenamed={(path, name) => setIdentity({ path, name })} />;
+    }
+    render(<Viewer />);
+    const editor = await screen.findByTestId('monaco-editor');
+    fireEvent.change(editor, { target: { value: 'first draft' } });
+    await waitFor(() => expect(mocks.saveFile).toHaveBeenCalledTimes(1), { timeout: 2000 });
+    fireEvent.change(editor, { target: { value: 'latest draft' } });
+    act(() => mocks.moves.forEach(callback => callback([{ oldPath: 'notes.md', newPath: 'renamed.md' }])));
+    fireEvent.click(screen.getByRole('button', { name: '关闭' }));
+    expect(mocks.saveFile).toHaveBeenCalledTimes(1);
+    await act(async () => finishSave());
+    await waitFor(() => expect(mocks.saveFile).toHaveBeenLastCalledWith({ path: 'renamed.md', content: 'latest draft', expectedContent: 'first draft' }));
+    expect(screen.getByTestId('monaco-editor')).toHaveValue('latest draft');
   });
 
   it('re-reads the open markdown file in place and shows a subtle update timestamp', async () => {

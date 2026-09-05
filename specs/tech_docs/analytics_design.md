@@ -257,7 +257,7 @@ with the existing locally peppered, domain-separated `record_hash` or
 transcript, note, Speaker name, source/output paths, media bytes, and raw error
 messages are forbidden. `error_code` accepts normalized uppercase codes only.
 Media duration, file bytes, count, coverage, and segment-final latency use the
-fixed buckets in PRD 0.4.12; model resource bytes and technical operation
+fixed buckets defined by the typed receipt mapper; model resource bytes and technical operation
 duration may remain exact because they contain no user media facts.
 
 `record_use` reports an accepted Record operation, never a hover or an

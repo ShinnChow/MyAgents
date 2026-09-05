@@ -1,160 +1,96 @@
-# React 稳定性规范
+# React 状态与 Effect 稳定性
 
-> **核心原则**：React 重新渲染时，对象/函数引用会改变。依赖这些引用的 useEffect 会重新执行，可能触发 API 调用、文件访问等副作用。
+本文记录 Renderer 中会影响副作用正确性和大型列表性能的稳定性约束。React API 的一般用法不在这里复述；具体依赖项以 lint、组件 owner 和测试为准。
 
-## 规则 1：Context Provider 必须 useMemo
+## 先判断语义，不按类型删依赖
 
-Provider value 必须使用 `useMemo` 包装，否则每次渲染都会创建新对象，导致所有消费者重新渲染。
+Effect dependency 表示“哪些值变化时需要重新同步外部系统”。不要因为某个值是 object、hook 返回值或 callback 就机械地加入或删除：
 
-```typescript
-// ✅ 正确
-const contextValue = useMemo(() => ({
-    showToast, success, error, warning, info
-}), [showToast, success, error, warning, info]);
+- effect 确实响应其变化：稳定上游引用，或把必要字段拆成 primitive dependency；
+- effect 只需调用最新版 callback、但不应因 callback identity 重启：使用 latest ref / effect event 模式；
+- 同一动作由用户事件触发：放在 event handler，不要借 effect 间接触发；
+- 可以在 render 中纯计算：不要建立 derived state effect。
 
-return <ToastContext.Provider value={contextValue}>{children}</ToastContext.Provider>;
+不得用空依赖数组掩盖会改变资源 identity 的值。也不得通过 eslint suppress 绕过不清楚的 lifecycle。
 
-// ❌ 错误：对象字面量每次渲染都是新引用
-return <ToastContext.Provider value={{ showToast, success, error }}>{children}</ToastContext.Provider>;
-```
+## Context owner
 
-## 规则 2：useEffect 依赖数组规范
+Context Provider 的 value 应按语义拆分并稳定化：
 
-**禁止**将以下内容放入依赖数组（除非确实需要响应其变化）：
+- data 与 actions 变化频率差异大时使用 dual context；
+- action 使用 `useCallback` 或稳定 dispatcher；
+- value 用 `useMemo`，依赖必须包含真正决定 value 的字段；
+- 频繁数据变化不能迫使只消费 action 的组件重渲染。
 
-| 禁止依赖 | 原因 | 替代方案 |
-|----------|------|----------|
-| `toast` hook 返回值 | 可能不稳定 | 在 effect 内部调用，不加依赖 |
-| `api` 对象 | 依赖 Provider 稳定性 | 使用 `useRef` 缓存 |
-| inline callback | 每次渲染新引用 | `useCallback` 或 `useRef` |
-| 对象/数组字面量 | 每次渲染新引用 | `useMemo` 包装 |
+`ConfigProvider` 的 data/actions separation 是当前参考实现。稳定引用是性能与 effect correctness 的契约，不只是 micro-optimization。
 
-```typescript
-// ✅ 正确：稳定依赖
-useEffect(() => {
-    loadData();
-}, [id]);  // 只依赖原始值
+## Latest ref 模式
 
-// ❌ 错误：不稳定依赖导致无限循环
-useEffect(() => {
-    loadData();
-}, [id, toast, api, { config }]);  // toast/api/对象字面量都不稳定
-```
+当长期存活的 callback、listener、timer 或 async completion 需要读取最新 state，但其订阅 identity 不应随 state 重建时：
 
-## 规则 3：跨组件回调稳定化
+```ts
+const valueRef = useRef(value);
+valueRef.current = value;
 
-父组件传递给子组件的回调，若在子组件 useEffect 中使用，必须稳定化：
-
-```typescript
-// 子组件内部
-const onChangeRef = useRef(onChange);
-onChangeRef.current = onChange;  // 每次渲染更新
-
-useEffect(() => {
-    onChangeRef.current?.(value);  // 使用 ref 调用
-}, [value]);  // 不依赖 onChange
-```
-
-## 规则 4：定时器必须清理
-
-```typescript
-const timeoutRef = useRef<NodeJS.Timeout>();
-
-useEffect(() => {
-    timeoutRef.current = setTimeout(doSomething, 1000);
-    return () => {
-        if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    };
+const stableHandler = useCallback(() => {
+  consume(valueRef.current);
 }, []);
 ```
 
-## 规则 5：memo + ref 稳定化模式（渲染列表优化）
+约束：
 
-当父组件用 `state.map()` 渲染子组件列表时，state 变化会重渲染所有子组件。若子组件很重（如 Chat），需用 `memo` + ref 稳定化回调实现精准重渲染：
+1. ref 必须在每次 render 同步，不能只在 effect 中延迟更新；
+2. stable callback 只能依赖 ref 或其它稳定 owner；
+3. 若 callback 本身是对外 observable prop，自定义 memo comparator 跳过它之前必须证明其 identity 稳定；
+4. ref 解决 stale closure，不改变 state owner，也不能用来绕过正常重渲染。
 
-**三步范式**：
+## 异步 lifecycle
 
-```typescript
-// Step 1: Ref 同步——回调通过 ref 读取最新 state，依赖数组为空
-const stateRef = useRef(state);
-stateRef.current = state;
+组件启动异步工作时优先使用 AbortSignal、generation token 或现有 service 的取消能力。只有 API 无法取消时才用 mounted ref 丢弃 completion：
 
-const stableCallback = useCallback(() => {
-    // 使用 stateRef.current 而非 state
-    const item = stateRef.current.find(...);
-}, []);  // 永远稳定
+```ts
+const mountedRef = useRef(false);
 
-// Step 2: memo 子组件——自定义 comparator 只比较数据 props（回调已稳定，无需比较）
-const MemoChild = memo(function Child(props) { ... }, (prev, next) => {
-    return prev.data === next.data && prev.isActive === next.isActive;
-    // 回调 props 不比较，因为已通过 Step 1 保证稳定
-});
-
-// Step 3: 仅传递与该子组件相关的数据 props（避免无关 prop 变化触发重渲染）
-{items.map(item => (
-    <MemoChild
-        key={item.id}
-        data={item}
-        isActive={item.id === activeId}
-        onAction={stableCallback}  // 引用永远不变
-    />
-))}
-```
-
-**关键约束**：
-- 自定义 comparator 跳过回调检查的前提是 **所有回调 props 确实稳定**（`[]` 依赖）。若某个回调依赖了不稳定值（如来自 hook 的函数），必须用 ref 包一层
-- 对仍由组件直接拥有的普通列表，`setItems(prev => prev.map(...))` 应保留未变更 item 的对象引用，使 `prev.data === next.data` 生效；Tab workspace 必须经 `useTabWorkspaceController` transition 保持同一性质，不能绕过 controller 直接调用 setter
-- 仅影响特定子组件类型的 prop，用条件表达式限制传递范围
-
-## 扩展模式
-
-### 模式 A：多 Ref 同步稳定复杂依赖
-
-当 `useCallback` 需要依赖多个 hook 返回值时，通过 Ref 同步避免 callback 频繁重建：
-
-```typescript
-const configRef = useRef(config);
-configRef.current = config;
-const apiKeysRef = useRef(apiKeys);
-apiKeysRef.current = apiKeys;
-
-const buildProviderEnv = useCallback((provider) => {
-  const aliases = getEffectiveModelAliases(provider, configRef.current.providerModelAliases);
-  return { apiKey: apiKeysRef.current[provider.id], ... };
-}, []);  // 依赖为空 → 永不重建
-```
-
-**应用**：`Chat.tsx` 的 `buildProviderEnv`、`handleSendMessage`。
-
-### 模式 B：isMountedRef 防竞态
-
-异步操作完成前检查组件是否仍 mounted：
-
-```typescript
-const isMountedRef = useRef(false);
 useEffect(() => {
-  isMountedRef.current = true;
-  return () => { isMountedRef.current = false; };
+  mountedRef.current = true;
+  return () => {
+    mountedRef.current = false;
+  };
 }, []);
-
-loadData().then(result => {
-  if (!isMountedRef.current) return;
-  setState(result);
-});
 ```
 
-setup 必须显式恢复 `true`：React StrictMode 会执行 effect setup → cleanup → setup 来验证清理对称性；只在初始化器写一次 `true` 会让第二次 setup 永久停留在 `false`，后续合法异步结果全部被误判为 unmounted。
+setup 必须每次显式恢复 `true`。即使生产入口暂未包 `StrictMode`，组件和测试也必须能承受 setup → cleanup → setup；不能依赖“effect 只执行一次”维持资源正确性。
 
-**应用**：`ConfigProvider`、`TabProvider`、`BotPlatformRegistry`。
+每个 timer、animation frame、DOM listener、Tauri event listener、Observer 和网络订阅都由创建它的 effect cleanup。若注册是 async 的，使用现有 abort-aware helper，避免 cleanup 发生后晚到的注册逃逸。
 
-### 模式 C：Dual Context 分离数据与行为
+## 列表与 memo
 
-当 Context 消费者众多且数据变化频繁时，将 data 和 actions 分为两个 Context：
+大型会话、Tab 或树列表需要避免无关 item 重渲染时：
 
-```typescript
-export const ConfigDataContext = createContext<ConfigDataValue>(null);
-export const ConfigActionsContext = createContext<ConfigActionsValue>(null);
-```
+- state transition 保留未变化 item 的对象 identity；
+- 子组件只接收自己的 data 和必要状态；
+- callback prop 先稳定，再决定是否使用 `memo`；
+- 自定义 comparator 只比较能完整决定渲染输出的 props，不能为了命中 memo 忽略不稳定或可见字段。
 
-**优势**：Actions 保持稳定引用，数据变化不导致 action 消费者重渲染。
-**应用**：`ConfigProvider`（`ConfigDataContext` + `ConfigActionsContext`）。
+Tab workspace 的 transition 必须经过 `useTabWorkspaceController`；不要直接 setter 破坏 identity-preserving update。优化前后用 React profiler 或有针对性的 render-count test 证明收益，避免为轻量组件增加 comparator 复杂度。
+
+## 外部状态同步
+
+Effect 与 API、文件、Sidecar 或 Tauri command 交互时：
+
+1. 明确 authority 和 generation；旧请求 completion 不得覆盖新选择；
+2. loading/error/data 应作为同一状态机提交，不能由多个 effect 互相修补；
+3. dependency 变化后的 cleanup 要使上一代结果失效；
+4. 不在 state updater 中执行 IO、广播或其它副作用；updater 必须保持纯函数；
+5. render phase 不读写外部可变状态。
+
+## 验证
+
+涉及稳定性修改时，按风险覆盖：
+
+- dependency 改变、快速切换与 late completion；
+- mount/unmount/remount，必要时在测试中包 `StrictMode`；
+- listener/timer/Observer 没有重复注册或 cleanup 泄漏；
+- memoized child 只在决定输出的 props 变化时更新；
+- state updater 可重复调用且无副作用；
+- Tab/Session 切换不会让旧 generation 的数据写入新 owner。
