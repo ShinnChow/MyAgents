@@ -88,7 +88,7 @@ Plugin 以当前用户权限执行。安装 UI 必须明确提示它可以运行
 
 ### Builtin Runtime
 
-`agent-session.ts` 构建 Query options 时确定 enabled ids：当前 Session 已有 snapshot 就使用 snapshot，否则由 `getDefaultEnabledPluginIdsForWorkspace()` 从 Agent/Project 读取默认值。`getEnabledPluginSdkConfigs()` 再同时应用全局可见性 gate，并对安装目录做 canonical path 校验，最后把本地配置传给 `Options.plugins`。
+`agent-session.ts` 构建 Query options 时确定 enabled ids：当前 Session 已有 snapshot 就使用 snapshot，否则由 `getDefaultEnabledPluginIdsForWorkspace()` 从 Agent/Project 读取默认值。`getEnabledPluginSdkConfigs()` 再同时应用全局可见性 gate，并对安装目录做 canonical path 校验，最后把本地配置传给 `Options.plugins`。Query 使用 `pluginDelivery: initialize`，由 SDK 初始化消息传递插件路径，避免多插件或长路径触发 Windows 命令行长度限制。
 
 Plugin 变更不能原地修改正在运行的 SDK Query。Builtin adapter 在安全边界 restart/pre-warm，让下一代 Query 读取新的插件集合；正在执行的 turn 先按既有 deferred-restart 协议结算。
 
