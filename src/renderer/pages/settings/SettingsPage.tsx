@@ -4241,7 +4241,7 @@ export default function Settings({
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
               <h3 className="truncate text-lg font-semibold text-[var(--ink)]">
-                {provider.name}
+                {tSettings('providers.cardTitles.chatgptSubscription')}
               </h3>
               <span className="shrink-0 rounded bg-[var(--paper-inset)] px-1.5 py-0.5 text-xs font-medium text-[var(--ink-muted)]">
                 {tSettings('providers.official')}
@@ -5177,7 +5177,11 @@ export default function Settings({
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           <h3 className="truncate font-semibold text-[var(--ink)]">
-                            {provider.name}
+                            {provider.id === 'anthropic-sub'
+                              ? tSettings('providers.cardTitles.claudeSubscription')
+                              : provider.id === 'anthropic-api'
+                                ? tSettings('providers.cardTitles.claudeApi')
+                                : provider.name}
                           </h3>
                           <span className="shrink-0 rounded bg-[var(--paper-inset)] px-1.5 py-0.5 text-xs font-medium text-[var(--ink-muted)]">
                             {provider.cloudProvider}
